@@ -1411,12 +1411,8 @@ fn test_scientific_notation_rejected_by_gnu_issue_11655() {
         .stderr_contains("invalid suffix in input");
 }
 
-// https://github.com/uutils/coreutils/issues/11662
-// `--to=auto` is accepted at parse time by uutils then rejected at runtime
-// with exit code 2; GNU rejects it in option parsing with exit code 1.
 #[test]
-#[ignore = "GNU compat: see uutils/coreutils#11662"]
-fn test_to_auto_rejected_at_parse_time_issue_11662() {
+fn test_to_auto_rejected_at_parse_time() {
     new_ucmd!()
         .args(&["--to=auto", "100"])
         .fails_with_code(1)
@@ -1457,7 +1453,6 @@ fn test_to_unit_prefix_selection() {
 // `--format='%.0f'` with `--to=<scale>` still prints one fractional digit;
 // the precision specifier `.0` is ignored.
 #[test]
-#[ignore = "GNU compat: see uutils/coreutils#11667"]
 fn test_format_precision_zero_with_to_scale_issue_11667() {
     new_ucmd!()
         .args(&["--to=iec", "--format=%.0f", "5183776"])
