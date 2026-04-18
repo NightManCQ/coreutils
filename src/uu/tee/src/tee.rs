@@ -118,11 +118,7 @@ fn copy(mut input: impl Read, mut output: impl Write) -> Result<()> {
 
     // Use buffer size from std implementation
     // https://github.com/rust-lang/rust/blob/2feb91181882e525e698c4543063f4d0296fcf91/library/std/src/sys/io/mod.rs#L44
-    const BUF_SIZE: usize = if cfg!(target_os = "espidf") {
-        512
-    } else {
-        8 * 1024
-    };
+    const BUF_SIZE: usize = 8 * 1024;
     let mut buffer = [0u8; BUF_SIZE];
 
     for _ in 0..2 {
@@ -134,8 +130,8 @@ fn copy(mut input: impl Read, mut output: impl Write) -> Result<()> {
                 // `tee` does not buffer the input.
                 output.flush()?;
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() != ErrorKind::Interrupted => return Err(e),
+            _ => {}
         }
     }
     // buffer is too small optimize for large input
@@ -150,8 +146,8 @@ fn copy(mut input: impl Read, mut output: impl Write) -> Result<()> {
                 // `tee` does not buffer the input.
                 output.flush()?;
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() != ErrorKind::Interrupted => return Err(e),
+            _ => {}
         }
     }
 }
@@ -246,18 +242,13 @@ impl Write for MultiWriter {
         let mode = self.output_error_mode.clone();
         let mut errors = 0;
         self.writers.retain_mut(|writer| {
-            let result = writer.write_all(buf);
-            match result {
-                Err(f) => {
-                    if let Err(e) = process_error(mode.as_ref(), f, writer, &mut errors) {
-                        if aborted.is_none() {
-                            aborted = Some(e);
-                        }
-                    }
-                    false
-                }
-                _ => true,
-            }
+            writer
+                .write_all(buf)
+                .map_err(|f| {
+                    let _ = process_error(mode.as_ref(), f, writer, &mut errors)
+                        .map_err(|e| aborted.get_or_insert(e));
+                })
+                .is_ok()
         });
         self.ignored_errors += errors;
         if let Some(e) = aborted {
@@ -277,18 +268,13 @@ impl Write for MultiWriter {
         let mode = self.output_error_mode.clone();
         let mut errors = 0;
         self.writers.retain_mut(|writer| {
-            let result = writer.flush();
-            match result {
-                Err(f) => {
-                    if let Err(e) = process_error(mode.as_ref(), f, writer, &mut errors) {
-                        if aborted.is_none() {
-                            aborted = Some(e);
-                        }
-                    }
-                    false
-                }
-                _ => true,
-            }
+            writer
+                .flush()
+                .map_err(|f| {
+                    let _ = process_error(mode.as_ref(), f, writer, &mut errors)
+                        .map_err(|e| aborted.get_or_insert(e));
+                })
+                .is_ok()
         });
         self.ignored_errors += errors;
         if let Some(e) = aborted {
