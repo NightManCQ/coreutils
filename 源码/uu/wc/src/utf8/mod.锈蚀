@@ -1,0 +1,92 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore Sapin
+模组 读锁定;
+
+公有 使用 读锁定::{BufReadDecoder, BufReadDecoderError};
+
+使用 标准库::比较;
+使用 标准库::字符串切片;
+
+///
+/// Incremental, zero-copy UTF-8 decoding with error handling
+///
+/// The original implementation was written by Simon Sapin in the utf-8 crate <https://crates.io/crates/utf-8>.
+/// `uu_wc` used to depend on that crate.
+/// The author archived the repository <https://github.com/SimonSapin/rust-utf8>.
+/// They suggested incorporating the source directly into `uu_wc` <https://github.com/uutils/coreutils/issues/4289>.
+///
+
+#[derive(调试协议, 复制协议, 克隆协议)]
+公有 结构 Incomplete {
+    公有 buffer: [正8; 4],
+    公有 buffer_len: 正8,
+}
+
+实现 Incomplete {
+    公有 方法 empty() -> 自身类型 {
+        自身类型 {
+            buffer: [0, 0, 0, 0],
+            buffer_len: 0,
+        }
+    }
+
+    公有 方法 为空(自身) -> 布尔 {
+        自身.buffer_len == 0
+    }
+
+    公有 方法 新建(bytes: &[正8]) -> 自身类型 {
+        设 可变 buffer = [0, 0, 0, 0];
+        设 长度 = bytes.长度();
+        buffer[..长度].copy_from_slice(bytes);
+        自身类型 {
+            buffer,
+            buffer_len: 长度 转换 正8,
+        }
+    }
+
+    方法 take_buffer(&可变 自身) -> &[正8] {
+        设 长度 = 自身.buffer_len 转换 正整数大小;
+        自身.buffer_len = 0;
+        &自身.buffer[..长度]
+    }
+
+    /// `(consumed_from_input, None)`: not enough input
+    /// `(consumed_from_input, Some(Err(())))`: error bytes in buffer
+    /// `(consumed_from_input, Some(Ok(())))`: UTF-8 string in buffer
+    方法 try_complete_offsets(&可变 自身, input: &[正8]) -> (正整数大小, 选项<结果<(), ()>>) {
+        设 initial_buffer_len = 自身.buffer_len 转换 正整数大小;
+        设 copied_from_input;
+        {
+            设 unwritten = &可变 自身.buffer[initial_buffer_len..];
+            copied_from_input = 比较::min(unwritten.长度(), input.长度());
+            unwritten[..copied_from_input].copy_from_slice(&input[..copied_from_input]);
+        }
+        设 spliced = &自身.buffer[..initial_buffer_len + copied_from_input];
+        匹配 字符串切片::from_utf8(spliced) {
+            好的(_) => {
+                自身.buffer_len = spliced.长度() 转换 正8;
+                (copied_from_input, 一些(好的(())))
+            }
+            坏的(错误) => {
+                设 valid_up_to = 错误.valid_up_to();
+                如果 valid_up_to > 0 {
+                    设 consumed = valid_up_to.checked_sub(initial_buffer_len).解包();
+                    自身.buffer_len = valid_up_to 转换 正8;
+                    (consumed, 一些(好的(())))
+                } 否则 如果 设 一些(invalid_sequence_length) = 错误.error_len() {
+                    设 consumed = invalid_sequence_length
+                        .checked_sub(initial_buffer_len)
+                        .解包();
+                    自身.buffer_len = invalid_sequence_length 转换 正8;
+                    (consumed, 一些(坏的(())))
+                } 否则 {
+                    自身.buffer_len = spliced.长度() 转换 正8;
+                    (copied_from_input, 无)
+                }
+            }
+        }
+    }
+}

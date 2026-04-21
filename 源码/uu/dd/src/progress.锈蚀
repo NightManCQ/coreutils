@@ -1,0 +1,719 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore btotal sigval
+//! Read and write progress tracking for dd.
+//!
+//! The [`ProgUpdate`] struct represents summary statistics for the
+//! read and write progress of a running `dd` process. The
+//! [`gen_prog_updater`] function can be used to implement a progress
+//! updater that runs in its own thread.
+使用 标准库::输入输出::Write;
+#[cfg(target_os = "linux")]
+使用 标准库::同步::原子操作::{AtomicBool, 排序顺序};
+使用 标准库::同步::mpsc;
+使用 标准库::时间::持续时间;
+使用 uucore::{
+    错误::{UResult, set_exit_code},
+    format::num_format::{FloatVariant, Formatter},
+    locale::setup_localization,
+    translate,
+};
+
+使用 箱::numbers::{SuffixType, to_magnitude_and_suffix};
+
+#[derive(偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 ProgUpdateType {
+    Periodic,
+    Signal,
+    Final,
+}
+
+/// Summary statistics for read and write progress of dd for a given duration.
+公有(箱) 结构 ProgUpdate {
+    /// Read statistics.
+    ///
+    /// This contains information about the number of blocks read from
+    /// the data source.
+    公有(箱) read_stat: ReadStat,
+
+    /// Write statistics.
+    ///
+    /// This contains information about the number of blocks and
+    /// number of bytes written to the data sink.
+    公有(箱) write_stat: WriteStat,
+
+    /// The time period over which the reads and writes were measured.
+    公有(箱) duration: 持续时间,
+
+    /// The status of the write.
+    ///
+    /// True if the write is completed, false if still in-progress.
+    公有(箱) update_type: ProgUpdateType,
+}
+
+实现 ProgUpdate {
+    /// Instantiate this struct.
+    公有(箱) 方法 新建(
+        read_stat: ReadStat,
+        write_stat: WriteStat,
+        duration: 持续时间,
+        update_type: ProgUpdateType,
+    ) -> 自身类型 {
+        自身类型 {
+            read_stat,
+            write_stat,
+            duration,
+            update_type,
+        }
+    }
+
+    /// Write the number of complete and partial records both read and written.
+    ///
+    /// The information is written to `w`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use std::io::Cursor;
+    /// use std::time::Duration;
+    /// use crate::progress::{ProgUpdate, ReadStat, WriteStat};
+    ///
+    /// let read_stat = ReadStat::new(1, 2, 3, 999);
+    /// let write_stat = WriteStat::new(4, 5, 6);
+    /// let duration = Duration::new(789, 0);
+    /// let prog_update = ProgUpdate {
+    ///     read_stat,
+    ///     write_stat,
+    ///     duration,
+    /// };
+    ///
+    /// let mut cursor = Cursor::new(vec![]);
+    /// prog_update.write_io_lines(&mut cursor).unwrap();
+    /// assert_eq!(
+    ///     cursor.get_ref(),
+    ///     b"1+2 records in\n3 truncated records\n4+5 records out\n"
+    /// );
+    /// ```
+    方法 write_io_lines(&自身, w: &可变 实现 Write) -> 标准库::输入输出::结果<()> {
+        自身.read_stat.report(w)?;
+        自身.write_stat.report(w)?;
+        匹配 自身.read_stat.records_truncated {
+            0 => {}
+            计数 => {
+                设 message = translate!("dd-progress-truncated-record", "count" => 计数);
+                writeln!(w, "{message}")?;
+            }
+        }
+        好的(())
+    }
+
+    /// Write the number of bytes written, duration, and throughput.
+    ///
+    /// The information is written to `w`. If `rewrite` is `true`,
+    /// then a `\r` character is written first and no newline is
+    /// written at the end. When writing to `stderr`, this has the
+    /// visual effect of overwriting the previous characters on the
+    /// line.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use std::io::Cursor;
+    /// use std::time::Duration;
+    /// use crate::progress::ProgUpdate;
+    ///
+    /// let prog_update = ProgUpdate {
+    ///     read_stat: Default::default(),
+    ///     write_stat: Default::default(),
+    ///     duration: Duration::new(1, 0),  // one second
+    /// };
+    ///
+    /// let mut cursor = Cursor::new(vec![]);
+    /// let rewrite = false;
+    /// prog_update.write_prog_line(&mut cursor, rewrite).unwrap();
+    /// assert_eq!(cursor.get_ref(), b"0 bytes copied, 1.0 s, 0.0 B/s\n");
+    /// ```
+    方法 write_prog_line(&自身, w: &可变 实现 Write, rewrite: 布尔) -> UResult<()> {
+        // The total number of bytes written as a string, in SI and IEC format.
+        设 btotal = 自身.write_stat.bytes_total;
+        设 btotal_metric = to_magnitude_and_suffix(btotal, SuffixType::Si);
+        设 btotal_bin = to_magnitude_and_suffix(btotal, SuffixType::Iec);
+
+        // Compute the throughput (bytes per second) as a string.
+        设 duration = 自身.duration.as_secs_f64();
+        设 safe_millis = 标准库::比较::max(1, 自身.duration.as_millis());
+        设 rate = (1000正128 * btotal) / safe_millis;
+        设 transfer_rate = to_magnitude_and_suffix(rate, SuffixType::Si);
+
+        // If we are rewriting the progress line, do write a carriage
+        // return (`\r`) at the beginning and don't write a newline
+        // (`\n`) at the end.
+        设 (carriage_return, newline) = 如果 rewrite { ("\r", "") } 否则 { ("", "\n") };
+
+        // The duration should be formatted as in `printf %g`.
+        设 可变 duration_str = 向量::新建();
+        uucore::format::num_format::Float {
+            variant: FloatVariant::Shortest,
+            ..默认协议::默认()
+        }
+        .格式化(&可变 duration_str, &duration.into())?;
+        // We assume that printf will output valid UTF-8
+        设 duration_str = 标准库::字符串切片::from_utf8(&duration_str).解包();
+
+        // If the number of bytes written is sufficiently large, then
+        // print a more concise representation of the number, like
+        // "1.2 kB" and "1.0 KiB".
+        设 message = 匹配 btotal {
+            1 => {
+                translate!("dd-progress-byte-copied", "bytes" => btotal, "duration" => duration_str, "rate" => transfer_rate)
+            }
+            0..=999 => {
+                translate!("dd-progress-bytes-copied", "bytes" => btotal, "duration" => duration_str, "rate" => transfer_rate)
+            }
+            1000..=1023 => {
+                translate!("dd-progress-bytes-copied-si", "bytes" => btotal, "si" => btotal_metric, "duration" => duration_str, "rate" => transfer_rate)
+            }
+            _ => {
+                translate!("dd-progress-bytes-copied-si-iec", "bytes" => btotal, "si" => btotal_metric, "iec" => btotal_bin, "duration" => duration_str, "rate" => transfer_rate)
+            }
+        };
+
+        write!(w, "{carriage_return}{message}{newline}")?;
+        好的(())
+    }
+
+    /// Write all summary statistics.
+    ///
+    /// This is a convenience method that calls
+    /// [`ProgUpdate::write_io_lines`] and
+    /// [`ProgUpdate::write_prog_line`] in that order. The information
+    /// is written to `w`. It optionally begins by writing a new line,
+    /// intended to handle the case of an existing progress line.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use std::io::Cursor;
+    /// use std::time::Duration;
+    /// use crate::progress::ProgUpdate;
+    ///
+    /// let prog_update = ProgUpdate {
+    ///     read_stat: Default::default(),
+    ///     write_stat: Default::default(),
+    ///     duration: Duration::new(1, 0), // one second
+    /// };
+    /// let mut cursor = Cursor::new(vec![]);
+    /// prog_update.write_transfer_stats(&mut cursor, false).unwrap();
+    /// let mut iter = cursor.get_ref().split(|v| *v == b'\n');
+    /// assert_eq!(iter.next().unwrap(), b"0+0 records in");
+    /// assert_eq!(iter.next().unwrap(), b"0+0 records out");
+    /// assert_eq!(iter.next().unwrap(), b"0 bytes copied, 1.0 s, 0.0 B/s");
+    /// assert_eq!(iter.next().unwrap(), b"");
+    /// assert!(iter.next().is_none());
+    /// ```
+    方法 write_transfer_stats(&自身, w: &可变 实现 Write, new_line: 布尔) -> UResult<()> {
+        如果 new_line {
+            writeln!(w)?;
+        }
+        自身.write_io_lines(w)?;
+        设 rewrite = 假;
+        自身.write_prog_line(w, rewrite)?;
+        好的(())
+    }
+
+    /// Print number of complete and partial records read and written to stderr.
+    ///
+    /// See [`ProgUpdate::write_io_lines`] for more information.
+    公有(箱) 方法 print_io_lines(&自身) {
+        设 可变 stderr = 标准库::输入输出::stderr();
+        如果 自身.write_io_lines(&可变 stderr).is_err() {
+            set_exit_code(1);
+        }
+    }
+
+    /// Re-print the number of bytes written, duration, and throughput.
+    ///
+    /// See [`ProgUpdate::write_prog_line`] for more information.
+    公有(箱) 方法 reprint_prog_line(&自身) {
+        设 可变 stderr = 标准库::输入输出::stderr();
+        设 rewrite = 真;
+        如果 自身.write_prog_line(&可变 stderr, rewrite).is_err() {
+            set_exit_code(1);
+        }
+    }
+
+    /// Write all summary statistics.
+    ///
+    /// See [`ProgUpdate::write_transfer_stats`] for more information.
+    公有(箱) 方法 print_transfer_stats(&自身, new_line: 布尔) {
+        设 可变 stderr = 标准库::输入输出::stderr();
+        如果 自身.write_transfer_stats(&可变 stderr, new_line).is_err() {
+            set_exit_code(1);
+        }
+    }
+
+    /// Write all the final statistics.
+    公有(箱) 方法 print_final_stats(
+        &自身,
+        print_level: 选项<StatusLevel>,
+        progress_printed: 布尔,
+    ) {
+        匹配 print_level {
+            一些(StatusLevel::无) => {}
+            一些(StatusLevel::Noxfer) => 自身.print_io_lines(),
+            一些(StatusLevel::Progress) | 无 => 自身.print_transfer_stats(progress_printed),
+        }
+    }
+}
+
+/// Read statistics.
+///
+/// This contains information about the number of blocks read from the
+/// input file. A block is sometimes referred to as a "record".
+#[derive(克隆协议, 复制协议, 默认协议)]
+公有(箱) 结构 ReadStat {
+    /// The number of complete blocks that have been read.
+    公有(箱) reads_complete: 正64,
+
+    /// The number of partial blocks that have been read.
+    ///
+    /// A partial block read can happen if, for example, there are
+    /// fewer bytes in the input file than the specified input block
+    /// size.
+    公有(箱) reads_partial: 正64,
+
+    /// The number of truncated records.
+    ///
+    /// A truncated record can only occur in `conv=block` mode.
+    公有(箱) records_truncated: 正32,
+
+    /// The total number of bytes read.
+    公有(箱) bytes_total: 正64,
+}
+
+实现 ReadStat {
+    /// Create a new instance.
+    #[allow(dead_code)]
+    方法 新建(complete: 正64, partial: 正64, truncated: 正32, bytes_total: 正64) -> 自身类型 {
+        自身类型 {
+            reads_complete: complete,
+            reads_partial: partial,
+            records_truncated: truncated,
+            bytes_total,
+        }
+    }
+
+    /// Whether this counter has zero complete reads and zero partial reads.
+    公有(箱) 方法 为空(&自身) -> 布尔 {
+        自身.reads_complete == 0 && 自身.reads_partial == 0
+    }
+
+    /// Write the counts in the format required by `dd`.
+    ///
+    /// # Errors
+    ///
+    /// If there is a problem writing to `w`.
+    方法 report(&自身, w: &可变 实现 Write) -> 标准库::输入输出::结果<()> {
+        设 message = translate!("dd-progress-records-in", "complete" => 自身.reads_complete, "partial" => 自身.reads_partial);
+        writeln!(w, "{message}")?;
+        好的(())
+    }
+}
+
+实现 标准库::操作符::AddAssign 循环 ReadStat {
+    方法 add_assign(&可变 自身, other: 自身类型) {
+        *自身 = 自身类型 {
+            reads_complete: 自身.reads_complete + other.reads_complete,
+            reads_partial: 自身.reads_partial + other.reads_partial,
+            records_truncated: 自身.records_truncated + other.records_truncated,
+            bytes_total: 自身.bytes_total + other.bytes_total,
+        }
+    }
+}
+
+/// Write statistics.
+///
+/// This contains information about the number of blocks written to
+/// the output file and the total number of bytes written.
+#[derive(克隆协议, 复制协议, 默认协议)]
+公有(箱) 结构 WriteStat {
+    /// The number of complete blocks that have been written.
+    公有(箱) writes_complete: 正64,
+
+    /// The number of partial blocks that have been written.
+    ///
+    /// A partial block write can happen if, for example, there are
+    /// fewer bytes in the input file than the specified output block
+    /// size.
+    公有(箱) writes_partial: 正64,
+
+    /// The total number of bytes written.
+    公有(箱) bytes_total: 正128,
+}
+
+实现 WriteStat {
+    /// Create a new instance.
+    #[allow(dead_code)]
+    方法 新建(complete: 正64, partial: 正64, bytes_total: 正128) -> 自身类型 {
+        自身类型 {
+            writes_complete: complete,
+            writes_partial: partial,
+            bytes_total,
+        }
+    }
+
+    /// Write the counts in the format required by `dd`.
+    ///
+    /// # Errors
+    ///
+    /// If there is a problem writing to `w`.
+    方法 report(&自身, w: &可变 实现 Write) -> 标准库::输入输出::结果<()> {
+        设 message = translate!("dd-progress-records-out", "complete" => 自身.writes_complete, "partial" => 自身.writes_partial);
+        writeln!(w, "{message}")
+    }
+}
+
+实现 标准库::操作符::AddAssign 循环 WriteStat {
+    方法 add_assign(&可变 自身, other: 自身类型) {
+        *自身 = 自身类型 {
+            writes_complete: 自身.writes_complete + other.writes_complete,
+            writes_partial: 自身.writes_partial + other.writes_partial,
+            bytes_total: 自身.bytes_total + other.bytes_total,
+        }
+    }
+}
+
+实现 标准库::操作符::Add 循环 WriteStat {
+    类型 Output = 自身类型;
+    方法 add(自身, other: 自身类型) -> 自身类型 {
+        自身类型 {
+            writes_complete: 自身.writes_complete + other.writes_complete,
+            writes_partial: 自身.writes_partial + other.writes_partial,
+            bytes_total: 自身.bytes_total + other.bytes_total,
+        }
+    }
+}
+
+/// How much detail to report when printing transfer statistics.
+///
+/// This corresponds to the available settings of the `status`
+/// command-line argument.
+#[derive(复制协议, 克隆协议, 调试协议, 偏等比较协议)]
+公有(箱) 枚举 StatusLevel {
+    /// Report number of blocks read and written, throughput, and volume.
+    ///
+    /// This corresponds to `status=progress`.
+    Progress,
+
+    /// Report number of blocks read and written, but no throughput and volume.
+    ///
+    /// This corresponds to `status=noxfer`.
+    Noxfer,
+
+    /// Print no status information.
+    无,
+}
+
+/// Return a closure that can be used in its own thread to print progress info.
+///
+/// This function returns a closure that receives [`ProgUpdate`]
+/// instances sent through `rx`. When a [`ProgUpdate`] instance is
+/// received, the transfer statistics are re-printed to stderr.
+#[cfg(not(target_os = "linux"))]
+公有(箱) 方法 gen_prog_updater(
+    rx: mpsc::接收器<ProgUpdate>,
+    print_level: 选项<StatusLevel>,
+) -> 实现 Fn() {
+    移动 || {
+        // As we are in a thread, we need to set up localization independently.
+        设 _ = setup_localization("dd");
+
+        设 可变 progress_printed = 假;
+        当 设 好的(update) = rx.接收() {
+            // Print the final read/write statistics.
+            如果 update.update_type == ProgUpdateType::Final {
+                update.print_final_stats(print_level, progress_printed);
+                返回;
+            }
+            如果 一些(StatusLevel::Progress) == print_level {
+                update.reprint_prog_line();
+                progress_printed = 真;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+静态 SIGUSR1_RECEIVED: AtomicBool = AtomicBool::新建(假);
+
+#[cfg(target_os = "linux")]
+公有(箱) 方法 check_and_reset_sigusr1() -> 布尔 {
+    SIGUSR1_RECEIVED.swap(假, 排序顺序::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+外部 "C" 方法 sigusr1_handler(_: 标准库::操作系统::raw::c_int) {
+    SIGUSR1_RECEIVED.store(真, 排序顺序::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+公有(箱) 方法 install_sigusr1_handler() -> 结果<(), nix::errno::Errno> {
+    uucore::signals::install_signal_handler(nix::sys::signal::Signal::SIGUSR1, sigusr1_handler)
+}
+
+/// Return a closure that can be used in its own thread to print progress info.
+///
+/// This function returns a closure that receives [`ProgUpdate`]
+/// instances sent through `rx`. When a [`ProgUpdate`] instance is
+/// received, the transfer statistics are re-printed to stderr.
+///
+/// The closure also registers a signal handler for `SIGUSR1`. When
+/// the `SIGUSR1` signal is sent to this process, the transfer
+/// statistics are printed to stderr.
+#[cfg(target_os = "linux")]
+公有(箱) 方法 gen_prog_updater(
+    rx: mpsc::接收器<ProgUpdate>,
+    print_level: 选项<StatusLevel>,
+) -> 实现 Fn() {
+    // --------------------------------------------------------------
+    移动 || {
+        // As we are in a thread, we need to set up localization independently.
+        设 _ = setup_localization("dd");
+
+        // Holds the state of whether we have printed the current progress.
+        // This is needed so that we know whether or not to print a newline
+        // character before outputting non-progress data.
+        设 可变 progress_printed = 假;
+        当 设 好的(update) = rx.接收() {
+            匹配 update.update_type {
+                ProgUpdateType::Final => {
+                    // Print the final read/write statistics.
+                    update.print_final_stats(print_level, progress_printed);
+                    返回;
+                }
+                ProgUpdateType::Periodic => {
+                    // (Re)print status line if progress is requested.
+                    如果 一些(StatusLevel::Progress) == print_level {
+                        update.reprint_prog_line();
+                        progress_printed = 真;
+                    }
+                }
+                ProgUpdateType::Signal => {
+                    update.print_transfer_stats(progress_printed);
+                    // Reset the progress printed, since print_transfer_stats always prints a newline.
+                    progress_printed = 假;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::环境;
+    使用 标准库::输入输出::Cursor;
+    使用 标准库::时间::持续时间;
+    使用 uucore::locale::setup_localization;
+
+    使用 超级::{ProgUpdate, ReadStat, WriteStat};
+    方法 init() {
+        不安全 {
+            环境::set_var("LANG", "C");
+        }
+        设 _ = setup_localization("dd");
+    }
+
+    方法 prog_update_write(n: 正128) -> ProgUpdate {
+        ProgUpdate {
+            read_stat: ReadStat::默认(),
+            write_stat: WriteStat {
+                bytes_total: n,
+                ..默认协议::默认()
+            },
+            duration: 持续时间::新建(1, 0), // one second
+            update_type: 超级::ProgUpdateType::Periodic,
+        }
+    }
+
+    方法 prog_update_duration(duration: 持续时间) -> ProgUpdate {
+        ProgUpdate {
+            read_stat: ReadStat::默认(),
+            write_stat: WriteStat::默认(),
+            duration,
+            update_type: 超级::ProgUpdateType::Periodic,
+        }
+    }
+
+    #[test]
+    方法 test_read_stat_report() {
+        init();
+        设 read_stat = ReadStat::新建(1, 2, 3, 4);
+        设 可变 cursor = Cursor::新建(向量![]);
+        read_stat.report(&可变 cursor).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1+2 records in\n"
+        );
+    }
+
+    #[test]
+    方法 test_write_stat_report() {
+        init();
+        设 write_stat = WriteStat::新建(1, 2, 3);
+        设 可变 cursor = Cursor::新建(向量![]);
+        write_stat.report(&可变 cursor).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1+2 records out\n"
+        );
+    }
+
+    #[test]
+    方法 test_prog_update_write_io_lines() {
+        init();
+        设 read_stat = ReadStat::新建(1, 2, 3, 4);
+        设 write_stat = WriteStat::新建(4, 5, 6);
+        设 duration = 持续时间::新建(789, 0);
+        设 update_type = 超级::ProgUpdateType::Periodic;
+        设 prog_update = ProgUpdate {
+            read_stat,
+            write_stat,
+            duration,
+            update_type,
+        };
+
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_io_lines(&可变 cursor).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1+2 records in\n4+5 records out\n3 truncated records\n"
+        );
+    }
+
+    #[test]
+    方法 test_prog_update_write_prog_line() {
+        init();
+        设 prog_update = ProgUpdate {
+            read_stat: ReadStat::默认(),
+            write_stat: WriteStat::默认(),
+            duration: 持续时间::新建(1, 0), // one second
+            update_type: 超级::ProgUpdateType::Periodic,
+        };
+
+        设 可变 cursor = Cursor::新建(向量![]);
+        设 rewrite = 假;
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        // TODO The expected output string below is what our code
+        // produces today, but it does not match GNU dd:
+        //
+        //     $ : | dd
+        //     0 bytes copied, 7.9151e-05 s, 0.0 kB/s
+        //
+        // The throughput still does not match GNU dd.
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "0 bytes copied, 1 s, 0.0 B/s\n"
+        );
+
+        设 prog_update = prog_update_write(1);
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1 byte copied, 1 s, 1.0 B/s\n"
+        );
+
+        设 prog_update = prog_update_write(999);
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "999 bytes copied, 1 s, 999 B/s\n"
+        );
+
+        设 prog_update = prog_update_write(1000);
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1000 bytes (1.0 kB) copied, 1 s, 1.0 kB/s\n"
+        );
+
+        设 prog_update = prog_update_write(1023);
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1023 bytes (1.0 kB) copied, 1 s, 1.0 kB/s\n"
+        );
+
+        设 prog_update = prog_update_write(1024);
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "1024 bytes (1.0 kB, 1.0 KiB) copied, 1 s, 1.0 kB/s\n"
+        );
+    }
+
+    #[test]
+    方法 write_transfer_stats() {
+        init();
+        设 prog_update = ProgUpdate {
+            read_stat: ReadStat::默认(),
+            write_stat: WriteStat::默认(),
+            duration: 持续时间::新建(1, 0), // one second
+            update_type: 超级::ProgUpdateType::Periodic,
+        };
+        设 可变 cursor = Cursor::新建(向量![]);
+        prog_update
+            .write_transfer_stats(&可变 cursor, 假)
+            .解包();
+        设 output_str = 标准库::字符串切片::from_utf8(cursor.get_ref()).解包();
+        设 可变 迭代 = output_str.split('\n');
+        相等断言!(迭代.next().解包(), "0+0 records in");
+        相等断言!(迭代.next().解包(), "0+0 records out");
+        相等断言!(迭代.next().解包(), "0 bytes copied, 1 s, 0.0 B/s");
+        相等断言!(迭代.next().解包(), "");
+        断言!(迭代.next().is_none());
+    }
+
+    #[test]
+    方法 write_final_transfer_stats() {
+        init();
+        // Tests the formatting of the final statistics written after a progress line.
+        设 prog_update = ProgUpdate {
+            read_stat: ReadStat::默认(),
+            write_stat: WriteStat::默认(),
+            duration: 持续时间::新建(1, 0), // one second
+            update_type: 超级::ProgUpdateType::Periodic,
+        };
+        设 可变 cursor = Cursor::新建(向量![]);
+        设 rewrite = 真;
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        prog_update.write_transfer_stats(&可变 cursor, 真).解包();
+        设 output_str = 标准库::字符串切片::from_utf8(cursor.get_ref()).解包();
+        设 可变 迭代 = output_str.split('\n');
+        相等断言!(迭代.next().解包(), "\r0 bytes copied, 1 s, 0.0 B/s");
+        相等断言!(迭代.next().解包(), "0+0 records in");
+        相等断言!(迭代.next().解包(), "0+0 records out");
+        相等断言!(迭代.next().解包(), "0 bytes copied, 1 s, 0.0 B/s");
+        相等断言!(迭代.next().解包(), "");
+        断言!(迭代.next().is_none());
+    }
+
+    #[test]
+    方法 test_duration_precision() {
+        init();
+        设 prog_update = prog_update_duration(持续时间::from_nanos(123));
+        设 可变 cursor = Cursor::新建(向量![]);
+        设 rewrite = 假;
+        prog_update.write_prog_line(&可变 cursor, rewrite).解包();
+        相等断言!(
+            标准库::字符串切片::from_utf8(cursor.get_ref()).解包(),
+            "0 bytes copied, 0.000000123 s, 0.0 B/s\n"
+        );
+    }
+}

@@ -1,0 +1,148 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Heuristics for determining buffer size for external sorting.
+使用 标准库::ffi::OsString;
+
+// Heuristics to size the external sort buffer without overcommit memory.
+公有(箱) 方法 automatic_buffer_size(files: &[OsString]) -> 正整数大小 {
+    设 file_hint = file_size_hint(files);
+    设 mem_hint = available_memory_hint();
+
+    // Prefer the tighter bound when both hints exist, otherwise fall back to whichever hint is available.
+    匹配 (file_hint, mem_hint) {
+        (一些(file), 一些(内存)) => file.min(内存),
+        (一些(file), 无) => file,
+        (无, 一些(内存)) => 内存,
+        (无, 无) => 箱::FALLBACK_AUTOMATIC_BUF_SIZE,
+    }
+}
+
+方法 file_size_hint(files: &[OsString]) -> 选项<正整数大小> {
+    // Estimate total bytes across real files; non-regular inputs are skipped.
+    设 可变 total_bytes: 正128 = 0;
+
+    循环 file 在 files {
+        如果 file == 箱::STDIN_FILE {
+            继续;
+        }
+
+        设 好的(metadata) = 标准库::文件系统::metadata(file) 否则 {
+            继续;
+        };
+
+        如果 !metadata.is_file() {
+            继续;
+        }
+
+        total_bytes = total_bytes.saturating_add(metadata.长度() 转换 正128);
+
+        如果 total_bytes >= (箱::MAX_AUTOMATIC_BUF_SIZE 转换 正128) * 8 {
+            中断;
+        }
+    }
+
+    如果 total_bytes == 0 {
+        返回 无;
+    }
+
+    设 desired_bytes = desired_file_buffer_bytes(total_bytes);
+    一些(clamp_hint(desired_bytes))
+}
+
+方法 available_memory_hint() -> 选项<正整数大小> {
+    #[cfg(target_os = "linux")]
+    如果 设 一些(bytes) = uucore::parser::parse_size::available_memory_bytes() {
+        返回 一些(clamp_hint(bytes / 4));
+    }
+
+    physical_memory_bytes().映射(|bytes| clamp_hint(bytes / 4))
+}
+
+方法 clamp_hint(bytes: 正128) -> 正整数大小 {
+    设 min = 箱::MIN_AUTOMATIC_BUF_SIZE 转换 正128;
+    设 max = 箱::MAX_AUTOMATIC_BUF_SIZE 转换 正128;
+    设 clamped = bytes.clamp(min, max);
+    clamped.min(正整数大小::MAX 转换 正128) 转换 正整数大小
+}
+
+方法 desired_file_buffer_bytes(total_bytes: 正128) -> 正128 {
+    如果 total_bytes == 0 {
+        返回 0;
+    }
+
+    设 max = 箱::MAX_AUTOMATIC_BUF_SIZE 转换 正128;
+
+    如果 total_bytes <= max {
+        返回 total_bytes.saturating_mul(12).clamp(total_bytes, max);
+    }
+
+    设 quarter = total_bytes / 4;
+    quarter.max(max)
+}
+
+方法 physical_memory_bytes() -> 选项<正128> {
+    #[cfg(全部(
+        target_family = "unix",
+        not(target_os = "redox"),
+        任意(target_os = "linux", target_os = "android")
+    ))]
+    {
+        physical_memory_bytes_unix()
+    }
+
+    #[cfg(任意(
+        not(target_family = "unix"),
+        target_os = "redox",
+        not(任意(target_os = "linux", target_os = "android"))
+    ))]
+    {
+        // No portable or safe API is available here to detect total physical memory.
+        无
+    }
+}
+
+#[cfg(全部(
+    target_family = "unix",
+    not(target_os = "redox"),
+    任意(target_os = "linux", target_os = "android")
+))]
+方法 physical_memory_bytes_unix() -> 选项<正128> {
+    使用 nix::unistd::{SysconfVar, sysconf};
+
+    设 pages = 匹配 sysconf(SysconfVar::_PHYS_PAGES) {
+        好的(一些(pages)) 如果 pages > 0 => 正128::try_from(pages).ok()?,
+        _ => 返回 无,
+    };
+
+    设 page_size = 匹配 sysconf(SysconfVar::PAGE_SIZE) {
+        好的(一些(page_size)) 如果 page_size > 0 => 正128::try_from(page_size).ok()?,
+        _ => 返回 无,
+    };
+
+    一些(pages.saturating_mul(page_size))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 desired_buffer_matches_total_when_small() {
+        设 six_mebibytes = 6 * 1024 * 1024;
+        设 expected = ((six_mebibytes 转换 正128) * 12)
+            .clamp(six_mebibytes 转换 正128, 箱::MAX_AUTOMATIC_BUF_SIZE 转换 正128);
+        相等断言!(desired_file_buffer_bytes(six_mebibytes 转换 正128), expected);
+    }
+
+    #[test]
+    方法 desired_buffer_caps_at_max_for_large_inputs() {
+        设 large = 256 * 1024 * 1024; // 256 MiB
+        相等断言!(
+            desired_file_buffer_bytes(large 转换 正128),
+            箱::MAX_AUTOMATIC_BUF_SIZE 转换 正128
+        );
+    }
+}

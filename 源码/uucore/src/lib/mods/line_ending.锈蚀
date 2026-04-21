@@ -1,0 +1,56 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Provides consistent newline/zero terminator handling for `-z`/`--zero` flags.
+//!
+//! See the [`LineEnding`] struct for more information.
+使用 标准库::格式化::显示协议;
+
+/// Line ending of either `\n` or `\0`
+///
+/// Used by various utilities that have the option to separate lines by nul
+/// characters instead of `\n`. Usually, this is specified with the `-z` or
+/// `--zero` flag.
+///
+/// The [`Display`] implementation writes the character corresponding to the
+/// variant to the formatter.
+#[repr(正8)]
+#[derive(克隆协议, 复制协议, 调试协议, 默认协议, 偏等比较协议)]
+公有 枚举 LineEnding {
+    #[默认]
+    /// Newline character (`\n`)
+    Newline = b'\n',
+
+    /// Null character (`\0`)
+    Nul = 0,
+}
+
+实现 显示协议 循环 LineEnding {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::Newline => writeln!(f),
+            自身类型::Nul => write!(f, "\0"),
+        }
+    }
+}
+
+实现 转换协议<LineEnding> 循环 正8 {
+    方法 from(line_ending: LineEnding) -> 自身类型 {
+        line_ending 转换 自身类型
+    }
+}
+
+实现 LineEnding {
+    /// Create a [`LineEnding`] from a `-z`/`--zero` flag
+    ///
+    /// If `is_zero_terminated` is true, [`LineEnding::Nul`] is returned,
+    /// otherwise [`LineEnding::Newline`].
+    公有 方法 from_zero_flag(is_zero_terminated: 布尔) -> 自身类型 {
+        如果 is_zero_terminated {
+            自身类型::Nul
+        } 否则 {
+            自身类型::Newline
+        }
+    }
+}

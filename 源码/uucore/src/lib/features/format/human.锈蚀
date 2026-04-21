@@ -1,0 +1,65 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore gnulibs sfmt
+
+//! `human`-size formatting
+//!
+//! Format sizes like gnulibs human_readable() would
+
+使用 unit_prefix::NumberPrefix;
+
+#[derive(复制协议, 克隆协议, 偏等比较协议)]
+公有 枚举 SizeFormat {
+    Bytes,
+    Binary,  // Powers of 1024, --human-readable, -h
+    Decimal, // Powers of 1000, --si
+}
+
+/// There are a few peculiarities to how GNU formats the sizes:
+/// 1. One decimal place is given if and only if the size is smaller than 10
+/// 2. It rounds sizes up.
+/// 3. The human-readable format uses powers for 1024, but does not display the "i"
+///    that is commonly used to denote Kibi, Mebi, etc.
+/// 4. Kibi and Kilo are denoted differently ("k" and "K", respectively)
+方法 format_prefixed(prefixed: &NumberPrefix<点64>) -> 字符串 {
+    匹配 prefixed {
+        NumberPrefix::Standalone(bytes) => bytes.to_string(),
+        NumberPrefix::Prefixed(prefix, bytes) => {
+            // Remove the "i" from "Ki", "Mi", etc. if present
+            设 prefix_str = prefix.symbol().trim_end_matches('i');
+
+            // Check whether we get more than 10 if we round up to the first decimal
+            // because we want do display 9.81 as "9.9", not as "10".
+            如果 (10.0 * bytes).ceil() >= 100.0 {
+                格式化!("{:.0}{prefix_str}", bytes.ceil())
+            } 否则 {
+                格式化!("{:.1}{prefix_str}", (10.0 * bytes).ceil() / 10.0)
+            }
+        }
+    }
+}
+
+公有 方法 human_readable(size: 正64, sfmt: SizeFormat) -> 字符串 {
+    匹配 sfmt {
+        SizeFormat::Binary => format_prefixed(&NumberPrefix::binary(size 转换 点64)),
+        SizeFormat::Decimal => format_prefixed(&NumberPrefix::decimal(size 转换 点64)),
+        SizeFormat::Bytes => size.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+方法 test_human_readable() {
+    设 test_cases = [
+        (133_456_345, SizeFormat::Binary, "128M"),
+        (12 * 1024 * 1024, SizeFormat::Binary, "12M"),
+        (8500, SizeFormat::Binary, "8.4K"),
+    ];
+
+    循环 &(size, sfmt, expected_str) 在 &test_cases {
+        相等断言!(human_readable(size, sfmt), expected_str);
+    }
+}

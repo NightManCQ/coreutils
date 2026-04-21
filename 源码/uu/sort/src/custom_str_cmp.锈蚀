@@ -1,0 +1,62 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Custom string comparisons.
+//!
+//! The goal is to compare strings without transforming them first (i.e. not allocating new strings)
+
+使用 标准库::比较::排序顺序;
+
+方法 filter_char(c: 正8, ignore_non_printing: 布尔, ignore_non_dictionary: 布尔) -> 布尔 {
+    如果 ignore_non_dictionary && !(c.is_ascii_alphanumeric() || c.is_ascii_whitespace()) {
+        返回 假;
+    }
+    如果 ignore_non_printing && (c.is_ascii_control() || !c.is_ascii()) {
+        返回 假;
+    }
+    真
+}
+
+方法 cmp_chars(a: 正8, b: 正8, ignore_case: 布尔) -> 排序顺序 {
+    如果 ignore_case {
+        a.to_ascii_uppercase().比较(&b.to_ascii_uppercase())
+    } 否则 {
+        a.比较(&b)
+    }
+}
+
+公有 方法 custom_str_cmp(
+    a: &[正8],
+    b: &[正8],
+    ignore_non_printing: 布尔,
+    ignore_non_dictionary: 布尔,
+    ignore_case: 布尔,
+) -> 排序顺序 {
+    如果 !(ignore_case || ignore_non_dictionary || ignore_non_printing) {
+        // There are no custom settings. Fall back to the default strcmp, which is faster.
+        返回 a.比较(b);
+    }
+    设 可变 a_chars = a
+        .迭代()
+        .过滤(|&&c| filter_char(c, ignore_non_printing, ignore_non_dictionary));
+    设 可变 b_chars = b
+        .迭代()
+        .过滤(|&&c| filter_char(c, ignore_non_printing, ignore_non_dictionary));
+    无限循环 {
+        设 a_char = a_chars.next();
+        设 b_char = b_chars.next();
+        匹配 (a_char, b_char) {
+            (无, 无) => 返回 排序顺序::Equal,
+            (一些(_), 无) => 返回 排序顺序::Greater,
+            (无, 一些(_)) => 返回 排序顺序::Less,
+            (一些(a_char), 一些(b_char)) => {
+                设 ordering = cmp_chars(*a_char, *b_char, ignore_case);
+                如果 ordering != 排序顺序::Equal {
+                    返回 ordering;
+                }
+            }
+        }
+    }
+}

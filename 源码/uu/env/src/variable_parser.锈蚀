@@ -1,0 +1,159 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::操作符::Range;
+
+使用 箱::EnvError;
+使用 箱::{native_int_str::NativeIntStr, string_parser::StringParser};
+
+公有 结构 VariableParser<'a, 'b> {
+    公有 parser: &'b 可变 StringParser<'a>,
+}
+
+实现<'a> VariableParser<'a, '_> {
+    方法 get_current_char(&自身) -> 选项<字符> {
+        自身.parser.peek().ok()
+    }
+
+    方法 check_variable_name_start(&自身) -> 结果<(), EnvError> {
+        如果 设 一些(c) = 自身.get_current_char() {
+            如果 c.is_ascii_digit() {
+                返回 坏的(EnvError::EnvParsingOfVariableUnexpectedNumber(
+                    自身.parser.get_peek_position(),
+                    c.to_string(),
+                ));
+            }
+        }
+        好的(())
+    }
+
+    方法 skip_one(&可变 自身) -> 结果<(), EnvError> {
+        自身.parser.consume_chunk()?;
+        好的(())
+    }
+
+    方法 parse_braced_variable_name(
+        &可变 自身,
+    ) -> 结果<(&'a NativeIntStr, 选项<&'a NativeIntStr>), EnvError> {
+        设 pos_start = 自身.parser.get_peek_position();
+
+        自身.check_variable_name_start()?;
+
+        设 (varname_end, default_end);
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => {
+                    返回 坏的(EnvError::EnvParsingOfVariableMissingClosingBrace(
+                        自身.parser.get_peek_position(),
+                    ));
+                }
+                一些(c) 如果 !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' => {
+                    自身.skip_one()?;
+                }
+                一些(':') => {
+                    varname_end = 自身.parser.get_peek_position();
+                    无限循环 {
+                        匹配 自身.get_current_char() {
+                            无 => {
+                                返回 坏的(
+                                    EnvError::EnvParsingOfVariableMissingClosingBraceAfterValue(
+                                        自身.parser.get_peek_position(),
+                                    ),
+                                );
+                            }
+                            一些('}') => {
+                                default_end = 一些(自身.parser.get_peek_position());
+                                自身.skip_one()?;
+                                中断;
+                            }
+                            一些(_) => {
+                                自身.skip_one()?;
+                            }
+                        }
+                    }
+                    中断;
+                }
+                一些('}') => {
+                    varname_end = 自身.parser.get_peek_position();
+                    default_end = 无;
+                    自身.skip_one()?;
+                    中断;
+                }
+                一些(c) => {
+                    返回 坏的(EnvError::EnvParsingOfVariableExceptedBraceOrColon(
+                        自身.parser.get_peek_position(),
+                        c.to_string(),
+                    ));
+                }
+            }
+        }
+
+        设 default_opt = 如果 设 一些(default_end) = default_end {
+            一些(自身.parser.substring(&Range {
+                start: varname_end + 1,
+                end: default_end,
+            }))
+        } 否则 {
+            无
+        };
+
+        设 varname = 自身.parser.substring(&Range {
+            start: pos_start,
+            end: varname_end,
+        });
+
+        好的((varname, default_opt))
+    }
+
+    方法 parse_unbraced_variable_name(&可变 自身) -> 结果<&'a NativeIntStr, EnvError> {
+        设 pos_start = 自身.parser.get_peek_position();
+
+        自身.check_variable_name_start()?;
+
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => 中断,
+                一些(c) 如果 c.is_ascii_alphanumeric() || c == '_' => {
+                    自身.skip_one()?;
+                }
+                一些(_) => 中断,
+            }
+        }
+
+        设 pos_end = 自身.parser.get_peek_position();
+
+        如果 pos_end == pos_start {
+            返回 坏的(EnvError::EnvParsingOfMissingVariable(pos_start));
+        }
+
+        设 varname = 自身.parser.substring(&Range {
+            start: pos_start,
+            end: pos_end,
+        });
+
+        好的(varname)
+    }
+
+    公有 方法 parse_variable(
+        &可变 自身,
+    ) -> 结果<(&'a NativeIntStr, 选项<&'a NativeIntStr>), EnvError> {
+        自身.skip_one()?;
+
+        设 (name, 默认) = 匹配 自身.get_current_char() {
+            无 => {
+                返回 坏的(EnvError::EnvParsingOfMissingVariable(
+                    自身.parser.get_peek_position(),
+                ));
+            }
+            一些('{') => {
+                自身.skip_one()?;
+                自身.parse_braced_variable_name()?
+            }
+            一些(_) => (自身.parse_unbraced_variable_name()?, 无),
+        };
+
+        好的((name, 默认))
+    }
+}

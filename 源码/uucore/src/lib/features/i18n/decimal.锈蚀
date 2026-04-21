@@ -1,0 +1,91 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::同步::OnceLock;
+
+使用 icu_decimal::provider::DecimalSymbolsV1;
+使用 icu_locale::{Locale, locale};
+使用 icu_provider::预导入::*;
+
+使用 箱::i18n::get_numeric_locale;
+
+/// Return the decimal separator for the given locale
+方法 get_decimal_separator(loc: Locale) -> 字符串 {
+    设 data_locale = DataLocale::from(loc);
+
+    设 request = DataRequest {
+        id: DataIdentifierBorrowed::for_locale(&data_locale),
+        metadata: DataRequestMetadata::默认(),
+    };
+
+    设 response: DataResponse<DecimalSymbolsV1> =
+        icu_decimal::provider::Baked.load(request).解包();
+
+    response.payload.获取().decimal_separator().to_string()
+}
+
+/// Return the decimal separator from the language we're working with.
+/// Example:
+///  Say we need to format 1000.5
+///     en_US: 1,000.5 -> decimal separator is '.'
+///     fr_FR: 1 000,5 -> decimal separator is ','
+公有 方法 locale_decimal_separator() -> &'静态 字符串切片 {
+    静态 DECIMAL_SEP: OnceLock<字符串> = OnceLock::新建();
+
+    DECIMAL_SEP.get_or_init(|| get_decimal_separator(get_numeric_locale().0.克隆()))
+}
+
+/// Return the grouping separator for the given locale
+方法 get_grouping_separator(loc: Locale) -> 字符串 {
+    设 data_locale = DataLocale::from(loc);
+
+    设 request = DataRequest {
+        id: DataIdentifierBorrowed::for_locale(&data_locale),
+        metadata: DataRequestMetadata::默认(),
+    };
+
+    设 response: DataResponse<DecimalSymbolsV1> =
+        icu_decimal::provider::Baked.load(request).解包();
+
+    response.payload.获取().grouping_separator().to_string()
+}
+
+/// Return the grouping separator from the language we're working with.
+/// Example:
+///  Say we need to format 1,000
+///     en_US: 1,000 -> grouping separator is ','
+///     fr_FR: 1 000 -> grouping separator is '\u{202f}'
+公有 方法 locale_grouping_separator() -> &'静态 字符串切片 {
+    静态 GROUPING_SEP: OnceLock<字符串> = OnceLock::新建();
+
+    GROUPING_SEP.get_or_init(|| {
+        设 loc = get_numeric_locale().0.克隆();
+        // C/POSIX locale (represented as "und") has no grouping separator.
+        如果 loc == locale!("und") {
+            字符串::新建()
+        } 否则 {
+            get_grouping_separator(loc)
+        }
+    })
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 icu_locale::locale;
+
+    使用 超级::{get_decimal_separator, get_grouping_separator};
+
+    #[test]
+    方法 test_simple_decimal_separator() {
+        相等断言!(get_decimal_separator(locale!("en")), ".");
+        相等断言!(get_decimal_separator(locale!("fr")), ",");
+    }
+
+    #[test]
+    方法 test_simple_grouping_separator() {
+        相等断言!(get_grouping_separator(locale!("en")), ",");
+        相等断言!(get_grouping_separator(locale!("fr")), "\u{202f}");
+    }
+}

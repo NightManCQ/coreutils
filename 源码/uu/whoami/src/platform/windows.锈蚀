@@ -1,0 +1,21 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出;
+使用 标准库::操作系统::windows::ffi::OsStringExt;
+使用 windows_sys::Win32::NetworkManagement::NetManagement::UNLEN;
+使用 windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+
+公有 方法 get_username() -> 输入输出::结果<OsString> {
+    常量 BUF_LEN: 正32 = UNLEN + 1;
+    设 可变 buffer = [0_u16; BUF_LEN 转换 正整数大小];
+    设 可变 长度 = BUF_LEN;
+    // SAFETY: buffer.len() == len
+    如果 不安全 { GetUserNameW(buffer.as_mut_ptr(), &raw 可变 长度) } == 0 {
+        返回 坏的(输入输出::错误协议::last_os_error());
+    }
+    好的(OsString::from_wide(&buffer[..长度 转换 正整数大小 - 1]))
+}

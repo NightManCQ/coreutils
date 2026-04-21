@@ -1,0 +1,40 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore reflink
+使用 标准库::文件系统;
+使用 标准库::路径::Path;
+使用 uucore::translate;
+
+使用 箱::{
+    CopyDebug, CopyResult, CpError, OffloadReflinkDebug, ReflinkMode, SparseDebug, SparseMode,
+};
+
+/// Copies `source` to `dest` for systems without copy-on-write
+公有(箱) 方法 copy_on_write(
+    source: &Path,
+    dest: &Path,
+    reflink_mode: ReflinkMode,
+    sparse_mode: SparseMode,
+    context: &字符串切片,
+) -> CopyResult<CopyDebug> {
+    如果 reflink_mode != ReflinkMode::Never {
+        返回 坏的(translate!("cp-error-reflink-not-supported")
+            .to_string()
+            .into());
+    }
+    如果 sparse_mode != SparseMode::Auto {
+        返回 坏的(translate!("cp-error-sparse-not-supported")
+            .to_string()
+            .into());
+    }
+    设 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unsupported,
+        reflink: OffloadReflinkDebug::Unsupported,
+        sparse_detection: SparseDebug::Unsupported,
+    };
+    文件系统::copy(source, dest).map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+
+    好的(copy_debug)
+}

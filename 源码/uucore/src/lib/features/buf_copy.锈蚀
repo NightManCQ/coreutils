@@ -1,0 +1,116 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! This module provides several buffer-based copy/write functions that leverage
+//! the `splice` system call in Linux systems, thus increasing the I/O
+//! performance of copying between two file descriptors. This module is mostly
+//! used by utilities to work around the limitations of Rust's `fs::copy` which
+//! does not handle copying special files (e.g pipes, character/block devices).
+
+公有 模组 common;
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 模组 linux;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 使用 linux::*;
+
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+公有 模组 other;
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+公有 使用 other::copy_stream;
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 标准库::文件系统::File;
+    使用 tempfile::tempdir;
+
+    #[cfg(unix)]
+    使用 {
+        箱::pipes,
+        标准库::文件系统::OpenOptions,
+        标准库::{
+            输入输出::{Seek, SeekFrom},
+            线程,
+        },
+    };
+
+    使用 标准库::输入输出::{Read, Write};
+
+    #[cfg(unix)]
+    方法 new_temp_file() -> File {
+        设 temp_dir = tempdir().解包();
+        OpenOptions::新建()
+            .读锁定(真)
+            .写锁定(真)
+            .create(真)
+            .truncate(真)
+            .open(temp_dir.路径().加入("file.txt"))
+            .解包()
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    #[test]
+    方法 test_copy_exact() {
+        设 (可变 pipe_read, 可变 pipe_write) = pipes::pipe().解包();
+        设 data = b"Hello, world!";
+        设 n = pipe_write.写锁定(data).解包();
+        相等断言!(n, data.长度());
+        设 可变 buf = [0; 1024];
+        设 n = copy_exact(&pipe_read, &pipe_write, data.长度()).解包();
+        设 n2 = pipe_read.读锁定(&可变 buf).解包();
+        相等断言!(n, n2);
+        相等断言!(&buf[..n], data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    方法 test_copy_stream() {
+        设 可变 dest_file = new_temp_file();
+
+        设 (可变 pipe_read, 可变 pipe_write) = pipes::pipe().解包();
+        设 data = b"Hello, world!";
+        设 线程 = 线程::生成(移动 || {
+            pipe_write.write_all(data).解包();
+        });
+        设 result = copy_stream(&可变 pipe_read, &可变 dest_file).解包();
+        线程.加入().解包();
+        相等断言!(result, data.长度() 转换 正64);
+
+        // We would have been at the end already, so seek again to the start.
+        dest_file.seek(SeekFrom::Start(0)).解包();
+
+        设 可变 buf = 向量::新建();
+        dest_file.read_to_end(&可变 buf).解包();
+
+        相等断言!(buf, data);
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    // Test for non-unix platforms. We use regular files instead.
+    方法 test_copy_stream() {
+        设 temp_dir = tempdir().解包();
+        设 src_path = temp_dir.路径().加入("src.txt");
+        设 dest_path = temp_dir.路径().加入("dest.txt");
+
+        设 可变 src_file = File::create(&src_path).解包();
+        设 可变 dest_file = File::create(&dest_path).解包();
+
+        设 data = b"Hello, world!";
+        src_file.write_all(data).解包();
+        src_file.sync_all().解包();
+
+        设 可变 src_file = File::open(&src_path).解包();
+        设 bytes_copied = copy_stream(&可变 src_file, &可变 dest_file).解包();
+
+        设 可变 dest_file = File::open(&dest_path).解包();
+        设 可变 buf = 向量::新建();
+        dest_file.read_to_end(&可变 buf).解包();
+
+        相等断言!(bytes_copied 转换 正整数大小, data.长度());
+        相等断言!(buf, data);
+    }
+}

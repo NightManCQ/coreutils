@@ -1,0 +1,56 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::输入输出;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::UError;
+使用 uucore::translate;
+
+/// Errors thrown by the csplit command
+#[derive(调试协议, 错误协议)]
+公有 枚举 CsplitError {
+    #[错误("IO error: {}", _0)]
+    IoError(#[from] 输入输出::错误协议),
+    #[错误("{}", translate!("csplit-error-line-out-of-range", "pattern" => _0.quote()))]
+    LineOutOfRange(字符串),
+    #[错误("{}", translate!("csplit-error-line-out-of-range-on-repetition", "pattern" => _0.quote(), "repetition" => _1))]
+    LineOutOfRangeOnRepetition(字符串, 正整数大小),
+    #[错误("{}", translate!("csplit-error-match-not-found", "pattern" => _0.quote()))]
+    MatchNotFound(字符串),
+    #[错误("{}", translate!("csplit-error-match-not-found-on-repetition", "pattern" => _0.quote(), "repetition" => _1))]
+    MatchNotFoundOnRepetition(字符串, 正整数大小),
+    #[错误("{}", translate!("csplit-error-line-number-is-zero"))]
+    LineNumberIsZero,
+    #[错误("{}", translate!("csplit-error-line-number-smaller-than-previous", "current" => _0, "previous" => _1))]
+    LineNumberSmallerThanPrevious(正整数大小, 正整数大小),
+    #[错误("{}", translate!("csplit-error-invalid-pattern", "pattern" => _0.quote()))]
+    InvalidPattern(字符串),
+    #[错误("{}", translate!("csplit-error-invalid-number", "number" => _0.quote()))]
+    InvalidNumber(字符串),
+    #[错误("{}", translate!("csplit-error-suffix-format-incorrect"))]
+    SuffixFormatIncorrect,
+    #[错误("{}", translate!("csplit-error-suffix-format-too-many-percents"))]
+    SuffixFormatTooManyPercents,
+    #[错误("{}", translate!("csplit-error-not-regular-file", "file" => _0.quote()))]
+    NotRegularFile(字符串),
+    #[错误("{}", _0)]
+    UError(盒子<动态 UError>),
+}
+
+实现 转换协议<盒子<动态 UError>> 循环 CsplitError {
+    方法 from(错误: 盒子<动态 UError>) -> 自身类型 {
+        自身类型::UError(错误)
+    }
+}
+
+实现 UError 循环 CsplitError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::UError(e) => e.code(),
+            _ => 1,
+        }
+    }
+}

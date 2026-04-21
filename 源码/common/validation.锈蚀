@@ -1,0 +1,148 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore memfd_create prefixcat rsplit testcat
+
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::输入输出::{Write, stderr};
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::进程;
+
+使用 uucore::Args;
+使用 uucore::display::Quotable;
+使用 uucore::locale;
+
+/// Gets all available utilities including "coreutils"
+#[allow(clippy::type_complexity)]
+公有 方法 get_all_utilities<T: Args>(
+    util_map: &phf::OrderedMap<&'静态 字符串切片, (方法(T) -> 整32, 方法() -> clap::Command)>,
+) -> 向量<&'静态 字符串切片> {
+    标准库::迭代::once("coreutils")
+        .chain(util_map.keys().copied())
+        .收集()
+}
+
+/// Prints a "utility not found" error and exits
+公有 方法 not_found(util: &OsStr) -> ! {
+    设 _ = writeln!(
+        stderr(),
+        "coreutils: unknown program '{}'",
+        util.maybe_quote()
+    );
+    进程::exit(1);
+}
+
+/// Prints an "unrecognized option" error and exits
+公有 方法 unrecognized_option(binary_name: &字符串切片, option: &OsStr) -> ! {
+    设 _ = writeln!(
+        stderr(),
+        "{binary_name}: unrecognized option '{}'",
+        option.to_string_lossy()
+    );
+    进程::exit(1);
+}
+
+/// Sets up localization for a utility with proper error handling
+公有 方法 setup_localization_or_exit(util_name: &字符串切片) {
+    设 util_name = get_canonical_util_name(util_name);
+    locale::setup_localization(util_name).unwrap_or_else(|err| {
+        匹配 err {
+            locale::LocalizationError::ParseResource {
+                错误: err_msg,
+                snippet,
+            } => 错误打印行!("Localization parse error at {snippet}: {err_msg}"),
+            other => 错误打印行!("Could not init the localization system: {other}"),
+        }
+        进程::exit(99)
+    });
+}
+
+/// Gets the canonical utility name, resolving aliases
+方法 get_canonical_util_name(util_name: &字符串切片) -> &字符串切片 {
+    匹配 util_name {
+        // uu_test aliases - '[' is an alias for test
+        "[" => "test",
+        "dir" => "ls",  // dir is an alias for ls
+        "vdir" => "ls", // vdir is an alias for ls
+
+        // Default case - return the util name as is
+        _ => util_name,
+    }
+}
+
+/// Gets the binary path from command line arguments
+/// Panics if the binary path cannot be determined
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+公有 方法 binary_path(args: &可变 实现 迭代器协议<Item = OsString>) -> PathBuf {
+    匹配 args.next() {
+        一些(引用 s) 如果 !s.为空() => PathBuf::from(s),
+        // the fallback is valid only for hardlinks
+        _ => 标准库::环境::current_exe().解包(),
+    }
+}
+/// Get actual binary path from kernel, not argv0, to prevent `env -a` from bypassing
+/// AppArmor, SELinux policies on hard-linked binaries
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 方法 binary_path(args: &可变 实现 迭代器协议<Item = OsString>) -> PathBuf {
+    使用 标准库::文件系统::File;
+    使用 标准库::输入输出::Read;
+    使用 标准库::操作系统::unix::ffi::OsStrExt;
+    设 execfn = rustix::param::linux_execfn();
+    设 execfn_bytes = execfn.to_bytes();
+    设 exec_path = Path::新建(OsStr::from_bytes(execfn_bytes));
+    设 argv0 = args.next().解包();
+    设 可变 shebang_buf = [0正8; 2];
+    // exec_path is wrong when called from shebang or memfd_create (/proc/self/fd/*)
+    // argv0 is not full-path when called from PATH
+    如果 execfn_bytes.rsplit(|&b| b == b'/').next() == argv0.as_bytes().rsplit(|&b| b == b'/').next()
+        || execfn_bytes.starts_with(b"/proc/")
+        || (File::open(Path::新建(exec_path))
+            .and_then(|可变 f| f.read_exact(&可变 shebang_buf))
+            .is_ok()
+            && &shebang_buf == b"#!")
+    {
+        argv0.into()
+    } 否则 {
+        exec_path.into()
+    }
+}
+/// Extracts the binary name from a path
+公有 方法 name(binary_path: &Path) -> 选项<&字符串切片> {
+    binary_path.file_stem()?.to_str()
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_get_canonical_util_name() {
+        // Test a few key aliases
+        相等断言!(get_canonical_util_name("["), "test");
+        相等断言!(get_canonical_util_name("dir"), "ls");
+
+        // Test passthrough case
+        相等断言!(get_canonical_util_name("cat"), "cat");
+    }
+
+    #[test]
+    方法 test_name() {
+        // Test normal executable name
+        相等断言!(name(Path::新建("/usr/bin/ls")), 一些("ls"));
+        相等断言!(name(Path::新建("cat")), 一些("cat"));
+        相等断言!(
+            name(Path::新建("./target/debug/coreutils")),
+            一些("coreutils")
+        );
+
+        // Test with extensions
+        相等断言!(name(Path::新建("program.exe")), 一些("program"));
+        相等断言!(name(Path::新建("/path/to/utility.bin")), 一些("utility"));
+
+        // Test edge cases
+        相等断言!(name(Path::新建("")), 无);
+        相等断言!(name(Path::新建("/")), 无);
+    }
+}

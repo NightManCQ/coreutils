@@ -1,0 +1,133 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::TempDir;
+使用 uu_du::uumain;
+使用 uucore::benchmark::{fs_tree, run_util_function};
+
+/// Helper to run du with given arguments on a directory
+方法 bench_du_with_args(bencher: Bencher, temp_dir: &TempDir, args: &[&字符串切片]) {
+    设 temp_path_str = temp_dir.路径().to_str().解包();
+    设 可变 full_args = args.to_vec();
+    full_args.压入(temp_path_str);
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &full_args));
+    });
+}
+
+/* too much variance
+/// Benchmark default du on balanced tree
+#[divan::bench(args = [(5, 4, 10)])]
+fn du_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (usize, usize, usize),
+) {
+    let temp_dir = TempDir::new().unwrap();
+    fs_tree::create_balanced_tree(temp_dir.path(), depth, dirs_per_level, files_per_dir);
+    bench_du_with_args(bencher, &temp_dir, &[]);
+}
+*/
+
+/* too much variance
+/// Benchmark du -a (all files) on balanced tree
+#[divan::bench(args = [(4, 3, 10)])]
+fn du_all_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (usize, usize, usize),
+) {
+    let temp_dir = TempDir::new().unwrap();
+    fs_tree::create_balanced_tree(temp_dir.path(), depth, dirs_per_level, files_per_dir);
+    bench_du_with_args(bencher, &temp_dir, &["-a"]);
+}
+*/
+
+/* too much variance
+/// Benchmark du -h (human readable) on balanced tree
+#[divan::bench(args = [(5, 4, 10)])]
+fn du_human_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (usize, usize, usize),
+) {
+    let temp_dir = TempDir::new().unwrap();
+    fs_tree::create_balanced_tree(temp_dir.path(), depth, dirs_per_level, files_per_dir);
+    bench_du_with_args(bencher, &temp_dir, &["-h"]);
+}
+*/
+
+/// Benchmark du on wide directory structures (many files/dirs, shallow)
+#[divan::bench(args = [(5000, 500)])]
+方法 du_wide_tree(bencher: Bencher, (total_files, total_dirs): (正整数大小, 正整数大小)) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_wide_tree(temp_dir.路径(), total_files, total_dirs);
+            temp_dir
+        })
+        .bench_values(|temp_dir| {
+            设 temp_path_str = temp_dir.路径().to_str().解包();
+            设 args = 向量![temp_path_str];
+            black_box(run_util_function(uumain, &args));
+        });
+}
+
+/// Benchmark du -a on wide directory structures
+#[divan::bench(args = [(5000, 500)])]
+方法 du_all_wide_tree(bencher: Bencher, (total_files, total_dirs): (正整数大小, 正整数大小)) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_wide_tree(temp_dir.路径(), total_files, total_dirs);
+            temp_dir
+        })
+        .bench_values(|temp_dir| {
+            设 temp_path_str = temp_dir.路径().to_str().解包();
+            设 args = 向量![temp_path_str, "-a"];
+            black_box(run_util_function(uumain, &args));
+        });
+}
+
+/// Benchmark du on deep directory structures
+#[divan::bench(args = [(100, 3)])]
+方法 du_deep_tree(bencher: Bencher, (depth, files_per_level): (正整数大小, 正整数大小)) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_deep_tree(temp_dir.路径(), depth, files_per_level);
+            temp_dir
+        })
+        .bench_values(|temp_dir| {
+            设 temp_path_str = temp_dir.路径().to_str().解包();
+            设 args = 向量![temp_path_str];
+            black_box(run_util_function(uumain, &args));
+        });
+}
+
+/// Benchmark du -s (summarize) on balanced tree
+#[divan::bench(args = [(5, 4, 10)])]
+方法 du_summarize_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_balanced_tree(temp_dir.路径(), depth, dirs_per_level, files_per_dir);
+    bench_du_with_args(bencher, &temp_dir, &["-s"]);
+}
+
+/// Benchmark du with --max-depth
+#[divan::bench(args = [(6, 4, 10)])]
+方法 du_max_depth_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_balanced_tree(temp_dir.路径(), depth, dirs_per_level, files_per_dir);
+    bench_du_with_args(bencher, &temp_dir, &["--max-depth=2"]);
+}
+
+方法 主函数() {
+    divan::主函数();
+}

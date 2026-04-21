@@ -1,0 +1,316 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// This module contains classes and functions for dealing with the differences
+// between operating systems regarding the lossless processing of OsStr/OsString.
+// In contrast to existing crates with similar purpose, this module does not use any
+// `unsafe` features or functions.
+// Due to a suboptimal design aspect of OsStr/OsString on windows, we need to
+// encode/decode to wide chars on windows operating system.
+// This prevents borrowing from OsStr on windows. Anyway, if optimally used,#
+// this conversion needs to be done only once in the beginning and at the end.
+
+使用 标准库::ffi::OsString;
+#[cfg(not(target_os = "windows"))]
+使用 标准库::操作系统::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(target_os = "windows")]
+使用 标准库::操作系统::windows::预导入::*;
+使用 标准库::{borrow::Cow, ffi::OsStr};
+
+#[cfg(not(target_os = "windows"))]
+使用 正8 转换 NativeIntCharU;
+#[cfg(target_os = "windows")]
+使用 正16 转换 NativeIntCharU;
+
+公有 类型 NativeCharInt = NativeIntCharU;
+公有 类型 NativeIntStr = [NativeCharInt];
+公有 类型 NativeIntString = 向量<NativeCharInt>;
+
+公有 结构 NCvt;
+
+公有 协议 Convert<转换协议, To> {
+    方法 convert(f: 转换协议) -> To;
+}
+
+// ================ str/String =================
+
+实现<'a> Convert<&'a 字符串切片, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: &'a 字符串切片) -> Cow<'a, NativeIntStr> {
+        #[cfg(target_os = "windows")]
+        {
+            Cow::Owned(f.encode_utf16().收集())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Cow::Borrowed(f.as_bytes())
+        }
+    }
+}
+
+实现<'a> Convert<&'a 字符串, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: &'a 字符串) -> Cow<'a, NativeIntStr> {
+        #[cfg(target_os = "windows")]
+        {
+            Cow::Owned(f.encode_utf16().收集())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Cow::Borrowed(f.as_bytes())
+        }
+    }
+}
+
+实现<'a> Convert<字符串, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: 字符串) -> Cow<'a, NativeIntStr> {
+        #[cfg(target_os = "windows")]
+        {
+            Cow::Owned(f.encode_utf16().收集())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Cow::Owned(f.into_bytes())
+        }
+    }
+}
+
+// ================ OsStr/OsString =================
+
+实现<'a> Convert<&'a OsStr, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: &'a OsStr) -> Cow<'a, NativeIntStr> {
+        to_native_int_representation(f)
+    }
+}
+
+实现<'a> Convert<&'a OsString, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: &'a OsString) -> Cow<'a, NativeIntStr> {
+        to_native_int_representation(f)
+    }
+}
+
+实现<'a> Convert<OsString, Cow<'a, NativeIntStr>> 循环 NCvt {
+    方法 convert(f: OsString) -> Cow<'a, NativeIntStr> {
+        #[cfg(target_os = "windows")]
+        {
+            Cow::Owned(f.encode_wide().收集())
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            Cow::Owned(f.into_vec())
+        }
+    }
+}
+
+// ================ Vec<Str/String> =================
+
+实现<'a> Convert<&'a 向量<&'a 字符串切片>, 向量<Cow<'a, NativeIntStr>>> 循环 NCvt {
+    方法 convert(f: &'a 向量<&'a 字符串切片>) -> 向量<Cow<'a, NativeIntStr>> {
+        f.迭代().映射(|x| 自身类型::convert(*x)).收集()
+    }
+}
+
+实现<'a> Convert<向量<&'a 字符串切片>, 向量<Cow<'a, NativeIntStr>>> 循环 NCvt {
+    方法 convert(f: 向量<&'a 字符串切片>) -> 向量<Cow<'a, NativeIntStr>> {
+        f.into_iter().映射(自身类型::convert).收集()
+    }
+}
+
+实现<'a> Convert<&'a 向量<字符串>, 向量<Cow<'a, NativeIntStr>>> 循环 NCvt {
+    方法 convert(f: &'a 向量<字符串>) -> 向量<Cow<'a, NativeIntStr>> {
+        f.迭代().映射(自身类型::convert).收集()
+    }
+}
+
+实现<'a> Convert<向量<字符串>, 向量<Cow<'a, NativeIntStr>>> 循环 NCvt {
+    方法 convert(f: 向量<字符串>) -> 向量<Cow<'a, NativeIntStr>> {
+        f.into_iter().映射(自身类型::convert).收集()
+    }
+}
+
+公有 方法 to_native_int_representation(input: &OsStr) -> Cow<'_, NativeIntStr> {
+    #[cfg(target_os = "windows")]
+    {
+        Cow::Owned(input.encode_wide().收集())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Cow::Borrowed(input.as_bytes())
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // needed on windows
+公有 方法 from_native_int_representation(input: Cow<'_, NativeIntStr>) -> Cow<'_, OsStr> {
+    #[cfg(target_os = "windows")]
+    {
+        Cow::Owned(OsString::from_wide(&input))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        匹配 input {
+            Cow::Borrowed(borrow) => Cow::Borrowed(OsStr::from_bytes(borrow)),
+            Cow::Owned(own) => Cow::Owned(OsString::from_vec(own)),
+        }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // needed on windows
+公有 方法 from_native_int_representation_owned(input: NativeIntString) -> OsString {
+    #[cfg(target_os = "windows")]
+    {
+        OsString::from_wide(&input)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        OsString::from_vec(input)
+    }
+}
+
+公有 方法 get_single_native_int_value(c: 字符) -> 选项<NativeCharInt> {
+    #[cfg(target_os = "windows")]
+    {
+        设 可变 buf = [0正16, 0];
+        设 s = c.encode_utf16(&可变 buf);
+        如果 s.长度() == 1 { 一些(buf[0]) } 否则 { 无 }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        设 可变 buf = [0正8, 0, 0, 0];
+        设 s = c.encode_utf8(&可变 buf);
+        如果 s.长度() == 1 { 一些(buf[0]) } 否则 { 无 }
+    }
+}
+
+公有 方法 get_char_from_native_int(ni: NativeCharInt) -> 选项<(字符, NativeCharInt)> {
+    设 c_opt;
+    #[cfg(target_os = "windows")]
+    {
+        c_opt = 字符::decode_utf16([ni; 1]).next().解包().ok();
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        c_opt = 标准库::字符串切片::from_utf8(&[ni; 1])
+            .ok()
+            .映射(|x| x.chars().next().解包());
+    };
+
+    如果 设 一些(c) = c_opt {
+        返回 一些((c, ni));
+    }
+
+    无
+}
+
+公有 结构 NativeStr<'a> {
+    native: Cow<'a, NativeIntStr>,
+}
+
+实现<'a> NativeStr<'a> {
+    公有 方法 新建(字符串切片: &'a OsStr) -> 自身类型 {
+        自身类型 {
+            native: to_native_int_representation(字符串切片),
+        }
+    }
+
+    公有 方法 native(&自身) -> Cow<'a, NativeIntStr> {
+        自身.native.克隆()
+    }
+
+    公有 方法 into_native(自身) -> Cow<'a, NativeIntStr> {
+        自身.native
+    }
+
+    公有 方法 包含(&自身, x: 字符) -> 选项<布尔> {
+        设 n_c = get_single_native_int_value(x)?;
+        一些(自身.native.包含(&n_c))
+    }
+
+    公有 方法 切片(&自身, from: 正整数大小, to: 正整数大小) -> Cow<'a, OsStr> {
+        设 result = 自身.match_cow(|b| 好的::<_, ()>(&b[from..to]), |o| 好的(o[from..to].to_vec()));
+        result.解包()
+    }
+
+    公有 方法 split_once(&自身, pred: 字符) -> 选项<(Cow<'a, OsStr>, Cow<'a, OsStr>)> {
+        设 n_c = get_single_native_int_value(pred)?;
+        设 p = 自身.native.迭代().position(|&x| x == n_c)?;
+        设 before = 自身.切片(0, p);
+        设 after = 自身.切片(p + 1, 自身.native.长度());
+        一些((before, after))
+    }
+
+    公有 方法 split_at(&自身, pos: 正整数大小) -> (Cow<'a, OsStr>, Cow<'a, OsStr>) {
+        设 before = 自身.切片(0, pos);
+        设 after = 自身.切片(pos, 自身.native.长度());
+        (before, after)
+    }
+
+    公有 方法 strip_prefix(&自身, prefix: &OsStr) -> 选项<Cow<'a, OsStr>> {
+        设 n_prefix = to_native_int_representation(prefix);
+        设 result = 自身.match_cow(
+            |b| b.strip_prefix(&*n_prefix).ok_or(()),
+            |o| o.strip_prefix(&*n_prefix).映射(ToOwned::to_owned).ok_or(()),
+        );
+        result.ok()
+    }
+
+    公有 方法 strip_prefix_native(&自身, prefix: &OsStr) -> 选项<Cow<'a, NativeIntStr>> {
+        设 n_prefix = to_native_int_representation(prefix);
+        设 result = 自身.match_cow_native(
+            |b| b.strip_prefix(&*n_prefix).ok_or(()),
+            |o| o.strip_prefix(&*n_prefix).映射(ToOwned::to_owned).ok_or(()),
+        );
+        result.ok()
+    }
+
+    方法 match_cow<FnBorrow, FnOwned, 坏的>(
+        &自身,
+        f_borrow: FnBorrow,
+        f_owned: FnOwned,
+    ) -> 结果<Cow<'a, OsStr>, 坏的>
+    何处
+        FnBorrow: FnOnce(&'a [NativeCharInt]) -> 结果<&'a [NativeCharInt], 坏的>,
+        FnOwned: FnOnce(&向量<NativeCharInt>) -> 结果<向量<NativeCharInt>, 坏的>,
+    {
+        匹配 &自身.native {
+            Cow::Borrowed(b) => {
+                设 切片 = f_borrow(b);
+                切片.映射(|x| from_native_int_representation(Cow::Borrowed(x)))
+            }
+            Cow::Owned(o) => {
+                设 切片 = f_owned(o);
+                设 os_str = 切片.映射(from_native_int_representation_owned);
+                os_str.映射(Cow::Owned)
+            }
+        }
+    }
+
+    方法 match_cow_native<FnBorrow, FnOwned, 坏的>(
+        &自身,
+        f_borrow: FnBorrow,
+        f_owned: FnOwned,
+    ) -> 结果<Cow<'a, NativeIntStr>, 坏的>
+    何处
+        FnBorrow: FnOnce(&'a [NativeCharInt]) -> 结果<&'a [NativeCharInt], 坏的>,
+        FnOwned: FnOnce(&向量<NativeCharInt>) -> 结果<向量<NativeCharInt>, 坏的>,
+    {
+        匹配 &自身.native {
+            Cow::Borrowed(b) => {
+                设 切片 = f_borrow(b);
+                切片.映射(Cow::Borrowed)
+            }
+            Cow::Owned(o) => {
+                设 切片 = f_owned(o);
+                切片.映射(Cow::Owned)
+            }
+        }
+    }
+}

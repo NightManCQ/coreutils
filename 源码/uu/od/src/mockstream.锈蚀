@@ -1,0 +1,112 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// https://github.com/lazy-bitfield/rust-mockstream/pull/2
+
+使用 标准库::输入输出::{Cursor, 错误协议, ErrorKind, Read, 结果};
+
+/// `FailingMockStream` mocks a stream which will fail upon read or write
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::io::{Cursor, Read};
+///
+/// struct CountIo {}
+///
+/// impl CountIo {
+///     fn read_data(&self, r: &mut Read) -> usize {
+///         let mut count: usize = 0;
+///         let mut retries = 3;
+///
+///         loop {
+///             let mut buffer = [0; 5];
+///             match r.read(&mut buffer) {
+///                 Err(_) => {
+///                     if retries == 0 { break; }
+///                     retries -= 1;
+///                 },
+///                 Ok(0) => break,
+///                 Ok(n) => count += n,
+///             }
+///         }
+///         count
+///     }
+/// }
+///
+/// #[test]
+/// fn test_io_retries() {
+///     let mut c = Cursor::new(&b"1234"[..])
+///             .chain(FailingMockStream::new(ErrorKind::Other, "Failing", 3))
+///             .chain(Cursor::new(&b"5678"[..]));
+///
+///     let sut = CountIo {};
+///     // this will fail unless read_data performs at least 3 retries on I/O errors
+///     assert_eq!(8, sut.read_data(&mut c));
+/// }
+/// ```
+#[derive(克隆协议)]
+公有 结构 FailingMockStream {
+    kind: ErrorKind,
+    message: &'静态 字符串切片,
+    repeat_count: 整32,
+}
+
+实现 FailingMockStream {
+    /// Creates a [`FailingMockStream`]
+    ///
+    /// When `read` or `write` is called, it will return an error `repeat_count` times.
+    /// `kind` and `message` can be specified to define the exact error.
+    公有 方法 新建(kind: ErrorKind, message: &'静态 字符串切片, repeat_count: 整32) -> 自身类型 {
+        自身类型 {
+            kind,
+            message,
+            repeat_count,
+        }
+    }
+
+    方法 错误(&可变 自身) -> 结果<正整数大小> {
+        如果 自身.repeat_count == 0 {
+            好的(0)
+        } 否则 {
+            如果 自身.repeat_count > 0 {
+                自身.repeat_count -= 1;
+            }
+            坏的(错误协议::新建(自身.kind, 自身.message))
+        }
+    }
+}
+
+实现 Read 循环 FailingMockStream {
+    方法 读锁定(&可变 自身, _: &可变 [正8]) -> 结果<正整数大小> {
+        自身.错误()
+    }
+}
+
+#[test]
+方法 test_failing_mock_stream_read() {
+    设 可变 s = FailingMockStream::新建(ErrorKind::BrokenPipe, "The dog ate the ethernet cable", 1);
+    设 可变 v = [0; 4];
+    设 错误 = s.读锁定(v.as_mut()).unwrap_err();
+    相等断言!(错误.kind(), ErrorKind::BrokenPipe);
+    相等断言!(错误.to_string(), "The dog ate the ethernet cable");
+    // after a single error, it will return Ok(0)
+    相等断言!(s.读锁定(v.as_mut()).解包(), 0);
+}
+
+#[test]
+方法 test_failing_mock_stream_chain_interrupted() {
+    设 可变 c = Cursor::新建(&b"abcd"[..])
+        .chain(FailingMockStream::新建(
+            ErrorKind::Interrupted,
+            "Interrupted",
+            5,
+        ))
+        .chain(Cursor::新建(&b"ABCD"[..]));
+
+    设 可变 v = [0; 8];
+    c.read_exact(v.as_mut()).解包();
+    相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x41, 0x42, 0x43, 0x44]);
+    相等断言!(c.读锁定(v.as_mut()).解包(), 0);
+}

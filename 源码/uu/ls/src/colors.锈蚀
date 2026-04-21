@@ -1,0 +1,849 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 超级::PathData;
+使用 lscolors::{Indicator, LsColors, Style};
+使用 rustc_hash::FxHashMap;
+使用 标准库::borrow::Cow;
+使用 标准库::环境;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::{自身, Metadata};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt};
+
+/// ANSI CSI (Control Sequence Introducer)
+常量 ANSI_CSI: &字符串切片 = "\x1b[";
+常量 ANSI_SGR_END: &字符串切片 = "m";
+常量 ANSI_RESET: &字符串切片 = "\x1b[0m";
+常量 ANSI_CLEAR_EOL: &字符串切片 = "\x1b[K";
+常量 EMPTY_STYLE: &字符串切片 = "\x1b[m";
+
+#[cfg(unix)]
+模组 mode {
+    // Unix file mode bits
+    公有 常量 SETUID: 正32 = 0o4000;
+    公有 常量 SETGID: 正32 = 0o2000;
+    公有 常量 EXECUTABLE: 正32 = 0o0111;
+    公有 常量 STICKY_OTHER_WRITABLE: 正32 = 0o1002;
+    公有 常量 OTHER_WRITABLE: 正32 = 0o0002;
+    公有 常量 STICKY: 正32 = 0o1000;
+}
+
+枚举 RawIndicatorStyle {
+    Empty,
+    Code(Indicator),
+}
+
+/// We need this struct to be able to store the previous style.
+/// This because we need to check the previous value in case we don't need
+/// the reset
+公有(箱) 结构 StyleManager<'a> {
+    /// last style that is applied, if `None` that means reset is applied.
+    公有(箱) current_style: 选项<Style>,
+    /// `true` if the initial reset is applied
+    公有(箱) initial_reset_is_done: 布尔,
+    公有(箱) colors: &'a LsColors,
+    /// raw indicator codes as specified in LS_COLORS (if available)
+    indicator_codes: FxHashMap<Indicator, 字符串>,
+    /// whether ln=target is active
+    ln_color_from_target: 布尔,
+}
+
+实现<'a> StyleManager<'a> {
+    公有(箱) 方法 新建(colors: &'a LsColors) -> 自身类型 {
+        设 (indicator_codes, ln_color_from_target) = parse_indicator_codes();
+        自身类型 {
+            initial_reset_is_done: 假,
+            current_style: 无,
+            colors,
+            indicator_codes,
+            ln_color_from_target,
+        }
+    }
+
+    公有(箱) 方法 apply_style(
+        &可变 自身,
+        new_style: 选项<&Style>,
+        路径: 选项<&PathData>,
+        name: OsString,
+        wrap: 布尔,
+    ) -> OsString {
+        设 可变 style_code = 字符串::新建();
+        设 可变 force_suffix_reset: 布尔 = 假;
+        设 可变 applied_raw_code = 假;
+
+        如果 自身.is_reset() {
+            如果 设 一些(norm_sty) = 自身.get_normal_style().copied() {
+                style_code.push_str(&自身.get_style_code(&norm_sty));
+            }
+        }
+
+        如果 设 一些(路径) = 路径 {
+            // Fast-path: apply LS_COLORS raw SGR codes verbatim,
+            // bypassing LsColors fallbacks so the entry from LS_COLORS
+            // is honored exactly as specified.
+            匹配 自身.raw_indicator_style_for_path(路径) {
+                一些(RawIndicatorStyle::Empty) => {
+                    // An explicit empty entry (e.g. "or=") disables coloring and
+                    // bypasses fallbacks, matching GNU ls behavior.
+                    返回 自身.apply_empty_style(name, wrap);
+                }
+                一些(RawIndicatorStyle::Code(indicator)) => {
+                    自身.append_raw_style_code_for_indicator(indicator, &可变 style_code);
+                    applied_raw_code = 真;
+                    自身.current_style = 无;
+                    force_suffix_reset = 真;
+                }
+                无 => {}
+            }
+        }
+
+        如果 !applied_raw_code {
+            自身.append_style_code_for_style(new_style, &可变 style_code, &可变 force_suffix_reset);
+        }
+
+        // we need this clear to eol code in some terminals, for instance if the
+        // text is in the last row of the terminal meaning the terminal need to
+        // scroll up in order to print new text in this situation if the clear
+        // to eol code is not present the background of the text would stretch
+        // till the end of line
+        设 clear_to_eol = 如果 wrap { ANSI_CLEAR_EOL } 否则 { "" };
+
+        设 可变 ret: OsString = style_code.into();
+        ret.压入(name);
+        ret.压入(自身.reset(force_suffix_reset));
+        ret.压入(clear_to_eol);
+        ret
+    }
+
+    方法 raw_indicator_style_for_path(&自身, 路径: &PathData) -> 选项<RawIndicatorStyle> {
+        设 indicator = 自身.indicator_for_raw_code(路径)?;
+        设 should_skip = indicator == Indicator::SymbolicLink
+            && 自身.ln_color_from_target
+            && 路径.路径().exists();
+
+        如果 should_skip {
+            返回 无;
+        }
+
+        设 raw = 自身.indicator_codes.获取(&indicator)?;
+        如果 raw.为空() {
+            一些(RawIndicatorStyle::Empty)
+        } 否则 {
+            一些(RawIndicatorStyle::Code(indicator))
+        }
+    }
+
+    // Append a raw SGR sequence for a validated LS_COLORS indicator.
+    方法 append_raw_style_code_for_indicator(
+        &可变 自身,
+        indicator: Indicator,
+        style_code: &可变 字符串,
+    ) {
+        如果 设 一些(raw) = 自身.indicator_codes.获取(&indicator).cloned() {
+            调试断言!(!raw.为空());
+            style_code.push_str(自身.reset(!自身.initial_reset_is_done));
+            style_code.push_str(ANSI_CSI);
+            style_code.push_str(&raw);
+            style_code.push_str(ANSI_SGR_END);
+        }
+    }
+
+    方法 build_raw_style_code(&可变 自身, raw: &字符串切片) -> 字符串 {
+        设 可变 style_code = 字符串::新建();
+        style_code.push_str(自身.reset(!自身.initial_reset_is_done));
+        style_code.push_str(ANSI_CSI);
+        style_code.push_str(raw);
+        style_code.push_str(ANSI_SGR_END);
+        style_code
+    }
+
+    方法 append_style_code_for_style(
+        &可变 自身,
+        new_style: 选项<&Style>,
+        style_code: &可变 字符串,
+        force_suffix_reset: &可变 布尔,
+    ) {
+        如果 设 一些(new_style) = new_style {
+            // we only need to apply a new style if it's not the same as the current
+            // style for example if normal is the current style and a file with
+            // normal style is to be printed we could skip printing new color
+            // codes
+            如果 !自身.is_current_style(new_style) {
+                style_code.push_str(自身.reset(!自身.initial_reset_is_done));
+                style_code.push_str(&自身.get_style_code(new_style));
+            }
+        }
+        // if new style is None and current style is Normal we should reset it
+        否则 如果 matches!(自身.get_normal_style().copied(), 一些(norm_style) 如果 自身.is_current_style(&norm_style))
+        {
+            style_code.push_str(自身.reset(假));
+            // even though this is an unnecessary reset for gnu compatibility we allow it here
+            *force_suffix_reset = 真;
+        }
+    }
+
+    /// Resets the current style and returns the default ANSI reset code to
+    /// reset all text formatting attributes. If `force` is true, the reset is
+    /// done even if the reset has been applied before.
+    公有(箱) 方法 reset(&可变 自身, force: 布尔) -> &'静态 字符串切片 {
+        // todo:
+        // We need to use style from `Indicator::Reset` but as of now ls colors
+        // uses a fallback mechanism and because of that if `Indicator::Reset`
+        // is not specified it would fallback to `Indicator::Normal` which seems
+        // to be non compatible with gnu
+        如果 自身.current_style.is_some() || force {
+            自身.initial_reset_is_done = 真;
+            自身.current_style = 无;
+            返回 ANSI_RESET;
+        }
+        ""
+    }
+
+    公有(箱) 方法 get_style_code(&可变 自身, new_style: &Style) -> 字符串 {
+        自身.current_style = 一些(*new_style);
+        设 可变 nu_a_style = new_style.to_nu_ansi_term_style();
+        nu_a_style.prefix_with_reset = 假;
+        设 可变 ret = nu_a_style.paint("").to_string();
+        // remove the suffix reset
+        ret.truncate(ret.长度() - 4);
+        ret
+    }
+
+    公有(箱) 方法 is_current_style(&自身, new_style: &Style) -> 布尔 {
+        matches!(&自身.current_style, 一些(style) 如果 style == new_style)
+    }
+
+    公有(箱) 方法 is_reset(&自身) -> 布尔 {
+        自身.current_style.is_none()
+    }
+
+    公有(箱) 方法 get_normal_style(&自身) -> 选项<&Style> {
+        自身.colors.style_for_indicator(Indicator::Normal)
+    }
+    公有(箱) 方法 apply_normal(&可变 自身) -> 字符串 {
+        如果 设 一些(sty) = 自身.get_normal_style().copied() {
+            返回 自身.get_style_code(&sty);
+        }
+        字符串::新建()
+    }
+
+    公有(箱) 方法 apply_style_based_on_metadata(
+        &可变 自身,
+        路径: &PathData,
+        md_option: 选项<&Metadata>,
+        name: OsString,
+        wrap: 布尔,
+    ) -> OsString {
+        设 style = 自身
+            .colors
+            .style_for_path_with_metadata(&路径.p_buf, md_option);
+        自身.apply_style(style, 一些(路径), name, wrap)
+    }
+
+    公有(箱) 方法 apply_style_for_path(
+        &可变 自身,
+        路径: &PathData,
+        name: OsString,
+        wrap: 布尔,
+    ) -> OsString {
+        设 style = 自身.colors.style_for(路径);
+        自身.apply_style(style, 一些(路径), name, wrap)
+    }
+
+    公有(箱) 方法 apply_indicator_style(
+        &可变 自身,
+        indicator: Indicator,
+        name: OsString,
+        wrap: 布尔,
+    ) -> OsString {
+        如果 设 一些(raw) = 自身.indicator_codes.获取(&indicator).cloned() {
+            如果 raw.为空() {
+                返回 自身.apply_empty_style(name, wrap);
+            }
+
+            设 可变 ret: OsString = 自身.build_raw_style_code(&raw).into();
+            ret.压入(name);
+            ret.压入(自身.reset(真));
+            如果 wrap {
+                ret.压入(ANSI_CLEAR_EOL);
+            }
+            ret
+        } 否则 {
+            设 style = 自身.colors.style_for_indicator(indicator);
+            自身.apply_style(style, 无, name, wrap)
+        }
+    }
+
+    公有(箱) 方法 has_indicator_style(&自身, indicator: Indicator) -> 布尔 {
+        自身.indicator_codes.contains_key(&indicator)
+            || 自身.colors.has_explicit_style_for(indicator)
+    }
+
+    公有(箱) 方法 apply_orphan_link_style(&可变 自身, name: OsString, wrap: 布尔) -> OsString {
+        如果 自身.has_indicator_style(Indicator::OrphanedSymbolicLink) {
+            自身.apply_indicator_style(Indicator::OrphanedSymbolicLink, name, wrap)
+        } 否则 {
+            自身.apply_indicator_style(Indicator::MissingFile, name, wrap)
+        }
+    }
+
+    公有(箱) 方法 apply_missing_target_style(&可变 自身, name: OsString, wrap: 布尔) -> OsString {
+        如果 自身.has_indicator_style(Indicator::MissingFile) {
+            自身.apply_indicator_style(Indicator::MissingFile, name, wrap)
+        } 否则 {
+            自身.apply_indicator_style(Indicator::OrphanedSymbolicLink, name, wrap)
+        }
+    }
+
+    方法 apply_empty_style(&可变 自身, name: OsString, wrap: 布尔) -> OsString {
+        设 可变 style_code = 字符串::新建();
+        style_code.push_str(自身.reset(!自身.initial_reset_is_done));
+        style_code.push_str(EMPTY_STYLE);
+
+        设 可变 ret: OsString = style_code.into();
+        ret.压入(name);
+        ret.压入(自身.reset(真));
+        如果 wrap {
+            ret.压入(ANSI_CLEAR_EOL);
+        }
+        ret
+    }
+
+    方法 color_symlink_name(
+        &可变 自身,
+        路径: &PathData,
+        name: OsString,
+        wrap: 布尔,
+    ) -> 选项<OsString> {
+        如果 !自身.ln_color_from_target {
+            返回 无;
+        }
+        如果 路径.must_dereference && 路径.metadata().is_none() {
+            返回 无;
+        }
+        设 可变 target = 路径.路径().read_link().ok()?;
+        如果 target.is_relative() {
+            如果 设 一些(parent) = 路径.路径().parent() {
+                target = parent.加入(target);
+            }
+        }
+
+        匹配 文件系统::metadata(&target) {
+            好的(metadata) => {
+                设 style = 自身
+                    .colors
+                    .style_for_path_with_metadata(&target, 一些(&metadata));
+                一些(自身.apply_style(style, 无, name, wrap))
+            }
+            坏的(_) => {
+                如果 自身.has_indicator_style(Indicator::OrphanedSymbolicLink) {
+                    一些(自身.apply_orphan_link_style(name, wrap))
+                } 否则 {
+                    无
+                }
+            }
+        }
+    }
+
+    方法 indicator_for_raw_code(&自身, 路径: &PathData) -> 选项<Indicator> {
+        如果 自身.indicator_codes.为空() {
+            返回 无;
+        }
+
+        设 可变 existence_cache: 选项<布尔> = 无;
+        设 可变 entry_exists =
+            || -> 布尔 { *existence_cache.get_or_insert_with(|| 路径.路径().exists()) };
+
+        设 一些(file_type) = 路径.file_type() 否则 {
+            如果 自身.has_indicator_style(Indicator::MissingFile) && !entry_exists() {
+                返回 一些(Indicator::MissingFile);
+            }
+            返回 无;
+        };
+
+        如果 file_type.is_symlink() {
+            返回 自身.indicator_for_symlink(&可变 entry_exists);
+        }
+
+        如果 自身.has_indicator_style(Indicator::MissingFile) && !entry_exists() {
+            返回 一些(Indicator::MissingFile);
+        }
+
+        如果 file_type.is_file() {
+            自身.indicator_for_file(路径)
+        } 否则 如果 file_type.is_dir() {
+            自身.indicator_for_directory(路径)
+        } 否则 {
+            自身.indicator_for_special_file(*file_type)
+        }
+    }
+
+    方法 indicator_for_symlink(&自身, entry_exists: &可变 动态 FnMut() -> 布尔) -> 选项<Indicator> {
+        设 orphan_enabled = 自身.has_indicator_style(Indicator::OrphanedSymbolicLink);
+        设 missing_enabled = 自身.has_indicator_style(Indicator::MissingFile);
+        设 needs_target_state = 自身.ln_color_from_target || orphan_enabled;
+        设 target_missing = needs_target_state && !entry_exists();
+
+        如果 target_missing {
+            设 orphan_raw = 自身.indicator_codes.获取(&Indicator::OrphanedSymbolicLink);
+            设 orphan_raw_is_empty = orphan_raw.is_some_and(字符串::为空);
+            如果 orphan_enabled && (!orphan_raw_is_empty || 自身.ln_color_from_target) {
+                返回 一些(Indicator::OrphanedSymbolicLink);
+            }
+            如果 自身.ln_color_from_target && missing_enabled {
+                返回 一些(Indicator::MissingFile);
+            }
+        }
+        如果 自身.has_indicator_style(Indicator::SymbolicLink) {
+            返回 一些(Indicator::SymbolicLink);
+        }
+        无
+    }
+
+    #[cfg(unix)]
+    方法 indicator_for_file(&自身, 路径: &PathData) -> 选项<Indicator> {
+        如果 自身.needs_file_metadata() {
+            如果 设 一些(metadata) = 路径.metadata() {
+                设 mode = metadata.mode();
+                如果 自身.has_indicator_style(Indicator::Setuid) && mode & mode::SETUID != 0 {
+                    返回 一些(Indicator::Setuid);
+                }
+                如果 自身.has_indicator_style(Indicator::Setgid) && mode & mode::SETGID != 0 {
+                    返回 一些(Indicator::Setgid);
+                }
+                如果 自身.has_indicator_style(Indicator::ExecutableFile)
+                    && mode & mode::EXECUTABLE != 0
+                {
+                    返回 一些(Indicator::ExecutableFile);
+                }
+                如果 自身.has_indicator_style(Indicator::MultipleHardLinks) && metadata.nlink() > 1 {
+                    返回 一些(Indicator::MultipleHardLinks);
+                }
+            }
+        }
+
+        如果 自身.has_indicator_style(Indicator::RegularFile) {
+            一些(Indicator::RegularFile)
+        } 否则 {
+            无
+        }
+    }
+
+    #[cfg(not(unix))]
+    方法 indicator_for_file(&自身, _path: &PathData) -> 选项<Indicator> {
+        如果 自身.has_indicator_style(Indicator::RegularFile) {
+            一些(Indicator::RegularFile)
+        } 否则 {
+            无
+        }
+    }
+
+    #[cfg(unix)]
+    方法 indicator_for_directory(&自身, 路径: &PathData) -> 选项<Indicator> {
+        如果 自身.needs_dir_metadata() {
+            如果 设 一些(metadata) = 路径.metadata() {
+                设 mode = metadata.mode();
+                如果 自身.has_indicator_style(Indicator::StickyAndOtherWritable)
+                    && mode & mode::STICKY_OTHER_WRITABLE == mode::STICKY_OTHER_WRITABLE
+                {
+                    返回 一些(Indicator::StickyAndOtherWritable);
+                }
+                如果 自身.has_indicator_style(Indicator::OtherWritable)
+                    && mode & mode::OTHER_WRITABLE != 0
+                {
+                    返回 一些(Indicator::OtherWritable);
+                }
+                如果 自身.has_indicator_style(Indicator::Sticky) && mode & mode::STICKY != 0 {
+                    返回 一些(Indicator::Sticky);
+                }
+            }
+        }
+
+        如果 自身.has_indicator_style(Indicator::Directory) {
+            一些(Indicator::Directory)
+        } 否则 {
+            无
+        }
+    }
+
+    #[cfg(not(unix))]
+    方法 indicator_for_directory(&自身, _path: &PathData) -> 选项<Indicator> {
+        如果 自身.has_indicator_style(Indicator::Directory) {
+            一些(Indicator::Directory)
+        } 否则 {
+            无
+        }
+    }
+
+    #[cfg(unix)]
+    方法 indicator_for_special_file(&自身, file_type: 文件系统::FileType) -> 选项<Indicator> {
+        如果 file_type.is_fifo() && 自身.has_indicator_style(Indicator::FIFO) {
+            返回 一些(Indicator::FIFO);
+        }
+        如果 file_type.is_socket() && 自身.has_indicator_style(Indicator::Socket) {
+            返回 一些(Indicator::Socket);
+        }
+        如果 file_type.is_block_device() && 自身.has_indicator_style(Indicator::BlockDevice) {
+            返回 一些(Indicator::BlockDevice);
+        }
+        如果 file_type.is_char_device() && 自身.has_indicator_style(Indicator::CharacterDevice) {
+            返回 一些(Indicator::CharacterDevice);
+        }
+        无
+    }
+
+    #[cfg(not(unix))]
+    方法 indicator_for_special_file(&自身, _file_type: 文件系统::FileType) -> 选项<Indicator> {
+        无
+    }
+
+    #[cfg(unix)]
+    方法 needs_file_metadata(&自身) -> 布尔 {
+        自身.has_indicator_style(Indicator::Setuid)
+            || 自身.has_indicator_style(Indicator::Setgid)
+            || 自身.has_indicator_style(Indicator::ExecutableFile)
+            || 自身.has_indicator_style(Indicator::MultipleHardLinks)
+    }
+
+    #[cfg(unix)]
+    方法 needs_dir_metadata(&自身) -> 布尔 {
+        自身.has_indicator_style(Indicator::StickyAndOtherWritable)
+            || 自身.has_indicator_style(Indicator::OtherWritable)
+            || 自身.has_indicator_style(Indicator::Sticky)
+    }
+}
+
+/// Colors the provided name based on the style determined for the given path
+公有(箱) 方法 color_name(
+    name: OsString,
+    路径: &PathData,
+    style_manager: &可变 StyleManager,
+    target_symlink: 选项<&PathData>,
+    wrap: 布尔,
+) -> OsString {
+    // Check if the file has capabilities
+    #[cfg(全部(unix, not(任意(target_os = "android", target_os = "macos"))))]
+    {
+        // Skip checking capabilities if LS_COLORS=ca=:
+        设 has_capabilities = style_manager
+            .colors
+            .has_explicit_style_for(Indicator::Capabilities)
+            && uucore::fsxattr::has_security_cap_acl(&路径.p_buf);
+
+        // If the file has capabilities, use a specific style for `ca` (capabilities)
+        如果 has_capabilities {
+            设 capabilities = style_manager
+                .colors
+                .style_for_indicator(Indicator::Capabilities);
+            返回 style_manager.apply_style(capabilities, 一些(路径), name, wrap);
+        }
+    }
+
+    如果 target_symlink.is_none() && 路径.file_type().is_some_and(文件系统::FileType::is_symlink) {
+        如果 设 一些(colored) = style_manager.color_symlink_name(路径, name.克隆(), wrap) {
+            返回 colored;
+        }
+    }
+
+    如果 设 一些(target) = target_symlink {
+        // use the optional target_symlink
+        // Use fn symlink_metadata directly instead of get_metadata() here because ls
+        // should not exit with an err, if we are unable to obtain the target_metadata
+        返回 style_manager.apply_style_for_path(target, name, wrap);
+    }
+
+    如果 !路径.must_dereference {
+        // If we need to dereference (follow) a symlink, we will need to get the metadata
+        // There is a DirEntry, we don't need to get the metadata for the color
+        返回 style_manager.apply_style_for_path(路径, name, wrap);
+    }
+
+    设 md_option: 选项<Metadata> = 路径
+        .metadata()
+        .cloned()
+        .or_else(|| 路径.p_buf.symlink_metadata().ok());
+
+    style_manager.apply_style_based_on_metadata(路径, md_option.as_ref(), name, wrap)
+}
+
+#[derive(调试协议)]
+公有(箱) 枚举 LsColorsParseError {
+    UnrecognizedPrefix(字符串),
+    InvalidSyntax,
+}
+
+公有(箱) 方法 validate_ls_colors_env() -> 结果<(), LsColorsParseError> {
+    设 好的(ls_colors) = 环境::var("LS_COLORS") 否则 {
+        返回 好的(());
+    };
+
+    如果 ls_colors.为空() {
+        返回 好的(());
+    }
+
+    validate_ls_colors(&ls_colors)
+}
+
+// GNU-like parser: ensure LS_COLORS has valid labels and well-formed escapes.
+方法 validate_ls_colors(ls_colors: &字符串切片) -> 结果<(), LsColorsParseError> {
+    设 bytes = ls_colors.as_bytes();
+    设 可变 idx = 0;
+
+    当 idx < bytes.长度() {
+        匹配 bytes[idx] {
+            b':' => {
+                idx += 1;
+            }
+            b'*' => {
+                idx += 1;
+                idx = parse_funky_string(bytes, idx, 真)?;
+                如果 idx >= bytes.长度() || bytes[idx] != b'=' {
+                    返回 坏的(LsColorsParseError::InvalidSyntax);
+                }
+                idx += 1;
+                idx = parse_funky_string(bytes, idx, 假)?;
+                如果 idx < bytes.长度() && bytes[idx] == b':' {
+                    idx += 1;
+                }
+            }
+            _ => {
+                如果 idx + 1 >= bytes.长度() {
+                    返回 坏的(LsColorsParseError::InvalidSyntax);
+                }
+                设 label = [bytes[idx], bytes[idx + 1]];
+                idx += 2;
+                如果 idx >= bytes.长度() || bytes[idx] != b'=' {
+                    返回 坏的(LsColorsParseError::InvalidSyntax);
+                }
+                如果 !is_valid_ls_colors_prefix(label) {
+                    设 prefix = 字符串::from_utf8_lossy(&label).into_owned();
+                    返回 坏的(LsColorsParseError::UnrecognizedPrefix(prefix));
+                }
+                idx += 1;
+                idx = parse_funky_string(bytes, idx, 假)?;
+                如果 idx < bytes.长度() && bytes[idx] == b':' {
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    好的(())
+}
+
+// Parse a value with GNU-compatible escape sequences, returning the index of the terminator.
+方法 parse_funky_string(
+    bytes: &[正8],
+    可变 idx: 正整数大小,
+    equals_end: 布尔,
+) -> 结果<正整数大小, LsColorsParseError> {
+    枚举 State {
+        Ground,
+        Backslash,
+        Octal(正8),
+        Hex(正8),
+        Caret,
+    }
+
+    设 可变 state = State::Ground;
+    无限循环 {
+        设 byte = 如果 idx < bytes.长度() { bytes[idx] } 否则 { 0 };
+        匹配 state {
+            State::Ground => 匹配 byte {
+                b':' | 0 => 返回 好的(idx),
+                b'=' 如果 equals_end => 返回 好的(idx),
+                b'\\' => {
+                    state = State::Backslash;
+                    idx += 1;
+                }
+                b'^' => {
+                    state = State::Caret;
+                    idx += 1;
+                }
+                _ => idx += 1,
+            },
+            State::Backslash => 匹配 byte {
+                0 => 返回 坏的(LsColorsParseError::InvalidSyntax),
+                b'0'..=b'7' => {
+                    state = State::Octal(byte - b'0');
+                    idx += 1;
+                }
+                b'x' | b'X' => {
+                    state = State::Hex(0);
+                    idx += 1;
+                }
+                b'a' | b'b' | b'e' | b'f' | b'n' | b'r' | b't' | b'v' | b'?' | b'_' => {
+                    state = State::Ground;
+                    idx += 1;
+                }
+                _ => {
+                    state = State::Ground;
+                    idx += 1;
+                }
+            },
+            State::Octal(数字) => 匹配 byte {
+                b'0'..=b'7' => {
+                    state = State::Octal(数字.wrapping_mul(8).wrapping_add(byte - b'0'));
+                    idx += 1;
+                }
+                _ => state = State::Ground,
+            },
+            State::Hex(数字) => 匹配 byte {
+                b'0'..=b'9' => {
+                    state = State::Hex(数字.wrapping_mul(16).wrapping_add(byte - b'0'));
+                    idx += 1;
+                }
+                b'a'..=b'f' => {
+                    state = State::Hex(数字.wrapping_mul(16).wrapping_add(byte - b'a' + 10));
+                    idx += 1;
+                }
+                b'A'..=b'F' => {
+                    state = State::Hex(数字.wrapping_mul(16).wrapping_add(byte - b'A' + 10));
+                    idx += 1;
+                }
+                _ => state = State::Ground,
+            },
+            State::Caret => 匹配 byte {
+                b'@'..=b'~' | b'?' => {
+                    state = State::Ground;
+                    idx += 1;
+                }
+                _ => 返回 坏的(LsColorsParseError::InvalidSyntax),
+            },
+        }
+    }
+}
+
+方法 is_valid_ls_colors_prefix(label: [正8; 2]) -> 布尔 {
+    matches!(
+        label,
+        [b'l', b'c']
+            | [b'r', b'c']
+            | [b'e', b'c']
+            | [b'r', b's']
+            | [b'n', b'o']
+            | [b'f', b'i']
+            | [b'd', b'i']
+            | [b'l', b'n']
+            | [b'p', b'i']
+            | [b's', b'o']
+            | [b'b', b'd']
+            | [b'c', b'd']
+            | [b'm', b'i']
+            | [b'o', b'r']
+            | [b'e', b'x']
+            | [b'd', b'o']
+            | [b's', b'u']
+            | [b's', b'g']
+            | [b's', b't']
+            | [b'o', b'w']
+            | [b't', b'w']
+            | [b'c', b'a']
+            | [b'm', b'h']
+            | [b'c', b'l']
+    )
+}
+
+方法 parse_indicator_codes() -> (FxHashMap<Indicator, 字符串>, 布尔) {
+    设 可变 indicator_codes = FxHashMap::默认();
+    设 可变 ln_color_from_target = 假;
+
+    // LS_COLORS validity is checked before enabling color output, so parse
+    // entries directly here for raw indicator overrides.
+    如果 设 好的(ls_colors) = 环境::var("LS_COLORS") {
+        循环 entry 在 ls_colors.split(':') {
+            如果 entry.为空() {
+                继续;
+            }
+            设 一些((key, value)) = entry.split_once('=') 否则 {
+                继续;
+            };
+
+            如果 设 一些(indicator) = Indicator::from(key) {
+                如果 indicator == Indicator::SymbolicLink && value == "target" {
+                    ln_color_from_target = 真;
+                    继续;
+                }
+                如果 indicator_value_is_disabled(indicator, value) {
+                    如果 value.为空()
+                        && matches!(
+                            indicator,
+                            Indicator::OrphanedSymbolicLink | Indicator::MissingFile
+                        )
+                    {
+                        indicator_codes.插入(indicator, 字符串::新建());
+                    }
+                    继续;
+                }
+                indicator_codes.插入(indicator, canonicalize_indicator_value(value).into_owned());
+            }
+        }
+    }
+
+    (indicator_codes, ln_color_from_target)
+}
+
+方法 canonicalize_indicator_value(value: &字符串切片) -> Cow<'_, 字符串切片> {
+    如果 value.长度() == 1 && value.as_bytes()[0].is_ascii_digit() {
+        设 可变 canonical = 字符串::with_capacity(2);
+        canonical.压入('0');
+        canonical.push_str(value);
+        Cow::Owned(canonical)
+    } 否则 {
+        Cow::Borrowed(value)
+    }
+}
+
+方法 indicator_value_is_disabled(indicator: Indicator, value: &字符串切片) -> 布尔 {
+    如果 value.为空() {
+        !matches!(
+            indicator,
+            Indicator::OrphanedSymbolicLink | Indicator::MissingFile
+        )
+    } 否则 {
+        value.chars().全部(|c| c == '0')
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    方法 style_manager(
+        colors: &LsColors,
+        indicator_codes: FxHashMap<Indicator, 字符串>,
+    ) -> StyleManager<'_> {
+        StyleManager {
+            current_style: 无,
+            initial_reset_is_done: 假,
+            colors,
+            indicator_codes,
+            ln_color_from_target: 假,
+        }
+    }
+
+    #[test]
+    方法 has_indicator_style_ignores_fallback_styles() {
+        设 colors = LsColors::from_string("ex=00:fi=32");
+        设 manager = style_manager(&colors, FxHashMap::默认());
+        断言!(!manager.has_indicator_style(Indicator::ExecutableFile));
+    }
+
+    #[test]
+    方法 has_indicator_style_detects_explicit_styles() {
+        设 colors = LsColors::from_string("ex=01;32");
+        设 manager = style_manager(&colors, FxHashMap::默认());
+        断言!(manager.has_indicator_style(Indicator::ExecutableFile));
+    }
+
+    #[test]
+    方法 has_indicator_style_detects_raw_codes() {
+        设 colors = LsColors::empty();
+        设 可变 indicator_codes = FxHashMap::默认();
+        indicator_codes.插入(Indicator::Directory, "01;34".to_string());
+        设 manager = style_manager(&colors, indicator_codes);
+        断言!(manager.has_indicator_style(Indicator::Directory));
+    }
+}

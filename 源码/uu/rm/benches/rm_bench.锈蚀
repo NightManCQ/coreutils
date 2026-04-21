@@ -1,0 +1,112 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::TempDir;
+使用 uu_rm::uumain;
+使用 uucore::benchmark::{fs_tree, run_util_function};
+
+/// Benchmark removing a single file (repeated to reach 100ms)
+#[divan::bench]
+方法 rm_single_file(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_wide_tree(temp_dir.路径(), 1000, 0);
+            设 paths: 向量<字符串> = (0..1000)
+                .映射(|i| {
+                    temp_dir
+                        .路径()
+                        .加入(格式化!("f{i}"))
+                        .to_str()
+                        .解包()
+                        .to_string()
+                })
+                .收集();
+            (temp_dir, paths)
+        })
+        .bench_values(|(temp_dir, paths)| {
+            循环 路径 在 &paths {
+                black_box(run_util_function(uumain, &[路径]));
+            }
+            drop(temp_dir);
+        });
+}
+
+/// Benchmark removing multiple files
+#[divan::bench]
+方法 rm_multiple_files(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_wide_tree(temp_dir.路径(), 1000, 0);
+            设 paths: 向量<字符串> = (0..1000)
+                .映射(|i| {
+                    temp_dir
+                        .路径()
+                        .加入(格式化!("f{i}"))
+                        .to_str()
+                        .解包()
+                        .to_string()
+                })
+                .收集();
+            (temp_dir, paths)
+        })
+        .bench_values(|(temp_dir, paths)| {
+            设 args: 向量<&字符串切片> = paths.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &args));
+            drop(temp_dir);
+        });
+}
+
+/// Benchmark recursive directory removal
+#[divan::bench]
+方法 rm_recursive_tree(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            设 test_dir = temp_dir.路径().加入("test_tree");
+            标准库::文件系统::create_dir(&test_dir).解包();
+            // Increase depth and width for longer benchmark
+            fs_tree::create_balanced_tree(&test_dir, 5, 5, 10);
+            (temp_dir, test_dir.to_str().解包().to_string())
+        })
+        .bench_values(|(temp_dir, 路径)| {
+            black_box(run_util_function(uumain, &["-r", &路径]));
+            drop(temp_dir);
+        });
+}
+
+/// Benchmark force removal
+#[divan::bench]
+方法 rm_force_files(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            fs_tree::create_wide_tree(temp_dir.路径(), 1000, 0);
+            设 paths: 向量<字符串> = (0..1000)
+                .映射(|i| {
+                    temp_dir
+                        .路径()
+                        .加入(格式化!("f{i}"))
+                        .to_str()
+                        .解包()
+                        .to_string()
+                })
+                .收集();
+            (temp_dir, paths)
+        })
+        .bench_values(|(temp_dir, paths)| {
+            设 可变 args = 向量!["-f"];
+            设 path_refs: 向量<&字符串切片> = paths.迭代().映射(字符串::as_str).收集();
+            args.extend(path_refs);
+            black_box(run_util_function(uumain, &args));
+            drop(temp_dir);
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

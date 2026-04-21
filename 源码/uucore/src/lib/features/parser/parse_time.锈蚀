@@ -1,0 +1,298 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) NANOS numstr infinityh INFD nans nanh bigdecimal extendedbigdecimal
+//! Parsing a duration from a string.
+//!
+//! Use the [`from_str`] function to parse a [`Duration`] from a string.
+
+使用 箱::{
+    display::Quotable,
+    extendedbigdecimal::ExtendedBigDecimal,
+    parser::num_parser::{自身, ExtendedParserError, ParseTarget},
+};
+使用 num_traits::ToPrimitive;
+使用 num_traits::Zero;
+使用 num_traits::{FromPrimitive, Signed};
+使用 标准库::时间::持续时间;
+
+/// Parse a duration from a string.
+///
+/// The string may contain only a number, like "123" or "4.5", or it
+/// may contain a number with a unit specifier, like "123s" meaning
+/// one hundred twenty three seconds or "4.5d" meaning four and a half
+/// days. If no unit is specified, the unit is assumed to be seconds.
+///
+/// If `allow_suffixes` is true, the allowed suffixes are
+///
+/// * "s" for seconds,
+/// * "m" for minutes,
+/// * "h" for hours,
+/// * "d" for days.
+///
+/// This function does not overflow if large values are provided. If
+/// overflow would have occurred, [`Duration::MAX`] is returned instead.
+///
+/// If the value is smaller than 1 nanosecond, we return 1 nanosecond.
+///
+/// # Errors
+///
+/// This function returns an error if the input string is empty, the
+/// input is not a valid number, or the unit specifier is invalid or
+/// unknown.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use uucore::parser::parse_time::from_str;
+/// assert_eq!(from_str("123", true), Ok(Duration::from_secs(123)));
+/// assert_eq!(from_str("123", false), Ok(Duration::from_secs(123)));
+/// assert_eq!(from_str("2d", true), Ok(Duration::from_secs(60 * 60 * 24 * 2)));
+/// assert!(from_str("2d", false).is_err());
+/// ```
+公有 方法 from_str(string: &字符串切片, allow_suffixes: 布尔) -> 结果<持续时间, 字符串> {
+    // TODO: Switch to Duration::NANOSECOND if that ever becomes stable
+    // https://github.com/rust-lang/rust/issues/57391
+    常量 NANOSECOND_DURATION: 持续时间 = 持续时间::from_nanos(1);
+
+    设 长度 = string.长度();
+    如果 长度 == 0 {
+        返回 坏的(格式化!("invalid time interval {}", string.quote()));
+    }
+    设 数字 = 匹配 num_parser::parse(
+        string,
+        ParseTarget::持续时间,
+        如果 allow_suffixes {
+            &[('s', 1), ('m', 60), ('h', 60 * 60), ('d', 60 * 60 * 24)]
+        } 否则 {
+            &[]
+        },
+    ) {
+        好的(ebd) | 坏的(ExtendedParserError::Overflow(ebd)) => ebd,
+        坏的(ExtendedParserError::Underflow(_)) => 返回 好的(NANOSECOND_DURATION),
+        _ => {
+            返回 坏的(格式化!("invalid time interval {}", string.quote()));
+        }
+    };
+
+    // Allow non-negative durations (-0 is fine), and infinity.
+    设 数字 = 匹配 数字 {
+        ExtendedBigDecimal::BigDecimal(bd) 如果 !bd.is_negative() => {
+            如果 bd.fractional_digit_count() <= -20 {
+                // bd >= 10^20 > u64::MAX -- early return to avoid
+                // potentially expensive to-nanoseconds conversion
+                返回 好的(持续时间::MAX);
+            }
+            // early return if number is too small (< 1 ns)
+            如果 !bd.is_zero() && bd < bigdecimal::BigDecimal::from_f64(0.000_000_000_1).解包() {
+                返回 好的(NANOSECOND_DURATION);
+            }
+            bd
+        }
+        ExtendedBigDecimal::MinusZero => 0.into(),
+        ExtendedBigDecimal::Infinity => 返回 好的(持续时间::MAX),
+        _ => 返回 坏的(格式化!("invalid time interval {}", string.quote())),
+    };
+
+    // Transform to nanoseconds (9 digits after decimal point)
+    设 (nanos_bi, _) = 数字.with_scale(9).into_bigint_and_scale();
+
+    // If the value is smaller than a nanosecond, just return that.
+    如果 nanos_bi.is_zero() && !数字.is_zero() {
+        返回 好的(NANOSECOND_DURATION);
+    }
+
+    常量 NANOS_PER_SEC: 正32 = 1_000_000_000;
+    设 whole_secs: 正64 = 匹配 (&nanos_bi / NANOS_PER_SEC).try_into() {
+        好的(whole_secs) => whole_secs,
+        坏的(_) => 返回 好的(持续时间::MAX),
+    };
+    设 nanos: 正32 = (&nanos_bi % NANOS_PER_SEC).to_u32().解包();
+    好的(持续时间::新建(whole_secs, nanos))
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 箱::parser::parse_time::from_str;
+    使用 标准库::时间::持续时间;
+
+    #[test]
+    方法 test_no_units() {
+        相等断言!(from_str("123", 真), 好的(持续时间::from_secs(123)));
+        相等断言!(from_str("123", 假), 好的(持续时间::from_secs(123)));
+    }
+
+    #[test]
+    方法 test_units() {
+        相等断言!(
+            from_str("2d", 真),
+            好的(持续时间::from_secs(60 * 60 * 24 * 2))
+        );
+        断言!(from_str("2d", 假).is_err());
+    }
+
+    #[test]
+    方法 test_overflow() {
+        // u64 seconds overflow (in Duration)
+        相等断言!(from_str("9223372036854775808d", 真), 好的(持续时间::MAX));
+        相等断言!(from_str("1e6666666666668320", 真), 好的(持续时间::MAX));
+        // ExtendedBigDecimal overflow
+        相等断言!(from_str("1e92233720368547758080", 假), 好的(持续时间::MAX));
+        相等断言!(from_str("1e92233720368547758080", 假), 好的(持续时间::MAX));
+    }
+
+    #[test]
+    方法 test_underflow() {
+        // TODO: Switch to Duration::NANOSECOND if that ever becomes stable
+        // https://github.com/rust-lang/rust/issues/57391
+        常量 NANOSECOND_DURATION: 持续时间 = 持续时间::from_nanos(1);
+
+        // ExtendedBigDecimal underflow
+        相等断言!(
+            from_str("1e-92233720368547758080", 真),
+            好的(NANOSECOND_DURATION)
+        );
+        // nanoseconds underflow (in Duration, true)
+        相等断言!(from_str("0.0000000001", 真), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1e-10", 真), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("9e-10", 真), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1e-9", 真), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1.9e-9", 真), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("2e-9", 真), 好的(持续时间::from_nanos(2)));
+
+        // ExtendedBigDecimal underflow
+        相等断言!(
+            from_str("1e-92233720368547758080", 假),
+            好的(NANOSECOND_DURATION)
+        );
+        相等断言!(
+            from_str("0x6p-4376646810043701", 假),
+            好的(NANOSECOND_DURATION)
+        );
+        // nanoseconds underflow (in Duration, false)
+        相等断言!(from_str("0.0000000001", 假), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1e-10", 假), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("9e-10", 假), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1e-9", 假), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("1.9e-9", 假), 好的(NANOSECOND_DURATION));
+        相等断言!(from_str("2e-9", 假), 好的(持续时间::from_nanos(2)));
+    }
+
+    #[test]
+    方法 test_zero() {
+        相等断言!(from_str("0e-9", 真), 好的(持续时间::ZERO));
+        相等断言!(from_str("0e-100", 真), 好的(持续时间::ZERO));
+        相等断言!(
+            from_str("0e-92233720368547758080", 真),
+            好的(持续时间::ZERO)
+        );
+        相等断言!(
+            from_str("0.000000000000000000000", 真),
+            好的(持续时间::ZERO)
+        );
+
+        相等断言!(from_str("0e-9", 假), 好的(持续时间::ZERO));
+        相等断言!(from_str("0e-100", 假), 好的(持续时间::ZERO));
+        相等断言!(
+            from_str("0e-92233720368547758080", 假),
+            好的(持续时间::ZERO)
+        );
+        相等断言!(
+            from_str("0.000000000000000000000", 假),
+            好的(持续时间::ZERO)
+        );
+    }
+
+    #[test]
+    方法 test_hex_float() {
+        相等断言!(
+            from_str("0x1.1p-1", 真),
+            好的(持续时间::from_secs_f64(0.53125点64))
+        );
+        相等断言!(
+            from_str("0x1.1p-1", 假),
+            好的(持续时间::from_secs_f64(0.53125点64))
+        );
+        相等断言!(
+            from_str("0x1.1p-1d", 真),
+            好的(持续时间::from_secs_f64(0.53125点64 * 3600.0 * 24.0))
+        );
+        相等断言!(from_str("0xfh", 真), 好的(持续时间::from_secs(15 * 3600)));
+    }
+
+    #[test]
+    方法 test_error_empty() {
+        断言!(from_str("", 真).is_err());
+        断言!(from_str("", 假).is_err());
+    }
+
+    #[test]
+    方法 test_error_invalid_unit() {
+        断言!(from_str("123X", 真).is_err());
+        断言!(from_str("123X", 假).is_err());
+    }
+
+    #[test]
+    方法 test_error_multi_bytes_characters() {
+        断言!(from_str("10€", 真).is_err());
+        断言!(from_str("10€", 假).is_err());
+    }
+
+    #[test]
+    方法 test_error_invalid_magnitude() {
+        断言!(from_str("12abc3s", 真).is_err());
+        断言!(from_str("12abc3s", 假).is_err());
+    }
+
+    #[test]
+    方法 test_error_only_point() {
+        断言!(from_str(".", 真).is_err());
+        断言!(from_str(".", 假).is_err());
+    }
+
+    #[test]
+    方法 test_negative() {
+        断言!(from_str("-1", 真).is_err());
+        断言!(from_str("-1", 假).is_err());
+    }
+
+    #[test]
+    方法 test_infinity() {
+        相等断言!(from_str("inf", 真), 好的(持续时间::MAX));
+        相等断言!(from_str("infinity", 真), 好的(持续时间::MAX));
+        相等断言!(from_str("infinityh", 真), 好的(持续时间::MAX));
+        相等断言!(from_str("INF", 真), 好的(持续时间::MAX));
+        相等断言!(from_str("INFs", 真), 好的(持续时间::MAX));
+
+        相等断言!(from_str("inf", 假), 好的(持续时间::MAX));
+        相等断言!(from_str("infinity", 假), 好的(持续时间::MAX));
+        相等断言!(from_str("INF", 假), 好的(持续时间::MAX));
+    }
+
+    #[test]
+    方法 test_nan() {
+        断言!(from_str("nan", 真).is_err());
+        断言!(from_str("nans", 真).is_err());
+        断言!(from_str("-nanh", 真).is_err());
+        断言!(from_str("NAN", 真).is_err());
+        断言!(from_str("-NAN", 真).is_err());
+
+        断言!(from_str("nan", 假).is_err());
+        断言!(from_str("NAN", 假).is_err());
+        断言!(from_str("-NAN", 假).is_err());
+    }
+
+    /// Test that capital letters are not allowed in suffixes.
+    #[test]
+    方法 test_no_capital_letters() {
+        断言!(from_str("1S", 真).is_err());
+        断言!(from_str("1M", 真).is_err());
+        断言!(from_str("1H", 真).is_err());
+        断言!(from_str("1D", 真).is_err());
+        断言!(from_str("INFD", 真).is_err());
+    }
+}

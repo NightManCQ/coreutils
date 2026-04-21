@@ -1,0 +1,130 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) NPROCESSORS nprocs numstr sysconf
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::{Write, stdout};
+使用 标准库::{环境, 线程};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+静态 OPT_ALL: &字符串切片 = "all";
+静态 OPT_IGNORE: &字符串切片 = "ignore";
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 ignore = 匹配 matches.get_one::<字符串>(OPT_IGNORE) {
+        一些(numstr) => 匹配 numstr.trim().parse::<正整数大小>() {
+            好的(数字) => 数字,
+            坏的(e) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("nproc-error-invalid-number", "value" => numstr.quote(), "error" => e),
+                ));
+            }
+        },
+        无 => 0,
+    };
+
+    设 limit = 匹配 环境::var("OMP_THREAD_LIMIT") {
+        // Uses the OpenMP variable to limit the number of threads
+        // If the parsing fails, returns the max size (so, no impact)
+        // If OMP_THREAD_LIMIT=0, rejects the value
+        好的(threads) => 匹配 threads.parse() {
+            好的(0) | 坏的(_) => 正整数大小::MAX,
+            好的(n) => n,
+        },
+        // the variable 'OMP_THREAD_LIMIT' doesn't exist
+        // fallback to the max
+        坏的(_) => 正整数大小::MAX,
+    };
+
+    设 可变 cores = 如果 matches.get_flag(OPT_ALL) {
+        num_cpus_all()
+    } 否则 {
+        // OMP_NUM_THREADS doesn't have an impact on --all
+        匹配 环境::var("OMP_NUM_THREADS") {
+            // Uses the OpenMP variable to force the number of threads
+            // If the parsing fails, returns the number of CPU
+            好的(threads) => {
+                // In some cases, OMP_NUM_THREADS can be "x,y,z"
+                // In this case, only take the first one (like GNU)
+                // If OMP_NUM_THREADS=0, rejects the value
+                匹配 threads.split_terminator(',').next() {
+                    无 => available_parallelism(),
+                    一些(s) => 匹配 s.trim().parse() {
+                        好的(0) | 坏的(_) => available_parallelism(),
+                        好的(n) => n,
+                    },
+                }
+            }
+            // the variable 'OMP_NUM_THREADS' doesn't exist
+            // fallback to the regular CPU detection
+            坏的(_) => available_parallelism(),
+        }
+    };
+
+    cores = 标准库::比较::min(limit, cores);
+    如果 cores <= ignore {
+        cores = 1;
+    } 否则 {
+        cores -= ignore;
+    }
+    //discard error about stdout flush
+    stdout()
+        .锁定()
+        .write_all(格式化!("{cores}\n").as_bytes())
+        .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("nproc")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("nproc"))
+        .about(translate!("nproc-about"))
+        .override_usage(format_usage(&translate!("nproc-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_ALL)
+                .long(OPT_ALL)
+                .help(translate!("nproc-help-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_IGNORE)
+                .long(OPT_IGNORE)
+                .value_name("N")
+                .help(translate!("nproc-help-ignore")),
+        )
+}
+
+#[cfg(unix)]
+方法 num_cpus_all() -> 正整数大小 {
+    // In some situation, /proc and /sys are not mounted, and sysconf returns 1.
+    // However, we want to guarantee that `nproc --all` >= `nproc`.
+    不安全 { libc::sysconf(libc::_SC_NPROCESSORS_CONF) }
+        .try_into()
+        .ok()
+        .过滤(|&n: &整数大小| n > 1)
+        .map_or_else(available_parallelism, |n| n 转换 正整数大小)
+}
+
+// Other platforms (e.g., windows), available_parallelism() directly.
+#[cfg(not(unix))]
+方法 num_cpus_all() -> 正整数大小 {
+    available_parallelism()
+}
+
+/// In some cases, [`thread::available_parallelism`]() may return an Err
+/// In this case, we will return 1 (like GNU)
+方法 available_parallelism() -> 正整数大小 {
+    线程::available_parallelism().map_or(1, 标准库::数字::NonZeroUsize::获取)
+}

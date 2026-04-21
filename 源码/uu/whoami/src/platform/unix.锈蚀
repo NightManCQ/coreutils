@@ -1,0 +1,15 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出;
+
+使用 uucore::entries::uid2usr;
+使用 uucore::进程::geteuid;
+
+公有 方法 get_username() -> 输入输出::结果<OsString> {
+    // uid2usr should arguably return an OsString but currently doesn't
+    uid2usr(geteuid()).映射(转换为目标协议::into)
+}

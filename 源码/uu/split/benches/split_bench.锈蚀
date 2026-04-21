@@ -1,0 +1,97 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::TempDir;
+使用 uu_split::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file, text_data};
+
+/// Benchmark splitting by line count
+#[divan::bench]
+方法 split_lines(bencher: Bencher) {
+    设 data = text_data::generate_by_lines(100_000, 80);
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("x");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &["-l", "1000", file_path.to_str().解包(), &prefix],
+            ));
+            drop(output_dir);
+        });
+}
+
+/// Benchmark splitting by byte size
+#[divan::bench]
+方法 split_bytes(bencher: Bencher) {
+    设 data = text_data::generate_by_size(10, 80);
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("x");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &["-b", "100K", file_path.to_str().解包(), &prefix],
+            ));
+            drop(output_dir);
+        });
+}
+
+/// Benchmark splitting by number of chunks
+#[divan::bench]
+方法 split_number_chunks(bencher: Bencher) {
+    设 data = text_data::generate_by_lines(100_000, 80);
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("x");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &["-n", "10", file_path.to_str().解包(), &prefix],
+            ));
+            drop(output_dir);
+        });
+}
+
+/// Benchmark splitting with numeric suffix
+#[divan::bench]
+方法 split_numeric_suffix(bencher: Bencher) {
+    设 data = text_data::generate_by_lines(100_000, 80);
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("x");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &["-d", "-l", "500", file_path.to_str().解包(), &prefix],
+            ));
+            drop(output_dir);
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

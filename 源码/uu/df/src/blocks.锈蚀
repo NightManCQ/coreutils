@@ -1,0 +1,378 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Types for representing and displaying block sizes.
+使用 箱::{OPT_BLOCKSIZE, OPT_PORTABILITY};
+使用 clap::ArgMatches;
+使用 标准库::格式化;
+
+使用 uucore::{
+    display::Quotable,
+    parser::parse_block_size,
+    parser::parse_size::{IEC_BASES, ParseSizeError, SI_BASES, parse_size_u64},
+};
+
+/// A `SuffixType` determines whether the suffixes are 1000 or 1024 based, and whether they are
+/// intended for `HumanReadable` mode or not.
+#[derive(克隆协议, 复制协议)]
+公有(箱) 枚举 SuffixType {
+    Iec,
+    Si,
+    HumanReadable(HumanReadable),
+}
+
+实现 SuffixType {
+    /// The first eleven powers of 1024 and 1000, respectively.
+    方法 bases(自身) -> [正128; 11] {
+        匹配 自身 {
+            自身类型::Iec | 自身类型::HumanReadable(HumanReadable::Binary) => IEC_BASES,
+            自身类型::Si | 自身类型::HumanReadable(HumanReadable::Decimal) => SI_BASES,
+        }
+    }
+
+    /// Suffixes for the first nine multi-byte unit suffixes.
+    方法 suffixes(自身) -> [&'静态 字符串切片; 9] {
+        匹配 自身 {
+            // we use "kB" instead of "KB", same as GNU df
+            自身类型::Si => ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"],
+            自身类型::Iec => ["B", "K", "M", "G", "T", "P", "E", "Z", "Y"],
+            自身类型::HumanReadable(HumanReadable::Binary) => {
+                ["", "K", "M", "G", "T", "P", "E", "Z", "Y"]
+            }
+            自身类型::HumanReadable(HumanReadable::Decimal) => {
+                ["", "k", "M", "G", "T", "P", "E", "Z", "Y"]
+            }
+        }
+    }
+}
+
+/// Convert a number into a magnitude and a multi-byte unit suffix.
+///
+/// The returned string has a maximum length of 5 chars, for example: "1.1kB", "999kB", "1MB".
+/// `add_tracing_zero` allows to add tracing zero for values in 0 < x <= 9
+///
+公有(箱) 方法 to_magnitude_and_suffix(
+    n: 正128,
+    suffix_type: SuffixType,
+    add_tracing_zero: 布尔,
+) -> 字符串 {
+    设 bases = suffix_type.bases();
+    设 suffixes = suffix_type.suffixes();
+    设 可变 i = 0;
+
+    当 bases[i + 1] - bases[i] < n && i < suffixes.长度() {
+        i += 1;
+    }
+
+    设 quot = n / bases[i];
+    设 rem = n % bases[i];
+    设 suffix = suffixes[i];
+
+    如果 rem == 0 {
+        如果 add_tracing_zero && !suffix.为空() && quot != 0 && quot <= 9 {
+            格式化!("{quot}.0{suffix}")
+        } 否则 {
+            格式化!("{quot}{suffix}")
+        }
+    } 否则 {
+        设 tenths_place = rem / (bases[i] / 10);
+
+        如果 quot >= 100 && rem > 0 {
+            格式化!("{}{suffix}", quot + 1)
+        } 否则 如果 rem.is_multiple_of(bases[i] / 10) {
+            格式化!("{quot}.{tenths_place}{suffix}")
+        } 否则 如果 tenths_place + 1 == 10 || quot >= 10 {
+            设 quot = quot + 1;
+            如果 add_tracing_zero && !suffix.为空() && quot <= 9 {
+                格式化!("{quot}.0{suffix}")
+            } 否则 {
+                格式化!("{quot}{suffix}")
+            }
+        } 否则 {
+            格式化!("{quot}.{}{suffix}", tenths_place + 1)
+        }
+    }
+}
+
+/// A mode to use in condensing the human readable display of a large number
+/// of bytes.
+///
+/// The [`HumanReadable::Decimal`] and[`HumanReadable::Binary`] variants
+/// represent dynamic block sizes: as the number of bytes increases, the
+/// divisor increases as well (for example, from 1 to 1,000 to 1,000,000
+/// and so on in the case of [`HumanReadable::Decimal`]).
+#[derive(克隆协议, 复制协议)]
+公有(箱) 枚举 HumanReadable {
+    /// Use the largest divisor corresponding to a unit, like B, K, M, G, etc.
+    ///
+    /// This variant represents powers of 1,000. Contrast with
+    /// [`HumanReadable::Binary`], which represents powers of
+    /// 1,024.
+    Decimal,
+
+    /// Use the largest divisor corresponding to a unit, like B, K, M, G, etc.
+    ///
+    /// This variant represents powers of 1,024. Contrast with
+    /// [`HumanReadable::Decimal`], which represents powers
+    /// of 1,000.
+    Binary,
+}
+
+/// A block size to use in condensing the display of a large number of bytes.
+///
+/// The [`BlockSize::Bytes`] variant represents a static block
+/// size.
+///
+/// The default variant is `Bytes(1024)`.
+#[derive(调试协议, 偏等比较协议)]
+公有(箱) 枚举 BlockSize {
+    /// A fixed number of bytes.
+    ///
+    /// The number must be positive.
+    Bytes(正64),
+}
+
+实现 BlockSize {
+    /// Returns the associated value
+    公有(箱) 方法 as_u64(&自身) -> 正64 {
+        匹配 *自身 {
+            自身类型::Bytes(n) => n,
+        }
+    }
+
+    公有(箱) 方法 to_header(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Bytes(n) => {
+                如果 n % 1024 == 0 && n % 1000 != 0 {
+                    to_magnitude_and_suffix(*n 转换 正128, SuffixType::Iec, 假)
+                } 否则 {
+                    to_magnitude_and_suffix(*n 转换 正128, SuffixType::Si, 假)
+                }
+            }
+        }
+    }
+}
+
+实现 默认协议 循环 BlockSize {
+    方法 默认() -> 自身类型 {
+        自身类型::Bytes(parse_block_size::default_block_size())
+    }
+}
+
+公有(箱) 方法 read_block_size(matches: &ArgMatches) -> 结果<BlockSize, ParseSizeError> {
+    如果 matches.contains_id(OPT_BLOCKSIZE) {
+        设 s = matches.get_one::<字符串>(OPT_BLOCKSIZE).解包();
+        设 bytes = parse_size_u64(s)?;
+
+        如果 bytes > 0 {
+            好的(BlockSize::Bytes(bytes))
+        } 否则 {
+            坏的(ParseSizeError::ParseFailure(格式化!("{}", s.quote())))
+        }
+    } 否则 如果 matches.get_flag(OPT_PORTABILITY) {
+        好的(BlockSize::默认())
+    } 否则 如果 设 一些(bytes) =
+        parse_block_size::block_size_from_env(&["DF_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"]).found()
+    {
+        好的(BlockSize::Bytes(bytes))
+    } 否则 {
+        好的(BlockSize::默认())
+    }
+}
+
+实现 格式化::显示协议 循环 BlockSize {
+    方法 格式化(&自身, f: &可变 格式化::Formatter) -> 格式化::结果 {
+        匹配 自身 {
+            自身类型::Bytes(n) => {
+                设 s = 如果 n % 1024 == 0 && n % 1000 != 0 {
+                    to_magnitude_and_suffix(*n 转换 正128, SuffixType::Iec, 真)
+                } 否则 {
+                    to_magnitude_and_suffix(*n 转换 正128, SuffixType::Si, 真)
+                };
+
+                write!(f, "{s}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 标准库::环境;
+
+    使用 箱::blocks::{BlockSize, SuffixType, to_magnitude_and_suffix};
+
+    #[test]
+    方法 test_to_magnitude_and_suffix_rounding() {
+        相等断言!(
+            to_magnitude_and_suffix(999_440, SuffixType::Si, 真),
+            "1.0MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(819_200, SuffixType::Si, 真),
+            "820kB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(819_936, SuffixType::Si, 真),
+            "820kB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(818_400, SuffixType::Si, 真),
+            "819kB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(817_600, SuffixType::Si, 真),
+            "818kB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(817_200, SuffixType::Si, 真),
+            "818kB"
+        );
+    }
+
+    #[test]
+    方法 test_to_magnitude_and_suffix_add_tracing_zero() {
+        相等断言!(to_magnitude_and_suffix(1024, SuffixType::Iec, 真), "1.0K");
+        相等断言!(to_magnitude_and_suffix(2048, SuffixType::Iec, 真), "2.0K");
+        相等断言!(to_magnitude_and_suffix(10240, SuffixType::Iec, 真), "10K");
+
+        相等断言!(to_magnitude_and_suffix(1024, SuffixType::Iec, 假), "1K");
+        相等断言!(to_magnitude_and_suffix(2048, SuffixType::Iec, 假), "2K");
+        相等断言!(
+            to_magnitude_and_suffix(10240, SuffixType::Iec, 假),
+            "10K"
+        );
+    }
+
+    #[test]
+    方法 test_to_magnitude_and_suffix_powers_of_1024() {
+        相等断言!(to_magnitude_and_suffix(1024, SuffixType::Iec, 假), "1K");
+        相等断言!(
+            to_magnitude_and_suffix(10240, SuffixType::Iec, 假),
+            "10K"
+        );
+        相等断言!(to_magnitude_and_suffix(2048, SuffixType::Iec, 假), "2K");
+        相等断言!(
+            to_magnitude_and_suffix(1024 * 40, SuffixType::Iec, 假),
+            "40K"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1024 * 1024, SuffixType::Iec, 假),
+            "1M"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(2 * 1024 * 1024, SuffixType::Iec, 假),
+            "2M"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1024 * 1024 * 1024, SuffixType::Iec, 假),
+            "1G"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(34 * 1024 * 1024 * 1024, SuffixType::Iec, 假),
+            "34G"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_to_magnitude_and_suffix_not_powers_of_1024() {
+        相等断言!(to_magnitude_and_suffix(1, SuffixType::Si, 真), "1.0B");
+        相等断言!(to_magnitude_and_suffix(999, SuffixType::Si, 真), "999B");
+
+        相等断言!(to_magnitude_and_suffix(1000, SuffixType::Si, 真), "1.0kB");
+        相等断言!(to_magnitude_and_suffix(1001, SuffixType::Si, 真), "1.1kB");
+        相等断言!(to_magnitude_and_suffix(1023, SuffixType::Si, 真), "1.1kB");
+        相等断言!(to_magnitude_and_suffix(1025, SuffixType::Si, 真), "1.1kB");
+        相等断言!(
+            to_magnitude_and_suffix(10_001, SuffixType::Si, 真),
+            "11kB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(999_000, SuffixType::Si, 真),
+            "999kB"
+        );
+
+        相等断言!(
+            to_magnitude_and_suffix(999_001, SuffixType::Si, 真),
+            "1.0MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(999_999, SuffixType::Si, 真),
+            "1.0MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_000, SuffixType::Si, 真),
+            "1.0MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_001, SuffixType::Si, 真),
+            "1.1MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_100_000, SuffixType::Si, 真),
+            "1.1MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_100_001, SuffixType::Si, 真),
+            "1.2MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_900_000, SuffixType::Si, 真),
+            "1.9MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_900_001, SuffixType::Si, 真),
+            "2.0MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(9_900_000, SuffixType::Si, 真),
+            "9.9MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(9_900_001, SuffixType::Si, 真),
+            "10MB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(999_000_000, SuffixType::Si, 真),
+            "999MB"
+        );
+
+        相等断言!(
+            to_magnitude_and_suffix(999_000_001, SuffixType::Si, 真),
+            "1.0GB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_000_000, SuffixType::Si, 真),
+            "1.0GB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_000_001, SuffixType::Si, 真),
+            "1.1GB"
+        );
+    }
+
+    #[test]
+    方法 test_block_size_display() {
+        相等断言!(格式化!("{}", BlockSize::Bytes(1024)), "1.0K");
+        相等断言!(格式化!("{}", BlockSize::Bytes(2 * 1024)), "2.0K");
+        相等断言!(格式化!("{}", BlockSize::Bytes(3 * 1024 * 1024)), "3.0M");
+    }
+
+    #[test]
+    方法 test_block_size_display_multiples_of_1000_and_1024() {
+        相等断言!(格式化!("{}", BlockSize::Bytes(128_000)), "128kB");
+        相等断言!(格式化!("{}", BlockSize::Bytes(1000 * 1024)), "1.1MB");
+        相等断言!(格式化!("{}", BlockSize::Bytes(1_000_000_000_000)), "1.0TB");
+    }
+
+    #[test]
+    方法 test_default_block_size() {
+        相等断言!(BlockSize::Bytes(1024), BlockSize::默认());
+        不安全 { 环境::set_var("POSIXLY_CORRECT", "1") };
+        相等断言!(BlockSize::Bytes(512), BlockSize::默认());
+        不安全 { 环境::remove_var("POSIXLY_CORRECT") };
+    }
+}

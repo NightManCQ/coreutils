@@ -1,0 +1,667 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Take all but the last elements of an iterator.
+使用 memchr::memchr_iter;
+使用 标准库::集合::VecDeque;
+使用 标准库::输入输出::{ErrorKind, Read, Write};
+
+常量 BUF_SIZE: 正整数大小 = 65536;
+
+结构 TakeAllBuffer {
+    buffer: 向量<正8>,
+    start_index: 正整数大小,
+}
+
+实现 TakeAllBuffer {
+    方法 新建() -> 自身类型 {
+        自身类型 {
+            buffer: 向量![],
+            start_index: 0,
+        }
+    }
+
+    方法 fill_buffer(&可变 自身, reader: &可变 实现 Read) -> 标准库::输入输出::结果<正整数大小> {
+        自身.buffer.resize(BUF_SIZE, 0);
+        自身.start_index = 0;
+        无限循环 {
+            匹配 reader.读锁定(&可变 自身.buffer[..]) {
+                好的(n) => {
+                    自身.buffer.truncate(n);
+                    返回 好的(n);
+                }
+                坏的(e) 如果 e.kind() == ErrorKind::Interrupted => (),
+                坏的(e) => 返回 坏的(e),
+            }
+        }
+    }
+
+    方法 write_bytes_exact(&可变 自身, writer: &可变 实现 Write, bytes: 正整数大小) -> 标准库::输入输出::结果<()> {
+        设 buffer_to_write = &自身.remaining_buffer()[..bytes];
+        writer.write_all(buffer_to_write)?;
+        自身.start_index += bytes;
+        断言!(自身.start_index <= 自身.buffer.长度());
+        好的(())
+    }
+
+    方法 write_all(&可变 自身, writer: &可变 实现 Write) -> 标准库::输入输出::结果<正整数大小> {
+        设 remaining_bytes = 自身.remaining_bytes();
+        自身.write_bytes_exact(writer, remaining_bytes)?;
+        好的(remaining_bytes)
+    }
+
+    方法 write_bytes_limit(
+        &可变 自身,
+        writer: &可变 实现 Write,
+        max_bytes: 正整数大小,
+    ) -> 标准库::输入输出::结果<正整数大小> {
+        设 bytes_to_write = 自身.remaining_bytes().min(max_bytes);
+        自身.write_bytes_exact(writer, bytes_to_write)?;
+        好的(bytes_to_write)
+    }
+
+    方法 remaining_buffer(&自身) -> &[正8] {
+        &自身.buffer[自身.start_index..]
+    }
+
+    方法 remaining_bytes(&自身) -> 正整数大小 {
+        自身.remaining_buffer().长度()
+    }
+
+    方法 为空(&自身) -> 布尔 {
+        断言!(自身.start_index <= 自身.buffer.长度());
+        自身.start_index == 自身.buffer.长度()
+    }
+}
+
+/// Function to copy all but `n` bytes from the reader to the writer.
+///
+/// If `n` exceeds the number of bytes in the input file then nothing is copied.
+/// If no errors are encountered then the function returns the number of bytes
+/// copied.
+///
+/// Algorithm for this function is as follows...
+/// 1 - Chunks of the input file are read into a queue of [`TakeAllBuffer`] instances.
+///     Chunks are read until at least we have enough data to write out the entire contents of the
+///     first [`TakeAllBuffer`] in the queue whilst still retaining at least `n` bytes in the queue.
+///     If we hit `EoF` at any point, stop reading.
+/// 2 - Assess whether we managed to queue up greater-than `n` bytes. If not, we must be done, in
+///     which case break and return.
+/// 3 - Write either the full first buffer of data, or just enough bytes to get back down to having
+///     the required `n` bytes of data queued.
+/// 4 - Go back to (1).
+公有 方法 copy_all_but_n_bytes(
+    reader: &可变 实现 Read,
+    writer: &可变 实现 Write,
+    n: 正整数大小,
+) -> 标准库::输入输出::结果<正整数大小> {
+    设 可变 buffers: VecDeque<TakeAllBuffer> = VecDeque::新建();
+    设 可变 empty_buffer_pool: 向量<TakeAllBuffer> = 向量![];
+    设 可变 buffered_bytes: 正整数大小 = 0;
+    设 可变 total_bytes_copied = 0;
+    无限循环 {
+        无限循环 {
+            // Try to buffer at least enough to write the entire first buffer.
+            设 front_buffer = buffers.front();
+            如果 front_buffer.is_some_and(|b| buffered_bytes >= n + b.remaining_bytes()) {
+                中断;
+            }
+            设 可变 new_buffer = empty_buffer_pool.弹出().unwrap_or_else(TakeAllBuffer::新建);
+            设 filled_bytes = new_buffer.fill_buffer(reader)?;
+            如果 filled_bytes == 0 {
+                // filled_bytes==0 => Eof
+                中断;
+            }
+            buffers.push_back(new_buffer);
+            buffered_bytes += filled_bytes;
+        }
+
+        // If we've got <=n bytes buffered here we have nothing left to do.
+        如果 buffered_bytes <= n {
+            中断;
+        }
+
+        设 excess_buffered_bytes = buffered_bytes - n;
+        // Since we have some data buffered, can assume we have >=1 buffer - i.e. safe to unwrap.
+        设 front_buffer = buffers.front_mut().解包();
+        设 bytes_written = front_buffer.write_bytes_limit(writer, excess_buffered_bytes)?;
+        buffered_bytes -= bytes_written;
+        total_bytes_copied += bytes_written;
+        // If the front buffer is empty (which it probably is), push it into the empty-buffer-pool.
+        如果 front_buffer.为空() {
+            empty_buffer_pool.压入(buffers.pop_front().解包());
+        }
+    }
+    好的(total_bytes_copied)
+}
+
+结构 TakeAllLinesBuffer {
+    inner: TakeAllBuffer,
+    terminated_lines: 正整数大小,
+    partial_line: 布尔,
+}
+
+结构 BytesAndLines {
+    bytes: 正整数大小,
+    terminated_lines: 正整数大小,
+}
+
+实现 TakeAllLinesBuffer {
+    方法 新建() -> 自身类型 {
+        自身类型 {
+            inner: TakeAllBuffer::新建(),
+            terminated_lines: 0,
+            partial_line: 假,
+        }
+    }
+
+    方法 fill_buffer(
+        &可变 自身,
+        reader: &可变 实现 Read,
+        separator: 正8,
+    ) -> 标准库::输入输出::结果<BytesAndLines> {
+        设 bytes_read = 自身.inner.fill_buffer(reader)?;
+        // Count the number of lines...
+        自身.terminated_lines = memchr_iter(separator, 自身.inner.remaining_buffer()).计数();
+        自身.partial_line = 自身
+            .inner
+            .remaining_buffer()
+            .最后()
+            .is_some_and(|&c| c != separator);
+        好的(BytesAndLines {
+            bytes: bytes_read,
+            terminated_lines: 自身.terminated_lines,
+        })
+    }
+
+    方法 write_lines(
+        &可变 自身,
+        writer: &可变 实现 Write,
+        max_lines: 正整数大小,
+        separator: 正8,
+    ) -> 标准库::输入输出::结果<BytesAndLines> {
+        断言!(max_lines > 0, "Must request at least 1 line.");
+        设 ret;
+        如果 max_lines > 自身.terminated_lines {
+            ret = BytesAndLines {
+                bytes: 自身.inner.write_all(writer)?,
+                terminated_lines: 自身.terminated_lines,
+            };
+            自身.terminated_lines = 0;
+        } 否则 {
+            设 index = memchr_iter(separator, 自身.inner.remaining_buffer()).nth(max_lines - 1);
+            断言!(
+                index.is_some(),
+                "Somehow we're being asked to write more lines than we have, that's a bug in copy_all_but_lines."
+            );
+            设 index = index.解包();
+            // index is the offset of the separator character, zero indexed. Need to add 1 to get the number
+            // of bytes to write.
+            设 bytes_to_write = index + 1;
+            自身.inner.write_bytes_exact(writer, bytes_to_write)?;
+            ret = BytesAndLines {
+                bytes: bytes_to_write,
+                terminated_lines: max_lines,
+            };
+            自身.terminated_lines -= max_lines;
+        }
+        好的(ret)
+    }
+
+    方法 为空(&自身) -> 布尔 {
+        自身.inner.为空()
+    }
+
+    方法 terminated_lines(&自身) -> 正整数大小 {
+        自身.terminated_lines
+    }
+
+    方法 partial_line(&自身) -> 布尔 {
+        自身.partial_line
+    }
+}
+
+/// Function to copy all but `n` lines from the reader to the writer.
+///
+/// Lines are inferred from the `separator` value passed in by the client.
+/// If `n` exceeds the number of lines in the input file then nothing is copied.
+/// The last line in the file is not required to end with a `separator` character.
+/// If no errors are encountered then they function returns the number of bytes
+/// copied.
+///
+/// Algorithm for this function is as follows...
+/// 1 - Chunks of the input file are read into a queue of [`TakeAllLinesBuffer`] instances.
+///     Chunks are read until at least we have enough lines that we can write out the entire
+///     contents of the first [`TakeAllLinesBuffer`] in the queue whilst still retaining at least
+///     `n` lines in the queue.
+///     If we hit `EoF` at any point, stop reading.
+/// 2 - Asses whether we managed to queue up greater-than `n` lines. If not, we must be done, in
+///     which case break and return.
+/// 3 - Write either the full first buffer of data, or just enough lines to get back down to
+///     having the required `n` lines of data queued.
+/// 4 - Go back to (1).
+///
+/// Note that lines will regularly straddle multiple [`TakeAllLinesBuffer`] instances. The `partial_line`
+/// flag on [`TakeAllLinesBuffer`] tracks this, and we use that to ensure that we write out enough
+/// lines in the case that the input file doesn't end with a `separator` character.
+公有 方法 copy_all_but_n_lines<R: Read, W: Write>(
+    可变 reader: R,
+    writer: &可变 W,
+    n: 正整数大小,
+    separator: 正8,
+) -> 标准库::输入输出::结果<正整数大小> {
+    // This function requires `n` > 0. Assert it!
+    断言!(n > 0);
+    设 可变 buffers: VecDeque<TakeAllLinesBuffer> = VecDeque::新建();
+    设 可变 buffered_terminated_lines: 正整数大小 = 0;
+    设 可变 empty_buffers = 向量![];
+    设 可变 total_bytes_copied = 0;
+    无限循环 {
+        // Try to buffer enough such that we can write out the entire first buffer.
+        无限循环 {
+            // First check if we have enough lines buffered that we can write out the entire
+            // front buffer. If so, break.
+            设 front_buffer = buffers.front();
+            如果 front_buffer.is_some_and(|b| buffered_terminated_lines > n + b.terminated_lines()) {
+                中断;
+            }
+            // Else we need to try to buffer more data...
+            设 可变 new_buffer = empty_buffers.弹出().unwrap_or_else(TakeAllLinesBuffer::新建);
+            设 fill_result = new_buffer.fill_buffer(&可变 reader, separator)?;
+            如果 fill_result.bytes == 0 {
+                // fill_result.bytes == 0 => EoF.
+                中断;
+            }
+            buffered_terminated_lines += fill_result.terminated_lines;
+            buffers.push_back(new_buffer);
+        }
+
+        // If we've not buffered more lines than we need to hold back we must be done.
+        如果 buffered_terminated_lines < n
+            || (buffered_terminated_lines == n && !buffers.back().解包().partial_line())
+        {
+            中断;
+        }
+
+        设 excess_buffered_terminated_lines = buffered_terminated_lines - n;
+        // Since we have some data buffered can assume we have at least 1 buffer, so safe to unwrap.
+        设 lines_to_write = 如果 buffers.back().解包().partial_line() {
+            excess_buffered_terminated_lines + 1
+        } 否则 {
+            excess_buffered_terminated_lines
+        };
+        设 front_buffer = buffers.front_mut().解包();
+        设 write_result = front_buffer.write_lines(writer, lines_to_write, separator)?;
+        buffered_terminated_lines -= write_result.terminated_lines;
+        total_bytes_copied += write_result.bytes;
+        // If the front buffer is empty (which it probably is), push it into the empty-buffer-pool.
+        如果 front_buffer.为空() {
+            empty_buffers.压入(buffers.pop_front().解包());
+        }
+    }
+    好的(total_bytes_copied)
+}
+
+/// Like `std::io::Take`, but for lines instead of bytes.
+///
+/// This struct is generally created by calling [`take_lines`] on a
+/// reader. Please see the documentation of [`take_lines`] for more
+/// details.
+公有 结构 TakeLines<T> {
+    inner: T,
+    limit: 正64,
+    separator: 正8,
+}
+
+实现<T: Read> Read 循环 TakeLines<T> {
+    /// Read bytes from a buffer up to the requested number of lines.
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> 标准库::输入输出::结果<正整数大小> {
+        如果 自身.limit == 0 {
+            返回 好的(0);
+        }
+        匹配 自身.inner.读锁定(buf) {
+            好的(0) => 好的(0),
+            好的(n) => {
+                循环 i 在 memchr_iter(自身.separator, &buf[..n]) {
+                    自身.limit -= 1;
+                    如果 自身.limit == 0 {
+                        返回 好的(i + 1);
+                    }
+                }
+                好的(n)
+            }
+            坏的(e) => 坏的(e),
+        }
+    }
+}
+
+/// Create an adaptor that will read at most `limit` lines from a given reader.
+///
+/// This function returns a new instance of `Read` that will read at
+/// most `limit` lines, after which it will always return EOF
+/// (`Ok(0)`).
+///
+/// The `separator` defines the character to interpret as the line
+/// ending. For the usual notion of "line", set this to `b'\n'`.
+公有 方法 take_lines<R>(reader: R, limit: 正64, separator: 正8) -> TakeLines<R> {
+    TakeLines {
+        inner: reader,
+        limit,
+        separator,
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 标准库::输入输出::{BufRead, BufReader};
+
+    使用 箱::take::{
+        TakeAllBuffer, TakeAllLinesBuffer, copy_all_but_n_bytes, copy_all_but_n_lines, take_lines,
+    };
+
+    #[test]
+    方法 test_take_all_buffer_exact_bytes() {
+        设 input_buffer = "abc";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_buffer = TakeAllBuffer::新建();
+        设 bytes_read = take_all_buffer.fill_buffer(&可变 input_reader).解包();
+        相等断言!(bytes_read, input_buffer.长度());
+        相等断言!(take_all_buffer.remaining_bytes(), input_buffer.长度());
+        相等断言!(take_all_buffer.remaining_buffer(), input_buffer.as_bytes());
+        断言!(!take_all_buffer.为空());
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        循环 (index, c) 在 input_buffer.bytes().enumerate() {
+            take_all_buffer
+                .write_bytes_exact(&可变 output_reader, 1)
+                .解包();
+            设 buf_ref = output_reader.get_ref();
+            相等断言!(buf_ref.长度(), index + 1);
+            相等断言!(buf_ref[index], c);
+            相等断言!(
+                take_all_buffer.remaining_bytes(),
+                input_buffer.长度() - (index + 1)
+            );
+            相等断言!(
+                take_all_buffer.remaining_buffer(),
+                &input_buffer.as_bytes()[index + 1..]
+            );
+        }
+
+        断言!(take_all_buffer.为空());
+        相等断言!(take_all_buffer.remaining_bytes(), 0);
+        相等断言!(take_all_buffer.remaining_buffer(), "".as_bytes());
+    }
+
+    #[test]
+    方法 test_take_all_buffer_all_bytes() {
+        设 input_buffer = "abc";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_buffer = TakeAllBuffer::新建();
+        设 bytes_read = take_all_buffer.fill_buffer(&可变 input_reader).解包();
+        相等断言!(bytes_read, input_buffer.长度());
+        相等断言!(take_all_buffer.remaining_bytes(), input_buffer.长度());
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_written = take_all_buffer.write_all(&可变 output_reader).解包();
+        相等断言!(bytes_written, input_buffer.长度());
+        相等断言!(output_reader.get_ref().as_slice(), input_buffer.as_bytes());
+
+        断言!(take_all_buffer.为空());
+        相等断言!(take_all_buffer.remaining_bytes(), 0);
+        相等断言!(take_all_buffer.remaining_buffer(), "".as_bytes());
+
+        // Now do a write_all on an empty TakeAllBuffer. Confirm correct behavior.
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_written = take_all_buffer.write_all(&可变 output_reader).解包();
+        相等断言!(bytes_written, 0);
+        相等断言!(output_reader.get_ref().as_slice().长度(), 0);
+    }
+
+    #[test]
+    方法 test_take_all_buffer_limit_bytes() {
+        设 input_buffer = "abc";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_buffer = TakeAllBuffer::新建();
+        设 bytes_read = take_all_buffer.fill_buffer(&可变 input_reader).解包();
+        相等断言!(bytes_read, input_buffer.长度());
+        相等断言!(take_all_buffer.remaining_bytes(), input_buffer.长度());
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        // Write all but 1 bytes.
+        设 bytes_to_write = input_buffer.长度() - 1;
+        设 bytes_written = take_all_buffer
+            .write_bytes_limit(&可变 output_reader, bytes_to_write)
+            .解包();
+        相等断言!(bytes_written, bytes_to_write);
+        相等断言!(
+            output_reader.get_ref().as_slice(),
+            &input_buffer.as_bytes()[..bytes_to_write]
+        );
+        断言!(!take_all_buffer.为空());
+        相等断言!(take_all_buffer.remaining_bytes(), 1);
+        相等断言!(
+            take_all_buffer.remaining_buffer(),
+            &input_buffer.as_bytes()[bytes_to_write..]
+        );
+
+        // Write 1 more byte - i.e. last byte in buffer.
+        设 bytes_to_write = 1;
+        设 bytes_written = take_all_buffer
+            .write_bytes_limit(&可变 output_reader, bytes_to_write)
+            .解包();
+        相等断言!(bytes_written, bytes_to_write);
+        相等断言!(output_reader.get_ref().as_slice(), input_buffer.as_bytes());
+        断言!(take_all_buffer.为空());
+        相等断言!(take_all_buffer.remaining_bytes(), 0);
+        相等断言!(take_all_buffer.remaining_buffer(), "".as_bytes());
+
+        // Write 1 more byte - i.e. confirm behavior on already empty buffer.
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_to_write = 1;
+        设 bytes_written = take_all_buffer
+            .write_bytes_limit(&可变 output_reader, bytes_to_write)
+            .解包();
+        相等断言!(bytes_written, 0);
+        相等断言!(output_reader.get_ref().as_slice().长度(), 0);
+        断言!(take_all_buffer.为空());
+        相等断言!(take_all_buffer.remaining_bytes(), 0);
+        相等断言!(take_all_buffer.remaining_buffer(), "".as_bytes());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_take_all_lines_buffer() {
+        // 3 lines with new-lines and one partial line.
+        设 input_buffer = "a\nb\nc\ndef";
+        设 separator = b'\n';
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_lines_buffer = TakeAllLinesBuffer::新建();
+        设 fill_result = take_all_lines_buffer
+            .fill_buffer(&可变 input_reader, separator)
+            .解包();
+        相等断言!(fill_result.bytes, input_buffer.长度());
+        相等断言!(fill_result.terminated_lines, 3);
+        相等断言!(take_all_lines_buffer.terminated_lines(), 3);
+        断言!(!take_all_lines_buffer.为空());
+        断言!(take_all_lines_buffer.partial_line());
+
+        // Write 1st line.
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 lines_to_write = 1;
+        设 write_result = take_all_lines_buffer
+            .write_lines(&可变 output_reader, lines_to_write, separator)
+            .解包();
+        相等断言!(write_result.bytes, 2);
+        相等断言!(write_result.terminated_lines, lines_to_write);
+        相等断言!(output_reader.get_ref().as_slice(), "a\n".as_bytes());
+        断言!(!take_all_lines_buffer.为空());
+        相等断言!(take_all_lines_buffer.terminated_lines(), 2);
+
+        // Write 2nd line.
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 lines_to_write = 1;
+        设 write_result = take_all_lines_buffer
+            .write_lines(&可变 output_reader, lines_to_write, separator)
+            .解包();
+        相等断言!(write_result.bytes, 2);
+        相等断言!(write_result.terminated_lines, lines_to_write);
+        相等断言!(output_reader.get_ref().as_slice(), "b\n".as_bytes());
+        断言!(!take_all_lines_buffer.为空());
+        相等断言!(take_all_lines_buffer.terminated_lines(), 1);
+
+        // Now try to write 3 lines even though we have only 1 line remaining. Should write everything left in the buffer.
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 lines_to_write = 3;
+        设 write_result = take_all_lines_buffer
+            .write_lines(&可变 output_reader, lines_to_write, separator)
+            .解包();
+        相等断言!(write_result.bytes, 5);
+        相等断言!(write_result.terminated_lines, 1);
+        相等断言!(output_reader.get_ref().as_slice(), "c\ndef".as_bytes());
+        断言!(take_all_lines_buffer.为空());
+        相等断言!(take_all_lines_buffer.terminated_lines(), 0);
+
+        // Test empty buffer.
+        设 input_buffer = "";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_lines_buffer = TakeAllLinesBuffer::新建();
+        设 fill_result = take_all_lines_buffer
+            .fill_buffer(&可变 input_reader, separator)
+            .解包();
+        相等断言!(fill_result.bytes, 0);
+        相等断言!(fill_result.terminated_lines, 0);
+        相等断言!(take_all_lines_buffer.terminated_lines(), 0);
+        断言!(take_all_lines_buffer.为空());
+        断言!(!take_all_lines_buffer.partial_line());
+
+        // Test buffer that ends with newline.
+        设 input_buffer = "\n";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 take_all_lines_buffer = TakeAllLinesBuffer::新建();
+        设 fill_result = take_all_lines_buffer
+            .fill_buffer(&可变 input_reader, separator)
+            .解包();
+        相等断言!(fill_result.bytes, 1);
+        相等断言!(fill_result.terminated_lines, 1);
+        相等断言!(take_all_lines_buffer.terminated_lines(), 1);
+        断言!(!take_all_lines_buffer.为空());
+        断言!(!take_all_lines_buffer.partial_line());
+    }
+
+    #[test]
+    方法 test_copy_all_but_n_bytes() {
+        // Test the copy_all_but_bytes fn. Test several scenarios...
+        // 1 - Hold back more bytes than the input will provide. Should have nothing written to output.
+        设 input_buffer = "a\nb\nc\ndef";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied = copy_all_but_n_bytes(
+            &可变 input_reader,
+            &可变 output_reader,
+            input_buffer.长度() + 1,
+        )
+        .解包();
+        相等断言!(bytes_copied, 0);
+
+        // 2 - Hold back exactly the number of bytes the input will provide. Should have nothing written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_bytes(&可变 input_reader, &可变 output_reader, input_buffer.长度())
+                .解包();
+        相等断言!(bytes_copied, 0);
+
+        // 3 - Hold back 1 fewer byte than input will provide. Should have one byte written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied = copy_all_but_n_bytes(
+            &可变 input_reader,
+            &可变 output_reader,
+            input_buffer.长度() - 1,
+        )
+        .解包();
+        相等断言!(bytes_copied, 1);
+        相等断言!(output_reader.get_ref()[..], input_buffer.as_bytes()[0..1]);
+    }
+
+    #[test]
+    方法 test_copy_all_but_n_lines() {
+        // Test the copy_all_but_lines fn. Test several scenarios...
+        // 1 - Hold back more lines than the input will provide. Should have nothing written to output.
+        设 input_buffer = "a\nb\nc\ndef";
+        设 separator = b'\n';
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 5, separator).解包();
+        相等断言!(bytes_copied, 0);
+
+        // 2 - Hold back exactly the number of lines the input will provide. Should have nothing written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 4, separator).解包();
+        相等断言!(bytes_copied, 0);
+
+        // 3 - Hold back 1 fewer lines than input will provide. Should have one line written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 3, separator).解包();
+        相等断言!(bytes_copied, 2);
+        相等断言!(output_reader.get_ref()[..], input_buffer.as_bytes()[0..2]);
+
+        // Now test again with an input that has a new-line ending...
+        // 4 - Hold back more lines than the input will provide. Should have nothing written to output.
+        设 input_buffer = "a\nb\nc\ndef\n";
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 5, separator).解包();
+        相等断言!(bytes_copied, 0);
+
+        // 5 - Hold back exactly the number of lines the input will provide. Should have nothing written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 4, separator).解包();
+        相等断言!(bytes_copied, 0);
+
+        // 6 - Hold back 1 fewer lines than input will provide. Should have one line written to output.
+        设 可变 input_reader = 标准库::输入输出::Cursor::新建(input_buffer);
+        设 可变 output_reader = 标准库::输入输出::Cursor::新建(向量![0x10; 0]);
+        设 bytes_copied =
+            copy_all_but_n_lines(&可变 input_reader, &可变 output_reader, 3, separator).解包();
+        相等断言!(bytes_copied, 2);
+        相等断言!(output_reader.get_ref()[..], input_buffer.as_bytes()[0..2]);
+    }
+
+    #[test]
+    方法 test_zero_lines() {
+        设 input_reader = 标准库::输入输出::Cursor::新建("a\nb\nc\n");
+        设 output_reader = BufReader::新建(take_lines(input_reader, 0, b'\n'));
+        设 可变 迭代 = output_reader.lines().映射(|l| l.解包());
+        相等断言!(无, 迭代.next());
+    }
+
+    #[test]
+    方法 test_fewer_lines() {
+        设 input_reader = 标准库::输入输出::Cursor::新建("a\nb\nc\n");
+        设 output_reader = BufReader::新建(take_lines(input_reader, 2, b'\n'));
+        设 可变 迭代 = output_reader.lines().映射(|l| l.解包());
+        相等断言!(一些(字符串::from("a")), 迭代.next());
+        相等断言!(一些(字符串::from("b")), 迭代.next());
+        相等断言!(无, 迭代.next());
+    }
+
+    #[test]
+    方法 test_more_lines() {
+        设 input_reader = 标准库::输入输出::Cursor::新建("a\nb\nc\n");
+        设 output_reader = BufReader::新建(take_lines(input_reader, 4, b'\n'));
+        设 可变 迭代 = output_reader.lines().映射(|l| l.解包());
+        相等断言!(一些(字符串::from("a")), 迭代.next());
+        相等断言!(一些(字符串::from("b")), 迭代.next());
+        相等断言!(一些(字符串::from("c")), 迭代.next());
+        相等断言!(无, 迭代.next());
+    }
+}

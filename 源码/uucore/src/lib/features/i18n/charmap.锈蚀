@@ -1,0 +1,140 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore langinfo charmap eucjp euckr euctw CTYPE HKSCS hkscs localedata
+
+//! Locale-aware multi-byte character length detection via `LC_CTYPE`.
+
+使用 标准库::同步::OnceLock;
+
+枚举 MbEncoding {
+    Utf8,
+    Gb18030,
+    EucJp,
+    EucKr,
+    Big5,
+}
+
+方法 encoding_from_name(enc: &字符串切片) -> MbEncoding {
+    匹配 enc {
+        "gb18030" | "gbk" | "gb2312" => MbEncoding::Gb18030,
+        "euc-jp" | "eucjp" => MbEncoding::EucJp,
+        "euc-kr" | "euckr" => MbEncoding::EucKr,
+        "big5" | "big5-hkscs" | "big5hkscs" | "euc-tw" | "euctw" => MbEncoding::Big5,
+        _ => MbEncoding::Utf8,
+    }
+}
+
+方法 get_encoding() -> &'静态 MbEncoding {
+    静态 ENCODING: OnceLock<MbEncoding> = OnceLock::新建();
+    ENCODING.get_or_init(|| {
+        设 val = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .迭代()
+            .find_map(|&k| 标准库::环境::var(k).ok().过滤(|v| !v.为空()));
+        设 s = 匹配 val.as_deref() {
+            一些(s) 如果 s != "C" && s != "POSIX" => s,
+            _ => 返回 MbEncoding::Utf8,
+        };
+        如果 设 一些(enc) = s.split('.').nth(1) {
+            设 enc = enc.split('@').next().unwrap_or(enc);
+            encoding_from_name(&enc.to_ascii_lowercase())
+        } 否则 {
+            // Bare locale defaults from glibc localedata/SUPPORTED
+            匹配 s.split('@').next().unwrap_or(s) {
+                "zh_CN" | "zh_SG" => MbEncoding::Gb18030,
+                "zh_TW" | "zh_HK" => MbEncoding::Big5,
+                _ => MbEncoding::Utf8,
+            }
+        }
+    })
+}
+
+/// Byte length of the first character in `bytes` under the current locale encoding.
+公有 方法 mb_char_len(bytes: &[正8]) -> 正整数大小 {
+    调试断言!(!bytes.为空());
+    设 b0 = bytes[0];
+    如果 b0 <= 0x7F {
+        返回 1;
+    }
+    匹配 get_encoding() {
+        MbEncoding::Utf8 => utf8_len(bytes, b0),
+        MbEncoding::Gb18030 => gb18030_len(bytes, b0),
+        MbEncoding::EucJp => eucjp_len(bytes, b0),
+        MbEncoding::EucKr => euckr_len(bytes, b0),
+        MbEncoding::Big5 => big5_len(bytes, b0),
+    }
+}
+
+// All helpers below assume b0 > 0x7F (ASCII already handled by caller).
+
+方法 utf8_len(b: &[正8], b0: 正8) -> 正整数大小 {
+    设 n = 匹配 b0 {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 返回 1,
+    };
+    如果 b.长度() >= n && b[1..n].迭代().全部(|&c| c & 0xC0 == 0x80) {
+        n
+    } 否则 {
+        1
+    }
+}
+
+// 2-byte: [81-FE][40-7E,80-FE]  4-byte: [81-FE][30-39][81-FE][30-39]
+方法 gb18030_len(b: &[正8], b0: 正8) -> 正整数大小 {
+    如果 !(0x81..=0xFE).包含(&b0) {
+        返回 1;
+    }
+    如果 b.长度() >= 4
+        && (0x30..=0x39).包含(&b[1])
+        && (0x81..=0xFE).包含(&b[2])
+        && (0x30..=0x39).包含(&b[3])
+    {
+        返回 4;
+    }
+    如果 b.长度() >= 2 && ((0x40..=0x7E).包含(&b[1]) || (0x80..=0xFE).包含(&b[1])) {
+        返回 2;
+    }
+    1
+}
+
+// 3-byte: [8F][A1-FE][A1-FE]  2-byte: [8E][A1-DF] or [A1-FE][A1-FE]
+方法 eucjp_len(b: &[正8], b0: 正8) -> 正整数大小 {
+    如果 b0 == 0x8F && b.长度() >= 3 && (0xA1..=0xFE).包含(&b[1]) && (0xA1..=0xFE).包含(&b[2])
+    {
+        返回 3;
+    }
+    如果 b.长度() >= 2 {
+        如果 b0 == 0x8E && (0xA1..=0xDF).包含(&b[1]) {
+            返回 2;
+        }
+        如果 (0xA1..=0xFE).包含(&b0) && (0xA1..=0xFE).包含(&b[1]) {
+            返回 2;
+        }
+    }
+    1
+}
+
+// 2-byte: [A1-FE][A1-FE]
+方法 euckr_len(b: &[正8], b0: 正8) -> 正整数大小 {
+    如果 (0xA1..=0xFE).包含(&b0) && b.长度() >= 2 && (0xA1..=0xFE).包含(&b[1]) {
+        2
+    } 否则 {
+        1
+    }
+}
+
+// 2-byte: [81-FE][40-7E,A1-FE]
+方法 big5_len(b: &[正8], b0: 正8) -> 正整数大小 {
+    如果 (0x81..=0xFE).包含(&b0)
+        && b.长度() >= 2
+        && ((0x40..=0x7E).包含(&b[1]) || (0xA1..=0xFE).包含(&b[1]))
+    {
+        2
+    } 否则 {
+        1
+    }
+}

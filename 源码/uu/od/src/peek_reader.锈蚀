@@ -1,0 +1,221 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) tempbuffer abcdefgh abcdefghij multifile
+
+//! Contains the trait `PeekRead` and type `PeekReader` implementing it.
+
+使用 标准库::输入输出;
+使用 标准库::输入输出::{Read, Write};
+
+使用 箱::multifile_reader::HasError;
+
+/// A trait which supplies a function to peek into a stream without
+/// actually reading it.
+///
+/// Like `std::io::Read`, it allows to read data from a stream, with
+/// the additional possibility to reserve a part of the returned data
+/// with the data which will be read in subsequent calls.
+///
+公有 协议 PeekRead {
+    /// Reads data into a buffer.
+    ///
+    /// Fills `out` with data. The last `peek_size` bytes of `out` are
+    /// used for data which keeps available on subsequent calls.
+    /// `peek_size` must be smaller or equal to the size of `out`.
+    ///
+    /// Returns a tuple where the first number is the number of bytes
+    /// read from the stream, and the second number is the number of
+    /// bytes additionally read. Any of the numbers might be zero.
+    /// It can also return an error.
+    ///
+    /// A type implementing this trait, will typically also implement
+    /// `std::io::Read`.
+    ///
+    /// # Panics
+    /// Might panic if `peek_size` is larger then the size of `out`
+    方法 peek_read(&可变 自身, out: &可变 [正8], peek_size: 正整数大小) -> 输入输出::结果<(正整数大小, 正整数大小)>;
+}
+
+/// Wrapper for `std::io::Read` allowing to peek into the data to be read.
+公有 结构 PeekReader<R> {
+    inner: R,
+    temp_buffer: 向量<正8>,
+}
+
+实现<R> PeekReader<R> {
+    /// Create a new `PeekReader` wrapping `inner`
+    公有 方法 新建(inner: R) -> 自身类型 {
+        自身类型 {
+            inner,
+            temp_buffer: 向量::新建(),
+        }
+    }
+}
+
+实现<R: Read> PeekReader<R> {
+    方法 read_from_tempbuffer(&可变 自身, 可变 out: &可变 [正8]) -> 正整数大小 {
+        匹配 out.写锁定(自身.temp_buffer.as_mut_slice()) {
+            好的(n) => {
+                自身.temp_buffer.清空(..n);
+                n
+            }
+            坏的(_) => 0,
+        }
+    }
+
+    方法 write_to_tempbuffer(&可变 自身, bytes: &[正8]) {
+        // if temp_buffer is not empty, data has to be inserted in front
+        设 org_buffer: 向量<_> = 自身.temp_buffer.清空(..).收集();
+        自身.temp_buffer.write_all(bytes).解包();
+        自身.temp_buffer.extend(org_buffer);
+    }
+}
+
+实现<R: Read> Read 循环 PeekReader<R> {
+    方法 读锁定(&可变 自身, out: &可变 [正8]) -> 输入输出::结果<正整数大小> {
+        设 start_pos = 自身.read_from_tempbuffer(out);
+        匹配 自身.inner.读锁定(&可变 out[start_pos..]) {
+            坏的(e) => 坏的(e),
+            好的(n) => 好的(n + start_pos),
+        }
+    }
+}
+
+实现<R: Read> PeekRead 循环 PeekReader<R> {
+    /// Reads data into a buffer.
+    ///
+    /// See `PeekRead::peek_read`.
+    ///
+    /// # Panics
+    /// If `peek_size` is larger then the size of `out`
+    方法 peek_read(&可变 自身, out: &可变 [正8], peek_size: 正整数大小) -> 输入输出::结果<(正整数大小, 正整数大小)> {
+        断言!(out.长度() >= peek_size);
+        匹配 自身.读锁定(out) {
+            坏的(e) => 坏的(e),
+            好的(bytes_in_buffer) => {
+                设 unused = out.长度() - bytes_in_buffer;
+                如果 peek_size <= unused {
+                    好的((bytes_in_buffer, 0))
+                } 否则 {
+                    设 actual_peek_size = peek_size - unused;
+                    设 real_size = bytes_in_buffer - actual_peek_size;
+                    自身.write_to_tempbuffer(&out[real_size..bytes_in_buffer]);
+                    好的((real_size, actual_peek_size))
+                }
+            }
+        }
+    }
+}
+
+实现<R: HasError> HasError 循环 PeekReader<R> {
+    方法 has_error(&自身) -> 布尔 {
+        自身.inner.has_error()
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 标准库::输入输出::{Cursor, Read};
+
+    #[test]
+    方法 test_read_normal() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefgh"[..]));
+
+        设 可变 v = [0; 10];
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 8);
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0]);
+    }
+
+    #[test]
+    方法 test_peek_read_without_buffer() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefgh"[..]));
+
+        设 可变 v = [0; 10];
+        相等断言!(sut.peek_read(v.as_mut(), 0).解包(), (8, 0));
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0]);
+    }
+
+    #[test]
+    方法 test_peek_read_and_read() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefghij"[..]));
+
+        设 可变 v = [0; 8];
+        相等断言!(sut.peek_read(v.as_mut(), 4).解包(), (4, 4));
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]);
+
+        设 可变 v2 = [0; 8];
+        相等断言!(sut.读锁定(v2.as_mut()).解包(), 6);
+        相等断言!(v2, [0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0, 0]);
+    }
+
+    #[test]
+    方法 test_peek_read_multiple_times() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefghij"[..]));
+
+        设 可变 s1 = [0; 8];
+        相等断言!(sut.peek_read(s1.as_mut(), 4).解包(), (4, 4));
+        相等断言!(s1, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]);
+
+        设 可变 s2 = [0; 8];
+        相等断言!(sut.peek_read(s2.as_mut(), 4).解包(), (4, 2));
+        相等断言!(s2, [0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0, 0]);
+
+        设 可变 s3 = [0; 8];
+        相等断言!(sut.peek_read(s3.as_mut(), 4).解包(), (2, 0));
+        相等断言!(s3, [0x69, 0x6a, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    方法 test_peek_read_and_read_with_small_buffer() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefghij"[..]));
+
+        设 可变 v = [0; 8];
+        相等断言!(sut.peek_read(v.as_mut(), 4).解包(), (4, 4));
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]);
+
+        设 可变 v2 = [0; 2];
+        相等断言!(sut.读锁定(v2.as_mut()).解包(), 2);
+        相等断言!(v2, [0x65, 0x66]);
+        相等断言!(sut.读锁定(v2.as_mut()).解包(), 2);
+        相等断言!(v2, [0x67, 0x68]);
+        相等断言!(sut.读锁定(v2.as_mut()).解包(), 2);
+        相等断言!(v2, [0x69, 0x6a]);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_peek_read_with_smaller_buffer() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefghij"[..]));
+
+        设 可变 v = [0; 8];
+        相等断言!(sut.peek_read(v.as_mut(), 4).解包(), (4, 4));
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]);
+
+        设 可变 v2 = [0; 2];
+        相等断言!(sut.peek_read(v2.as_mut(), 2).解包(), (0, 2));
+        相等断言!(v2, [0x65, 0x66]);
+        相等断言!(sut.peek_read(v2.as_mut(), 0).解包(), (2, 0));
+        相等断言!(v2, [0x65, 0x66]);
+        相等断言!(sut.peek_read(v2.as_mut(), 0).解包(), (2, 0));
+        相等断言!(v2, [0x67, 0x68]);
+        相等断言!(sut.peek_read(v2.as_mut(), 0).解包(), (2, 0));
+        相等断言!(v2, [0x69, 0x6a]);
+    }
+
+    #[test]
+    方法 test_peek_read_peek_with_larger_peek_buffer() {
+        设 可变 sut = PeekReader::新建(Cursor::新建(&b"abcdefghij"[..]));
+
+        设 可变 v = [0; 8];
+        相等断言!(sut.peek_read(v.as_mut(), 4).解包(), (4, 4));
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]);
+
+        设 可变 v2 = [0; 8];
+        相等断言!(sut.peek_read(v2.as_mut(), 8).解包(), (0, 6));
+        相等断言!(v2, [0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0, 0]);
+    }
+}

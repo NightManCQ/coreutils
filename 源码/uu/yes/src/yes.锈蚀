@@ -1,0 +1,161 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// cSpell:ignore strs
+
+使用 clap::{Arg, ArgAction, Command, builder::ValueParser};
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{自身, Write};
+使用 uucore::错误::{UResult, USimpleError, strip_errno};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+// it's possible that using a smaller or larger buffer might provide better performance
+常量 BUF_SIZE: 正整数大小 = 16 * 1024;
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    #[allow(clippy::unwrap_used, reason = "clap provides 'y' by default")]
+    设 可变 buffer = args_into_buffer(matches.get_many::<OsString>("STRING").解包())?;
+    prepare_buffer(&可变 buffer);
+
+    匹配 exec(&buffer) {
+        好的(()) => 好的(()),
+        // On Windows, silently handle broken pipe since there's no SIGPIPE
+        #[cfg(windows)]
+        坏的(err) 如果 err.kind() == 输入输出::ErrorKind::BrokenPipe => 好的(()),
+        坏的(err) => 坏的(USimpleError::新建(
+            1,
+            translate!("yes-error-standard-output", "error" => strip_errno(&err)),
+        )),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("yes")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("yes"))
+        .about(translate!("yes-about"))
+        .override_usage(format_usage(&translate!("yes-usage")))
+        .arg(
+            Arg::新建("STRING")
+                .default_value("y")
+                .value_parser(ValueParser::os_string())
+                .action(ArgAction::Append),
+        )
+        .infer_long_args(真)
+}
+
+/// create a buffer filled by words `i` separated by spaces.
+#[allow(clippy::unnecessary_wraps, reason = "needed on some platforms")]
+方法 args_into_buffer<'a>(i: 实现 迭代器协议<Item = &'a OsString>) -> UResult<向量<正8>> {
+    设 可变 buf = 向量::with_capacity(BUF_SIZE);
+    // On Unix (and wasi), OsStrs are just &[u8]'s underneath...
+    #[cfg(任意(unix, target_os = "wasi"))]
+    {
+        #[cfg(unix)]
+        使用 标准库::操作系统::unix::ffi::OsStrExt;
+        #[cfg(target_os = "wasi")]
+        使用 标准库::操作系统::wasi::ffi::OsStrExt;
+
+        循环 part 在 itertools::intersperse(i.映射(|a| a.as_bytes()), b" ") {
+            buf.extend_from_slice(part);
+        }
+    }
+
+    // But, on Windows, we must hop through a String.
+    #[cfg(not(任意(unix, target_os = "wasi")))]
+    {
+        循环 part 在 itertools::intersperse(i.映射(|a| a.to_str()), 一些(" ")) {
+            设 bytes = part
+                .ok_or_else(|| USimpleError::新建(1, translate!("yes-error-invalid-utf8")))?
+                .as_bytes();
+            buf.extend_from_slice(bytes);
+        }
+    }
+
+    buf.压入(b'\n');
+
+    好的(buf)
+}
+
+/// Assumes buf holds a single output line forged from the command line arguments, copies it
+/// repeatedly until the buffer holds as many copies as it can
+方法 prepare_buffer(buf: &可变 向量<正8>) {
+    设 line_len = buf.长度();
+    调试断言!(line_len > 0, "buffer is not empty since we have newline");
+    设 target_size = line_len * (buf.capacity() / line_len); // 0 if line_len is already large enough
+
+    当 buf.长度() < target_size {
+        设 to_copy = 标准库::比较::min(target_size - buf.长度(), buf.长度());
+        调试相等断言!(to_copy % line_len, 0);
+        buf.extend_from_within(..to_copy);
+    }
+}
+
+公有 方法 exec(bytes: &[正8]) -> 输入输出::结果<()> {
+    设 stdout = 输入输出::stdout();
+    设 可变 stdout = stdout.锁定();
+
+    无限循环 {
+        stdout.write_all(bytes)?;
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_prepare_buffer() {
+        设 tests = [
+            (150, 16350),
+            (1000, 16000),
+            (4093, 16372),
+            (4099, 12297),
+            (4111, 12333),
+            (2, 16384),
+            (3, 16383),
+            (4, 16384),
+            (5, 16380),
+            (8192, 16384),
+            (8191, 16382),
+            (8193, 8193),
+            (10000, 10000),
+            (15000, 15000),
+            (25000, 25000),
+        ];
+
+        循环 (line, final_len) 在 tests {
+            设 可变 v = 向量::with_capacity(BUF_SIZE);
+            v.extend(标准库::迭代::repeat_n(b'a', line));
+            prepare_buffer(&可变 v);
+            相等断言!(v.长度(), final_len);
+        }
+    }
+
+    #[test]
+    方法 test_args_into_buf() {
+        {
+            设 default_args = ["y".into()];
+            设 v = args_into_buffer(default_args.迭代()).解包();
+            相等断言!(字符串::from_utf8(v).解包(), "y\n");
+        }
+
+        {
+            设 args = ["foo".into()];
+            设 v = args_into_buffer(args.迭代()).解包();
+            相等断言!(字符串::from_utf8(v).解包(), "foo\n");
+        }
+
+        {
+            设 args = ["foo".into(), "bar    baz".into(), "qux".into()];
+            设 v = args_into_buffer(args.迭代()).解包();
+            相等断言!(字符串::from_utf8(v).解包(), "foo bar    baz qux\n");
+        }
+    }
+}

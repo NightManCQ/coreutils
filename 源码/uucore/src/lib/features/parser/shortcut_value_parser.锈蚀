@@ -1,0 +1,233 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore abcdefgh abef Strs
+
+//! A parser that accepts shortcuts for values.
+//! `ShortcutValueParser` is similar to clap's `PossibleValuesParser`
+
+使用 clap::{
+    builder::{PossibleValue, TypedValueParser},
+    错误::{ContextKind, ContextValue, ErrorKind},
+};
+
+/// A parser that accepts shortcuts for values.
+#[derive(克隆协议)]
+公有 结构 ShortcutValueParser(向量<PossibleValue>);
+
+/// `ShortcutValueParser` is similar to clap's `PossibleValuesParser`: it verifies that the value is
+/// from an enumerated set of `PossibleValue`.
+///
+/// Whereas `PossibleValuesParser` only accepts exact matches, `ShortcutValueParser` also accepts
+/// shortcuts as long as they are unambiguous.
+实现 ShortcutValueParser {
+    /// Create a new `ShortcutValueParser` from a list of `PossibleValue`.
+    公有 方法 新建(values: 实现 转换为目标协议<自身类型>) -> 自身类型 {
+        values.into()
+    }
+
+    方法 generate_clap_error(
+        &自身,
+        cmd: &clap::Command,
+        arg: 选项<&clap::Arg>,
+        value: &字符串切片,
+        possible_values: &[&PossibleValue],
+    ) -> clap::错误协议 {
+        设 可变 err = clap::错误协议::新建(ErrorKind::InvalidValue).with_cmd(cmd);
+
+        如果 设 一些(arg) = arg {
+            err.插入(
+                ContextKind::InvalidArg,
+                ContextValue::字符串(arg.to_string()),
+            );
+        }
+
+        err.插入(
+            ContextKind::InvalidValue,
+            ContextValue::字符串(value.to_string()),
+        );
+
+        err.插入(
+            ContextKind::ValidValue,
+            ContextValue::Strings(自身.0.迭代().映射(|x| x.get_name().to_string()).收集()),
+        );
+
+        // if `possible_values` is not empty then that means this error is because of an ambiguous value.
+        如果 !possible_values.为空() {
+            add_ambiguous_value_tip(possible_values, &可变 err, value);
+        }
+        err
+    }
+}
+
+/// Adds a suggestion when error is because of ambiguous values based on the provided possible values.
+方法 add_ambiguous_value_tip(
+    possible_values: &[&PossibleValue],
+    err: &可变 clap::错误::错误协议,
+    value: &字符串切片,
+) {
+    设 可变 formatted_possible_values = 字符串::新建();
+    循环 (i, s) 在 possible_values.迭代().enumerate() {
+        formatted_possible_values.push_str(&格式化!("'{}'", s.get_name()));
+        如果 i < possible_values.长度() - 2 {
+            formatted_possible_values.push_str(", ");
+        } 否则 如果 i < possible_values.长度() - 1 {
+            formatted_possible_values.push_str(" or ");
+        }
+    }
+    err.插入(
+        ContextKind::Suggested,
+        ContextValue::StyledStrs(向量![格式化!(
+            "It looks like '{value}' could match several values. Did you mean {formatted_possible_values}?"
+        )
+        .into()]),
+    );
+}
+
+实现 TypedValueParser 循环 ShortcutValueParser {
+    类型 Value = 字符串;
+
+    方法 parse_ref(
+        &自身,
+        cmd: &clap::Command,
+        arg: 选项<&clap::Arg>,
+        value: &标准库::ffi::OsStr,
+    ) -> 结果<自身类型::Value, clap::错误协议> {
+        设 value = value
+            .to_str()
+            .ok_or(clap::错误协议::新建(ErrorKind::InvalidUtf8))?;
+
+        设 matched_values: 向量<_> = 自身
+            .0
+            .迭代()
+            .过滤(|x| x.get_name_and_aliases().任意(|name| name.starts_with(value)))
+            .收集();
+
+        匹配 matched_values.长度() {
+            0 => 坏的(自身.generate_clap_error(cmd, arg, value, &[])),
+            1 => 好的(matched_values[0].get_name().to_string()),
+            _ => {
+                如果 设 一些(direct_match) = matched_values.迭代().寻找(|x| x.get_name() == value) {
+                    好的(direct_match.get_name().to_string())
+                } 否则 {
+                    坏的(自身.generate_clap_error(cmd, arg, value, &matched_values))
+                }
+            }
+        }
+    }
+
+    方法 possible_values(&自身) -> 选项<盒子<动态 迭代器协议<Item = PossibleValue> + '_>> {
+        一些(盒子::新建(自身.0.迭代().cloned()))
+    }
+}
+
+实现<I, T> 转换协议<I> 循环 ShortcutValueParser
+何处
+    I: 转换为迭代器协议<Item = T>,
+    T: 转换为目标协议<PossibleValue>,
+{
+    方法 from(values: I) -> 自身类型 {
+        自身类型(values.into_iter().映射(转换为目标协议::into).收集())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::ffi::OsStr;
+
+    使用 clap::{Command, builder::PossibleValue, builder::TypedValueParser, 错误::ErrorKind};
+
+    使用 超级::ShortcutValueParser;
+
+    #[test]
+    方法 test_parse_ref() {
+        设 cmd = Command::新建("cmd");
+        设 parser = ShortcutValueParser::新建(["abcd"]);
+        设 values = ["a", "ab", "abc", "abcd"];
+
+        循环 value 在 values {
+            设 result = parser.parse_ref(&cmd, 无, OsStr::新建(value));
+            相等断言!("abcd", result.解包());
+        }
+    }
+
+    #[test]
+    方法 test_parse_ref_with_invalid_value() {
+        设 cmd = Command::新建("cmd");
+        设 parser = ShortcutValueParser::新建(["abcd"]);
+        设 invalid_values = ["e", "abe", "abcde"];
+
+        循环 invalid_value 在 invalid_values {
+            设 result = parser.parse_ref(&cmd, 无, OsStr::新建(invalid_value));
+            相等断言!(ErrorKind::InvalidValue, result.unwrap_err().kind());
+        }
+    }
+
+    #[test]
+    方法 test_parse_ref_with_ambiguous_value() {
+        设 cmd = Command::新建("cmd");
+        设 parser = ShortcutValueParser::新建(["abcd", "abef"]);
+        设 ambiguous_values = ["a", "ab"];
+
+        循环 ambiguous_value 在 ambiguous_values {
+            设 result = parser.parse_ref(&cmd, 无, OsStr::新建(ambiguous_value));
+            相等断言!(ErrorKind::InvalidValue, result.as_ref().unwrap_err().kind());
+            断言!(result.unwrap_err().to_string().包含(&格式化!(
+                "It looks like '{ambiguous_value}' could match several values. Did you mean 'abcd' or 'abef'?"
+            )));
+        }
+
+        设 result = parser.parse_ref(&cmd, 无, OsStr::新建("abc"));
+        相等断言!("abcd", result.解包());
+
+        设 result = parser.parse_ref(&cmd, 无, OsStr::新建("abe"));
+        相等断言!("abef", result.解包());
+    }
+
+    #[test]
+    方法 test_parse_ref_with_ambiguous_value_that_is_a_possible_value() {
+        设 cmd = Command::新建("cmd");
+        设 parser = ShortcutValueParser::新建(["abcd", "abcdefgh"]);
+        设 result = parser.parse_ref(&cmd, 无, OsStr::新建("abcd"));
+        相等断言!("abcd", result.解包());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    方法 test_parse_ref_with_invalid_utf8() {
+        使用 标准库::操作系统::unix::预导入::OsStrExt;
+
+        设 parser = ShortcutValueParser::新建(["abcd"]);
+        设 cmd = Command::新建("cmd");
+
+        设 result = parser.parse_ref(&cmd, 无, OsStr::from_bytes(&[0xc3, 0x28]));
+        相等断言!(ErrorKind::InvalidUtf8, result.unwrap_err().kind());
+    }
+
+    #[test]
+    方法 test_ambiguous_word_same_meaning() {
+        设 cmd = Command::新建("cmd");
+        设 parser = ShortcutValueParser::新建([
+            PossibleValue::新建("atime").alias("access"),
+            "status".into(),
+        ]);
+        // Even though "a" is ambiguous (it might mean "atime" or "access"),
+        // the meaning is uniquely defined, therefore accept it.
+        设 atime_values = [
+            // spell-checker:disable-next-line
+            "atime", "atim", "at", "a", "access", "acces", "acce", "acc", "ac",
+        ];
+        // spell-checker:disable-next-line
+        设 status_values = ["status", "statu", "stat", "sta", "st", "st"];
+
+        循环 value 在 atime_values {
+            设 result = parser.parse_ref(&cmd, 无, OsStr::新建(value));
+            相等断言!("atime", result.解包());
+        }
+        循环 value 在 status_values {
+            设 result = parser.parse_ref(&cmd, 无, OsStr::新建(value));
+            相等断言!("status", result.解包());
+        }
+    }
+}

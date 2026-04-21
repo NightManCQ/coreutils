@@ -1,0 +1,202 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 uu_tsort::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file};
+
+/// Generate topological sort test data - linear chain
+方法 generate_linear_chain(num_nodes: 正整数大小) -> 向量<正8> {
+    设 可变 data = 向量::新建();
+
+    循环 i 在 0..num_nodes.saturating_sub(1) {
+        data.extend_from_slice(格式化!("node{i} node{}\n", i + 1).as_bytes());
+    }
+
+    data
+}
+
+/// Generate a DAG with tree-like structure
+方法 generate_tree_dag(depth: 正整数大小, branching_factor: 正整数大小) -> 向量<正8> {
+    设 可变 data = 向量::新建();
+    设 可变 node_id = 0;
+
+    // Generate a tree-like DAG
+    循环 level 在 0..depth {
+        设 nodes_at_level = branching_factor.pow(level 转换 正32);
+
+        循环 parent 在 0..nodes_at_level {
+            设 parent_id = node_id + parent;
+            循环 child 在 0..branching_factor {
+                如果 level + 1 < depth {
+                    设 child_id = node_id + nodes_at_level + parent * branching_factor + child;
+                    data.extend_from_slice(格式化!("node{parent_id} node{child_id}\n").as_bytes());
+                }
+            }
+        }
+        node_id += nodes_at_level;
+    }
+
+    data
+}
+
+/// Generate a more complex graph with cross-dependencies
+方法 generate_complex_dag(num_nodes: 正整数大小) -> 向量<正8> {
+    设 可变 data = 向量::新建();
+
+    // Create a diamond-like pattern with multiple levels
+    设 levels = ((num_nodes 转换 点64).sqrt() 转换 正整数大小).max(4);
+    设 nodes_per_level = num_nodes / levels;
+
+    循环 level 在 0..levels - 1 {
+        设 start_current = level * nodes_per_level;
+        设 start_next = (level + 1) * nodes_per_level;
+        设 end_current = ((level + 1) * nodes_per_level).min(num_nodes);
+        设 end_next = ((level + 2) * nodes_per_level).min(num_nodes);
+
+        循环 i 在 start_current..end_current {
+            // Each node connects to 1-3 nodes in the next level
+            设 connections = ((i % 3) + 1).min(end_next - start_next);
+            循环 j 在 0..connections {
+                设 target = start_next + ((i + j) % (end_next - start_next));
+                data.extend_from_slice(格式化!("node{i} node{target}\n").as_bytes());
+            }
+        }
+    }
+
+    data
+}
+
+/// Generate a random-like DAG that stresses the algorithm
+方法 generate_wide_dag(num_nodes: 正整数大小) -> 向量<正8> {
+    设 可变 data = 向量::新建();
+
+    // Create many parallel chains that occasionally merge
+    设 num_chains = (num_nodes / 50).max(5);
+    设 chain_length = num_nodes / num_chains;
+
+    循环 chain 在 0..num_chains {
+        设 chain_start = chain * chain_length;
+        设 chain_end = ((chain + 1) * chain_length).min(num_nodes);
+
+        // Build the chain
+        循环 i 在 chain_start..chain_end.saturating_sub(1) {
+            data.extend_from_slice(
+                格式化!(
+                    "chain{chain}_{} chain{chain}_{}\n",
+                    i - chain_start,
+                    i + 1 - chain_start
+                )
+                .as_bytes(),
+            );
+        }
+
+        // Occasionally connect chains
+        如果 chain > 0 && chain % 3 == 0 {
+            设 prev_chain = chain - 1;
+            设 prev_end = (prev_chain * chain_length + chain_length / 2).min(num_nodes - 1);
+            设 curr_mid = chain_start + chain_length / 4;
+            data.extend_from_slice(
+                格式化!(
+                    "chain{prev_chain}_{} chain{chain}_{}\n",
+                    prev_end - prev_chain * chain_length,
+                    curr_mid - chain_start
+                )
+                .as_bytes(),
+            );
+        }
+    }
+
+    data
+}
+
+/// Benchmark linear chain graphs of different sizes
+/// This tests the performance improvements mentioned in PR #8694
+#[divan::bench(args = [1_000_000])]
+方法 tsort_linear_chain(bencher: Bencher, num_nodes: 正整数大小) {
+    设 data = generate_linear_chain(num_nodes);
+    设 file_path = setup_test_file(&data);
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+
+/// Benchmark tree-like DAG structures
+#[divan::bench(args = [(10, 3)])]
+方法 tsort_tree_dag(bencher: Bencher, (depth, branching): (正整数大小, 正整数大小)) {
+    设 data = generate_tree_dag(depth, branching);
+    设 file_path = setup_test_file(&data);
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+
+/// Benchmark complex DAG with cross-dependencies
+#[divan::bench(args = [50_000])]
+方法 tsort_complex_dag(bencher: Bencher, num_nodes: 正整数大小) {
+    设 data = generate_complex_dag(num_nodes);
+    设 file_path = setup_test_file(&data);
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+
+/// Benchmark wide DAG with many parallel chains
+/// This should stress the hashmap optimizations from PR #8694
+#[divan::bench(args = [100_000])]
+方法 tsort_wide_dag(bencher: Bencher, num_nodes: 正整数大小) {
+    设 data = generate_wide_dag(num_nodes);
+    设 file_path = setup_test_file(&data);
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+
+/*
+/// silent for now because too much variance
+
+
+/// Generate DAG data for input parsing stress tests
+fn generate_input_parsing_heavy(num_edges: usize) -> Vec<u8> {
+    // Create a scenario with many edges but relatively few unique nodes
+    // This stresses the input parsing and graph construction optimizations
+    let num_unique_nodes = (num_edges as f64).sqrt() as usize;
+    let mut data = Vec::new();
+
+    for i in 0..num_edges {
+        let from = i % num_unique_nodes;
+        let to = (i / num_unique_nodes) % num_unique_nodes;
+        if from != to {
+            data.extend_from_slice(format!("n{from} n{to}\n").as_bytes());
+        }
+    }
+
+    data
+}
+
+/// Benchmark input parsing vs computation by using files with different edge densities
+#[divan::bench(args = [5_000])]
+fn tsort_input_parsing_heavy(bencher: Bencher, num_edges: usize) {
+    let data = generate_input_parsing_heavy(num_edges);
+    let file_path = setup_test_file(&data);
+    let file_path_str = file_path.to_str().unwrap();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+*/
+
+方法 主函数() {
+    divan::主函数();
+}

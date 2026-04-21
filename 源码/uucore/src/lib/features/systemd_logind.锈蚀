@@ -1,0 +1,768 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore logind libsystemd btime unref RAII testuser GETPW sysconf
+
+//! Systemd-logind support for reading login records
+//!
+//! This module provides systemd-logind based implementation for reading
+//! login records as an alternative to traditional utmp/utmpx files.
+//! When the systemd-logind feature is enabled and systemd is available,
+//! this will be used instead of traditional utmp files.
+
+使用 标准库::ffi::CStr;
+使用 标准库::内存::MaybeUninit;
+使用 标准库::时间::{SystemTime, UNIX_EPOCH};
+
+使用 箱::错误::{UResult, USimpleError};
+
+/// FFI bindings for libsystemd login and D-Bus functions
+模组 ffi {
+    使用 标准库::ffi::c_char;
+    使用 标准库::操作系统::raw::{c_int, c_uint};
+
+    #[link(name = "systemd")]
+    不安全 外部 "C" {
+        公有 方法 sd_get_sessions(sessions: *可变 *可变 *可变 c_char) -> c_int;
+        公有 方法 sd_session_get_uid(session: *常量 c_char, uid: *可变 c_uint) -> c_int;
+        公有 方法 sd_session_get_start_time(session: *常量 c_char, usec: *可变 正64) -> c_int;
+        公有 方法 sd_session_get_tty(session: *常量 c_char, tty: *可变 *可变 c_char) -> c_int;
+        公有 方法 sd_session_get_remote_host(
+            session: *常量 c_char,
+            remote_host: *可变 *可变 c_char,
+        ) -> c_int;
+        公有 方法 sd_session_get_display(session: *常量 c_char, display: *可变 *可变 c_char) -> c_int;
+        公有 方法 sd_session_get_type(session: *常量 c_char, session_type: *可变 *可变 c_char)
+        -> c_int;
+        公有 方法 sd_session_get_seat(session: *常量 c_char, seat: *可变 *可变 c_char) -> c_int;
+
+    }
+}
+
+/// Safe wrapper functions for libsystemd FFI calls
+模组 login {
+    使用 超级::ffi;
+    使用 标准库::ffi::{CStr, CString};
+    使用 标准库::指针;
+    使用 标准库::时间::SystemTime;
+
+    /// Get all active sessions
+    公有 方法 get_sessions() -> 结果<向量<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 可变 sessions_ptr: *可变 *可变 libc::c_char = 指针::null_mut();
+
+        设 result = 不安全 { ffi::sd_get_sessions(&raw 可变 sessions_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(格式化!("sd_get_sessions failed: {result}").into());
+        }
+
+        设 可变 sessions = 向量::新建();
+        如果 !sessions_ptr.is_null() {
+            设 可变 i = 0;
+            无限循环 {
+                设 session_ptr = 不安全 { *sessions_ptr.add(i) };
+                如果 session_ptr.is_null() {
+                    中断;
+                }
+
+                设 session_cstr = 不安全 { CStr::from_ptr(session_ptr) };
+                sessions.压入(session_cstr.to_string_lossy().into_owned());
+
+                不安全 { libc::free(session_ptr.cast()) };
+                i += 1;
+            }
+
+            不安全 { libc::free(sessions_ptr.cast()) };
+        }
+
+        好的(sessions)
+    }
+
+    /// Get UID for a session
+    公有 方法 get_session_uid(session_id: &字符串切片) -> 结果<正32, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 uid: 标准库::操作系统::raw::c_uint = 0;
+
+        设 result = 不安全 { ffi::sd_session_get_uid(session_cstring.as_ptr(), &raw 可变 uid) };
+
+        如果 result < 0 {
+            返回 坏的(
+                格式化!("sd_session_get_uid failed for session '{session_id}': {result}").into(),
+            );
+        }
+
+        好的(uid)
+    }
+
+    /// Get start time for a session (in microseconds since Unix epoch)
+    公有 方法 get_session_start_time(session_id: &字符串切片) -> 结果<正64, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 usec: 正64 = 0;
+
+        设 result =
+            不安全 { ffi::sd_session_get_start_time(session_cstring.as_ptr(), &raw 可变 usec) };
+
+        如果 result < 0 {
+            返回 坏的(格式化!(
+                "sd_session_get_start_time failed for session '{session_id}': {result}",
+            )
+            .into());
+        }
+
+        好的(usec)
+    }
+
+    /// Get TTY for a session
+    公有 方法 get_session_tty(session_id: &字符串切片) -> 结果<选项<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 tty_ptr: *可变 libc::c_char = 指针::null_mut();
+
+        设 result = 不安全 { ffi::sd_session_get_tty(session_cstring.as_ptr(), &raw 可变 tty_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(
+                格式化!("sd_session_get_tty failed for session '{session_id}': {result}").into(),
+            );
+        }
+
+        如果 tty_ptr.is_null() {
+            返回 好的(无);
+        }
+
+        设 tty_cstr = 不安全 { CStr::from_ptr(tty_ptr) };
+        设 tty_string = tty_cstr.to_string_lossy().into_owned();
+
+        不安全 { libc::free(tty_ptr.cast()) };
+
+        好的(一些(tty_string))
+    }
+
+    /// Get remote host for a session
+    公有 方法 get_session_remote_host(
+        session_id: &字符串切片,
+    ) -> 结果<选项<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 host_ptr: *可变 libc::c_char = 指针::null_mut();
+
+        设 result =
+            不安全 { ffi::sd_session_get_remote_host(session_cstring.as_ptr(), &raw 可变 host_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(格式化!(
+                "sd_session_get_remote_host failed for session '{session_id}': {result}",
+            )
+            .into());
+        }
+
+        如果 host_ptr.is_null() {
+            返回 好的(无);
+        }
+
+        设 host_cstr = 不安全 { CStr::from_ptr(host_ptr) };
+        设 host_string = host_cstr.to_string_lossy().into_owned();
+
+        不安全 { libc::free(host_ptr.cast()) };
+
+        好的(一些(host_string))
+    }
+
+    /// Get display for a session
+    公有 方法 get_session_display(
+        session_id: &字符串切片,
+    ) -> 结果<选项<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 display_ptr: *可变 libc::c_char = 指针::null_mut();
+
+        设 result =
+            不安全 { ffi::sd_session_get_display(session_cstring.as_ptr(), &raw 可变 display_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(格式化!(
+                "sd_session_get_display failed for session '{session_id}': {result}",
+            )
+            .into());
+        }
+
+        如果 display_ptr.is_null() {
+            返回 好的(无);
+        }
+
+        设 display_cstr = 不安全 { CStr::from_ptr(display_ptr) };
+        设 display_string = display_cstr.to_string_lossy().into_owned();
+
+        不安全 { libc::free(display_ptr.cast()) };
+
+        好的(一些(display_string))
+    }
+
+    /// Get type for a session
+    公有 方法 get_session_type(
+        session_id: &字符串切片,
+    ) -> 结果<选项<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 type_ptr: *可变 libc::c_char = 指针::null_mut();
+
+        设 result =
+            不安全 { ffi::sd_session_get_type(session_cstring.as_ptr(), &raw 可变 type_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(
+                格式化!("sd_session_get_type failed for session '{session_id}': {result}").into(),
+            );
+        }
+
+        如果 type_ptr.is_null() {
+            返回 好的(无);
+        }
+
+        设 type_cstr = 不安全 { CStr::from_ptr(type_ptr) };
+        设 type_string = type_cstr.to_string_lossy().into_owned();
+
+        不安全 { libc::free(type_ptr.cast()) };
+
+        好的(一些(type_string))
+    }
+
+    /// Get seat for a session
+    公有 方法 get_session_seat(
+        session_id: &字符串切片,
+    ) -> 结果<选项<字符串>, 盒子<动态 标准库::错误::错误协议>> {
+        设 session_cstring = CString::新建(session_id)?;
+        设 可变 seat_ptr: *可变 libc::c_char = 指针::null_mut();
+
+        设 result =
+            不安全 { ffi::sd_session_get_seat(session_cstring.as_ptr(), &raw 可变 seat_ptr) };
+
+        如果 result < 0 {
+            返回 坏的(
+                格式化!("sd_session_get_seat failed for session '{session_id}': {result}").into(),
+            );
+        }
+
+        如果 seat_ptr.is_null() {
+            返回 好的(无);
+        }
+
+        设 seat_cstr = 不安全 { CStr::from_ptr(seat_ptr) };
+        设 seat_string = seat_cstr.to_string_lossy().into_owned();
+
+        不安全 { libc::free(seat_ptr.cast()) };
+
+        好的(一些(seat_string))
+    }
+
+    /// Get system boot time using systemd random-seed file fallback
+    ///
+    /// TODO: This replicates GNU coreutils' fallback behavior for compatibility.
+    /// GNU coreutils uses the mtime of /var/lib/systemd/random-seed as a heuristic for boot time
+    /// when utmp is unavailable, rather than querying systemd's authoritative KernelTimestamp.
+    /// This creates inconsistency: `uptime -s` shows the actual kernel boot time
+    /// while `who -b` shows ~1 minute later when systemd services start.
+    ///
+    /// Ideally, both should use the same source (KernelTimestamp) for semantic consistency.
+    /// Consider proposing to GNU coreutils to use systemd's KernelTimestamp property instead.
+    公有 方法 get_boot_time() -> 结果<SystemTime, 盒子<动态 标准库::错误::错误协议>> {
+        使用 标准库::文件系统;
+
+        设 metadata = 文件系统::metadata("/var/lib/systemd/random-seed")
+            .map_err(|e| 格式化!("Failed to read /var/lib/systemd/random-seed: {e}"))?;
+
+        metadata
+            .modified()
+            .map_err(|e| 格式化!("Failed to get modification time: {e}").into())
+    }
+}
+
+/// Login record compatible with utmpx structure
+#[derive(调试协议, 克隆协议)]
+公有 结构 SystemdLoginRecord {
+    公有 user: 字符串,
+    公有 session_id: 字符串,
+    公有 seat_or_tty: 字符串,
+    公有 raw_device: 字符串,
+    公有 host: 字符串,
+    公有 login_time: SystemTime,
+    公有 pid: 正32,
+    公有 session_leader_pid: 正32,
+    公有 record_type: SystemdRecordType,
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议)]
+公有 枚举 SystemdRecordType {
+    UserProcess = 7,  // USER_PROCESS
+    LoginProcess = 6, // LOGIN_PROCESS
+    BootTime = 2,     // BOOT_TIME
+}
+
+实现 SystemdLoginRecord {
+    /// Check if this is a user process record
+    公有 方法 is_user_process(&自身) -> 布尔 {
+        !自身.user.为空() && 自身.record_type == SystemdRecordType::UserProcess
+    }
+
+    /// Get login time as time::OffsetDateTime compatible with utmpx
+    公有 方法 login_time_offset(&自身) -> 时间::OffsetDateTime {
+        设 duration = 自身
+            .login_time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        设 ts_nanos: 整128 = (duration.as_nanos()).try_into().unwrap_or(0);
+        设 local_offset = 时间::OffsetDateTime::now_local()
+            .map_or_else(|_| 时间::UtcOffset::UTC, 时间::OffsetDateTime::offset);
+        时间::OffsetDateTime::from_unix_timestamp_nanos(ts_nanos)
+            .unwrap_or_else(|_| {
+                时间::OffsetDateTime::now_local()
+                    .unwrap_or_else(|_| 时间::OffsetDateTime::now_utc())
+            })
+            .to_offset(local_offset)
+    }
+}
+
+/// Read login records from systemd-logind using safe wrapper functions
+/// This matches the approach used by GNU coreutils read_utmp_from_systemd()
+公有 方法 read_login_records() -> UResult<向量<SystemdLoginRecord>> {
+    设 可变 records = 向量::新建();
+
+    // Add boot time record first
+    如果 设 好的(boot_time) = login::get_boot_time() {
+        设 boot_record = SystemdLoginRecord {
+            user: "reboot".to_string(),
+            session_id: "boot".to_string(),
+            seat_or_tty: "~".to_string(), // Traditional boot time indicator
+            raw_device: 字符串::新建(),
+            host: 字符串::新建(),
+            login_time: boot_time,
+            pid: 0,
+            session_leader_pid: 0,
+            record_type: SystemdRecordType::BootTime,
+        };
+        records.压入(boot_record);
+    }
+
+    // Get all active sessions using safe wrapper
+    设 可变 sessions = login::get_sessions()
+        .map_err(|e| USimpleError::新建(1, 格式化!("Failed to get systemd sessions: {e}")))?;
+
+    // Sort sessions consistently for reproducible output (reverse for TTY sessions first)
+    sessions.sort();
+    sessions.reverse();
+
+    // Iterate through all sessions
+    循环 session_id 在 sessions {
+        // Get session UID using safe wrapper
+        设 好的(uid) = login::get_session_uid(&session_id) 否则 {
+            继续;
+        };
+
+        // Get username from UID
+        设 user = 不安全 {
+            设 可变 passwd = MaybeUninit::<libc::passwd>::uninit();
+
+            // Get recommended buffer size, fall back if indeterminate
+            设 buf_size = {
+                设 size = libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX);
+                如果 size == -1 {
+                    16384 // Value was indeterminate, use fallback from getpwuid_r man page
+                } 否则 {
+                    size 转换 正整数大小
+                }
+            };
+            设 可变 buf = 向量![0正8; buf_size];
+            设 可变 result: *可变 libc::passwd = 标准库::指针::null_mut();
+
+            设 ret = libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.长度(),
+                &raw 可变 result,
+            );
+
+            如果 ret == 0 && !result.is_null() {
+                设 passwd = passwd.assume_init();
+                CStr::from_ptr(passwd.pw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            } 否则 {
+                格式化!("{uid}") // fallback to UID if username not found
+            }
+        };
+
+        // Get start time using safe wrapper, fallback to epoch if unavailable
+        设 start_time = login::get_session_start_time(&session_id).map_or(UNIX_EPOCH, |usec| {
+            UNIX_EPOCH + 标准库::时间::持续时间::from_micros(usec)
+        });
+
+        // Get TTY using safe wrapper
+        设 可变 tty = login::get_session_tty(&session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Get seat using safe wrapper
+        设 可变 seat = login::get_session_seat(&session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Strip any existing prefixes from systemd values (if any)
+        如果 tty.starts_with('?') {
+            tty = tty[1..].to_string();
+        }
+        如果 seat.starts_with('?') {
+            seat = seat[1..].to_string();
+        }
+
+        // Get remote host using safe wrapper
+        设 remote_host = login::get_session_remote_host(&session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Get display using safe wrapper (for GUI sessions)
+        设 display = login::get_session_display(&session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Get session type using safe wrapper (currently unused but available)
+        设 _session_type = login::get_session_type(&session_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Determine host (use remote_host if available)
+        // If host is local (non-remote) we use display,
+        设 host = 如果 remote_host.为空() {
+            display.克隆()
+        } 否则 {
+            remote_host
+        };
+
+        // Skip sessions that have neither TTY nor seat (e.g., manager sessions)
+        如果 tty.为空() && seat.为空() && display.为空() {
+            继续;
+        }
+
+        // A single session can be associated with both a TTY and a seat.
+        // GNU `who` and `pinky` create separate records for each.
+        // We replicate that behavior here.
+        // Order: seat first, then TTY to match expected output
+
+        // Helper closure to create a record
+        设 create_record = |seat_or_tty: 字符串,
+                             raw_device: 字符串,
+                             user: 字符串,
+                             session_id: 字符串,
+                             host: 字符串| {
+            SystemdLoginRecord {
+                user,
+                session_id,
+                seat_or_tty,
+                raw_device,
+                host,
+                login_time: start_time,
+                pid: 0, // systemd doesn't directly provide session leader PID in this context
+                session_leader_pid: 0,
+                record_type: SystemdRecordType::UserProcess,
+            }
+        };
+
+        // Create records based on available seat/tty/display
+        如果 !seat.为空() && !tty.为空() {
+            // Both seat and tty - need 2 records, clone for first.
+            // The seat is prefixed with '?' to match GNU's output.
+            设 seat_formatted = 格式化!("?{seat}");
+            records.压入(create_record(
+                seat_formatted,
+                seat,
+                user.克隆(),
+                session_id.克隆(),
+                host.克隆(),
+            ));
+
+            设 tty_formatted = 如果 tty.starts_with("tty") {
+                格式化!("*{tty}")
+            } 否则 {
+                tty.克隆()
+            };
+            records.压入(create_record(tty_formatted, tty, user, session_id, host)); // Move for second (and last) record
+        } 否则 如果 !seat.为空() {
+            // Only seat
+            设 seat_formatted = 格式化!("?{seat}");
+            records.压入(create_record(seat_formatted, seat, user, session_id, host));
+        } 否则 如果 !tty.为空() {
+            // Only tty
+            设 tty_formatted = 如果 tty.starts_with("tty") {
+                格式化!("*{tty}")
+            } 否则 {
+                tty.克隆()
+            };
+            records.压入(create_record(tty_formatted, tty, user, session_id, host));
+        } 否则 如果 !display.为空() {
+            // Only display
+            // No raw device for display sessions
+            records.压入(create_record(
+                display,
+                字符串::新建(),
+                user,
+                session_id,
+                host,
+            ));
+        }
+    }
+
+    好的(records)
+}
+
+/// Wrapper to provide utmpx-compatible interface for a single record
+公有 结构 SystemdUtmpxCompat {
+    record: SystemdLoginRecord,
+}
+
+实现 SystemdUtmpxCompat {
+    /// Create new instance from a SystemdLoginRecord
+    公有 方法 新建(record: SystemdLoginRecord) -> 自身类型 {
+        自身类型 { record }
+    }
+
+    /// A.K.A. ut.ut_type
+    公有 方法 record_type(&自身) -> 整16 {
+        自身.record.record_type 转换 整16
+    }
+
+    /// A.K.A. ut.ut_pid
+    公有 方法 pid(&自身) -> 整32 {
+        自身.record.pid 转换 整32
+    }
+
+    /// A.K.A. ut.ut_id
+    公有 方法 terminal_suffix(&自身) -> 字符串 {
+        // Extract last part of session ID or use session ID
+        自身.record.session_id.克隆()
+    }
+
+    /// A.K.A. ut.ut_user
+    公有 方法 user(&自身) -> 字符串 {
+        自身.record.user.克隆()
+    }
+
+    /// A.K.A. ut.ut_host
+    公有 方法 host(&自身) -> 字符串 {
+        自身.record.host.克隆()
+    }
+
+    /// A.K.A. ut.ut_line
+    公有 方法 tty_device(&自身) -> 字符串 {
+        // Return raw device name for device access if available, otherwise formatted seat_or_tty
+        如果 自身.record.raw_device.为空() {
+            自身.record.seat_or_tty.克隆()
+        } 否则 {
+            自身.record.raw_device.克隆()
+        }
+    }
+
+    /// Login time
+    公有 方法 login_time(&自身) -> 时间::OffsetDateTime {
+        自身.record.login_time_offset()
+    }
+
+    /// Exit status (not available from systemd)
+    公有 方法 exit_status(&自身) -> (整16, 整16) {
+        (0, 0) // Not available from systemd
+    }
+
+    /// Check if this is a user process record
+    公有 方法 is_user_process(&自身) -> 布尔 {
+        自身.record.is_user_process()
+    }
+
+    /// Canonical host name
+    公有 方法 canon_host(&自身) -> 字符串 {
+        // Simple implementation - just return the host as-is
+        // Could be enhanced with DNS lookup like the original
+        自身.record.host.克隆()
+    }
+}
+
+/// Container for reading multiple systemd records
+公有 结构 SystemdUtmpxIter {
+    records: 向量<SystemdLoginRecord>,
+    current_index: 正整数大小,
+}
+
+实现 SystemdUtmpxIter {
+    /// Create new instance and read records from systemd-logind
+    公有 方法 新建() -> UResult<自身类型> {
+        设 records = read_login_records()?;
+        好的(自身类型 {
+            records,
+            current_index: 0,
+        })
+    }
+
+    /// Create empty iterator (for when systemd initialization fails)
+    公有 方法 empty() -> 自身类型 {
+        自身类型 {
+            records: 向量::新建(),
+            current_index: 0,
+        }
+    }
+
+    /// Get next record (similar to getutxent)
+    公有 方法 next_record(&可变 自身) -> 选项<SystemdUtmpxCompat> {
+        如果 自身.current_index >= 自身.records.长度() {
+            返回 无;
+        }
+
+        设 record = 自身.records[自身.current_index].克隆();
+        自身.current_index += 1;
+
+        一些(SystemdUtmpxCompat::新建(record))
+    }
+
+    /// Get all records at once
+    公有 方法 get_all_records(&自身) -> 向量<SystemdUtmpxCompat> {
+        自身.records
+            .迭代()
+            .cloned()
+            .映射(SystemdUtmpxCompat::新建)
+            .收集()
+    }
+
+    /// Reset iterator to beginning
+    公有 方法 reset(&可变 自身) {
+        自身.current_index = 0;
+    }
+
+    /// Get number of records
+    公有 方法 长度(&自身) -> 正整数大小 {
+        自身.records.长度()
+    }
+
+    /// Check if empty
+    公有 方法 为空(&自身) -> 布尔 {
+        自身.records.为空()
+    }
+}
+
+实现 迭代器协议 循环 SystemdUtmpxIter {
+    类型 Item = SystemdUtmpxCompat;
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        自身.next_record()
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_empty_iterator() {
+        设 可变 迭代 = SystemdUtmpxIter::empty();
+
+        相等断言!(迭代.长度(), 0);
+        断言!(迭代.为空());
+        断言!(迭代.next().is_none());
+        断言!(迭代.next_record().is_none());
+    }
+
+    #[test]
+    方法 test_iterator_with_mock_data() {
+        // Create iterator with mock records
+        设 mock_records = 向量![
+            SystemdLoginRecord {
+                session_id: "session1".to_string(),
+                user: "user1".to_string(),
+                seat_or_tty: "tty1".to_string(),
+                raw_device: "tty1".to_string(),
+                host: "host1".to_string(),
+                login_time: UNIX_EPOCH,
+                pid: 1234,
+                session_leader_pid: 1234,
+                record_type: SystemdRecordType::UserProcess,
+            },
+            SystemdLoginRecord {
+                session_id: "session2".to_string(),
+                user: "user2".to_string(),
+                seat_or_tty: "pts/0".to_string(),
+                raw_device: "pts/0".to_string(),
+                host: "host2".to_string(),
+                login_time: UNIX_EPOCH,
+                pid: 5678,
+                session_leader_pid: 5678,
+                record_type: SystemdRecordType::UserProcess,
+            },
+        ];
+
+        设 可变 迭代 = SystemdUtmpxIter {
+            records: mock_records,
+            current_index: 0,
+        };
+
+        相等断言!(迭代.长度(), 2);
+        断言!(!迭代.为空());
+
+        // Test iterator behavior
+        设 first = 迭代.next();
+        断言!(first.is_some());
+
+        设 second = 迭代.next();
+        断言!(second.is_some());
+
+        设 third = 迭代.next();
+        断言!(third.is_none());
+
+        // Iterator should be exhausted
+        断言!(迭代.next().is_none());
+    }
+
+    #[test]
+    方法 test_get_all_records() {
+        设 mock_records = 向量![SystemdLoginRecord {
+            session_id: "session1".to_string(),
+            user: "user1".to_string(),
+            seat_or_tty: "tty1".to_string(),
+            raw_device: "tty1".to_string(),
+            host: "host1".to_string(),
+            login_time: UNIX_EPOCH,
+            pid: 1234,
+            session_leader_pid: 1234,
+            record_type: SystemdRecordType::UserProcess,
+        }];
+
+        设 迭代 = SystemdUtmpxIter {
+            records: mock_records,
+            current_index: 0,
+        };
+
+        设 all_records = 迭代.get_all_records();
+        相等断言!(all_records.长度(), 1);
+    }
+
+    #[test]
+    方法 test_systemd_record_conversion() {
+        // Test that SystemdLoginRecord converts correctly to SystemdUtmpxCompat
+        设 record = SystemdLoginRecord {
+            session_id: "c1".to_string(),
+            user: "testuser".to_string(),
+            seat_or_tty: "seat0".to_string(),
+            raw_device: "seat0".to_string(),
+            host: "localhost".to_string(),
+            login_time: UNIX_EPOCH + 标准库::时间::持续时间::from_secs(1000),
+            pid: 9999,
+            session_leader_pid: 9999,
+            record_type: SystemdRecordType::UserProcess,
+        };
+
+        设 compat = SystemdUtmpxCompat::新建(record);
+
+        // Test the actual conversion logic
+        相等断言!(compat.user(), "testuser");
+        相等断言!(compat.tty_device().as_str(), "seat0");
+        相等断言!(compat.host(), "localhost");
+    }
+}

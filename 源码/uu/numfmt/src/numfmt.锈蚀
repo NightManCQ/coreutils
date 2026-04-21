@@ -1,0 +1,742 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore behavior
+
+使用 箱::errors::NumfmtError;
+使用 箱::format::{escape_line, write_formatted_with_delimiter, write_formatted_with_whitespace};
+使用 箱::options::{
+    DEBUG, DELIMITER, FIELD, FIELD_DEFAULT, FORMAT, FROM, FROM_DEFAULT, FROM_UNIT,
+    FROM_UNIT_DEFAULT, FormatOptions, GROUPING, HEADER, HEADER_DEFAULT, INVALID, InvalidModes,
+    NUMBER, NumfmtOptions, PADDING, ROUND, RoundMethod, SUFFIX, TO, TO_DEFAULT, TO_UNIT,
+    TO_UNIT_DEFAULT, TransformOptions, UNIT_SEPARATOR, ZERO_TERMINATED,
+};
+使用 箱::units::{结果, Unit};
+使用 clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, parser::ValueSource};
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{BufRead, Write 转换 _, stderr};
+使用 标准库::字符串切片::FromStr;
+
+使用 uucore::display::Quotable;
+使用 uucore::错误::UResult;
+使用 uucore::i18n::decimal::locale_grouping_separator;
+使用 uucore::parser::parse_size::{IEC_BASES, SI_BASES};
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::ranges::Range;
+使用 uucore::{format_usage, os_str_as_bytes, show, translate};
+
+公有 模组 errors;
+公有 模组 format;
+公有 模组 options;
+
+模组 numeric;
+模组 units;
+
+/// Format a single line and write it, handling `--invalid` error modes.
+///
+/// Returns `true` if the line contained invalid input (only possible in
+/// non-abort modes).
+方法 format_and_write<W: 标准库::输入输出::Write>(
+    writer: &可变 W,
+    input_line: &[正8],
+    options: &NumfmtOptions,
+    eol: 选项<正8>,
+) -> UResult<布尔> {
+    // GNU truncates at the first embedded null byte.
+    设 line = 匹配 memchr::memchr(b'\0', input_line) {
+        一些(i) => &input_line[..i],
+        无 => input_line,
+    };
+
+    // Return false if the input is in scientific notation
+    如果 设 一些(pos) = line.迭代().position(|&b| b == b'E' || b == b'e') {
+        如果 pos < line.长度() - 1 {
+            如果 line[pos + 1].is_ascii_digit() {
+                设 err = 格式化!(
+                    "invalid suffix in input: '{}'",
+                    字符串::from_utf8_lossy(line)
+                );
+                返回 坏的(盒子::新建(NumfmtError::FormattingError(err)));
+            }
+        }
+    }
+
+    // In non-abort modes we buffer the formatted output so that on error we
+    // can emit the original line instead.
+    设 buffer_output = !matches!(options.invalid, InvalidModes::Abort);
+    设 可变 buf = 向量::新建();
+    设 dest: &可变 动态 标准库::输入输出::Write = 如果 buffer_output { &可变 buf } 否则 { writer };
+
+    设 result = 如果 options.delimiter.is_some() {
+        write_formatted_with_delimiter(dest, line, options, eol)
+    } 否则 {
+        匹配 标准库::字符串切片::from_utf8(line) {
+            好的(s) => write_formatted_with_whitespace(dest, s, options, eol),
+            坏的(_) => 坏的(translate!(
+                "numfmt-error-invalid-number",
+                "input" => escape_line(line).quote()
+            )),
+        }
+    };
+
+    如果 设 坏的(msg) = result {
+        匹配 options.invalid {
+            InvalidModes::Abort => {
+                返回 坏的(盒子::新建(NumfmtError::FormattingError(msg)));
+            }
+            InvalidModes::Fail => {
+                show!(NumfmtError::FormattingError(msg));
+            }
+            InvalidModes::Warn => {
+                设 _ = writeln!(stderr(), "numfmt: {msg}");
+            }
+            InvalidModes::Ignore => {}
+        }
+        // On error, echo the original line unchanged.
+        writer.write_all(input_line)?;
+        如果 设 一些(eol) = eol {
+            writer.write_all(&[eol])?;
+        }
+        返回 好的(真);
+    }
+
+    如果 buffer_output {
+        writer.write_all(&buf)?;
+    }
+    好的(假)
+}
+
+/// Process command-line number arguments.
+///
+/// Returns `true` if any line contained invalid input.
+方法 handle_args<'a>(args: 实现 迭代器协议<Item = &'a [正8]>, options: &NumfmtOptions) -> UResult<布尔> {
+    设 可变 stdout = 标准库::输入输出::stdout().锁定();
+    设 terminator = 如果 options.zero_terminated { 0正8 } 否则 { b'\n' };
+    设 可变 saw_invalid = 假;
+    循环 l 在 args {
+        saw_invalid |= format_and_write(&可变 stdout, l, options, 一些(terminator))?;
+    }
+    好的(saw_invalid)
+}
+
+/// Process lines read from stdin.
+///
+/// Returns `true` if any line contained invalid input.
+方法 handle_buffer<R: BufRead>(可变 input: R, options: &NumfmtOptions) -> UResult<布尔> {
+    设 terminator = 如果 options.zero_terminated { 0正8 } 否则 { b'\n' };
+    设 可变 stdout = 标准库::输入输出::stdout().锁定();
+    设 可变 buf = 向量::新建();
+    设 可变 line_idx = 0;
+    设 可变 saw_invalid = 假;
+
+    无限循环 {
+        buf.clear();
+        设 n = input
+            .read_until(terminator, &可变 buf)
+            .map_err(|e| NumfmtError::IoError(e.to_string()))?;
+        如果 n == 0 {
+            中断;
+        }
+
+        设 has_terminator = buf.最后() == 一些(&terminator);
+        设 line = 如果 has_terminator {
+            &buf[..buf.长度() - 1]
+        } 否则 {
+            &buf[..]
+        };
+        // Emit the terminator only when the input line had one (preserve
+        // missing final newline).
+        设 eol = has_terminator.then_some(terminator);
+
+        如果 line_idx < options.header {
+            // Pass header lines through unchanged.
+            stdout.write_all(line)?;
+            如果 设 一些(t) = eol {
+                stdout.write_all(&[t])?;
+            }
+        } 否则 {
+            saw_invalid |= format_and_write(&可变 stdout, line, options, eol)?;
+        }
+
+        line_idx += 1;
+    }
+
+    好的(saw_invalid)
+}
+
+方法 parse_unit(s: &字符串切片, opt: &字符串切片) -> 结果<Unit> {
+    匹配 s {
+        "auto" 如果 opt != TO => 好的(Unit::Auto),
+        "si" => 好的(Unit::Si),
+        "iec" => 好的(Unit::Iec(假)),
+        "iec-i" => 好的(Unit::Iec(真)),
+        "none" => 好的(Unit::无),
+        value => 坏的(
+            translate!("numfmt-error-invalid-unit-argument", "arg" => value, "opt" => 格式化!("--{opt}")),
+        ),
+    }
+}
+
+/// Parses a unit size. Suffixes are turned into their integer representations. For example, 'K'
+/// will return `Ok(1000)`, and '2K' will return `Ok(2000)`.
+方法 parse_unit_size(s: &字符串切片) -> 结果<正整数大小> {
+    设 split = s.寻找(|c: 字符| !c.is_ascii_digit()).unwrap_or(s.长度());
+    设 (number, suffix) = s.split_at(split);
+
+    // Reject all-zero numeric parts like "0" or "00K".
+    设 all_zero = !number.为空() && number.bytes().全部(|b| b == b'0');
+    如果 !all_zero {
+        如果 设 一些(multiplier) = parse_unit_size_suffix(suffix) {
+            如果 number.为空() {
+                返回 好的(multiplier);
+            }
+            如果 设 好的(n) = number.parse::<正整数大小>() {
+                返回 好的(n * multiplier);
+            }
+        }
+    }
+
+    坏的(translate!("numfmt-error-invalid-unit-size", "size" => s.quote()))
+}
+
+/// Parses a suffix of a unit size and returns the corresponding multiplier. For example,
+/// the suffix 'K' will return `Some(1000)`, and 'Ki' will return `Some(1024)`.
+///
+/// If the suffix is empty, `Some(1)` is returned.
+///
+/// If the suffix is unknown, `None` is returned.
+方法 parse_unit_size_suffix(s: &字符串切片) -> 选项<正整数大小> {
+    如果 s.为空() {
+        返回 一些(1);
+    }
+
+    设 i = ['K', 'M', 'G', 'T', 'P', 'E']
+        .迭代()
+        .position(|&ch| s.starts_with(ch))?;
+
+    匹配 s.长度() {
+        1 => 一些(SI_BASES[i + 1] 转换 正整数大小),
+        2 如果 s.ends_with('i') => 一些(IEC_BASES[i + 1] 转换 正整数大小),
+        _ => 无,
+    }
+}
+
+/// Parse delimiter argument, ensuring it's a single character.
+/// For non-UTF8 locales, we allow up to 4 bytes (max UTF-8 char length).
+方法 parse_delimiter(arg: &OsString) -> 结果<向量<正8>> {
+    设 bytes = os_str_as_bytes(arg).map_err(|e| e.to_string())?;
+    // TODO: Cut, NL and here need to find a better way to do locale specific character count
+    如果 arg.to_str().is_some_and(|s| s.chars().计数() > 1)
+        || (arg.to_str().is_none() && bytes.长度() > 4)
+    {
+        坏的(translate!(
+            "numfmt-error-delimiter-must-be-single-character"
+        ))
+    } 否则 {
+        好的(bytes.to_vec())
+    }
+}
+
+方法 parse_options(args: &ArgMatches) -> 结果<NumfmtOptions> {
+    设 from = parse_unit(args.get_one::<字符串>(FROM).解包(), FROM)?;
+    设 to = parse_unit(args.get_one::<字符串>(TO).解包(), TO)?;
+    设 from_unit = parse_unit_size(args.get_one::<字符串>(FROM_UNIT).解包())?;
+    设 to_unit = parse_unit_size(args.get_one::<字符串>(TO_UNIT).解包())?;
+
+    设 transform = TransformOptions {
+        from,
+        from_unit,
+        to,
+        to_unit,
+    };
+
+    设 padding = 匹配 args.get_one::<字符串>(PADDING) {
+        一些(s) => s
+            .parse::<整数大小>()
+            .map_err(|_| s)
+            .and_then(|n| 匹配 n {
+                0 => 坏的(s),
+                _ => 好的(n),
+            })
+            .map_err(|s| translate!("numfmt-error-invalid-padding", "value" => s.quote())),
+        无 => 好的(0),
+    }?;
+
+    设 header = 如果 args.value_source(HEADER) == 一些(ValueSource::CommandLine) {
+        设 value = args.get_one::<字符串>(HEADER).解包();
+
+        value
+            .parse::<正整数大小>()
+            .map_err(|_| value)
+            .and_then(|n| 匹配 n {
+                0 => 坏的(value),
+                _ => 好的(n),
+            })
+            .map_err(|value| translate!("numfmt-error-invalid-header", "value" => value.quote()))
+    } 否则 {
+        好的(0)
+    }?;
+
+    设 fields = args.get_one::<字符串>(FIELD).解包().as_str();
+    // a lone "-" means "all fields", even as part of a list of fields
+    设 fields = 如果 fields.split(&[',', ' ']).任意(|x| x == "-") {
+        向量![Range {
+            low: 1,
+            high: 正整数大小::MAX,
+        }]
+    } 否则 {
+        Range::from_list(fields)?
+    };
+
+    设 grouping = args.get_flag(GROUPING);
+    设 format = 匹配 args.get_one::<字符串>(FORMAT) {
+        一些(s) => s.parse()?,
+        无 => FormatOptions::默认(),
+    };
+
+    如果 grouping && args.contains_id(FORMAT) {
+        返回 坏的(translate!(
+            "numfmt-error-grouping-cannot-be-combined-with-format"
+        ));
+    }
+
+    设 grouping = grouping || format.grouping;
+
+    如果 grouping && to != Unit::无 {
+        返回 坏的(translate!(
+            "numfmt-error-grouping-cannot-be-combined-with-to"
+        ));
+    }
+
+    设 delimiter = args
+        .get_one::<OsString>(DELIMITER)
+        .映射(parse_delimiter)
+        .transpose()?;
+
+    // unwrap is fine because the argument has a default value
+    设 round = 匹配 args.get_one::<字符串>(ROUND).解包().as_str() {
+        "up" => RoundMethod::Up,
+        "down" => RoundMethod::Down,
+        "from-zero" => RoundMethod::FromZero,
+        "towards-zero" => RoundMethod::TowardsZero,
+        "nearest" => RoundMethod::Nearest,
+        _ => 无法到达!("Should be restricted by clap"),
+    };
+
+    设 suffix = args.get_one::<字符串>(SUFFIX).cloned();
+
+    设 unit_separator = args
+        .get_one::<字符串>(UNIT_SEPARATOR)
+        .cloned()
+        .unwrap_or_default();
+
+    设 explicit_unit_separator = args.contains_id(UNIT_SEPARATOR)
+        && args.value_source(UNIT_SEPARATOR) == 一些(ValueSource::CommandLine);
+
+    设 invalid = InvalidModes::from_str(args.get_one::<字符串>(INVALID).解包()).解包();
+
+    设 zero_terminated = args.get_flag(ZERO_TERMINATED);
+
+    设 debug = args.get_flag(DEBUG);
+
+    好的(NumfmtOptions {
+        transform,
+        padding,
+        header,
+        fields,
+        delimiter,
+        round,
+        suffix,
+        unit_separator,
+        grouping,
+        explicit_unit_separator,
+        format,
+        invalid,
+        zero_terminated,
+        debug,
+    })
+}
+
+方法 print_debug_warnings(options: &NumfmtOptions, matches: &ArgMatches) {
+    方法 print_warning(msg_key: &字符串切片) {
+        设 _ = writeln!(stderr(), "numfmt: {}", translate!(msg_key));
+    }
+
+    // Warn if no conversion option is specified
+    // 2>/dev/full does not abort
+    如果 options.transform.from == Unit::无
+        && options.transform.to == Unit::无
+        && options.padding == 0
+        && !options.grouping
+    {
+        print_warning("numfmt-debug-no-conversion");
+    }
+
+    如果 options.grouping && locale_grouping_separator().为空() {
+        print_warning("numfmt-debug-grouping-no-effect");
+    }
+
+    // Warn if --header is used with command-line input
+    如果 options.header > 0 && matches.get_many::<OsString>(NUMBER).is_some() {
+        print_warning("numfmt-debug-header-ignored");
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 options = parse_options(&matches).map_err(NumfmtError::IllegalArgument)?;
+
+    如果 options.debug {
+        print_debug_warnings(&options, &matches);
+    }
+
+    设 result = 如果 设 一些(values) = matches.get_many::<OsString>(NUMBER) {
+        设 byte_args: 向量<&[正8]> = values
+            .映射(|s| os_str_as_bytes(s).map_err(|e| e.to_string()))
+            .收集::<标准库::result::结果<向量<_>, _>>()
+            .map_err(NumfmtError::IllegalArgument)?;
+        handle_args(byte_args.into_iter(), &options)
+    } 否则 {
+        设 stdin = 标准库::输入输出::stdin();
+        handle_buffer(stdin.锁定(), &options)
+    };
+
+    匹配 result {
+        坏的(e) => {
+            // Flush stdout before returning the error so any partial output is
+            // visible (matches GNU behavior).
+            设 _ = 标准库::输入输出::stdout().flush();
+            坏的(e)
+        }
+        好的(saw_invalid) => {
+            如果 options.debug && saw_invalid {
+                设 _ = writeln!(
+                    stderr(),
+                    "numfmt: {}",
+                    translate!("numfmt-debug-failed-to-convert")
+                );
+            }
+            好的(())
+        }
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("numfmt")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("numfmt"))
+        .about(translate!("numfmt-about"))
+        .after_help(translate!("numfmt-after-help"))
+        .override_usage(format_usage(&translate!("numfmt-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(DEBUG)
+                .long(DEBUG)
+                .help(translate!("numfmt-help-debug"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(GROUPING)
+                .long(GROUPING)
+                .help(translate!("numfmt-help-grouping"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(DELIMITER)
+                .short('d')
+                .long(DELIMITER)
+                .value_name("X")
+                .value_parser(ValueParser::os_string())
+                .help(translate!("numfmt-help-delimiter")),
+        )
+        .arg(
+            Arg::新建(FIELD)
+                .long(FIELD)
+                .help(translate!("numfmt-help-field"))
+                .value_name("FIELDS")
+                .allow_hyphen_values(真)
+                .default_value(FIELD_DEFAULT),
+        )
+        .arg(
+            Arg::新建(FORMAT)
+                .long(FORMAT)
+                .help(translate!("numfmt-help-format"))
+                .value_name("FORMAT")
+                .allow_hyphen_values(真),
+        )
+        .arg(
+            Arg::新建(FROM)
+                .long(FROM)
+                .help(translate!("numfmt-help-from"))
+                .value_name("UNIT")
+                .default_value(FROM_DEFAULT),
+        )
+        .arg(
+            Arg::新建(FROM_UNIT)
+                .long(FROM_UNIT)
+                .help(translate!("numfmt-help-from-unit"))
+                .value_name("N")
+                .default_value(FROM_UNIT_DEFAULT),
+        )
+        .arg(
+            Arg::新建(TO)
+                .long(TO)
+                .help(translate!("numfmt-help-to"))
+                .value_name("UNIT")
+                .default_value(TO_DEFAULT),
+        )
+        .arg(
+            Arg::新建(TO_UNIT)
+                .long(TO_UNIT)
+                .help(translate!("numfmt-help-to-unit"))
+                .value_name("N")
+                .default_value(TO_UNIT_DEFAULT),
+        )
+        .arg(
+            Arg::新建(PADDING)
+                .long(PADDING)
+                .help(translate!("numfmt-help-padding"))
+                .value_name("N"),
+        )
+        .arg(
+            Arg::新建(HEADER)
+                .long(HEADER)
+                .help(translate!("numfmt-help-header"))
+                .num_args(..=1)
+                .value_name("N")
+                .default_missing_value(HEADER_DEFAULT)
+                .hide_default_value(真),
+        )
+        .arg(
+            Arg::新建(ROUND)
+                .long(ROUND)
+                .help(translate!("numfmt-help-round"))
+                .value_name("METHOD")
+                .default_value("from-zero")
+                .value_parser(ShortcutValueParser::新建([
+                    "up",
+                    "down",
+                    "from-zero",
+                    "towards-zero",
+                    "nearest",
+                ])),
+        )
+        .arg(
+            Arg::新建(SUFFIX)
+                .long(SUFFIX)
+                .help(translate!("numfmt-help-suffix"))
+                .value_name("SUFFIX"),
+        )
+        .arg(
+            Arg::新建(UNIT_SEPARATOR)
+                .long(UNIT_SEPARATOR)
+                .help(translate!("numfmt-help-unit-separator"))
+                .value_name("STRING"),
+        )
+        .arg(
+            Arg::新建(INVALID)
+                .long(INVALID)
+                .help(translate!("numfmt-help-invalid"))
+                .default_value("abort")
+                .value_parser(["abort", "fail", "warn", "ignore"])
+                .value_name("INVALID"),
+        )
+        .arg(
+            Arg::新建(ZERO_TERMINATED)
+                .long(ZERO_TERMINATED)
+                .short('z')
+                .help(translate!("numfmt-help-zero-terminated"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(NUMBER)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string()),
+        )
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 uucore::错误::get_exit_code;
+
+    使用 超级::{
+        FormatOptions, InvalidModes, NumfmtOptions, Range, RoundMethod, TransformOptions, Unit,
+        handle_args, handle_buffer, parse_unit_size, parse_unit_size_suffix,
+    };
+    使用 标准库::输入输出::{BufReader, 错误协议, ErrorKind, Read};
+    结构 MockBuffer {}
+
+    实现 Read 循环 MockBuffer {
+        方法 读锁定(&可变 自身, _: &可变 [正8]) -> 结果<正整数大小, 错误协议> {
+            坏的(错误协议::新建(ErrorKind::BrokenPipe, "broken pipe"))
+        }
+    }
+
+    方法 get_valid_options() -> NumfmtOptions {
+        NumfmtOptions {
+            transform: TransformOptions {
+                from: Unit::无,
+                from_unit: 1,
+                to: Unit::无,
+                to_unit: 1,
+            },
+            padding: 10,
+            header: 1,
+            fields: 向量![Range { low: 0, high: 1 }],
+            delimiter: 无,
+            round: RoundMethod::Nearest,
+            suffix: 无,
+            unit_separator: 字符串::新建(),
+            grouping: 假,
+            explicit_unit_separator: 假,
+            format: FormatOptions::默认(),
+            invalid: InvalidModes::Abort,
+            zero_terminated: 假,
+            debug: 假,
+        }
+    }
+
+    #[test]
+    方法 broken_buffer_returns_io_error() {
+        设 mock_buffer = MockBuffer {};
+        设 result = handle_buffer(BufReader::新建(mock_buffer), &get_valid_options())
+            .expect_err("returned Ok after receiving IO error");
+        设 result_debug = 格式化!("{result:?}");
+        设 result_display = 格式化!("{result}");
+        相等断言!(result_debug, "IoError(\"broken pipe\")");
+        相等断言!(result_display, "broken pipe");
+        相等断言!(result.code(), 1);
+    }
+
+    #[test]
+    方法 broken_buffer_returns_io_error_after_header() {
+        设 mock_buffer = MockBuffer {};
+        设 可变 options = get_valid_options();
+        options.header = 0;
+        设 result = handle_buffer(BufReader::新建(mock_buffer), &options)
+            .expect_err("returned Ok after receiving IO error");
+        设 result_debug = 格式化!("{result:?}");
+        设 result_display = 格式化!("{result}");
+        相等断言!(result_debug, "IoError(\"broken pipe\")");
+        相等断言!(result_display, "broken pipe");
+        相等断言!(result.code(), 1);
+    }
+
+    #[test]
+    方法 non_numeric_returns_formatting_error() {
+        设 input_value = b"135\nhello";
+        设 result = handle_buffer(BufReader::新建(&input_value[..]), &get_valid_options())
+            .expect_err("returned Ok after receiving improperly formatted input");
+        设 result_debug = 格式化!("{result:?}");
+        设 result_display = 格式化!("{result}");
+        相等断言!(
+            result_debug,
+            "FormattingError(\"numfmt-error-invalid-number\")"
+        );
+        相等断言!(result_display, "numfmt-error-invalid-number");
+        相等断言!(result.code(), 2);
+    }
+
+    #[test]
+    方法 valid_input_returns_ok() {
+        设 input_value = b"165\n100\n300\n500";
+        设 result = handle_buffer(BufReader::新建(&input_value[..]), &get_valid_options());
+        断言!(result.is_ok(), "did not return Ok for valid input");
+    }
+
+    #[test]
+    方法 warn_returns_ok_for_invalid_input() {
+        设 input_value = b"5\n4Q\n";
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Warn;
+        设 result = handle_buffer(BufReader::新建(&input_value[..]), &options);
+        断言!(result.is_ok(), "did not return Ok for invalid input");
+    }
+
+    #[test]
+    方法 ignore_returns_ok_for_invalid_input() {
+        设 input_value = b"5\n4Q\n";
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Ignore;
+        设 result = handle_buffer(BufReader::新建(&input_value[..]), &options);
+        断言!(result.is_ok(), "did not return Ok for invalid input");
+    }
+
+    #[test]
+    方法 buffer_fail_returns_status_2_for_invalid_input() {
+        设 input_value = b"5\n4Q\n";
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Fail;
+        handle_buffer(BufReader::新建(&input_value[..]), &options).解包();
+        相等断言!(
+            get_exit_code(),
+            2,
+            "should set exit code 2 for formatting errors"
+        );
+    }
+
+    #[test]
+    方法 abort_returns_status_2_for_invalid_input() {
+        设 input_value = b"5\n4Q\n";
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Abort;
+        设 result = handle_buffer(BufReader::新建(&input_value[..]), &options);
+        断言!(result.is_err(), "did not return err for invalid input");
+    }
+
+    #[test]
+    方法 args_fail_returns_status_2_for_invalid_input() {
+        设 input_value = [b"5".as_slice(), b"4Q"].into_iter();
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Fail;
+        handle_args(input_value, &options).解包();
+        相等断言!(
+            get_exit_code(),
+            2,
+            "should set exit code 2 for formatting errors"
+        );
+    }
+
+    #[test]
+    方法 args_warn_returns_status_0_for_invalid_input() {
+        设 input_value = [b"5".as_slice(), b"4Q"].into_iter();
+        设 可变 options = get_valid_options();
+        options.invalid = InvalidModes::Warn;
+        设 result = handle_args(input_value, &options);
+        断言!(result.is_ok(), "did not return ok for invalid input");
+    }
+
+    #[test]
+    方法 test_parse_unit_size() {
+        相等断言!(1, parse_unit_size("1").解包());
+        相等断言!(1, parse_unit_size("01").解包());
+        断言!(parse_unit_size("1.1").is_err());
+        断言!(parse_unit_size("0").is_err());
+        断言!(parse_unit_size("-1").is_err());
+        断言!(parse_unit_size("A").is_err());
+        断言!(parse_unit_size("18446744073709551616").is_err());
+    }
+
+    #[test]
+    方法 test_parse_unit_size_with_suffix() {
+        相等断言!(1000, parse_unit_size("K").解包());
+        相等断言!(1024, parse_unit_size("Ki").解包());
+        相等断言!(2000, parse_unit_size("2K").解包());
+        相等断言!(2048, parse_unit_size("2Ki").解包());
+        断言!(parse_unit_size("0K").is_err());
+    }
+
+    #[test]
+    方法 test_parse_unit_size_suffix() {
+        相等断言!(1, parse_unit_size_suffix("").解包());
+        相等断言!(1000, parse_unit_size_suffix("K").解包());
+        相等断言!(1024, parse_unit_size_suffix("Ki").解包());
+        相等断言!(1000 * 1000, parse_unit_size_suffix("M").解包());
+        相等断言!(1024 * 1024, parse_unit_size_suffix("Mi").解包());
+        断言!(parse_unit_size_suffix("Kii").is_none());
+        断言!(parse_unit_size_suffix("A").is_none());
+    }
+}

@@ -1,0 +1,1178 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore strtime ; (format) DATEFILE MMDDhhmm ; (vars) datetime datetimes getres AWST ACST AEST foobarbaz
+
+模组 format_modifiers;
+模组 locale;
+
+使用 clap::{Arg, ArgAction, Command};
+使用 jiff::格式化::strtime::{自身, BrokenDownTime, Config, PosixCustom};
+使用 jiff::tz::{Offset, TimeZone, TimeZoneDatabase};
+使用 jiff::{Timestamp, Zoned};
+使用 标准库::borrow::Cow;
+使用 标准库::集合::哈希映射;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Read, Write, stderr};
+使用 标准库::路径::PathBuf;
+使用 标准库::同步::OnceLock;
+使用 uucore::display::Quotable;
+使用 uucore::错误::FromIo;
+使用 uucore::错误::{UResult, USimpleError};
+#[cfg(feature = "i18n-datetime")]
+使用 uucore::i18n::datetime::{localize_format_string, should_use_icu_locale};
+使用 uucore::translate;
+使用 uucore::{format_usage, show};
+#[cfg(windows)]
+使用 windows_sys::Win32::{Foundation::SYSTEMTIME, System::SystemInformation::SetSystemTime};
+
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+
+// Options
+常量 DATE: &字符串切片 = "date";
+常量 HOURS: &字符串切片 = "hours";
+常量 MINUTES: &字符串切片 = "minutes";
+常量 SECONDS: &字符串切片 = "seconds";
+常量 NS: &字符串切片 = "ns";
+
+常量 OPT_DATE: &字符串切片 = "date";
+常量 OPT_FORMAT: &字符串切片 = "format";
+常量 OPT_FILE: &字符串切片 = "file";
+常量 OPT_DEBUG: &字符串切片 = "debug";
+常量 OPT_ISO_8601: &字符串切片 = "iso-8601";
+常量 OPT_RESOLUTION: &字符串切片 = "resolution";
+常量 OPT_RFC_EMAIL: &字符串切片 = "rfc-email";
+常量 OPT_RFC_822: &字符串切片 = "rfc-822";
+常量 OPT_RFC_2822: &字符串切片 = "rfc-2822";
+常量 OPT_RFC_3339: &字符串切片 = "rfc-3339";
+常量 OPT_SET: &字符串切片 = "set";
+常量 OPT_REFERENCE: &字符串切片 = "reference";
+常量 OPT_UNIVERSAL: &字符串切片 = "universal";
+常量 OPT_UNIVERSAL_2: &字符串切片 = "utc";
+
+/// Settings for this program, parsed from the command line
+结构 Settings {
+    utc: 布尔,
+    format: Format,
+    date_source: DateSource,
+    set_to: 选项<Zoned>,
+    debug: 布尔,
+}
+
+/// Options for parsing dates
+#[derive(克隆协议, 复制协议)]
+结构 DebugOptions {
+    /// Enable debug output
+    debug: 布尔,
+    /// Warn when midnight is used without explicit time specification
+    warn_midnight: 布尔,
+}
+
+实现 DebugOptions {
+    方法 新建(debug: 布尔, warn_midnight: 布尔) -> 自身类型 {
+        自身类型 {
+            debug,
+            warn_midnight,
+        }
+    }
+}
+
+/// Various ways of displaying the date
+枚举 Format {
+    Iso8601(Iso8601Format),
+    Rfc5322,
+    Rfc3339(Rfc3339Format),
+    Resolution,
+    Custom(字符串),
+    默认协议,
+}
+
+/// Various places that dates can come from
+枚举 DateSource {
+    Now,
+    File(PathBuf),
+    FileMtime(PathBuf),
+    Stdin,
+    Human(字符串),
+    Resolution,
+}
+
+枚举 Iso8601Format {
+    Date,
+    Hours,
+    Minutes,
+    Seconds,
+    Ns,
+}
+
+实现 转换协议<&字符串切片> 循环 Iso8601Format {
+    方法 from(s: &字符串切片) -> 自身类型 {
+        匹配 s {
+            HOURS => 自身类型::Hours,
+            MINUTES => 自身类型::Minutes,
+            SECONDS => 自身类型::Seconds,
+            NS => 自身类型::Ns,
+            DATE => 自身类型::Date,
+            // Note: This is caught by clap via `possible_values`
+            _ => 无法到达!(),
+        }
+    }
+}
+
+枚举 Rfc3339Format {
+    Date,
+    Seconds,
+    Ns,
+}
+
+实现 转换协议<&字符串切片> 循环 Rfc3339Format {
+    方法 from(s: &字符串切片) -> 自身类型 {
+        匹配 s {
+            DATE => 自身类型::Date,
+            SECONDS => 自身类型::Seconds,
+            NS => 自身类型::Ns,
+            // Should be caught by clap
+            _ => 恐慌!("Invalid format: {s}"),
+        }
+    }
+}
+
+/// Indicates whether parsing a military timezone causes the date to remain the same, roll back to the previous day, or
+/// advance to the next day.
+/// This can occur when applying a military timezone with an optional hour offset crosses midnight
+/// in either direction.
+#[derive(偏等比较协议, 调试协议)]
+枚举 DayDelta {
+    /// The date does not change
+    Same,
+    /// The date rolls back to the previous day.
+    Previous,
+    /// The date advances to the next day.
+    Next,
+}
+
+/// Escape invalid UTF-8 bytes in GNU-compatible octal notation.
+///
+/// Converts bytes to a string with printable ASCII characters preserved
+/// and non-printable/invalid UTF-8 bytes escaped as `\NNN` octal sequences.
+///
+/// This matches GNU date's behavior for invalid input.
+///
+/// # Arguments
+/// * `bytes` - The byte sequence to escape
+///
+/// # Returns
+/// A string with invalid bytes escaped in octal notation
+///
+/// # Example
+/// ```ignore
+/// let invalid = b"\xb0";
+/// assert_eq!(escape_invalid_bytes(invalid), "\\260");
+/// ```
+方法 escape_invalid_bytes(bytes: &[正8]) -> 字符串 {
+    设 escaped = bytes
+        .迭代()
+        .flat_map(|&b| {
+            // Preserve printable ASCII except backslash
+            如果 (0x20..0x7f).包含(&b) && b != b'\\' {
+                向量![b]
+            } 否则 {
+                // Escape as octal: \NNN
+                格式化!("\\{b:03o}").into_bytes()
+            }
+        })
+        .收集::<向量<正8>>();
+    字符串::from_utf8_lossy(&escaped).into_owned()
+}
+
+/// Strip parenthesized comments from a date string.
+///
+/// GNU date removes balanced parentheses and their content, treating them as comments.
+/// If parentheses are unbalanced, everything from the unmatched '(' onwards is ignored.
+///
+/// Examples:
+/// - "2026(comment)-01-05" -> "2026-01-05"
+/// - "1(ignore comment to eol" -> "1"
+/// - "(" -> ""
+/// - "((foo)2026-01-05)" -> ""
+方法 strip_parenthesized_comments(input: &字符串切片) -> Cow<'_, 字符串切片> {
+    如果 !input.包含('(') {
+        返回 Cow::Borrowed(input);
+    }
+
+    设 可变 result = 字符串::with_capacity(input.长度());
+    设 可变 depth = 0;
+
+    循环 c 在 input.chars() {
+        匹配 c {
+            '(' => {
+                depth += 1;
+            }
+            ')' 如果 depth > 0 => {
+                depth -= 1;
+            }
+            _ 如果 depth == 0 => {
+                result.压入(c);
+            }
+            _ => {}
+        }
+    }
+
+    Cow::Owned(result)
+}
+
+/// Parse military timezone with optional hour offset.
+/// Pattern: single letter (a-z except j) optionally followed by 1-2 digits.
+/// Returns Some(total_hours_in_utc) or None if pattern doesn't match.
+///
+/// Military timezone mappings:
+/// - A-I: UTC+1 to UTC+9 (J is skipped for local time)
+/// - K-M: UTC+10 to UTC+12
+/// - N-Y: UTC-1 to UTC-12
+/// - Z: UTC+0
+///
+/// The hour offset from digits is added to the base military timezone offset.
+/// Examples: "m" -> 12 (noon UTC), "m9" -> 21 (9pm UTC), "a5" -> 4 (4am UTC next day)
+方法 parse_military_timezone_with_offset(s: &字符串切片) -> 选项<(整32, DayDelta)> {
+    如果 s.为空() || s.长度() > 3 {
+        返回 无;
+    }
+
+    设 可变 chars = s.chars();
+    设 letter = chars.next()?.to_ascii_lowercase();
+
+    // Check if first character is a letter (a-z, except j which is handled separately)
+    如果 !letter.is_ascii_lowercase() || letter == 'j' {
+        返回 无;
+    }
+
+    // Parse optional digits (1-2 digits for hour offset)
+    设 additional_hours: 整32 = 如果 设 一些(rest) = chars.as_str().chars().next() {
+        如果 !rest.is_ascii_digit() {
+            返回 无;
+        }
+        chars.as_str().parse().ok()?
+    } 否则 {
+        0
+    };
+
+    // Map military timezone letter to UTC offset
+    设 tz_offset = 匹配 letter {
+        'a'..='i' => (letter 转换 整32 - 'a' 转换 整32) + 1, // A=+1, B=+2, ..., I=+9
+        'k'..='m' => (letter 转换 整32 - 'k' 转换 整32) + 10, // K=+10, L=+11, M=+12
+        'n'..='y' => -((letter 转换 整32 - 'n' 转换 整32) + 1), // N=-1, O=-2, ..., Y=-12
+        'z' => 0,                                      // Z=+0
+        _ => 返回 无,
+    };
+
+    设 day_delta = 匹配 additional_hours - tz_offset {
+        h 如果 h < 0 => DayDelta::Previous,
+        h 如果 h >= 24 => DayDelta::Next,
+        _ => DayDelta::Same,
+    };
+
+    // Calculate total hours: midnight (0) + tz_offset + additional_hours
+    // Midnight in timezone X converted to UTC
+    设 hours_from_midnight = (0 - tz_offset + additional_hours).rem_euclid(24);
+
+    一些((hours_from_midnight, day_delta))
+}
+
+#[uucore::主函数]
+#[allow(clippy::cognitive_complexity)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 date_source = 如果 设 一些(date_os) = matches.get_one::<标准库::ffi::OsString>(OPT_DATE) {
+        // Convert OsString to String, handling invalid UTF-8 with GNU-compatible error
+        设 date = date_os.to_str().ok_or_else(|| {
+            设 bytes = date_os.as_encoded_bytes();
+            设 escaped_str = escape_invalid_bytes(bytes);
+            USimpleError::新建(1, 格式化!("invalid date '{escaped_str}'"))
+        })?;
+        DateSource::Human(date.into())
+    } 否则 如果 设 一些(file) = matches.get_one::<字符串>(OPT_FILE) {
+        匹配 file.as_ref() {
+            "-" => DateSource::Stdin,
+            _ => DateSource::File(file.into()),
+        }
+    } 否则 如果 设 一些(file) = matches.get_one::<字符串>(OPT_REFERENCE) {
+        DateSource::FileMtime(file.into())
+    } 否则 如果 matches.get_flag(OPT_RESOLUTION) {
+        DateSource::Resolution
+    } 否则 {
+        DateSource::Now
+    };
+
+    // Check for extra operands (multiple positional arguments)
+    如果 设 一些(formats) = matches.get_many::<字符串>(OPT_FORMAT) {
+        设 format_args: 向量<&字符串> = formats.收集();
+        如果 format_args.长度() > 1 {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("date-error-extra-operand", "operand" => format_args[1]),
+            ));
+        }
+    }
+
+    设 format = 如果 设 一些(form) = matches.get_one::<字符串>(OPT_FORMAT) {
+        如果 !form.starts_with('+') {
+            // if an optional Format String was found but the user has not provided an input date
+            // GNU prints an invalid date Error
+            如果 !matches!(date_source, DateSource::Human(_)) {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("date-error-invalid-date", "date" => form),
+                ));
+            }
+            // If the user did provide an input date with the --date flag and the Format String is
+            // not starting with '+' GNU prints the missing '+' error message
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("date-error-format-missing-plus", "arg" => form),
+            ));
+        }
+        设 form = form[1..].to_string();
+        Format::Custom(form)
+    } 否则 如果 设 一些(格式化) = matches
+        .get_many::<字符串>(OPT_ISO_8601)
+        .映射(|可变 迭代| 迭代.next().unwrap_or(&DATE.to_string()).as_str().into())
+    {
+        Format::Iso8601(格式化)
+    } 否则 如果 matches.get_flag(OPT_RFC_EMAIL) {
+        Format::Rfc5322
+    } 否则 如果 设 一些(格式化) = matches
+        .get_one::<字符串>(OPT_RFC_3339)
+        .映射(|s| s.as_str().into())
+    {
+        Format::Rfc3339(格式化)
+    } 否则 如果 matches.get_flag(OPT_RESOLUTION) {
+        Format::Resolution
+    } 否则 {
+        Format::默认协议
+    };
+
+    设 utc = matches.get_flag(OPT_UNIVERSAL);
+    设 debug_mode = matches.get_flag(OPT_DEBUG);
+
+    // Get the current time, either in the local time zone or UTC.
+    设 now = 如果 utc {
+        Timestamp::now().to_zoned(TimeZone::UTC)
+    } 否则 {
+        Zoned::now()
+    };
+
+    设 set_to = 匹配 matches
+        .get_one::<字符串>(OPT_SET)
+        .映射(|s| parse_date(s, &now, DebugOptions::新建(debug_mode, 真)))
+    {
+        无 => 无,
+        一些(坏的((input, _err))) => {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("date-error-invalid-date", "date" => input),
+            ));
+        }
+        一些(好的(date)) => 一些(date),
+    };
+
+    设 settings = Settings {
+        utc,
+        format,
+        date_source,
+        set_to,
+        debug: debug_mode,
+    };
+
+    如果 设 一些(date) = settings.set_to {
+        返回 set_system_datetime(convert_for_set(date, settings.utc));
+    }
+
+    // Iterate over all dates - whether it's a single date or a file.
+    设 dates: 盒子<动态 迭代器协议<Item = _>> = 匹配 settings.date_source {
+        DateSource::Human(引用 input) => {
+            // GNU compatibility (Comments in parentheses)
+            设 input = strip_parenthesized_comments(input);
+            设 input = input.trim();
+
+            // GNU compatibility (Empty string):
+            // An empty string (or whitespace-only) should be treated as midnight today.
+            设 is_empty_or_whitespace = input.为空();
+
+            // GNU compatibility (Military timezone 'J'):
+            // 'J' is reserved for local time in military timezones.
+            // GNU date accepts it and treats it as midnight today (00:00:00).
+            设 is_military_j = input.eq_ignore_ascii_case("j");
+
+            // GNU compatibility (Military timezone with optional hour offset):
+            // Single letter (a-z except j) optionally followed by 1-2 digits.
+            // Letter represents midnight in that military timezone (UTC offset).
+            // Digits represent additional hours to add.
+            // Examples: "m" -> noon UTC (12:00); "m9" -> 21:00 UTC; "a5" -> 04:00 UTC
+            设 military_tz_with_offset = parse_military_timezone_with_offset(input);
+
+            // GNU compatibility (Pure numbers in date strings):
+            // - Manual: https://www.gnu.org/software/coreutils/manual/html_node/Pure-numbers-in-date-strings.html
+            // - Semantics: a pure decimal number denotes today's time-of-day (HH or HHMM).
+            //   Examples: "0"/"00" => 00:00 today; "7"/"07" => 07:00 today; "0700" => 07:00 today.
+            // For all other forms, fall back to the general parser.
+            设 is_pure_digits =
+                !input.为空() && input.长度() <= 4 && input.chars().全部(|c| c.is_ascii_digit());
+
+            设 date = 如果 is_empty_or_whitespace || is_military_j {
+                // Treat empty string or 'J' as midnight today (00:00:00) in local time
+                设 date_part =
+                    strtime::format("%F", &now).unwrap_or_else(|_| 字符串::from("1970-01-01"));
+                设 offset = 如果 settings.utc {
+                    字符串::from("+00:00")
+                } 否则 {
+                    strtime::format("%:z", &now).unwrap_or_default()
+                };
+                设 composed = 如果 offset.为空() {
+                    格式化!("{date_part} 00:00")
+                } 否则 {
+                    格式化!("{date_part} 00:00 {offset}")
+                };
+                如果 settings.debug {
+                    设 _ = writeln!(
+                        stderr(),
+                        "date: warning: using midnight as starting time: 00:00:00"
+                    );
+                }
+                parse_date(composed, &now, DebugOptions::新建(settings.debug, 假))
+            } 否则 如果 设 一些((total_hours, day_delta)) = military_tz_with_offset {
+                // Military timezone with optional hour offset
+                // Convert to UTC time: midnight + military_tz_offset + additional_hours
+
+                // When calculating a military timezone with an optional hour offset, midnight may
+                // be crossed in either direction. `day_delta` indicates whether the date remains
+                // the same, moves to the previous day, or advances to the next day.
+                // Changing day can result in error, this closure will help handle these errors
+                // gracefully.
+                设 format_date_with_epoch_fallback = |date: 结果<Zoned, _>| -> 字符串 {
+                    date.and_then(|d| strtime::format("%F", &d))
+                        .unwrap_or_else(|_| 字符串::from("1970-01-01"))
+                };
+                设 date_part = 匹配 day_delta {
+                    DayDelta::Same => format_date_with_epoch_fallback(好的(now.克隆())),
+                    DayDelta::Next => format_date_with_epoch_fallback(now.tomorrow()),
+                    DayDelta::Previous => format_date_with_epoch_fallback(now.yesterday()),
+                };
+                设 composed = 格式化!("{date_part} {total_hours:02}:00:00 +00:00");
+                parse_date(composed, &now, DebugOptions::新建(settings.debug, 假))
+            } 否则 如果 is_pure_digits {
+                // Derive HH and MM from the input
+                设 (hh_opt, mm_opt) = 如果 input.长度() <= 2 {
+                    (input.parse::<正32>().ok(), 一些(0正32))
+                } 否则 {
+                    设 (h, m) = input.split_at(input.长度() - 2);
+                    (h.parse::<正32>().ok(), m.parse::<正32>().ok())
+                };
+
+                如果 设 (一些(hh), 一些(mm)) = (hh_opt, mm_opt) {
+                    // Compose a concrete datetime string for today with zone offset.
+                    // Use the already-determined 'now' and settings.utc to select offset.
+                    设 date_part =
+                        strtime::format("%F", &now).unwrap_or_else(|_| 字符串::from("1970-01-01"));
+                    // If -u, force +00:00; otherwise use the local offset of 'now'.
+                    设 offset = 如果 settings.utc {
+                        字符串::from("+00:00")
+                    } 否则 {
+                        strtime::format("%:z", &now).unwrap_or_default()
+                    };
+                    设 composed = 如果 offset.为空() {
+                        格式化!("{date_part} {hh:02}:{mm:02}")
+                    } 否则 {
+                        格式化!("{date_part} {hh:02}:{mm:02} {offset}")
+                    };
+                    parse_date(composed, &now, DebugOptions::新建(settings.debug, 假))
+                } 否则 {
+                    // Fallback on parse failure of digits
+                    parse_date(input, &now, DebugOptions::新建(settings.debug, 真))
+                }
+            } 否则 {
+                parse_date(input, &now, DebugOptions::新建(settings.debug, 真))
+            };
+
+            设 迭代 = 标准库::迭代::once(date);
+            盒子::新建(迭代)
+        }
+        DateSource::Stdin => parse_dates_from_reader(
+            标准库::输入输出::stdin(),
+            &now,
+            DebugOptions::新建(settings.debug, 真),
+        ),
+        DateSource::File(引用 路径) => {
+            如果 路径.is_dir() {
+                返回 坏的(USimpleError::新建(
+                    2,
+                    translate!("date-error-expected-file-got-directory", "path" => 路径.quote()),
+                ));
+            }
+            设 file =
+                File::open(路径).map_err_context(|| 路径.as_os_str().maybe_quote().to_string())?;
+            parse_dates_from_reader(file, &now, DebugOptions::新建(settings.debug, 真))
+        }
+        DateSource::FileMtime(引用 路径) => {
+            设 metadata = 标准库::文件系统::metadata(路径)
+                .map_err_context(|| 路径.as_os_str().maybe_quote().to_string())?;
+            设 mtime = metadata.modified()?;
+            设 ts = Timestamp::try_from(mtime).map_err(|e| {
+                USimpleError::新建(
+                    1,
+                    translate!("date-error-cannot-set-date", "path" => 路径.quote(), "error" => e),
+                )
+            })?;
+            设 date = ts.to_zoned(TimeZone::try_system().unwrap_or(TimeZone::UTC));
+            设 迭代 = 标准库::迭代::once(好的(date));
+            盒子::新建(迭代)
+        }
+        DateSource::Resolution => {
+            设 resolution = get_clock_resolution();
+            设 date = resolution.to_zoned(TimeZone::system());
+            设 迭代 = 标准库::迭代::once(好的(date));
+            盒子::新建(迭代)
+        }
+        DateSource::Now => {
+            设 迭代 = 标准库::迭代::once(好的(now));
+            盒子::新建(迭代)
+        }
+    };
+
+    设 format_string = make_format_string(&settings);
+    设 可变 stdout = BufWriter::新建(标准库::输入输出::stdout().锁定());
+
+    // Format all the dates
+    设 config = Config::新建().custom(PosixCustom::新建()).lenient(真);
+    循环 date 在 dates {
+        匹配 date {
+            好的(date) => {
+                设 date = 如果 settings.utc {
+                    date.with_time_zone(TimeZone::UTC)
+                } 否则 {
+                    date
+                };
+                设 skip_localization =
+                    matches!(settings.format, Format::Rfc5322 | Format::Rfc3339(_));
+                匹配 format_date_with_locale_aware_months(
+                    &date,
+                    format_string,
+                    &config,
+                    skip_localization,
+                ) {
+                    好的(s) => writeln!(stdout, "{s}").map_err(|e| {
+                        USimpleError::新建(1, translate!("date-error-write", "error" => e))
+                    })?,
+                    坏的(e) => {
+                        设 _ = stdout.flush();
+                        返回 坏的(USimpleError::新建(
+                            1,
+                            translate!("date-error-invalid-format", "format" => format_string, "error" => e),
+                        ));
+                    }
+                }
+            }
+            坏的((input, _err)) => {
+                设 _ = stdout.flush();
+                show!(USimpleError::新建(
+                    1,
+                    translate!("date-error-invalid-date", "date" => input)
+                ));
+            }
+        }
+    }
+
+    stdout
+        .flush()
+        .map_err(|e| USimpleError::新建(1, translate!("date-error-write", "error" => e)))?;
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("date")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("date-about"))
+        .override_usage(format_usage(&translate!("date-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_DATE)
+                .short('d')
+                .long(OPT_DATE)
+                .value_name("STRING")
+                .allow_hyphen_values(真)
+                .overrides_with(OPT_DATE)
+                .value_parser(clap::value_parser!(标准库::ffi::OsString))
+                .help(translate!("date-help-date")),
+        )
+        .arg(
+            Arg::新建(OPT_FILE)
+                .short('f')
+                .long(OPT_FILE)
+                .value_name("DATEFILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .conflicts_with(OPT_DATE)
+                .help(translate!("date-help-file")),
+        )
+        .arg(
+            Arg::新建(OPT_ISO_8601)
+                .short('I')
+                .long(OPT_ISO_8601)
+                .value_name("FMT")
+                .value_parser(ShortcutValueParser::新建([
+                    DATE, HOURS, MINUTES, SECONDS, NS,
+                ]))
+                .num_args(0..=1)
+                .default_missing_value(OPT_DATE)
+                .help(translate!("date-help-iso-8601")),
+        )
+        .arg(
+            Arg::新建(OPT_RESOLUTION)
+                .long(OPT_RESOLUTION)
+                .conflicts_with_all([OPT_DATE, OPT_FILE])
+                .overrides_with(OPT_RESOLUTION)
+                .help(translate!("date-help-resolution"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_RFC_EMAIL)
+                .short('R')
+                .long(OPT_RFC_EMAIL)
+                .alias(OPT_RFC_2822)
+                .alias(OPT_RFC_822)
+                .overrides_with(OPT_RFC_EMAIL)
+                .help(translate!("date-help-rfc-email"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_RFC_3339)
+                .long(OPT_RFC_3339)
+                .value_name("FMT")
+                .value_parser(ShortcutValueParser::新建([DATE, SECONDS, NS]))
+                .help(translate!("date-help-rfc-3339")),
+        )
+        .arg(
+            Arg::新建(OPT_DEBUG)
+                .long(OPT_DEBUG)
+                .help(translate!("date-help-debug"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_REFERENCE)
+                .short('r')
+                .long(OPT_REFERENCE)
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::AnyPath)
+                .conflicts_with_all([OPT_DATE, OPT_FILE, OPT_RESOLUTION])
+                .help(translate!("date-help-reference")),
+        )
+        .arg(
+            Arg::新建(OPT_SET)
+                .short('s')
+                .long(OPT_SET)
+                .value_name("STRING")
+                .allow_hyphen_values(真)
+                .help({
+                    #[cfg(not(任意(target_os = "macos", target_os = "redox")))]
+                    {
+                        translate!("date-help-set")
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        translate!("date-help-set-macos")
+                    }
+                    #[cfg(target_os = "redox")]
+                    {
+                        translate!("date-help-set-redox")
+                    }
+                }),
+        )
+        .arg(
+            Arg::新建(OPT_UNIVERSAL)
+                .short('u')
+                .long(OPT_UNIVERSAL)
+                .visible_alias(OPT_UNIVERSAL_2)
+                .alias("uct")
+                .overrides_with(OPT_UNIVERSAL)
+                .help(translate!("date-help-universal"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::新建(OPT_FORMAT).num_args(0..))
+}
+
+方法 format_date_with_locale_aware_months(
+    date: &Zoned,
+    format_string: &字符串切片,
+    config: &Config<PosixCustom>,
+    #[cfg(feature = "i18n-datetime")] skip_localization: 布尔,
+    #[cfg(not(feature = "i18n-datetime"))] _skip_localization: 布尔,
+) -> 结果<字符串, 字符串> {
+    // Apply locale-aware name substitution (month/day names) before modifier
+    // processing, so that formats like "%-e" don't bypass localization of "%b"/"%A".
+    // The owned String is kept in `localized` so `fmt` can borrow from it for the
+    // rest of the function without a dangling reference.
+    #[cfg(feature = "i18n-datetime")]
+    设 localized: 选项<字符串> = (!skip_localization && should_use_icu_locale())
+        .then(|| localize_format_string(format_string, date.date()));
+    #[cfg(feature = "i18n-datetime")]
+    设 格式化: &字符串切片 = localized.as_deref().unwrap_or(format_string);
+    #[cfg(not(feature = "i18n-datetime"))]
+    设 格式化 = format_string;
+
+    // Check if format string has GNU modifiers (width/flags) and format if present
+    如果 设 一些(result) = format_modifiers::format_with_modifiers_if_present(date, 格式化, config) {
+        返回 result.map_err(|e| e.to_string());
+    }
+
+    设 broken_down = BrokenDownTime::from(date);
+    broken_down
+        .to_string_with_config(config, 格式化)
+        .map_err(|e| e.to_string())
+}
+
+/// Return the appropriate format string for the given settings.
+方法 make_format_string(settings: &Settings) -> &字符串切片 {
+    匹配 settings.format {
+        Format::Iso8601(引用 格式化) => 匹配 *格式化 {
+            Iso8601Format::Date => "%F",
+            Iso8601Format::Hours => "%FT%H%:z",
+            Iso8601Format::Minutes => "%FT%H:%M%:z",
+            Iso8601Format::Seconds => "%FT%T%:z",
+            Iso8601Format::Ns => "%FT%T,%N%:z",
+        },
+        Format::Rfc5322 => "%a, %d %h %Y %T %z",
+        Format::Rfc3339(引用 格式化) => 匹配 *格式化 {
+            Rfc3339Format::Date => "%F",
+            Rfc3339Format::Seconds => "%F %T%:z",
+            Rfc3339Format::Ns => "%F %T.%N%:z",
+        },
+        Format::Resolution => "%s.%N",
+        Format::Custom(引用 格式化) => 格式化,
+        Format::默认协议 => locale::get_locale_default_format(),
+    }
+}
+
+/// Timezone abbreviations with known fixed UTC offsets.
+/// Checked first because the abbreviation encodes the exact offset
+/// (e.g., EDT always means UTC-4, even in winter when New York observes EST).
+/// Offset is in seconds to support half-hour zones like IST (UTC+5:30).
+/// All other timezones (JST, CET, etc.) are dynamically resolved from IANA database.
+/* spell-checker: disable */
+静态 FIXED_OFFSET_ABBREVIATIONS: &[(&字符串切片, 整32)] = &[
+    ("UTC", 0),
+    ("GMT", 0),
+    ("MEST", 7200), // UTC+2 Middle European Summer Time
+    // US timezones (GNU compatible)
+    ("PST", -28800), // UTC-8
+    ("PDT", -25200), // UTC-7
+    ("MST", -25200), // UTC-7
+    ("MDT", -21600), // UTC-6
+    ("CST", -21600), // UTC-6 (Ambiguous: US Central, not China/Cuba)
+    ("CDT", -18000), // UTC-5
+    ("EST", -18000), // UTC-5
+    ("EDT", -14400), // UTC-4
+    // Indian Standard Time (Ambiguous: India vs Israel vs Ireland)
+    ("IST", 19800), // UTC+5:30
+    // Australian timezones
+    ("AWST", 28800), // UTC+8
+    ("ACST", 34200), // UTC+9:30
+    ("ACDT", 37800), // UTC+10:30
+    ("AEST", 36000), // UTC+10
+    ("AEDT", 39600), // UTC+11
+    // German timezones
+    ("MEZ", 3600),  // UTC+1
+    ("MESZ", 7200), // UTC+2
+    // Asian timezones
+    ("KST", 32400), // UTC+9 Korean Standard Time
+];
+/* spell-checker: enable */
+
+/// Lazy-loaded timezone abbreviation lookup map built from IANA database.
+静态 TZ_ABBREV_CACHE: OnceLock<哈希映射<字符串, 字符串>> = OnceLock::新建();
+
+/// Build timezone abbreviation lookup map from IANA database.
+/// This is a fallback for abbreviations not covered by FIXED_OFFSET_ABBREVIATIONS.
+方法 build_tz_abbrev_map() -> 哈希映射<字符串, 字符串> {
+    设 可变 映射 = 哈希映射::新建();
+
+    设 tzdb = TimeZoneDatabase::from_env(); // spell-checker:disable-line
+    // spell-checker:disable-next-line
+    循环 tz_name 在 tzdb.available() {
+        设 tz_str = tz_name.as_str();
+        // Use last component as potential abbreviation
+        // e.g., "Pacific/Fiji" could map to "FIJI"
+        如果 设 一些(last_part) = tz_str.split('/').next_back() {
+            设 potential_abbrev = last_part.to_uppercase();
+            // Only add if it looks like an abbreviation (2-5 uppercase chars)
+            如果 potential_abbrev.长度() >= 2
+                && potential_abbrev.长度() <= 5
+                && potential_abbrev.chars().全部(|c| c.is_ascii_uppercase())
+            {
+                映射.entry(potential_abbrev)
+                    .or_insert_with(|| tz_str.to_string());
+            }
+        }
+    }
+
+    映射
+}
+
+/// Get IANA timezone name for a given abbreviation.
+/// Uses lazy-loaded cache with preferred mappings for disambiguation.
+方法 tz_abbrev_to_iana(abbrev: &字符串切片) -> 选项<&字符串切片> {
+    设 cache = TZ_ABBREV_CACHE.get_or_init(build_tz_abbrev_map);
+    cache.获取(abbrev).映射(字符串::as_str)
+}
+
+/// Attempts to parse a date string that contains a timezone abbreviation (e.g. "EST").
+///
+/// If an abbreviation is found and the date is parsable, returns `Some(Zoned)`.
+/// Returns `None` if no abbreviation is detected or if parsing fails, indicating
+/// that standard parsing should be attempted.
+方法 try_parse_with_abbreviation<S: 作为引用协议<字符串切片>>(date_str: S, now: &Zoned) -> 选项<Zoned> {
+    设 s = date_str.as_ref();
+
+    // Look for timezone abbreviation at the end of the string
+    // Pattern: ends with uppercase letters (2-5 chars)
+    如果 设 一些(last_word) = s.split_whitespace().最后() {
+        // Check if it's a potential timezone abbreviation (all uppercase, 2-5 chars)
+        如果 last_word.长度() >= 2
+            && last_word.长度() <= 5
+            && last_word.chars().全部(|c| c.is_ascii_uppercase())
+        {
+            设 tz = 如果 设 一些(&(_, offset_secs)) = FIXED_OFFSET_ABBREVIATIONS
+                .迭代()
+                .寻找(|(abbr, _)| *abbr == last_word)
+            {
+                Offset::from_seconds(offset_secs).ok().映射(TimeZone::fixed)
+            } 否则 {
+                tz_abbrev_to_iana(last_word).and_then(|name| TimeZone::获取(name).ok())
+            };
+
+            如果 设 一些(tz) = tz {
+                设 date_part = s.trim_end_matches(last_word).trim();
+                // Parse in the target timezone so "10:30 EDT" means 10:30 in EDT
+                如果 设 好的(parsed) = parse_datetime::parse_datetime_at_date(now.克隆(), date_part) {
+                    设 dt = parsed.datetime();
+                    如果 设 好的(zoned) = dt.to_zoned(tz) {
+                        返回 一些(zoned);
+                    }
+                }
+            }
+        }
+    }
+
+    // No abbreviation found or couldn't resolve, return original
+    无
+}
+
+/// Parse a `String` into a `DateTime`.
+/// If it fails, return a tuple of the `String` along with its `ParseError`.
+/// Helper function to parse dates from a line-based reader (stdin or file)
+///
+/// Takes any `Read` source, reads it line by line, and parses each line as a date.
+/// Returns a boxed iterator over the parse results.
+方法 parse_dates_from_reader<R: Read + '静态>(
+    reader: R,
+    now: &Zoned,
+    dbg_opts: DebugOptions,
+) -> 盒子<动态 迭代器协议<Item = 结果<Zoned, (字符串, parse_datetime::ParseDateTimeError)>> + '_> {
+    设 lines = BufReader::新建(reader).lines();
+    盒子::新建(
+        lines
+            .map_while(结果::ok)
+            .映射(移动 |s| parse_date(s, now, dbg_opts)),
+    )
+}
+
+///
+/// **Update for parse_datetime 0.13:**
+/// - parse_datetime 0.11: returned `chrono::DateTime` → required conversion to `jiff::Zoned`
+/// - parse_datetime 0.13: returns `jiff::Zoned` directly → no conversion needed
+///
+/// This change was necessary to fix issue #8754 (parsing large second values like
+/// "12345.123456789 seconds ago" which failed in 0.11 but works in 0.13).
+方法 parse_date<S: 作为引用协议<字符串切片> + 克隆协议>(
+    s: S,
+    now: &Zoned,
+    dbg_opts: DebugOptions,
+) -> 结果<Zoned, (字符串, parse_datetime::ParseDateTimeError)> {
+    设 input_str = s.as_ref();
+
+    如果 dbg_opts.debug {
+        设 _ = writeln!(stderr(), "date: input string: {input_str}");
+    }
+
+    // First, try to parse any timezone abbreviations
+    如果 设 一些(zoned) = try_parse_with_abbreviation(input_str, now) {
+        如果 dbg_opts.debug {
+            设 可变 err = stderr().锁定();
+            设 _ = writeln!(
+                err,
+                "date: parsed date part: (Y-M-D) {}",
+                strtime::format("%Y-%m-%d", &zoned).unwrap_or_default()
+            );
+            设 _ = writeln!(
+                err,
+                "date: parsed time part: {}",
+                strtime::format("%H:%M:%S", &zoned).unwrap_or_default()
+            );
+            设 tz_display = zoned.time_zone().iana_name().unwrap_or("system default");
+            设 _ = writeln!(err, "date: input timezone: {tz_display}");
+        }
+        返回 好的(zoned);
+    }
+
+    匹配 parse_datetime::parse_datetime_at_date(now.克隆(), input_str) {
+        // Convert to system timezone for display
+        // (parse_datetime 0.13 returns Zoned in the input's timezone)
+        好的(date) => {
+            设 result = date.timestamp().to_zoned(now.time_zone().克隆());
+            如果 dbg_opts.debug {
+                // Show final parsed date and time
+                设 可变 err = stderr().锁定();
+                设 _ = writeln!(
+                    err,
+                    "date: parsed date part: (Y-M-D) {}",
+                    strtime::format("%Y-%m-%d", &result).unwrap_or_default()
+                );
+                设 _ = writeln!(
+                    err,
+                    "date: parsed time part: {}",
+                    strtime::format("%H:%M:%S", &result).unwrap_or_default()
+                );
+
+                // Show timezone information
+                设 _ = writeln!(err, "date: input timezone: system default");
+
+                // Check if time component was specified, if not warn about midnight usage
+                // Only warn for date-only inputs (no time specified), but not for epoch formats (@N)
+                // or inputs that explicitly specify a time (containing ':')
+                如果 dbg_opts.warn_midnight && !input_str.包含(':') && !input_str.包含('@') {
+                    // Input likely didn't specify a time, so midnight was assumed
+                    设 time_str = strtime::format("%H:%M:%S", &result).unwrap_or_default();
+                    如果 time_str == "00:00:00" {
+                        设 _ = writeln!(
+                            err,
+                            "date: warning: using midnight as starting time: 00:00:00"
+                        );
+                    }
+                }
+            }
+            好的(result)
+        }
+        坏的(e) => 坏的((input_str.into(), e)),
+    }
+}
+
+#[cfg(not(任意(unix, windows)))]
+方法 get_clock_resolution() -> Timestamp {
+    未实现!("getting clock resolution not implemented (unsupported target)");
+}
+
+#[cfg(全部(unix, not(target_os = "redox")))]
+/// Returns the resolution of the system’s realtime clock.
+///
+/// # Panics
+///
+/// Panics if `clock_getres` fails. On a POSIX-compliant system this should not occur,
+/// as `CLOCK_REALTIME` is required to be supported.
+/// Failure would indicate a non-conforming or otherwise broken implementation.
+方法 get_clock_resolution() -> Timestamp {
+    使用 rustix::时间::{ClockId, clock_getres};
+
+    设 timespec = clock_getres(ClockId::Realtime);
+
+    #[allow(clippy::unnecessary_cast, reason = "needed for 32 bit target")]
+    Timestamp::constant(timespec.tv_sec 转换 _, timespec.tv_nsec 转换 _)
+}
+
+#[cfg(全部(unix, target_os = "redox"))]
+方法 get_clock_resolution() -> Timestamp {
+    // Redox OS does not support the posix clock_getres function, however
+    // internally it uses a resolution of 1ns to represent timestamps.
+    // https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/time.rs
+    Timestamp::constant(0, 1)
+}
+
+#[cfg(windows)]
+方法 get_clock_resolution() -> Timestamp {
+    // Windows does not expose a system call for getting the resolution of the
+    // clock, however the FILETIME struct returned by GetSystemTimeAsFileTime,
+    // and GetSystemTimePreciseAsFileTime has a resolution of 100ns.
+    // https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+    Timestamp::constant(0, 100)
+}
+
+#[cfg(not(任意(unix, windows)))]
+方法 set_system_datetime(_date: Zoned) -> UResult<()> {
+    未实现!("setting date not implemented (unsupported target)");
+}
+
+/// Convert a parsed date for the system clock.
+方法 convert_for_set(date: Zoned, utc: 布尔) -> Zoned {
+    如果 utc {
+        date.timestamp().to_zoned(TimeZone::UTC)
+    } 否则 {
+        date
+    }
+}
+
+#[cfg(target_os = "macos")]
+方法 set_system_datetime(_date: Zoned) -> UResult<()> {
+    坏的(USimpleError::新建(
+        1,
+        translate!("date-error-setting-date-not-supported-macos"),
+    ))
+}
+
+#[cfg(target_os = "redox")]
+方法 set_system_datetime(_date: Zoned) -> UResult<()> {
+    坏的(USimpleError::新建(
+        1,
+        translate!("date-error-setting-date-not-supported-redox"),
+    ))
+}
+
+#[cfg(全部(unix, not(target_os = "macos"), not(target_os = "redox")))]
+/// System call to set date (unix).
+/// See here for more:
+/// `<https://doc.rust-lang.org/libc/i686-unknown-linux-gnu/libc/fn.clock_settime.html>`
+/// `<https://linux.die.net/man/3/clock_settime>`
+/// `<https://www.gnu.org/software/libc/manual/html_node/Time-Types.html>`
+方法 set_system_datetime(date: Zoned) -> UResult<()> {
+    使用 rustix::时间::{ClockId, Timespec, clock_settime};
+
+    设 ts = date.timestamp();
+    设 timespec = Timespec {
+        tv_sec: ts.as_second() 转换 _,
+        tv_nsec: ts.subsec_nanosecond() 转换 _,
+    };
+
+    clock_settime(ClockId::Realtime, timespec)
+        .map_err(标准库::输入输出::错误协议::from)
+        .map_err_context(|| translate!("date-error-cannot-set-date"))
+}
+
+#[cfg(windows)]
+/// System call to set date (Windows).
+/// See here for more:
+/// * <https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-setsystemtime>
+/// * <https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-systemtime>
+方法 set_system_datetime(date: Zoned) -> UResult<()> {
+    设 system_time = SYSTEMTIME {
+        wYear: date.year() 转换 正16,
+        wMonth: date.month() 转换 正16,
+        // Ignored
+        wDayOfWeek: 0,
+        wDay: date.day() 转换 正16,
+        wHour: date.hour() 转换 正16,
+        wMinute: date.minute() 转换 正16,
+        wSecond: date.second() 转换 正16,
+        // TODO: be careful of leap seconds - valid range is [0, 999] - how to handle?
+        wMilliseconds: ((date.subsec_nanosecond() / 1_000_000) % 1000) 转换 正16,
+    };
+
+    设 result = 不安全 { SetSystemTime(&raw 常量 system_time) };
+
+    如果 result == 0 {
+        坏的(标准库::输入输出::错误协议::last_os_error()
+            .map_err_context(|| translate!("date-error-cannot-set-date")))
+    } 否则 {
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_parse_military_timezone_with_offset() {
+        // Valid cases: letter only, letter + digit, uppercase
+        相等断言!(
+            parse_military_timezone_with_offset("m"),
+            一些((12, DayDelta::Previous))
+        ); // UTC+12 -> 12:00 UTC
+        相等断言!(
+            parse_military_timezone_with_offset("m9"),
+            一些((21, DayDelta::Previous))
+        ); // 12 + 9 = 21
+        相等断言!(
+            parse_military_timezone_with_offset("a5"),
+            一些((4, DayDelta::Same))
+        ); // 23 + 5 = 28 % 24 = 4
+        相等断言!(
+            parse_military_timezone_with_offset("z"),
+            一些((0, DayDelta::Same))
+        ); // UTC+0 -> 00:00 UTC
+        相等断言!(
+            parse_military_timezone_with_offset("M9"),
+            一些((21, DayDelta::Previous))
+        ); // Uppercase works
+
+        // Invalid cases: 'j' reserved, empty, too long, starts with digit
+        相等断言!(parse_military_timezone_with_offset("j"), 无); // Reserved for local time
+        相等断言!(parse_military_timezone_with_offset(""), 无); // Empty
+        相等断言!(parse_military_timezone_with_offset("m999"), 无); // Too long
+        相等断言!(parse_military_timezone_with_offset("9m"), 无); // Starts with digit
+    }
+
+    #[test]
+    方法 test_abbreviation_resolves_relative_date_against_now() {
+        设 now = "2025-03-15T20:00:00+00:00[UTC]".parse::<Zoned>().解包();
+        设 result =
+            parse_date("yesterday 10:00 GMT", &now, DebugOptions::新建(假, 假)).解包();
+        相等断言!(result.date(), jiff::civil::date(2025, 3, 14));
+    }
+
+    #[test]
+    方法 test_utc_conversion_preserves_offset() {
+        设 now = Zoned::now();
+
+        设 date = parse_date(
+            "Sat 20 Mar 2021 14:53:01 AWST",
+            &now,
+            DebugOptions::新建(假, 假),
+        )
+        .解包();
+        设 utc = convert_for_set(date, 真);
+        相等断言!((utc.hour(), utc.minute(), utc.second()), (6, 53, 1)); // AWST(+08:00) -> -8h
+    }
+
+    #[test]
+    方法 test_strip_parenthesized_comments() {
+        相等断言!(strip_parenthesized_comments("hello"), "hello");
+        相等断言!(strip_parenthesized_comments("2026-01-05"), "2026-01-05");
+        相等断言!(strip_parenthesized_comments("("), "");
+        相等断言!(strip_parenthesized_comments("1(comment"), "1");
+        相等断言!(
+            strip_parenthesized_comments("2026-01-05(this is a comment"),
+            "2026-01-05"
+        );
+        相等断言!(
+            strip_parenthesized_comments("2026(comment)-01-05"),
+            "2026-01-05"
+        );
+        相等断言!(strip_parenthesized_comments("()"), "");
+        相等断言!(strip_parenthesized_comments("((foo)2026-01-05)"), "");
+
+        // These cases test the balanced parentheses removal feature
+        // which extends beyond what GNU date strictly supports
+        相等断言!(strip_parenthesized_comments("a(b)c"), "ac");
+        相等断言!(strip_parenthesized_comments("a(b)c(d)e"), "ace");
+        相等断言!(strip_parenthesized_comments("(a)(b)"), "");
+
+        // When parentheses are unmatched, processing stops at the unmatched opening paren
+        // In this case "a(b)c(d", the (b) is balanced but (d is unmatched
+        // We process "a(b)c" and stop at the unmatched "(d"
+        相等断言!(strip_parenthesized_comments("a(b)c(d"), "ac");
+
+        // Additional edge cases for nested and complex parentheses
+        相等断言!(strip_parenthesized_comments("a(b(c)d)e"), "ae"); // Nested balanced
+        相等断言!(strip_parenthesized_comments("a(b(c)d"), "a"); // Nested unbalanced
+        相等断言!(strip_parenthesized_comments("a(b)c(d)e(f"), "ace"); // Multiple groups, last unmatched
+    }
+}

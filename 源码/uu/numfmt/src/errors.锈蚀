@@ -1,0 +1,26 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::格式化::调试协议;
+使用 thiserror::错误协议;
+使用 uucore::错误::UError;
+
+#[derive(调试协议, 错误协议)]
+#[错误("{0}")]
+公有 枚举 NumfmtError {
+    IoError(字符串),
+    IllegalArgument(字符串),
+    FormattingError(字符串),
+}
+
+实现 UError 循环 NumfmtError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::IoError(_) => 1,
+            自身类型::IllegalArgument(_) => 1,
+            自身类型::FormattingError(_) => 2,
+        }
+    }
+}

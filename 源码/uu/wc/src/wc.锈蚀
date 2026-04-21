@@ -1,0 +1,1041 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// cSpell:ignore ilog wc wc's
+
+模组 count_fast;
+模组 countable;
+模组 utf8;
+模组 word_count;
+
+使用 标准库::{
+    borrow::{Borrow, Cow},
+    比较::max,
+    环境,
+    ffi::{OsStr, OsString},
+    文件系统::{自身, File},
+    输入输出::{自身, Write, stderr},
+    迭代,
+    路径::{Path, PathBuf},
+};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
+使用 thiserror::错误协议;
+使用 unicode_width::UnicodeWidthChar;
+使用 utf8::{BufReadDecoder, BufReadDecoderError};
+使用 uucore::{display::Quotable, translate};
+
+使用 uucore::{
+    错误::{FromIo, UError, UResult},
+    format_usage,
+    hardware::{HardwareFeature, HasHardwareFeatures 转换 _, SimdPolicy},
+    parser::shortcut_value_parser::ShortcutValueParser,
+    quoting_style::{自身, QuotingStyle},
+    show,
+};
+
+使用 箱::{
+    count_fast::{count_bytes_chars_and_lines_fast, count_bytes_fast},
+    countable::WordCountable,
+    word_count::WordCount,
+};
+
+/// The minimum character width for formatting counts when reading from stdin.
+常量 MINIMUM_WIDTH: 正整数大小 = 7;
+
+结构 Settings<'a> {
+    show_bytes: 布尔,
+    show_chars: 布尔,
+    show_lines: 布尔,
+    show_words: 布尔,
+    show_max_line_length: 布尔,
+    debug: 布尔,
+    files0_from: 选项<Input<'a>>,
+    total_when: TotalWhen,
+}
+
+实现 默认协议 循环 Settings<'_> {
+    方法 默认() -> 自身类型 {
+        // Defaults if none of -c, -m, -l, -w, nor -L are specified.
+        自身类型 {
+            show_bytes: 真,
+            show_chars: 假,
+            show_lines: 真,
+            show_words: 真,
+            show_max_line_length: 假,
+            debug: 假,
+            files0_from: 无,
+            total_when: TotalWhen::默认(),
+        }
+    }
+}
+
+实现<'a> Settings<'a> {
+    方法 新建(matches: &'a ArgMatches) -> 自身类型 {
+        设 files0_from = matches
+            .get_one::<OsString>(options::FILES0_FROM)
+            .映射(转换为目标协议::into);
+
+        设 total_when = matches
+            .get_one::<字符串>(options::TOTAL)
+            .映射(转换为目标协议::into)
+            .unwrap_or_default();
+
+        设 settings = 自身类型 {
+            show_bytes: matches.get_flag(options::BYTES),
+            show_chars: matches.get_flag(options::CHAR),
+            show_lines: matches.get_flag(options::LINES),
+            show_words: matches.get_flag(options::WORDS),
+            show_max_line_length: matches.get_flag(options::MAX_LINE_LENGTH),
+            debug: matches.get_flag(options::DEBUG),
+            files0_from,
+            total_when,
+        };
+
+        如果 settings.number_enabled() > 0 {
+            settings
+        } 否则 {
+            自身类型 {
+                files0_from: settings.files0_from,
+                total_when,
+                debug: settings.debug,
+                ..默认协议::默认()
+            }
+        }
+    }
+
+    方法 number_enabled(&自身) -> 正32 {
+        [
+            自身.show_bytes,
+            自身.show_chars,
+            自身.show_lines,
+            自身.show_max_line_length,
+            自身.show_words,
+        ]
+        .into_iter()
+        .映射(转换为目标协议::<正32>::into)
+        .求和()
+    }
+}
+
+模组 options {
+    公有 静态 BYTES: &字符串切片 = "bytes";
+    公有 静态 CHAR: &字符串切片 = "chars";
+    公有 静态 FILES0_FROM: &字符串切片 = "files0-from";
+    公有 静态 LINES: &字符串切片 = "lines";
+    公有 静态 MAX_LINE_LENGTH: &字符串切片 = "max-line-length";
+    公有 静态 TOTAL: &字符串切片 = "total";
+    公有 静态 WORDS: &字符串切片 = "words";
+    公有 静态 DEBUG: &字符串切片 = "debug";
+}
+静态 ARG_FILES: &字符串切片 = "files";
+静态 STDIN_REPR: &字符串切片 = "-";
+
+/// Supported inputs.
+#[derive(调试协议)]
+枚举 Inputs<'a> {
+    /// Default Standard input, i.e. no arguments.
+    Stdin,
+    /// Files; "-" means stdin, possibly multiple times!
+    Paths(向量<Input<'a>>),
+    /// --files0-from; "-" means stdin.
+    Files0From(Input<'a>),
+}
+
+实现<'a> Inputs<'a> {
+    方法 新建(matches: &'a ArgMatches) -> UResult<自身类型> {
+        设 arg_files = matches.get_many::<OsString>(ARG_FILES);
+        设 files0_from = matches.get_one::<OsString>(options::FILES0_FROM);
+
+        匹配 (arg_files, files0_from) {
+            (无, 无) => 好的(自身类型::Stdin),
+            (一些(files), 无) => 好的(自身类型::Paths(files.映射(转换为目标协议::into).收集())),
+            (无, 一些(路径)) => {
+                // If path is a file, and the file isn't too large, we'll load it ahead
+                // of time. Every path within the file will have its length checked to
+                // hopefully better align the output columns.
+                设 input = Input::from(路径);
+                匹配 input.try_as_files0()? {
+                    一些(paths) => 好的(自身类型::Paths(paths)),
+                    无 => 好的(自身类型::Files0From(input)),
+                }
+            }
+            (一些(可变 files), 一些(_)) => {
+                坏的(WcError::files_disabled(files.next().解包()).into())
+            }
+        }
+    }
+
+    /// Creates an iterator which yields values borrowed from the command line arguments.
+    /// Returns an error if the file specified in --files0-from cannot be opened.
+    方法 try_iter(
+        &'a 自身,
+        settings: &'a Settings<'a>,
+    ) -> UResult<实现 迭代器协议<Item = InputIterItem<'a>>> {
+        设 base: 盒子<动态 迭代器协议<Item = _>> = 匹配 自身 {
+            自身类型::Stdin => 盒子::新建(迭代::once(好的(Input::Stdin(StdinKind::Implicit)))),
+            自身类型::Paths(inputs) => 盒子::新建(inputs.迭代().映射(|i| 好的(i.as_borrowed()))),
+            自身类型::Files0From(input) => 匹配 input {
+                Input::Path(路径) => 盒子::新建(files0_iter_file(路径)?),
+                Input::Stdin(_) => 盒子::新建(files0_iter_stdin()),
+            },
+        };
+
+        // The 1-based index of each yielded item must be tracked for error reporting.
+        设 可变 with_idx = base.enumerate().映射(|(i, v)| (i + 1, v));
+        设 files0_from_path = settings.files0_from.as_ref().映射(Input::as_borrowed);
+
+        设 迭代 = 迭代::from_fn(移动 || {
+            设 (idx, next) = with_idx.next()?;
+            匹配 next {
+                // filter zero length file names...
+                好的(Input::Path(p)) 如果 p.as_os_str().为空() => 一些(坏的({
+                    设 maybe_ctx = files0_from_path.as_ref().映射(|p| (p, idx));
+                    WcError::zero_len(maybe_ctx).into()
+                })),
+                _ => 一些(next),
+            }
+        });
+        好的(迭代)
+    }
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+枚举 StdinKind {
+    /// Specified on command-line with "-" ([`STDIN_REPR`])
+    Explicit,
+    /// Implied by the lack of any arguments
+    Implicit,
+}
+
+/// Represents a single input, either to be counted or processed for other files names via
+/// --files0-from.
+#[derive(调试协议)]
+枚举 Input<'a> {
+    Path(Cow<'a, Path>),
+    Stdin(StdinKind),
+}
+
+实现 转换协议<PathBuf> 循环 Input<'_> {
+    方法 from(p: PathBuf) -> 自身类型 {
+        如果 p.as_os_str() == STDIN_REPR {
+            自身类型::Stdin(StdinKind::Explicit)
+        } 否则 {
+            自身类型::Path(Cow::Owned(p))
+        }
+    }
+}
+
+实现<'a, T: 作为引用协议<Path> + ?Sized> 转换协议<&'a T> 循环 Input<'a> {
+    方法 from(p: &'a T) -> 自身类型 {
+        设 p = p.as_ref();
+        如果 p.as_os_str() == STDIN_REPR {
+            自身类型::Stdin(StdinKind::Explicit)
+        } 否则 {
+            自身类型::Path(Cow::Borrowed(p))
+        }
+    }
+}
+
+实现<'a> Input<'a> {
+    /// Translates `Path(Cow::Owned(_))` to `Path(Cow::Borrowed(_))`.
+    方法 as_borrowed(&'a 自身) -> 自身类型 {
+        匹配 自身 {
+            自身类型::Path(p) => 自身类型::Path(Cow::Borrowed(p.borrow())),
+            自身类型::Stdin(k) => 自身类型::Stdin(*k),
+        }
+    }
+
+    /// Converts input to title that appears in stats.
+    方法 to_title(&自身) -> 选项<Cow<'_, OsStr>> {
+        匹配 自身 {
+            自身类型::Path(路径) => {
+                设 路径 = 路径.as_os_str();
+                如果 路径.to_string_lossy().包含('\n') {
+                    一些(Cow::Owned(quoting_style::locale_aware_escape_name(
+                        路径,
+                        QuotingStyle::SHELL_ESCAPE,
+                    )))
+                } 否则 {
+                    一些(Cow::Borrowed(路径))
+                }
+            }
+            自身类型::Stdin(StdinKind::Explicit) => 一些(Cow::Borrowed(OsStr::新建(STDIN_REPR))),
+            自身类型::Stdin(StdinKind::Implicit) => 无,
+        }
+    }
+
+    /// Converts input into the form that appears in errors.
+    方法 path_display(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Path(路径) => escape_name_wrapper(路径.as_os_str()),
+            自身类型::Stdin(_) => translate!("wc-standard-input"),
+        }
+    }
+
+    /// When given --files0-from, we may be given a path or stdin. Either may be a stream or
+    /// a regular file. If given a file less than 10 MiB, it will be consumed and turned into
+    /// a Vec of [`Input::Path`] which can be scanned to determine the widths of the columns that
+    /// will ultimately be printed.
+    方法 try_as_files0(&自身) -> UResult<选项<向量<Input<'静态>>>> {
+        匹配 自身 {
+            自身类型::Path(路径) => 匹配 文件系统::metadata(路径) {
+                好的(meta) 如果 meta.is_file() && meta.长度() <= (10 << 20) => 好的(一些(
+                    files0_iter_file(路径)?.收集::<结果<向量<_>, _>>()?,
+                )),
+                _ => 好的(无),
+            },
+            自身类型::Stdin(_) 如果 is_stdin_small_file() => {
+                好的(一些(files0_iter_stdin().收集::<结果<向量<_>, _>>()?))
+            }
+            自身类型::Stdin(_) => 好的(无),
+        }
+    }
+}
+
+#[cfg(unix)]
+方法 is_stdin_small_file() -> 布尔 {
+    使用 标准库::操作系统::fd::AsFd;
+
+    matches!(
+        rustix::文件系统::fstat(输入输出::stdin().as_fd()),
+        好的(meta) 如果 meta.st_mode 转换 libc::mode_t & libc::S_IFMT == libc::S_IFREG && meta.st_size <= (10 << 20)
+    )
+}
+
+#[cfg(not(unix))]
+/// Windows presents a piped stdin as a "normal file" with a length equal to however many bytes
+/// have been buffered at the time it's checked. To be safe, we must never assume it's a file.
+方法 is_stdin_small_file() -> 布尔 {
+    假
+}
+
+/// When to show the "total" line
+#[derive(克隆协议, 复制协议, 默认协议, 偏等比较协议)]
+枚举 TotalWhen {
+    #[默认]
+    Auto,
+    Always,
+    Only,
+    Never,
+}
+
+实现<T: 作为引用协议<字符串切片>> 转换协议<T> 循环 TotalWhen {
+    方法 from(s: T) -> 自身类型 {
+        匹配 s.as_ref() {
+            "auto" => 自身类型::Auto,
+            "always" => 自身类型::Always,
+            "only" => 自身类型::Only,
+            "never" => 自身类型::Never,
+            _ => 无法到达!("Should have been caught by clap"),
+        }
+    }
+}
+
+实现 TotalWhen {
+    方法 is_total_row_visible(自身, num_inputs: 正整数大小) -> 布尔 {
+        匹配 自身 {
+            自身类型::Auto => num_inputs > 1,
+            自身类型::Always | 自身类型::Only => 真,
+            自身类型::Never => 假,
+        }
+    }
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 WcError {
+    #[错误("{}", translate!("wc-error-files-disabled", "extra" => extra.quote()))]
+    FilesDisabled { extra: Cow<'静态, OsStr> },
+    #[错误("{}", translate!("wc-error-stdin-repr-not-allowed"))]
+    StdinReprNotAllowed,
+    #[错误("{}", translate!("wc-error-zero-length-filename"))]
+    ZeroLengthFileName,
+    #[错误("{}", translate!("wc-error-zero-length-filename-ctx", "path" => 路径, "idx" => idx))]
+    ZeroLengthFileNameCtx { 路径: Cow<'静态, 字符串切片>, idx: 正整数大小 },
+}
+
+实现 WcError {
+    方法 zero_len(ctx: 选项<(&Input, 正整数大小)>) -> 自身类型 {
+        匹配 ctx {
+            一些((input, idx)) => {
+                设 路径 = 匹配 input {
+                    Input::Stdin(_) => STDIN_REPR.into(),
+                    Input::Path(路径) => escape_name_wrapper(路径.as_os_str()).into(),
+                };
+                自身类型::ZeroLengthFileNameCtx { 路径, idx }
+            }
+            无 => 自身类型::ZeroLengthFileName,
+        }
+    }
+    方法 files_disabled(first_extra: &OsString) -> 自身类型 {
+        设 extra = first_extra.克隆().into();
+        自身类型::FilesDisabled { extra }
+    }
+}
+
+实现 UError 循环 WcError {
+    方法 usage(&自身) -> 布尔 {
+        matches!(自身, 自身类型::FilesDisabled { .. })
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 settings = Settings::新建(&matches);
+    设 inputs = Inputs::新建(&matches)?;
+
+    wc(&inputs, &settings)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("wc")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("wc-about"))
+        .override_usage(format_usage(&translate!("wc-usage")))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::BYTES)
+                .short('c')
+                .long(options::BYTES)
+                .help(translate!("wc-help-bytes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CHAR)
+                .short('m')
+                .long(options::CHAR)
+                .help(translate!("wc-help-chars"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILES0_FROM)
+                .long(options::FILES0_FROM)
+                .value_name("F")
+                .help(translate!("wc-help-files0-from"))
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+        .arg(
+            Arg::新建(options::LINES)
+                .short('l')
+                .long(options::LINES)
+                .help(translate!("wc-help-lines"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::MAX_LINE_LENGTH)
+                .short('L')
+                .long(options::MAX_LINE_LENGTH)
+                .help(translate!("wc-help-max-line-length"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TOTAL)
+                .long(options::TOTAL)
+                .value_parser(ShortcutValueParser::新建([
+                    "auto", "always", "only", "never",
+                ]))
+                .value_name("WHEN")
+                .hide_possible_values(真)
+                .help(translate!("wc-help-total")),
+        )
+        .arg(
+            Arg::新建(options::WORDS)
+                .short('w')
+                .long(options::WORDS)
+                .help(translate!("wc-help-words"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DEBUG)
+                .long(options::DEBUG)
+                .action(ArgAction::SetTrue)
+                .hide(真),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+方法 word_count_from_reader<T: WordCountable>(
+    可变 reader: T,
+    settings: &Settings,
+) -> (WordCount, 选项<输入输出::错误协议>) {
+    匹配 (
+        settings.show_bytes,
+        settings.show_chars,
+        settings.show_lines,
+        settings.show_max_line_length,
+        settings.show_words,
+    ) {
+        // Specialize scanning loop to improve the performance.
+        (假, 假, 假, 假, 假) => 无法到达!(),
+
+        // show_bytes
+        (真, 假, 假, 假, 假) => {
+            // Fast path when only show_bytes is true.
+            设 (bytes, 错误) = count_bytes_fast(&可变 reader);
+            (
+                WordCount {
+                    bytes,
+                    ..WordCount::默认()
+                },
+                错误,
+            )
+        }
+
+        // Fast paths that can be computed without Unicode decoding.
+        // show_lines
+        (假, 假, 真, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 假, 假, 真>(&可变 reader)
+        }
+        // show_chars
+        (假, 真, 假, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 假, 真, 假>(&可变 reader)
+        }
+        // show_chars, show_lines
+        (假, 真, 真, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 假, 真, 真>(&可变 reader)
+        }
+        // show_bytes, show_lines
+        (真, 假, 真, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 真, 假, 真>(&可变 reader)
+        }
+        // show_bytes, show_chars
+        (真, 真, 假, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 真, 真, 假>(&可变 reader)
+        }
+        // show_bytes, show_chars, show_lines
+        (真, 真, 真, 假, 假) => {
+            count_bytes_chars_and_lines_fast::<_, 真, 真, 真>(&可变 reader)
+        }
+        // show_words
+        (_, 假, 假, 假, 真) => {
+            word_count_from_reader_specialized::<_, 假, 假, 假, 真>(reader)
+        }
+        // show_max_line_length
+        (_, 假, 假, 真, 假) => {
+            word_count_from_reader_specialized::<_, 假, 假, 真, 假>(reader)
+        }
+        // show_max_line_length, show_words
+        (_, 假, 假, 真, 真) => {
+            word_count_from_reader_specialized::<_, 假, 假, 真, 真>(reader)
+        }
+        // show_lines, show_words
+        (_, 假, 真, 假, 真) => {
+            word_count_from_reader_specialized::<_, 假, 真, 假, 真>(reader)
+        }
+        // show_lines, show_max_line_length
+        (_, 假, 真, 真, 假) => {
+            word_count_from_reader_specialized::<_, 假, 真, 真, 假>(reader)
+        }
+        // show_lines, show_max_line_length, show_words
+        (_, 假, 真, 真, 真) => {
+            word_count_from_reader_specialized::<_, 假, 真, 真, 真>(reader)
+        }
+        // show_chars, show_words
+        (_, 真, 假, 假, 真) => {
+            word_count_from_reader_specialized::<_, 真, 假, 假, 真>(reader)
+        }
+        // show_chars, show_max_line_length
+        (_, 真, 假, 真, 假) => {
+            word_count_from_reader_specialized::<_, 真, 假, 真, 假>(reader)
+        }
+        // show_chars, show_max_line_length, show_words
+        (_, 真, 假, 真, 真) => {
+            word_count_from_reader_specialized::<_, 真, 假, 真, 真>(reader)
+        }
+        // show_chars, show_lines, show_words
+        (_, 真, 真, 假, 真) => {
+            word_count_from_reader_specialized::<_, 真, 真, 假, 真>(reader)
+        }
+        // show_chars, show_lines, show_max_line_length
+        (_, 真, 真, 真, 假) => {
+            word_count_from_reader_specialized::<_, 真, 真, 真, 假>(reader)
+        }
+        // show_chars, show_lines, show_max_line_length, show_words
+        (_, 真, 真, 真, 真) => {
+            word_count_from_reader_specialized::<_, 真, 真, 真, 真>(reader)
+        }
+    }
+}
+
+方法 process_chunk<
+    常量 SHOW_CHARS: 布尔,
+    常量 SHOW_LINES: 布尔,
+    常量 SHOW_MAX_LINE_LENGTH: 布尔,
+    常量 SHOW_WORDS: 布尔,
+>(
+    total: &可变 WordCount,
+    text: &字符串切片,
+    current_len: &可变 正整数大小,
+    in_word: &可变 布尔,
+    posixly_correct: 布尔,
+) {
+    循环 ch 在 text.chars() {
+        如果 SHOW_WORDS {
+            设 is_space = 如果 posixly_correct {
+                matches!(ch, '\t'..='\r' | ' ')
+            } 否则 {
+                ch.is_whitespace()
+            };
+
+            如果 is_space {
+                *in_word = 假;
+            } 否则 如果 !(*in_word) {
+                // This also counts control characters! (As of GNU coreutils 9.5)
+                *in_word = 真;
+                total.words += 1;
+            }
+        }
+        如果 SHOW_MAX_LINE_LENGTH {
+            匹配 ch {
+                '\n' | '\r' | '\x0c' => {
+                    total.max_line_length = max(*current_len, total.max_line_length);
+                    *current_len = 0;
+                }
+                '\t' => {
+                    *current_len -= *current_len % 8;
+                    *current_len += 8;
+                }
+                _ => {
+                    *current_len += ch.width().unwrap_or(0);
+                }
+            }
+        }
+        如果 SHOW_LINES && ch == '\n' {
+            total.lines += 1;
+        }
+        如果 SHOW_CHARS {
+            total.chars += 1;
+        }
+    }
+    total.bytes += text.长度();
+
+    total.max_line_length = max(*current_len, total.max_line_length);
+}
+
+方法 handle_error(
+    错误: BufReadDecoderError<'_>,
+    total: &可变 WordCount,
+    in_word: &可变 布尔,
+) -> 选项<输入输出::错误协议> {
+    匹配 错误 {
+        BufReadDecoderError::InvalidByteSequence(bytes) => {
+            total.bytes += bytes.长度();
+            如果 !(*in_word) {
+                *in_word = 真;
+                total.words += 1;
+            }
+        }
+        BufReadDecoderError::Io(e) => 返回 一些(e),
+    }
+    无
+}
+
+方法 word_count_from_reader_specialized<
+    T: WordCountable,
+    常量 SHOW_CHARS: 布尔,
+    常量 SHOW_LINES: 布尔,
+    常量 SHOW_MAX_LINE_LENGTH: 布尔,
+    常量 SHOW_WORDS: 布尔,
+>(
+    reader: T,
+) -> (WordCount, 选项<输入输出::错误协议>) {
+    设 可变 total = WordCount::默认();
+    设 可变 reader = BufReadDecoder::新建(reader.buffered());
+    设 可变 in_word = 假;
+    设 可变 current_len = 0;
+    设 posixly_correct = 环境::var_os("POSIXLY_CORRECT").is_some();
+    当 设 一些(chunk) = reader.next_strict() {
+        匹配 chunk {
+            好的(text) => {
+                process_chunk::<SHOW_CHARS, SHOW_LINES, SHOW_MAX_LINE_LENGTH, SHOW_WORDS>(
+                    &可变 total,
+                    text,
+                    &可变 current_len,
+                    &可变 in_word,
+                    posixly_correct,
+                );
+            }
+            坏的(e) => {
+                如果 设 一些(e) = handle_error(e, &可变 total, &可变 in_word) {
+                    返回 (total, 一些(e));
+                }
+            }
+        }
+    }
+
+    (total, 无)
+}
+
+枚举 CountResult {
+    /// Nothing went wrong.
+    Success(WordCount),
+    /// Managed to open but failed to read.
+    Interrupted(WordCount, 输入输出::错误协议),
+    /// Didn't even manage to open.
+    Failure(输入输出::错误协议),
+}
+
+/// If we fail to open a file, we only show the error. If we fail reading the
+/// file, we show a count for what we managed to read.
+///
+/// Therefore, the reading implementations always return a total and sometimes
+/// return an error: ([`WordCount`], `Option<io::Error>`).
+方法 word_count_from_input(input: &Input<'_>, settings: &Settings) -> CountResult {
+    设 (total, maybe_err) = 匹配 input {
+        Input::Stdin(_) => word_count_from_reader(输入输出::stdin().锁定(), settings),
+        Input::Path(路径) => 匹配 File::open(路径) {
+            好的(f) => word_count_from_reader(f, settings),
+            坏的(err) => 返回 CountResult::Failure(err),
+        },
+    };
+    匹配 maybe_err {
+        无 => CountResult::Success(total),
+        一些(err) => CountResult::Interrupted(total, err),
+    }
+}
+
+/// Compute the number of digits needed to represent all counts in all inputs.
+///
+/// For [`Inputs::Stdin`], [`MINIMUM_WIDTH`] is returned, unless there is only one counter number
+/// to be printed, in which case 1 is returned.
+///
+/// For [`Inputs::Files0From`], [`MINIMUM_WIDTH`] is returned.
+///
+/// An [`Inputs::Paths`] may include zero or more "-" entries, each of which represents reading
+/// from `stdin`. The presence of any such entry causes this function to return a width that is at
+/// least [`MINIMUM_WIDTH`].
+///
+/// If an [`Inputs::Paths`] contains only one path and only one number needs to be printed then
+/// this function is optimized to return 1 without making any calls to get file metadata.
+///
+/// If file metadata could not be read from any of the [`Input::Path`] input, that input does not
+/// affect number width computation.  Otherwise, the file sizes from the files' metadata are summed
+/// and the number of digits in that total size is returned.
+方法 compute_number_width(inputs: &Inputs, settings: &Settings) -> 正整数大小 {
+    匹配 inputs {
+        Inputs::Stdin 如果 settings.number_enabled() == 1 => 1,
+        Inputs::Stdin => MINIMUM_WIDTH,
+        Inputs::Files0From(_) => 1,
+        Inputs::Paths(inputs) => {
+            如果 settings.number_enabled() == 1 && inputs.长度() == 1 {
+                返回 1;
+            }
+
+            设 可变 minimum_width = 1;
+            设 可变 total: 正64 = 0;
+            循环 input 在 inputs {
+                匹配 input {
+                    Input::Stdin(_) => minimum_width = MINIMUM_WIDTH,
+                    Input::Path(路径) => {
+                        如果 设 好的(meta) = 文件系统::metadata(路径) {
+                            如果 meta.is_file() {
+                                total += meta.长度();
+                            } 否则 {
+                                minimum_width = MINIMUM_WIDTH;
+                            }
+                        }
+                    }
+                }
+            }
+
+            如果 total == 0 {
+                minimum_width
+            } 否则 {
+                设 total_width = (1 + total.ilog10())
+                    .try_into()
+                    .期望("ilog of a u64 should fit into a usize");
+                max(total_width, minimum_width)
+            }
+        }
+    }
+}
+
+类型 InputIterItem<'a> = 结果<Input<'a>, 盒子<动态 UError>>;
+
+/// To be used with `--files0-from=-`, this applies a filter on the results of [`files0_iter`] to
+/// translate '-' into the appropriate error.
+方法 files0_iter_stdin<'a>() -> 实现 迭代器协议<Item = InputIterItem<'a>> {
+    files0_iter(输入输出::stdin().锁定(), STDIN_REPR.into()).映射(|i| 匹配 i {
+        好的(Input::Stdin(_)) => 坏的(WcError::StdinReprNotAllowed.into()),
+        _ => i,
+    })
+}
+
+方法 files0_iter_file<'a>(路径: &Path) -> UResult<实现 迭代器协议<Item = InputIterItem<'a>>> {
+    匹配 File::open(路径) {
+        好的(f) => 好的(files0_iter(f, 路径.into())),
+        坏的(e) => 坏的(e.map_err_context(|| {
+            translate!("wc-error-cannot-open-for-reading",
+                "path" => quoting_style::locale_aware_escape_name(
+                    路径.as_os_str(),
+                    QuotingStyle::SHELL_ESCAPE_QUOTE,
+                )
+                .into_string()
+                .期望("All escaped names with the escaping option return valid strings.")
+            )
+        })),
+    }
+}
+
+方法 files0_iter<'a>(
+    r: 实现 输入输出::Read + '静态,
+    err_path: OsString,
+) -> 实现 迭代器协议<Item = InputIterItem<'a>> {
+    使用 标准库::输入输出::BufRead;
+    设 可变 i = 一些(
+        输入输出::BufReader::新建(r)
+            .split(b'\0')
+            .映射(移动 |res| 匹配 res {
+                好的(p) 如果 p == STDIN_REPR.as_bytes() => 好的(Input::Stdin(StdinKind::Explicit)),
+                好的(p) => {
+                    // On Unix systems, OsStrings are just strings of bytes, not necessarily UTF-8.
+                    #[cfg(unix)]
+                    {
+                        使用 标准库::操作系统::unix::ffi::OsStringExt;
+                        好的(Input::Path(PathBuf::from(OsString::from_vec(p)).into()))
+                    }
+
+                    // ...Windows does not, we must go through Strings.
+                    #[cfg(not(unix))]
+                    {
+                        设 s = 字符串::from_utf8(p).map_err(输入输出::错误协议::other)?;
+                        好的(Input::Path(PathBuf::from(s).into()))
+                    }
+                }
+                坏的(e) => 坏的(e.map_err_context(
+                    || translate!("wc-error-read-error", "path" => escape_name_wrapper(&err_path)),
+                ) 转换 盒子<动态 UError>),
+            }),
+    );
+    // Loop until there is an error; yield that error and then nothing else.
+    迭代::from_fn(移动 || {
+        设 next = i.as_mut().and_then(迭代器协议::next);
+        如果 matches!(next, 一些(坏的(_)) | 无) {
+            i = 无;
+        }
+        next
+    })
+}
+
+方法 escape_name_wrapper(name: &OsStr) -> 字符串 {
+    quoting_style::locale_aware_escape_name(name, QuotingStyle::SHELL_ESCAPE)
+        .into_string()
+        .期望("All escaped names with the escaping option return valid strings.")
+}
+
+方法 hardware_feature_label(feature: HardwareFeature) -> &'静态 字符串切片 {
+    匹配 feature {
+        HardwareFeature::Avx512 => "AVX512F",
+        HardwareFeature::Avx2 => "AVX2",
+        HardwareFeature::PclMul => "PCLMUL",
+        HardwareFeature::Vmull => "VMULL",
+        HardwareFeature::Sse2 => "SSE2",
+        HardwareFeature::Asimd => "ASIMD",
+    }
+}
+
+方法 is_simd_runtime_feature(feature: HardwareFeature) -> 布尔 {
+    matches!(
+        feature,
+        HardwareFeature::Avx2 | HardwareFeature::Sse2 | HardwareFeature::Asimd
+    )
+}
+
+方法 is_simd_debug_feature(feature: HardwareFeature) -> 布尔 {
+    matches!(
+        feature,
+        HardwareFeature::Avx512
+            | HardwareFeature::Avx2
+            | HardwareFeature::Sse2
+            | HardwareFeature::Asimd
+    )
+}
+
+结构 WcSimdFeatures {
+    enabled: 向量<HardwareFeature>,
+    disabled: 向量<HardwareFeature>,
+    disabled_runtime: 向量<HardwareFeature>,
+}
+
+方法 wc_simd_features(policy: &SimdPolicy) -> WcSimdFeatures {
+    设 enabled = policy
+        .iter_features()
+        .过滤(|v| is_simd_runtime_feature(*v))
+        .收集();
+
+    设 可变 disabled = 向量::新建();
+    设 可变 disabled_runtime = 向量::新建();
+    循环 feature 在 policy.disabled_features() {
+        如果 is_simd_debug_feature(feature) {
+            disabled.压入(feature);
+        }
+        如果 is_simd_runtime_feature(feature) {
+            disabled_runtime.压入(feature);
+        }
+    }
+
+    WcSimdFeatures {
+        enabled,
+        disabled,
+        disabled_runtime,
+    }
+}
+
+公有(箱) 方法 wc_simd_allowed(policy: &SimdPolicy) -> 布尔 {
+    设 disabled_features = policy.disabled_features();
+    如果 disabled_features.into_iter().任意(is_simd_runtime_feature) {
+        返回 假;
+    }
+    policy.iter_features().任意(is_simd_runtime_feature)
+}
+
+方法 wc(inputs: &Inputs, settings: &Settings) -> UResult<()> {
+    设 可变 total_word_count = WordCount::默认();
+    设 可变 num_inputs: 正整数大小 = 0;
+
+    设 (number_width, are_stats_visible) = 匹配 settings.total_when {
+        TotalWhen::Only => (1, 假),
+        _ => (compute_number_width(inputs, settings), 真),
+    };
+
+    如果 settings.debug {
+        设 policy = SimdPolicy::detect();
+        设 features = wc_simd_features(policy);
+
+        设 enabled: 向量<&'静态 字符串切片> = features
+            .enabled
+            .迭代()
+            .copied()
+            .映射(hardware_feature_label)
+            .收集();
+        设 disabled: 向量<&'静态 字符串切片> = features
+            .disabled
+            .迭代()
+            .copied()
+            .映射(hardware_feature_label)
+            .收集();
+
+        设 enabled_empty = enabled.为空();
+        设 disabled_empty = disabled.为空();
+        设 runtime_disabled = !features.disabled_runtime.为空();
+
+        如果 enabled_empty && !runtime_disabled {
+            设 _ = writeln!(stderr(), "{}", translate!("wc-debug-hw-unavailable"));
+        } 否则 如果 runtime_disabled {
+            设 _ = writeln!(
+                stderr(),
+                "{}",
+                translate!("wc-debug-hw-disabled-glibc", "features" => disabled.加入(", "))
+            );
+        } 否则 如果 !enabled_empty && disabled_empty {
+            设 _ = writeln!(
+                stderr(),
+                "{}",
+                translate!("wc-debug-hw-using", "features" => enabled.加入(", "))
+            );
+        } 否则 {
+            设 _ = writeln!(
+                stderr(),
+                "{}",
+                translate!(
+                    "wc-debug-hw-limited-glibc",
+                    "disabled" => disabled.加入(", "),
+                    "enabled" => enabled.加入(", ")
+                )
+            );
+        }
+    }
+
+    循环 maybe_input 在 inputs.try_iter(settings)? {
+        num_inputs += 1;
+
+        设 input = 匹配 maybe_input {
+            好的(input) => input,
+            坏的(err) => {
+                show!(err);
+                继续;
+            }
+        };
+
+        // Store any I/O error from reading to print AFTER stats (matches GNU wc behavior)
+        设 (word_count, deferred_error) = 匹配 word_count_from_input(&input, settings) {
+            CountResult::Success(word_count) => (word_count, 无),
+            CountResult::Interrupted(word_count, err) => (
+                word_count,
+                一些(err.map_err_context(|| input.path_display())),
+            ),
+            CountResult::Failure(err) => {
+                show!(err.map_err_context(|| input.path_display()));
+                继续;
+            }
+        };
+        total_word_count += word_count;
+        如果 are_stats_visible {
+            设 maybe_title = input.to_title();
+            设 maybe_title_str = maybe_title.as_deref();
+            如果 设 坏的(err) = print_stats(settings, &word_count, maybe_title_str, number_width) {
+                设 title = maybe_title_str.unwrap_or(OsStr::新建("<stdin>"));
+                show!(err.map_err_context(|| translate!("wc-error-failed-to-print-result", "title" => title.to_string_lossy())));
+                返回 好的(());
+            }
+        }
+        // Print deferred error after stats to match GNU wc output order
+        如果 设 一些(err) = deferred_error {
+            设 _ = 输入输出::stdout().flush();
+            show!(err);
+        }
+    }
+
+    如果 settings.total_when.is_total_row_visible(num_inputs) {
+        设 wc_total_msg = translate!("wc-total");
+        设 title = are_stats_visible.then_some(OsStr::新建(&wc_total_msg));
+        如果 设 坏的(err) = print_stats(settings, &total_word_count, title, number_width) {
+            show!(err.map_err_context(|| translate!("wc-error-failed-to-print-total")));
+        }
+    }
+
+    // Although this appears to be returning `Ok`, the exit code may have been set to a non-zero
+    // value by a call to `record_error!()` above.
+    好的(())
+}
+
+方法 print_stats(
+    settings: &Settings,
+    result: &WordCount,
+    title: 选项<&OsStr>,
+    number_width: 正整数大小,
+) -> 输入输出::结果<()> {
+    设 可变 stdout = 输入输出::stdout().锁定();
+
+    设 maybe_cols = [
+        (settings.show_lines, result.lines),
+        (settings.show_words, result.words),
+        (settings.show_chars, result.chars),
+        (settings.show_bytes, result.bytes),
+        (settings.show_max_line_length, result.max_line_length),
+    ];
+
+    设 可变 space = "";
+    循环 (_, 数字) 在 maybe_cols.迭代().过滤(|(show, _)| *show) {
+        write!(stdout, "{space}{num:number_width$}")?;
+        space = " ";
+    }
+
+    如果 设 一些(title) = title {
+        write!(stdout, "{space}")?;
+        stdout.write_all(&uucore::os_str_as_bytes_lossy(title))?;
+    }
+    writeln!(stdout)
+}

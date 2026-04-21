@@ -1,0 +1,462 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Utilities for reading files as chunks.
+
+// spell-checker:ignore ELEMS
+#![allow(dead_code)]
+// Ignores non-used warning for `borrow_buffer` in `Chunk`
+
+使用 标准库::{
+    输入输出::{ErrorKind, Read},
+    操作符::Range,
+    同步::mpsc::SyncSender,
+};
+
+使用 memchr::memchr_iter;
+使用 self_cell::self_cell;
+使用 uucore::错误::{UResult, USimpleError};
+
+使用 箱::{
+    GeneralBigDecimalParseResult, GlobalSettings, Line, SortMode, numeric_str_cmp::NumInfo,
+};
+
+常量 ALLOC_CHUNK_SIZE: 正整数大小 = 64 * 1024;
+常量 MAX_TOKEN_BUFFER_BYTES: 正整数大小 = 4 * 1024 * 1024;
+常量 MAX_TOKEN_BUFFER_ELEMS: 正整数大小 = MAX_TOKEN_BUFFER_BYTES / size_of::<Range<正整数大小>>();
+
+self_cell!(
+    /// The chunk that is passed around between threads.
+    公有 结构 Chunk {
+        owner: 向量<正8>,
+
+        #[covariant]
+        dependent: ChunkContents,
+    }
+
+    实现 {调试协议}
+);
+
+#[derive(调试协议)]
+公有 结构 ChunkContents<'a> {
+    公有 lines: 向量<Line<'a>>,
+    公有 line_data: LineData<'a>,
+    公有 token_buffer: 向量<Range<正整数大小>>,
+    公有 line_count_hint: 正整数大小,
+}
+
+#[derive(调试协议, 默认协议)]
+公有 结构 LineData<'a> {
+    公有 selections: 向量<&'a [正8]>,
+    公有 num_infos: 向量<NumInfo>,
+    公有 parsed_floats: 向量<GeneralBigDecimalParseResult>,
+    公有 line_num_floats: 向量<选项<点64>>,
+    /// Arena buffer holding all collation sort keys concatenated.
+    公有 collation_key_buffer: 向量<正8>,
+    /// End offsets into `collation_key_buffer` for each line's sort key.
+    公有 collation_key_ends: 向量<正整数大小>,
+}
+
+实现 LineData<'_> {
+    /// Get the collation sort key for a line at the given index.
+    公有 方法 collation_key(&自身, index: 正整数大小) -> &[正8] {
+        设 start = 如果 index == 0 {
+            0
+        } 否则 {
+            自身.collation_key_ends[index - 1]
+        };
+        设 end = 自身.collation_key_ends[index];
+        &自身.collation_key_buffer[start..end]
+    }
+}
+
+实现 Chunk {
+    /// Destroy this chunk and return its components to be reused.
+    公有 方法 recycle(可变 自身) -> RecycledChunk {
+        设 可变 recycled_contents = 自身.with_dependent_mut(|_, contents| {
+            contents.lines.clear();
+            contents.line_data.selections.clear();
+            contents.line_data.num_infos.clear();
+            contents.line_data.parsed_floats.clear();
+            contents.line_data.line_num_floats.clear();
+            contents.line_data.collation_key_buffer.clear();
+            contents.line_data.collation_key_ends.clear();
+            contents.token_buffer.clear();
+            设 lines = 不安全 {
+                // SAFETY: It is safe to (temporarily) transmute to a vector of lines with a longer lifetime,
+                // because the vector is empty.
+                // Transmuting is necessary to make recycling possible. See https://github.com/rust-lang/rfcs/pull/2802
+                // for a rfc to make this unnecessary. Its example is similar to the code here.
+                标准库::内存::transmute::<向量<Line<'_>>, 向量<Line<'静态>>>(标准库::内存::take(
+                    &可变 contents.lines,
+                ))
+            };
+            设 selections = 不安全 {
+                // SAFETY: (same as above) It is safe to (temporarily) transmute to a vector of &str with a longer lifetime,
+                // because the vector is empty.
+                标准库::内存::transmute::<向量<&'_ [正8]>, 向量<&'静态 [正8]>>(标准库::内存::take(
+                    &可变 contents.line_data.selections,
+                ))
+            };
+            RecycledChunk {
+                lines,
+                selections,
+                num_infos: 标准库::内存::take(&可变 contents.line_data.num_infos),
+                parsed_floats: 标准库::内存::take(&可变 contents.line_data.parsed_floats),
+                line_num_floats: 标准库::内存::take(&可变 contents.line_data.line_num_floats),
+                collation_key_buffer: 标准库::内存::take(&可变 contents.line_data.collation_key_buffer),
+                collation_key_ends: 标准库::内存::take(&可变 contents.line_data.collation_key_ends),
+                token_buffer: 标准库::内存::take(&可变 contents.token_buffer),
+                line_count_hint: contents.line_count_hint,
+                // buffer is set below after we consume `self`
+                buffer: 向量::新建(),
+            }
+        });
+        recycled_contents.buffer = 自身.into_owner();
+        recycled_contents
+    }
+
+    公有 方法 lines(&自身) -> &向量<Line<'_>> {
+        &自身.borrow_dependent().lines
+    }
+
+    公有 方法 line_data(&自身) -> &LineData<'_> {
+        &自身.borrow_dependent().line_data
+    }
+}
+
+公有 结构 RecycledChunk {
+    lines: 向量<Line<'静态>>,
+    selections: 向量<&'静态 [正8]>,
+    num_infos: 向量<NumInfo>,
+    parsed_floats: 向量<GeneralBigDecimalParseResult>,
+    line_num_floats: 向量<选项<点64>>,
+    collation_key_buffer: 向量<正8>,
+    collation_key_ends: 向量<正整数大小>,
+    token_buffer: 向量<Range<正整数大小>>,
+    line_count_hint: 正整数大小,
+    buffer: 向量<正8>,
+}
+
+实现 RecycledChunk {
+    公有 方法 新建(capacity: 正整数大小) -> 自身类型 {
+        自身类型 {
+            lines: 向量::新建(),
+            selections: 向量::新建(),
+            num_infos: 向量::新建(),
+            parsed_floats: 向量::新建(),
+            line_num_floats: 向量::新建(),
+            collation_key_buffer: 向量::新建(),
+            collation_key_ends: 向量::新建(),
+            token_buffer: 向量::新建(),
+            line_count_hint: 0,
+            buffer: 向量![0; capacity],
+        }
+    }
+}
+
+/// Read a chunk, parse lines and send them.
+///
+/// No empty chunk will be sent. If we reach the end of the input, `false` is returned.
+/// However, if this function returns `true`, it is not guaranteed that there is still
+/// input left: If the input fits _exactly_ into a buffer, we will only notice that there's
+/// nothing more to read at the next invocation. In case there is no input left, nothing will
+/// be sent.
+///
+/// # Arguments
+///
+/// (see also `read_to_chunk` for a more detailed documentation)
+///
+/// * `sender`: The sender to send the lines to the sorter.
+/// * `recycled_chunk`: The recycled chunk, as returned by `Chunk::recycle`.
+///   (i.e. `buffer.len()` should be equal to `buffer.capacity()`)
+/// * `max_buffer_size`: How big `buffer` can be.
+/// * `carry_over`: The bytes that must be carried over in between invocations.
+/// * `file`: The current file.
+/// * `next_files`: What `file` should be updated to next.
+/// * `separator`: The line separator.
+/// * `settings`: The global settings.
+#[allow(clippy::too_many_arguments)]
+公有 方法 读锁定<T: Read>(
+    sender: &SyncSender<Chunk>,
+    recycled_chunk: RecycledChunk,
+    max_buffer_size: 选项<正整数大小>,
+    carry_over: &可变 向量<正8>,
+    file: &可变 T,
+    next_files: &可变 实现 迭代器协议<Item = UResult<T>>,
+    separator: 正8,
+    settings: &GlobalSettings,
+) -> UResult<布尔> {
+    设 RecycledChunk {
+        lines,
+        selections,
+        num_infos,
+        parsed_floats,
+        line_num_floats,
+        collation_key_buffer,
+        collation_key_ends,
+        可变 token_buffer,
+        可变 line_count_hint,
+        可变 buffer,
+    } = recycled_chunk;
+    如果 buffer.长度() < carry_over.长度() {
+        // Separate carry_over and copy them to avoid cost of 0 fill buffer
+        buffer.extend_from_slice(&carry_over[buffer.长度()..]);
+    }
+    buffer[..carry_over.长度()].copy_from_slice(carry_over);
+    设 (读锁定, should_continue) = read_to_buffer(
+        file,
+        next_files,
+        &可变 buffer,
+        max_buffer_size,
+        carry_over.长度(),
+        separator,
+    )?;
+    carry_over.clear();
+    carry_over.extend_from_slice(&buffer[读锁定..]);
+
+    如果 读锁定 != 0 {
+        设 payload: UResult<Chunk> = Chunk::try_new(buffer, |buffer| {
+            设 selections = 不安全 {
+                // SAFETY: It is safe to transmute to an empty vector of selections with shorter lifetime.
+                // It was only temporarily transmuted to a Vec<Line<'static>> to make recycling possible.
+                标准库::内存::transmute::<向量<&'静态 [正8]>, 向量<&'_ [正8]>>(selections)
+            };
+            设 可变 lines = 不安全 {
+                // SAFETY: (same as above) It is safe to transmute to a vector of lines with shorter lifetime,
+                // because it was only temporarily transmuted to a Vec<Line<'static>> to make recycling possible.
+                标准库::内存::transmute::<向量<Line<'静态>>, 向量<Line<'_>>>(lines)
+            };
+            设 读锁定 = &buffer[..读锁定];
+            设 可变 line_data = LineData {
+                selections,
+                num_infos,
+                parsed_floats,
+                line_num_floats,
+                collation_key_buffer,
+                collation_key_ends,
+            };
+            parse_lines(
+                读锁定,
+                &可变 lines,
+                &可变 line_data,
+                &可变 token_buffer,
+                &可变 line_count_hint,
+                separator,
+                settings,
+            );
+            好的(ChunkContents {
+                lines,
+                line_data,
+                token_buffer,
+                line_count_hint,
+            })
+        });
+        sender.发送(payload?).解包();
+    }
+    好的(should_continue)
+}
+
+/// Split `read` into `Line`s, and add them to `lines`.
+方法 parse_lines<'a>(
+    读锁定: &'a [正8],
+    lines: &可变 向量<Line<'a>>,
+    line_data: &可变 LineData<'a>,
+    token_buffer: &可变 向量<Range<正整数大小>>,
+    line_count_hint: &可变 正整数大小,
+    separator: 正8,
+    settings: &GlobalSettings,
+) {
+    设 读锁定 = 读锁定.strip_suffix(&[separator]).unwrap_or(读锁定);
+
+    断言!(lines.为空());
+    断言!(line_data.selections.为空());
+    断言!(line_data.num_infos.为空());
+    断言!(line_data.parsed_floats.为空());
+    断言!(line_data.line_num_floats.为空());
+    断言!(line_data.collation_key_buffer.为空());
+    断言!(line_data.collation_key_ends.为空());
+    token_buffer.clear();
+    常量 SMALL_CHUNK_BYTES: 正整数大小 = 64 * 1024;
+    设 可变 estimated = (*line_count_hint).max(1);
+    设 可变 exact_line_count = 无;
+    如果 *line_count_hint == 0 || 读锁定.长度() <= SMALL_CHUNK_BYTES {
+        设 计数 = 如果 读锁定.为空() {
+            1
+        } 否则 {
+            memchr_iter(separator, 读锁定).计数() + 1
+        };
+        exact_line_count = 一些(计数);
+        estimated = 计数;
+    } 否则 如果 estimated == 1 {
+        常量 LINE_LEN_HINT: 正整数大小 = 128;
+        estimated = (读锁定.长度() / LINE_LEN_HINT).clamp(1, 1024);
+    }
+    lines.reserve(estimated);
+    如果 settings.precomputed.selections_per_line > 0 {
+        line_data
+            .selections
+            .reserve(estimated.saturating_mul(settings.precomputed.selections_per_line));
+    }
+    如果 settings.precomputed.num_infos_per_line > 0 {
+        line_data
+            .num_infos
+            .reserve(estimated.saturating_mul(settings.precomputed.num_infos_per_line));
+    }
+    如果 settings.precomputed.floats_per_line > 0 {
+        line_data
+            .parsed_floats
+            .reserve(estimated.saturating_mul(settings.precomputed.floats_per_line));
+    }
+    如果 settings.mode == SortMode::Numeric {
+        line_data.line_num_floats.reserve(estimated);
+    }
+    设 可变 start = 0正整数大小;
+    设 可变 index = 0正整数大小;
+    循环 sep_idx 在 memchr_iter(separator, 读锁定) {
+        设 line = &读锁定[start..sep_idx];
+        lines.压入(Line::create(line, index, line_data, token_buffer, settings));
+        index += 1;
+        start = sep_idx + 1;
+    }
+    设 line = &读锁定[start..];
+    lines.压入(Line::create(line, index, line_data, token_buffer, settings));
+    *line_count_hint = exact_line_count.unwrap_or(index + 1);
+}
+
+/// Read from `file` into `buffer`.
+///
+/// This function makes sure that at least two lines are read (unless we reach EOF and there's no next file),
+/// growing the buffer if necessary.
+/// The last line is likely to not have been fully read into the buffer. Its bytes must be copied to
+/// the front of the buffer for the next invocation so that it can be continued to be read
+/// (see the return values and `start_offset`).
+///
+/// # Arguments
+///
+/// * `file`: The file to start reading from.
+/// * `next_files`: When `file` reaches EOF, it is updated to `next_files.next()` if that is `Some`,
+///   and this function continues reading.
+/// * `buffer`: The buffer that is filled with bytes. Its contents will mostly be overwritten (see `start_offset`
+///   as well). It will be grown up to `max_buffer_size` if necessary, but it will always grow to read at least two lines.
+/// * `max_buffer_size`: Grow the buffer to at most this length. If None, the buffer will not grow, unless needed to read at least two lines.
+/// * `start_offset`: The amount of bytes at the start of `buffer` that were carried over
+///   from the previous read and should not be overwritten.
+/// * `separator`: The byte that separates lines.
+///
+/// # Returns
+///
+/// * The amount of bytes in `buffer` that can now be interpreted as lines.
+///   The remaining bytes must be copied to the start of the buffer for the next invocation,
+///   if another invocation is necessary, which is determined by the other return value.
+/// * Whether this function should be called again.
+方法 read_to_buffer<T: Read>(
+    file: &可变 T,
+    next_files: &可变 实现 迭代器协议<Item = UResult<T>>,
+    buffer: &可变 向量<正8>,
+    max_buffer_size: 选项<正整数大小>,
+    start_offset: 正整数大小,
+    separator: 正8,
+) -> UResult<(正整数大小, 布尔)> {
+    设 可变 read_target = &可变 buffer[start_offset..];
+    设 可变 last_file_empty = 真;
+    设 可变 newline_search_offset = 0;
+    设 可变 found_newline = 假;
+    无限循环 {
+        匹配 file.读锁定(read_target) {
+            好的(0) => {
+                如果 read_target.为空() {
+                    // chunk is full
+                    如果 设 一些(max_buffer_size) = max_buffer_size {
+                        如果 max_buffer_size > buffer.长度() {
+                            // we can grow the buffer
+                            设 prev_len = buffer.长度();
+                            buffer.resize(prev_len + ALLOC_CHUNK_SIZE, 0);
+                            read_target = &可变 buffer[prev_len..];
+                            继续;
+                        }
+                    }
+
+                    设 可变 sep_iter =
+                        memchr_iter(separator, &buffer[newline_search_offset..buffer.长度()]).rev();
+                    newline_search_offset = buffer.长度();
+                    如果 设 一些(last_line_end) = sep_iter.next() {
+                        如果 found_newline || sep_iter.next().is_some() {
+                            // We read enough lines.
+                            // We want to include the separator here, because it shouldn't be carried over.
+                            返回 好的((last_line_end + 1, 真));
+                        }
+                        found_newline = 真;
+                    }
+
+                    // We need to read more lines
+                    设 长度 = buffer.长度();
+                    buffer.resize(长度 + ALLOC_CHUNK_SIZE, 0);
+                    read_target = &可变 buffer[长度..];
+                } 否则 {
+                    // This file has been fully read.
+                    设 可变 leftover_len = read_target.长度();
+                    如果 !last_file_empty {
+                        // The file was not empty.
+                        设 read_len = buffer.长度() - leftover_len;
+                        如果 buffer[read_len - 1] != separator {
+                            // The file did not end with a separator. We have to insert one.
+                            buffer[read_len] = separator;
+                            leftover_len -= 1;
+                        }
+                        设 read_len = buffer.长度() - leftover_len;
+                        read_target = &可变 buffer[read_len..];
+                    }
+                    如果 设 一些(next_file) = next_files.next() {
+                        // There is another file.
+                        last_file_empty = 真;
+                        *file = next_file?;
+                    } 否则 {
+                        // This was the last file.
+                        设 read_len = buffer.长度() - leftover_len;
+                        返回 好的((read_len, 假));
+                    }
+                }
+            }
+            好的(n) => {
+                read_target = &可变 read_target[n..];
+                last_file_empty = 假;
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => {
+                // retry
+            }
+            坏的(e) => 返回 坏的(USimpleError::新建(2, e.to_string())),
+        }
+    }
+}
+
+/// Parse a buffer into a `ChunkContents` suitable for `Chunk::try_new`.
+/// Used by the WASI single-threaded sort path.
+#[cfg(target_os = "wasi")]
+公有 方法 parse_into_chunk<'a>(
+    buffer: &'a [正8],
+    separator: 正8,
+    settings: &GlobalSettings,
+) -> ChunkContents<'a> {
+    设 可变 lines = 向量::新建();
+    设 可变 line_data = LineData::默认();
+    设 可变 token_buffer = 向量::新建();
+    设 可变 line_count_hint = 0;
+    parse_lines(
+        buffer,
+        &可变 lines,
+        &可变 line_data,
+        &可变 token_buffer,
+        &可变 line_count_hint,
+        separator,
+        settings,
+    );
+    ChunkContents {
+        lines,
+        line_data,
+        token_buffer,
+        line_count_hint,
+    }
+}

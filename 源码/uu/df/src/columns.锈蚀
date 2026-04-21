@@ -1,0 +1,221 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore itotal iused iavail ipcent pcent squashfs
+使用 箱::{OPT_INODES, OPT_OUTPUT, OPT_PRINT_TYPE};
+使用 clap::{ArgMatches, parser::ValueSource};
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+
+/// The columns in the output table produced by `df`.
+///
+/// The [`Row`] struct has a field corresponding to each of the
+/// variants of this enumeration.
+///
+/// [`Row`]: crate::table::Row
+#[derive(偏等比较协议, 复制协议, 克隆协议)]
+公有(箱) 枚举 Column {
+    /// The source of the mount point, usually a device.
+    Source,
+
+    /// Total number of blocks.
+    Size,
+
+    /// Number of used blocks.
+    Used,
+
+    /// Number of available blocks.
+    Avail,
+
+    /// Percentage of blocks used out of total number of blocks.
+    Pcent,
+
+    /// The mount point.
+    Target,
+
+    /// Total number of inodes.
+    Itotal,
+
+    /// Number of used inodes.
+    Iused,
+
+    /// Number of available inodes.
+    Iavail,
+
+    /// Percentage of inodes used out of total number of inodes.
+    Ipcent,
+
+    /// The filename given as a command-line argument.
+    File,
+
+    /// The filesystem type, like "ext4" or "squashfs".
+    Fstype,
+
+    /// Percentage of bytes available to non-privileged processes.
+    #[cfg(target_os = "macos")]
+    Capacity,
+}
+
+/// An error while defining which columns to display in the output table.
+#[derive(调试协议, 错误协议)]
+公有(箱) 枚举 ColumnError {
+    /// If a column appears more than once in the `--output` argument.
+    #[错误("{}", .0.quote())]
+    MultipleColumns(字符串),
+}
+
+实现 Column {
+    /// Convert from command-line arguments to sequence of columns.
+    ///
+    /// The set of columns that will appear in the output table can be
+    /// specified by command-line arguments. This function converts
+    /// those arguments to a [`Vec`] of [`Column`] variants.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if a column is specified more
+    /// than once in the command-line argument.
+    公有(箱) 方法 from_matches(matches: &ArgMatches) -> 结果<向量<自身类型>, ColumnError> {
+        匹配 (
+            matches.get_flag(OPT_PRINT_TYPE),
+            matches.get_flag(OPT_INODES),
+            matches.value_source(OPT_OUTPUT) == 一些(ValueSource::CommandLine),
+        ) {
+            (假, 假, 假) => 好的(向量![
+                自身类型::Source,
+                自身类型::Size,
+                自身类型::Used,
+                自身类型::Avail,
+                #[cfg(target_os = "macos")]
+                自身类型::Capacity,
+                自身类型::Pcent,
+                自身类型::Target,
+            ]),
+            (假, 假, 真) => {
+                // Unwrapping should not panic because in this arm of
+                // the `match` statement, we know that `OPT_OUTPUT`
+                // is non-empty.
+                设 names = matches
+                    .get_many::<字符串>(OPT_OUTPUT)
+                    .解包()
+                    .映射(字符串::as_str);
+                设 可变 seen: 向量<&字符串切片> = 向量![];
+                设 可变 columns = 向量![];
+                循环 name 在 names {
+                    如果 seen.包含(&name) {
+                        返回 坏的(ColumnError::MultipleColumns(name.to_string()));
+                    }
+                    seen.压入(name);
+                    // Unwrapping here should not panic because the
+                    // command-line argument parsing library should be
+                    // responsible for ensuring each comma-separated
+                    // string is a valid column label.
+                    设 column = 自身类型::parse(name).解包();
+                    columns.压入(column);
+                }
+                好的(columns)
+            }
+            (假, 真, 假) => 好的(向量![
+                自身类型::Source,
+                自身类型::Itotal,
+                自身类型::Iused,
+                自身类型::Iavail,
+                自身类型::Ipcent,
+                自身类型::Target,
+            ]),
+            (真, 假, 假) => 好的(向量![
+                自身类型::Source,
+                自身类型::Fstype,
+                自身类型::Size,
+                自身类型::Used,
+                自身类型::Avail,
+                #[cfg(target_os = "macos")]
+                自身类型::Capacity,
+                自身类型::Pcent,
+                自身类型::Target,
+            ]),
+            (真, 真, 假) => 好的(向量![
+                自身类型::Source,
+                自身类型::Fstype,
+                自身类型::Itotal,
+                自身类型::Iused,
+                自身类型::Iavail,
+                自身类型::Ipcent,
+                自身类型::Target,
+            ]),
+            // The command-line arguments -T and -i are each mutually
+            // exclusive with --output, so the command-line argument
+            // parser should reject those combinations before we get
+            // to this point in the code.
+            _ => 无法到达!(),
+        }
+    }
+
+    /// Convert a column name to the corresponding enumeration variant.
+    ///
+    /// There are twelve valid column names, one for each variant:
+    ///
+    /// - "source"
+    /// - "fstype"
+    /// - "itotal"
+    /// - "iused"
+    /// - "iavail"
+    /// - "ipcent"
+    /// - "size"
+    /// - "used"
+    /// - "avail"
+    /// - "pcent"
+    /// - "file"
+    /// - "target"
+    ///
+    /// # Errors
+    ///
+    /// If the string `s` is not one of the valid column names.
+    方法 parse(s: &字符串切片) -> 结果<自身类型, ()> {
+        匹配 s {
+            "source" => 好的(自身类型::Source),
+            "fstype" => 好的(自身类型::Fstype),
+            "itotal" => 好的(自身类型::Itotal),
+            "iused" => 好的(自身类型::Iused),
+            "iavail" => 好的(自身类型::Iavail),
+            "ipcent" => 好的(自身类型::Ipcent),
+            "size" => 好的(自身类型::Size),
+            "used" => 好的(自身类型::Used),
+            "avail" => 好的(自身类型::Avail),
+            "pcent" => 好的(自身类型::Pcent),
+            "file" => 好的(自身类型::File),
+            "target" => 好的(自身类型::Target),
+            _ => 坏的(()),
+        }
+    }
+
+    /// Return the alignment of the specified column.
+    公有(箱) 方法 alignment(自身) -> Alignment {
+        匹配 自身 {
+            自身类型::Source | 自身类型::Target | 自身类型::File | 自身类型::Fstype => Alignment::Left,
+            _ => Alignment::Right,
+        }
+    }
+
+    /// Return the minimum width of the specified column.
+    公有(箱) 方法 min_width(自身) -> 正整数大小 {
+        匹配 自身 {
+            // 14 = length of "Filesystem" plus 4 spaces
+            自身类型::Source => 14,
+            自身类型::Used => 5,
+            自身类型::Size => 5,
+            // the shortest headers have a length of 4 chars so we use that as the minimum width
+            _ => 4,
+        }
+    }
+}
+
+/// A column's alignment.
+///
+/// We define our own `Alignment` enum instead of using `std::fmt::Alignment` because df doesn't
+/// have centered columns and hence a `Center` variant is not needed.
+公有(箱) 枚举 Alignment {
+    Left,
+    Right,
+}

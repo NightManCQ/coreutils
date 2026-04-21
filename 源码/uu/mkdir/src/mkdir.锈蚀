@@ -1,0 +1,374 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) ugoa cmode RAII
+
+使用 clap::builder::ValueParser;
+使用 clap::parser::ValuesRef;
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{Write, stdout};
+使用 标准库::路径::{Path, PathBuf};
+#[cfg(全部(unix, target_os = "linux"))]
+使用 uucore::错误::FromIo;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::translate;
+
+#[cfg(not(windows))]
+使用 uucore::mode;
+使用 uucore::{display::Quotable, 文件系统::dir_strip_dot_for_creation};
+使用 uucore::{format_usage, show_if_err};
+
+静态 DEFAULT_PERM: 正32 = 0o777;
+
+模组 options {
+    公有 常量 MODE: &字符串切片 = "mode";
+    公有 常量 PARENTS: &字符串切片 = "parents";
+    公有 常量 VERBOSE: &字符串切片 = "verbose";
+    公有 常量 DIRS: &字符串切片 = "dirs";
+    公有 常量 SECURITY_CONTEXT: &字符串切片 = "z";
+    公有 常量 CONTEXT: &字符串切片 = "context";
+}
+
+/// Configuration for directory creation.
+公有 结构 Config<'a> {
+    /// Create parent directories as needed.
+    公有 recursive: 布尔,
+
+    /// File permissions (octal).
+    公有 mode: 正32,
+
+    /// Print message for each created directory.
+    公有 verbose: 布尔,
+
+    /// Set security context (SELinux/SMACK).
+    公有 set_security_context: 布尔,
+
+    /// Specific `SELinux` context.
+    公有 context: 选项<&'a 字符串>,
+}
+
+#[cfg(windows)]
+#[期望(
+    clippy::unnecessary_wraps,
+    reason = "fn sig must match on all platforms"
+)]
+方法 get_mode(_matches: &ArgMatches) -> 结果<正32, 字符串> {
+    好的(DEFAULT_PERM)
+}
+
+#[cfg(not(windows))]
+方法 get_mode(matches: &ArgMatches) -> 结果<正32, 字符串> {
+    // Not tested on Windows
+    如果 设 一些(m) = matches.get_one::<字符串>(options::MODE) {
+        mode::parse_chmod(DEFAULT_PERM, m, 真, mode::get_umask())
+    } 否则 {
+        // If no mode argument is specified return the mode derived from umask
+        好的(!mode::get_umask() & DEFAULT_PERM)
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    // Linux-specific options, not implemented
+    // opts.optflag("Z", "context", "set SELinux security context" +
+    // " of each created directory to CTX"),
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 dirs = matches
+        .get_many::<OsString>(options::DIRS)
+        .unwrap_or_default();
+    设 verbose = matches.get_flag(options::VERBOSE);
+    设 recursive = matches.get_flag(options::PARENTS);
+
+    // Extract the SELinux related flags and options
+    设 set_security_context = matches.get_flag(options::SECURITY_CONTEXT);
+    设 context = matches.get_one::<字符串>(options::CONTEXT);
+
+    匹配 get_mode(&matches) {
+        好的(mode) => {
+            设 config = Config {
+                recursive,
+                mode,
+                verbose,
+                set_security_context: set_security_context || context.is_some(),
+                context,
+            };
+            exec(dirs, &config);
+            好的(())
+        }
+        坏的(f) => 坏的(USimpleError::新建(1, f)),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("mkdir")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("mkdir"))
+        .about(translate!("mkdir-about"))
+        .override_usage(format_usage(&translate!("mkdir-usage")))
+        .infer_long_args(真)
+        .after_help(translate!("mkdir-after-help"))
+        .arg(
+            Arg::新建(options::MODE)
+                .short('m')
+                .long(options::MODE)
+                .help(translate!("mkdir-help-mode"))
+                .allow_hyphen_values(真)
+                .num_args(1),
+        )
+        .arg(
+            Arg::新建(options::PARENTS)
+                .short('p')
+                .long(options::PARENTS)
+                .help(translate!("mkdir-help-parents"))
+                .overrides_with(options::PARENTS)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long(options::VERBOSE)
+                .help(translate!("mkdir-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SECURITY_CONTEXT)
+                .short('Z')
+                .help(translate!("mkdir-help-selinux"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CONTEXT)
+                .long(options::CONTEXT)
+                .value_name("CTX")
+                .help(translate!("mkdir-help-context")),
+        )
+        .arg(
+            Arg::新建(options::DIRS)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .required(真)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::DirPath),
+        )
+}
+
+/**
+ * Create the list of new directories
+ */
+方法 exec(dirs: ValuesRef<OsString>, config: &Config) {
+    循环 dir 在 dirs {
+        设 path_buf = PathBuf::from(dir);
+        设 路径 = path_buf.as_path();
+
+        show_if_err!(mkdir(路径, config));
+    }
+}
+
+/// Create directory at a given `path`.
+///
+/// ## Options
+///
+/// * `recursive` --- create parent directories for the `path`, if they do not
+///   exist.
+/// * `mode` --- file mode for the directories (not implemented on windows).
+/// * `verbose` --- print a message for each printed directory.
+///
+/// ## Trailing dot
+///
+/// To match the GNU behavior, a path with the last directory being a single dot
+/// (like `some/path/to/.`) is created (with the dot stripped).
+公有 方法 mkdir(路径: &Path, config: &Config) -> UResult<()> {
+    如果 路径.as_os_str().为空() {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("mkdir-error-empty-directory-name"),
+        ));
+    }
+    // Special case to match GNU's behavior:
+    // mkdir -p foo/. should work and just create foo/
+    // std::fs::create_dir("foo/."); fails in pure Rust
+    设 path_buf = dir_strip_dot_for_creation(路径);
+    设 路径 = path_buf.as_path();
+    create_dir(路径, 假, config)
+}
+
+/// Only needed on Linux to add ACL permission bits after directory creation.
+#[cfg(全部(unix, target_os = "linux"))]
+方法 chmod(路径: &Path, mode: 正32) -> UResult<()> {
+    使用 标准库::文件系统::{Permissions, set_permissions};
+    使用 标准库::操作系统::unix::文件系统::PermissionsExt;
+    设 mode = Permissions::from_mode(mode);
+    set_permissions(路径, mode).map_err_context(
+        || translate!("mkdir-error-cannot-set-permissions", "path" => 路径.quote()),
+    )
+}
+
+// Create a directory at the given path.
+// Uses iterative approach instead of recursion to avoid stack overflow with deep nesting.
+方法 create_dir(路径: &Path, is_parent: 布尔, config: &Config) -> UResult<()> {
+    设 path_exists = 路径.exists();
+    如果 path_exists && !config.recursive {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("mkdir-error-file-exists", "path" => 路径.maybe_quote()),
+        ));
+    }
+    如果 路径 == Path::新建("") {
+        返回 好的(());
+    }
+
+    // Iterative implementation: collect all directories to create, then create them
+    // This avoids stack overflow with deeply nested directories
+    如果 config.recursive {
+        // Pre-allocate approximate capacity to avoid reallocations
+        设 可变 dirs_to_create = 向量::with_capacity(16);
+        设 可变 current = 路径;
+
+        // First pass: collect all parent directories
+        当 设 一些(parent) = current.parent() {
+            如果 parent == Path::新建("") {
+                中断;
+            }
+            dirs_to_create.压入(parent);
+            current = parent;
+        }
+
+        // Second pass: create directories from root to leaf
+        // Only create those that don't exist
+        循环 dir 在 dirs_to_create.迭代().rev() {
+            如果 !dir.exists() {
+                create_single_dir(dir, 真, config)?;
+            }
+        }
+    }
+
+    // Create the target directory
+    create_single_dir(路径, is_parent, config)
+}
+
+/// RAII guard to restore umask on drop, ensuring cleanup even on panic.
+#[cfg(unix)]
+结构 UmaskGuard(rustix::文件系统::Mode);
+
+#[cfg(unix)]
+实现 UmaskGuard {
+    /// Set umask to the given value and return a guard that restores the original on drop.
+    方法 set(new_mask: rustix::文件系统::Mode) -> 自身类型 {
+        设 old_mask = rustix::进程::umask(new_mask);
+        自身类型(old_mask)
+    }
+}
+
+#[cfg(unix)]
+实现 Drop 循环 UmaskGuard {
+    方法 drop(&可变 自身) {
+        rustix::进程::umask(自身.0);
+    }
+}
+
+/// Create a directory with the exact mode specified, bypassing umask.
+///
+/// GNU mkdir temporarily sets umask to 0 before calling mkdir(2), ensuring the
+/// directory is created atomically with the correct permissions. This avoids a
+/// race condition where the directory briefly exists with umask-based permissions.
+#[cfg(unix)]
+方法 create_dir_with_mode(路径: &Path, mode: 正32) -> 标准库::输入输出::结果<()> {
+    使用 标准库::操作系统::unix::文件系统::DirBuilderExt;
+
+    // Temporarily set umask to 0 so the directory is created with the exact mode.
+    // The guard restores the original umask on drop, even if we panic.
+    设 _guard = UmaskGuard::set(rustix::文件系统::Mode::empty());
+
+    标准库::文件系统::DirBuilder::新建().mode(mode).create(路径)
+}
+
+#[cfg(not(unix))]
+方法 create_dir_with_mode(路径: &Path, _mode: 正32) -> 标准库::输入输出::结果<()> {
+    标准库::文件系统::create_dir(路径)
+}
+
+// Helper function to create a single directory with appropriate permissions
+// `is_parent` argument is not used on windows
+#[allow(unused_variables)]
+方法 create_single_dir(路径: &Path, is_parent: 布尔, config: &Config) -> UResult<()> {
+    设 path_exists = 路径.exists();
+
+    // Calculate the mode to use for directory creation
+    #[cfg(unix)]
+    设 create_mode = 如果 is_parent {
+        // For parent directories with -p, use umask-derived mode with u+wx
+        (!mode::get_umask() & 0o777) | 0o300
+    } 否则 {
+        config.mode
+    };
+    #[cfg(not(unix))]
+    设 create_mode = config.mode;
+
+    匹配 create_dir_with_mode(路径, create_mode) {
+        好的(()) => {
+            如果 config.verbose {
+                writeln!(
+                    stdout(),
+                    "{}",
+                    translate!("mkdir-verbose-created-directory", "util_name" => "mkdir", "path" => 路径.quote())
+                )?;
+            }
+
+            // On Linux, we may need to add ACL permission bits via chmod.
+            // On other Unix systems, the directory was already created with the correct mode.
+            #[cfg(全部(unix, target_os = "linux"))]
+            如果 !path_exists {
+                // TODO: Make this macos and freebsd compatible by creating a function to get permission bits from
+                // acl in extended attributes
+                设 acl_perm_bits = uucore::fsxattr::get_acl_perm_bits_from_xattr(路径);
+                如果 acl_perm_bits != 0 {
+                    chmod(路径, create_mode | acl_perm_bits)?;
+                }
+            }
+
+            // Apply SELinux context if requested
+            #[cfg(feature = "selinux")]
+            如果 config.set_security_context && uucore::selinux::is_selinux_enabled() {
+                如果 设 坏的(e) = uucore::selinux::set_selinux_security_context(路径, config.context)
+                {
+                    设 _ = 标准库::文件系统::remove_dir(路径);
+                    返回 坏的(USimpleError::新建(1, e.to_string()));
+                }
+            }
+
+            // Apply SMACK context if requested
+            #[cfg(feature = "smack")]
+            如果 config.set_security_context {
+                uucore::smack::set_smack_label_and_cleanup(路径, config.context, |p| {
+                    标准库::文件系统::remove_dir(p)
+                })?;
+            }
+            好的(())
+        }
+
+        坏的(_) 如果 路径.is_dir() => {
+            // Directory already exists - check if this is a logical directory creation
+            // (i.e., not just a parent reference like "test_dir/..")
+            设 ends_with_parent_dir = matches!(
+                路径.components().next_back(),
+                一些(标准库::路径::Component::ParentDir)
+            );
+
+            // Print verbose message for logical directories, even if they exist
+            // This matches GNU behavior for paths like "test_dir/../test_dir_a"
+            如果 config.verbose && is_parent && config.recursive && !ends_with_parent_dir {
+                writeln!(
+                    stdout(),
+                    "{}",
+                    translate!("mkdir-verbose-created-directory", "util_name" => "mkdir", "path" => 路径.quote())
+                )?;
+            }
+            好的(())
+        }
+        坏的(e) => 坏的(e.into()),
+    }
+}

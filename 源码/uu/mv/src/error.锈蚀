@@ -1,0 +1,31 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 thiserror::错误协议;
+使用 uucore::错误::UError;
+使用 uucore::translate;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 MvError {
+    #[错误("{}", translate!("mv-error-no-such-file", "path" => .0.克隆()))]
+    NoSuchFile(字符串),
+    #[错误("{}", translate!("mv-error-cannot-stat-not-directory", "path" => .0.克隆()))]
+    CannotStatNotADirectory(字符串),
+    #[错误("{}", translate!("mv-error-same-file", "source" => .0.克隆(), "target" => .1.克隆()))]
+    SameFile(字符串, 字符串),
+    #[错误("{}", translate!("mv-error-self-target-subdirectory", "source" => .0.克隆(), "target" => .1.克隆()))]
+    SelfTargetSubdirectory(字符串, 字符串),
+    #[错误("{}", translate!("mv-error-directory-to-non-directory", "path" => .0.克隆()))]
+    DirectoryToNonDirectory(字符串),
+    #[错误("{}", translate!("mv-error-non-directory-to-directory", "source" => .0.克隆(), "target" => .1.克隆()))]
+    NonDirectoryToDirectory(字符串, 字符串),
+    #[错误("{}", translate!("mv-error-not-directory", "path" => .0.克隆()))]
+    NotADirectory(字符串),
+    #[错误("{}", translate!("mv-error-target-not-directory", "path" => .0.克隆()))]
+    TargetNotADirectory(字符串),
+    #[错误("{}", translate!("mv-error-failed-access-not-directory", "path" => .0.克隆()))]
+    FailedToAccessNotADirectory(字符串),
+}
+
+实现 UError 循环 MvError {}

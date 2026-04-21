@@ -1,0 +1,56 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) stdlib, ISCHR, GETFD
+// spell-checker:ignore (options) EPERM, ENOSYS, NOSYS
+
+使用 rustix::进程::{Pid 转换 RustixPid, test_kill_process};
+
+公有 类型 Pid = 整32;
+
+公有 结构 ProcessChecker {
+    pid: Pid,
+}
+
+实现 ProcessChecker {
+    公有 方法 新建(process_id: Pid) -> 自身类型 {
+        自身类型 { pid: process_id }
+    }
+
+    公有 方法 is_dead(&自身) -> 布尔 {
+        设 一些(pid) = RustixPid::from_raw(自身.pid) 否则 {
+            返回 真;
+        };
+        匹配 test_kill_process(pid) {
+            好的(()) => 假,
+            坏的(rustix::输入输出::Errno::PERM) => 假,
+            坏的(_) => 真,
+        }
+    }
+}
+
+实现 Drop 循环 ProcessChecker {
+    方法 drop(&可变 自身) {}
+}
+
+公有 方法 supports_pid_checks(pid: Pid) -> 布尔 {
+    设 一些(pid) = RustixPid::from_raw(pid) 否则 {
+        返回 假;
+    };
+    匹配 test_kill_process(pid) {
+        好的(()) => 真,
+        坏的(rustix::输入输出::Errno::NOSYS) => 假,
+        坏的(_) => 真,
+    }
+}
+
+//pub fn stdin_is_bad_fd() -> bool {
+// FIXME: Detect a closed file descriptor, e.g.: `tail <&-`
+// this is never `true`, even with `<&-` because Rust's stdlib is reopening fds as /dev/null
+// see also: https://github.com/uutils/coreutils/issues/2873
+// (gnu/tests/tail-2/follow-stdin.sh fails because of this)
+// unsafe { libc::fcntl(fd, libc::F_GETFD) == -1 && get_errno() == libc::EBADF }
+//false
+//}

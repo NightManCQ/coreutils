@@ -1,0 +1,966 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore hexupper lsbf msbf unpadded nopad aGVsbG8sIHdvcmxkIQ
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufRead, BufReader, Write};
+使用 标准库::路径::{Path, PathBuf};
+使用 uucore::display::Quotable;
+使用 uucore::encoding::{
+    BASE2LSBF, BASE2MSBF, Base32Wrapper, Base58Wrapper, Base64SimdWrapper, EncodingWrapper, Format,
+    SupportsFastDecodeAndEncode, Z85Wrapper,
+    for_base_common::{BASE32, BASE32HEX, BASE64URL, HEXUPPER_PERMISSIVE},
+};
+使用 uucore::错误::{FromIo, UResult, USimpleError, UUsageError, strip_errno};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+公有 常量 BASE_CMD_PARSE_ERROR: 整32 = 1;
+
+/// Encoded output will be formatted in lines of this length (the last line can be shorter)
+///
+/// Other implementations default to 76
+///
+/// This default is only used if no "-w"/"--wrap" argument is passed
+公有 常量 WRAP_DEFAULT: 正整数大小 = 76;
+
+// Fixed to 8 KiB (equivalent to `std::sys::io::DEFAULT_BUF_SIZE` on most targets)
+公有 常量 DEFAULT_BUF_SIZE: 正整数大小 = 8 * 1024;
+
+公有 结构 Config {
+    公有 decode: 布尔,
+    公有 ignore_garbage: 布尔,
+    公有 wrap_cols: 选项<正整数大小>,
+    公有 to_read: 选项<PathBuf>,
+}
+
+公有 模组 options {
+    公有 静态 DECODE: &字符串切片 = "decode";
+    公有 静态 WRAP: &字符串切片 = "wrap";
+    公有 静态 IGNORE_GARBAGE: &字符串切片 = "ignore-garbage";
+    公有 静态 FILE: &字符串切片 = "file";
+}
+
+实现 Config {
+    公有 方法 from(options: &clap::ArgMatches) -> UResult<自身类型> {
+        设 to_read = 匹配 options.get_many::<OsString>(options::FILE) {
+            一些(可变 values) => {
+                设 name = values.next().解包();
+
+                如果 设 一些(extra_op) = values.next() {
+                    返回 坏的(UUsageError::新建(
+                        BASE_CMD_PARSE_ERROR,
+                        translate!("base-common-extra-operand", "operand" => extra_op.quote()),
+                    ));
+                }
+
+                如果 name == "-" {
+                    无
+                } 否则 {
+                    设 路径 = Path::新建(name);
+
+                    如果 !路径.exists() {
+                        返回 坏的(USimpleError::新建(
+                            BASE_CMD_PARSE_ERROR,
+                            translate!("base-common-no-such-file", "file" => 路径.maybe_quote()),
+                        ));
+                    }
+
+                    一些(路径.to_owned())
+                }
+            }
+            无 => 无,
+        };
+
+        设 wrap_cols = options
+            .get_one::<字符串>(options::WRAP)
+            .映射(|数字| {
+                数字.parse::<正整数大小>().map_err(|_| {
+                    USimpleError::新建(
+                        BASE_CMD_PARSE_ERROR,
+                        translate!("base-common-invalid-wrap-size", "size" => 数字.quote()),
+                    )
+                })
+            })
+            .transpose()?;
+
+        好的(自身类型 {
+            decode: options.get_flag(options::DECODE),
+            ignore_garbage: options.get_flag(options::IGNORE_GARBAGE),
+            wrap_cols,
+            to_read,
+        })
+    }
+}
+
+公有 方法 parse_base_cmd_args(args: 实现 uucore::Args, command: Command) -> UResult<Config> {
+    设 matches = uucore::clap_localization::handle_clap_result(command, args)?;
+    Config::from(&matches)
+}
+
+公有 方法 base_app(about: 字符串, usage: 字符串) -> Command {
+    设 cmd = Command::新建("")
+        .version(uucore::crate_version!())
+        .about(about)
+        .override_usage(format_usage(&usage))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        // Format arguments.
+        .arg(
+            Arg::新建(options::DECODE)
+                .short('d')
+                .visible_short_alias('D')
+                .long(options::DECODE)
+                .help(translate!("base-common-help-decode"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::DECODE),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_GARBAGE)
+                .short('i')
+                .long(options::IGNORE_GARBAGE)
+                .help(translate!("base-common-help-ignore-garbage"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::IGNORE_GARBAGE),
+        )
+        .arg(
+            Arg::新建(options::WRAP)
+                .short('w')
+                .long(options::WRAP)
+                .value_name("COLS")
+                .help(translate!("base-common-help-wrap", "default" => WRAP_DEFAULT))
+                .overrides_with(options::WRAP),
+        )
+        // "multiple" arguments are used to check whether there is more than one
+        // file passed in.
+        .arg(
+            Arg::新建(options::FILE)
+                .index(1)
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(OsString))
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+公有 方法 get_input(config: &Config) -> UResult<盒子<动态 BufRead>> {
+    匹配 &config.to_read {
+        一些(path_buf) => {
+            设 file =
+                File::open(path_buf).map_err_context(|| path_buf.maybe_quote().to_string())?;
+            好的(盒子::新建(BufReader::with_capacity(DEFAULT_BUF_SIZE, file)))
+        }
+        无 => {
+            // Stdin is already buffered by the OS; wrap once more to reduce syscalls per read.
+            好的(盒子::新建(BufReader::with_capacity(
+                DEFAULT_BUF_SIZE,
+                输入输出::stdin(),
+            )))
+        }
+    }
+}
+公有 方法 handle_input<R: BufRead>(input: &可变 R, format: Format, config: Config) -> UResult<()> {
+    // Always allow padding for Base64 to avoid a full pre-scan of the input.
+    设 supports_fast_decode_and_encode =
+        get_supports_fast_decode_and_encode(format, config.decode, 真);
+
+    设 supports_fast_decode_and_encode_ref = supports_fast_decode_and_encode.as_ref();
+    设 可变 stdout_lock = 输入输出::stdout().锁定();
+    设 result = 匹配 (format, config.decode) {
+        // Base58 must process the entire input as one big integer; keep the
+        // historical behavior of buffering everything for this format only.
+        (Format::Base58, _) => {
+            设 可变 buffered = 向量::新建();
+            input
+                .read_to_end(&可变 buffered)
+                .map_err(|err| USimpleError::新建(1, format_read_error(&err)))?;
+            如果 config.decode {
+                fast_decode::fast_decode_buffer(
+                    buffered,
+                    &可变 stdout_lock,
+                    supports_fast_decode_and_encode_ref,
+                    config.ignore_garbage,
+                )
+            } 否则 {
+                fast_encode::fast_encode_buffer(
+                    buffered,
+                    &可变 stdout_lock,
+                    supports_fast_decode_and_encode_ref,
+                    config.wrap_cols,
+                )
+            }
+        }
+        // Streaming path for all other encodings keeps memory bounded.
+        (_, 真) => fast_decode::fast_decode_stream(
+            input,
+            &可变 stdout_lock,
+            supports_fast_decode_and_encode_ref,
+            config.ignore_garbage,
+        ),
+        (_, 假) => fast_encode::fast_encode_stream(
+            input,
+            &可变 stdout_lock,
+            supports_fast_decode_and_encode_ref,
+            config.wrap_cols,
+        ),
+    };
+
+    // Ensure any pending stdout buffer is flushed even if decoding failed; GNU basenc
+    // keeps already-decoded bytes visible before reporting the error.
+    匹配 (result, stdout_lock.flush()) {
+        (res, 好的(())) => res,
+        (好的(_), 坏的(err)) => 坏的(err.into()),
+        (坏的(original), 坏的(_)) => 坏的(original),
+    }
+}
+
+公有 方法 get_supports_fast_decode_and_encode(
+    format: Format,
+    decode: 布尔,
+    has_padding: 布尔,
+) -> 盒子<动态 SupportsFastDecodeAndEncode> {
+    常量 BASE16_VALID_DECODING_MULTIPLE: 正整数大小 = 2;
+    常量 BASE2_VALID_DECODING_MULTIPLE: 正整数大小 = 8;
+    常量 BASE32_VALID_DECODING_MULTIPLE: 正整数大小 = 8;
+    常量 BASE64_VALID_DECODING_MULTIPLE: 正整数大小 = 4;
+
+    常量 BASE16_UNPADDED_MULTIPLE: 正整数大小 = 1;
+    常量 BASE2_UNPADDED_MULTIPLE: 正整数大小 = 1;
+    常量 BASE32_UNPADDED_MULTIPLE: 正整数大小 = 5;
+    常量 BASE64_UNPADDED_MULTIPLE: 正整数大小 = 3;
+
+    匹配 format {
+        Format::Base16 => 盒子::from(EncodingWrapper::新建(
+            HEXUPPER_PERMISSIVE,
+            BASE16_VALID_DECODING_MULTIPLE,
+            BASE16_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"0123456789ABCDEFabcdef",
+        )),
+        Format::Base2Lsbf => 盒子::from(EncodingWrapper::新建(
+            BASE2LSBF,
+            BASE2_VALID_DECODING_MULTIPLE,
+            BASE2_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"01",
+        )),
+        Format::Base2Msbf => 盒子::from(EncodingWrapper::新建(
+            BASE2MSBF,
+            BASE2_VALID_DECODING_MULTIPLE,
+            BASE2_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"01",
+        )),
+        Format::Base32 => 盒子::from(Base32Wrapper::新建(
+            BASE32,
+            BASE32_VALID_DECODING_MULTIPLE,
+            BASE32_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=",
+        )),
+        Format::Base32Hex => 盒子::from(Base32Wrapper::新建(
+            BASE32HEX,
+            BASE32_VALID_DECODING_MULTIPLE,
+            BASE32_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUV=",
+        )),
+        Format::Base64 => {
+            设 alphabet: &[正8] = 如果 has_padding {
+                &b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/="[..]
+            } 否则 {
+                &b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"[..]
+            };
+            设 use_padding = !decode || has_padding;
+            盒子::from(Base64SimdWrapper::新建(
+                use_padding,
+                BASE64_VALID_DECODING_MULTIPLE,
+                BASE64_UNPADDED_MULTIPLE,
+                alphabet,
+            ))
+        }
+        Format::Base64Url => 盒子::from(EncodingWrapper::新建(
+            BASE64URL,
+            BASE64_VALID_DECODING_MULTIPLE,
+            BASE64_UNPADDED_MULTIPLE,
+            // spell-checker:disable-next-line
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789=_-",
+        )),
+        Format::Z85 => 盒子::from(Z85Wrapper {}),
+        Format::Base58 => 盒子::from(Base58Wrapper {}),
+    }
+}
+
+公有 模组 fast_encode {
+    使用 箱::base_common::WRAP_DEFAULT;
+    使用 标准库::{
+        比较::min,
+        集合::VecDeque,
+        输入输出::{自身, BufRead, Write},
+        数字::NonZeroUsize,
+    };
+    使用 uucore::{
+        encoding::SupportsFastDecodeAndEncode,
+        错误::{UResult, USimpleError},
+    };
+
+    结构 LineWrapping {
+        line_length: NonZeroUsize,
+        print_buffer: 向量<正8>,
+    }
+
+    // Start of helper functions
+    方法 encode_in_chunks_to_buffer(
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        read_buffer: &[正8],
+        encoded_buffer: &可变 VecDeque<正8>,
+    ) -> UResult<()> {
+        supports_fast_decode_and_encode.encode_to_vec_deque(read_buffer, encoded_buffer)?;
+        好的(())
+    }
+
+    方法 write_without_line_breaks(
+        encoded_buffer: &可变 VecDeque<正8>,
+        output: &可变 动态 Write,
+        is_cleanup: 布尔,
+        empty_wrap: 布尔,
+    ) -> 输入输出::结果<()> {
+        // TODO
+        // `encoded_buffer` only has to be a VecDeque if line wrapping is enabled
+        // (`make_contiguous` should be a no-op here)
+        // Refactoring could avoid this call
+        output.write_all(encoded_buffer.make_contiguous())?;
+
+        如果 is_cleanup {
+            如果 !empty_wrap {
+                output.write_all(b"\n")?;
+            }
+        } 否则 {
+            encoded_buffer.clear();
+        }
+
+        好的(())
+    }
+
+    方法 write_with_line_breaks(
+        &可变 LineWrapping {
+            引用 line_length,
+            引用 可变 print_buffer,
+        }: &可变 LineWrapping,
+        encoded_buffer: &可变 VecDeque<正8>,
+        output: &可变 动态 Write,
+        is_cleanup: 布尔,
+    ) -> 输入输出::结果<()> {
+        设 line_length = line_length.获取();
+
+        设 make_contiguous_result = encoded_buffer.make_contiguous();
+
+        设 chunks_exact = make_contiguous_result.chunks_exact(line_length);
+
+        设 可变 bytes_added_to_print_buffer = 0;
+
+        循环 sl 在 chunks_exact {
+            bytes_added_to_print_buffer += sl.长度();
+
+            print_buffer.extend_from_slice(sl);
+            print_buffer.压入(b'\n');
+        }
+
+        output.write_all(print_buffer)?;
+
+        // Remove the bytes that were just printed from `encoded_buffer`
+        drop(encoded_buffer.清空(..bytes_added_to_print_buffer));
+
+        如果 is_cleanup {
+            如果 encoded_buffer.为空() {
+                // Do not write a newline in this case, because two trailing newlines should never be printed
+            } 否则 {
+                // Print the partial line, since this is cleanup and no more data is coming
+                output.write_all(encoded_buffer.make_contiguous())?;
+                output.write_all(b"\n")?;
+            }
+        } 否则 {
+            print_buffer.clear();
+        }
+
+        好的(())
+    }
+
+    方法 write_to_output(
+        line_wrapping: &可变 选项<LineWrapping>,
+        encoded_buffer: &可变 VecDeque<正8>,
+        output: &可变 动态 Write,
+        is_cleanup: 布尔,
+        empty_wrap: 布尔,
+    ) -> 输入输出::结果<()> {
+        // Write all data in `encoded_buffer` to `output`
+        如果 设 &可变 一些(引用 可变 li) = line_wrapping {
+            write_with_line_breaks(li, encoded_buffer, output, is_cleanup)?;
+        } 否则 {
+            write_without_line_breaks(encoded_buffer, output, is_cleanup, empty_wrap)?;
+        }
+
+        好的(())
+    }
+    // End of helper functions
+
+    公有 方法 fast_encode_buffer(
+        input: 向量<正8>,
+        output: &可变 动态 Write,
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        wrap: 选项<正整数大小>,
+    ) -> UResult<()> {
+        // Based on performance testing
+
+        常量 ENCODE_IN_CHUNKS_OF_SIZE_MULTIPLE: 正整数大小 = 1_024;
+
+        设 encode_in_chunks_of_size =
+            supports_fast_decode_and_encode.unpadded_multiple() * ENCODE_IN_CHUNKS_OF_SIZE_MULTIPLE;
+
+        断言!(encode_in_chunks_of_size > 0);
+
+        // The "data-encoding" crate supports line wrapping, but not arbitrary line wrapping, only certain widths, so
+        // line wrapping must be handled here.
+        // https://github.com/ia0/data-encoding/blob/4f42ad7ef242f6d243e4de90cd1b46a57690d00e/lib/src/lib.rs#L1710
+        设 可变 line_wrapping = 匹配 wrap {
+            // Line wrapping is disabled because "-w"/"--wrap" was passed with "0"
+            一些(0) => 无,
+            // A custom line wrapping value was passed
+            一些(an) => 一些(LineWrapping {
+                line_length: NonZeroUsize::新建(an).解包(),
+                print_buffer: 向量::<正8>::新建(),
+            }),
+            // Line wrapping was not set, so the default is used
+            无 => 一些(LineWrapping {
+                line_length: NonZeroUsize::新建(WRAP_DEFAULT).解包(),
+                print_buffer: 向量::<正8>::新建(),
+            }),
+        };
+
+        设 input_size = input.长度();
+
+        // Start of buffers
+        // Data that was read from `input` but has not been encoded yet
+        设 可变 leftover_buffer = VecDeque::<正8>::新建();
+
+        // Encoded data that needs to be written to `output`
+        设 可变 encoded_buffer = VecDeque::<正8>::新建();
+        // End of buffers
+
+        input
+            .迭代()
+            .enumerate()
+            .step_by(encode_in_chunks_of_size)
+            .filter_map(|(idx, _)| {
+                // The part of `input_buffer` that was actually filled by the call
+                // to `read`
+                设 buffer = &input[idx..min(input_size, idx + encode_in_chunks_of_size)];
+
+                如果 buffer.长度() < encode_in_chunks_of_size {
+                    leftover_buffer.extend(buffer);
+                    断言!(leftover_buffer.长度() < encode_in_chunks_of_size);
+                    无
+                } 否则 {
+                    一些(buffer)
+                }
+            })
+            .for_each(|read_buffer| {
+                // Encode data in chunks, then place it in `encoded_buffer`
+                相等断言!(read_buffer.长度(), encode_in_chunks_of_size);
+                encode_in_chunks_to_buffer(
+                    supports_fast_decode_and_encode,
+                    read_buffer,
+                    &可变 encoded_buffer,
+                )
+                .解包();
+                // Write all data in `encoded_buffer` to `output`
+                write_to_output(
+                    &可变 line_wrapping,
+                    &可变 encoded_buffer,
+                    output,
+                    假,
+                    wrap == 一些(0),
+                )
+                .解包();
+            });
+
+        // Cleanup
+        // `input` has finished producing data, so the data remaining in the buffers needs to be encoded and printed
+        {
+            // Encode all remaining unencoded bytes, placing them in `encoded_buffer`
+            supports_fast_decode_and_encode
+                .encode_to_vec_deque(leftover_buffer.make_contiguous(), &可变 encoded_buffer)?;
+
+            // Write all data in `encoded_buffer` to output
+            // `is_cleanup` triggers special cleanup-only logic
+            write_to_output(
+                &可变 line_wrapping,
+                &可变 encoded_buffer,
+                output,
+                真,
+                wrap == 一些(0),
+            )?;
+        }
+        好的(())
+    }
+
+    /// Encodes all data read from `input` into Base32 using a fast, chunked
+    /// implementation and writes the result to `output`.
+    ///
+    /// The `supports_fast_decode_and_encode` parameter supplies an optimized
+    /// encoder and determines the chunk size used for bulk processing. When
+    /// `wrap` is:
+    /// - `Some(0)`: no line wrapping is performed,
+    /// - `Some(n)`: lines are wrapped every `n` characters,
+    /// - `None`: the default wrap width is applied.
+    ///
+    /// Remaining bytes are encoded and flushed at the end. I/O or encoding
+    /// failures are propagated via `UResult`.
+    公有 方法 fast_encode_stream(
+        input: &可变 动态 BufRead,
+        output: &可变 动态 Write,
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        wrap: 选项<正整数大小>,
+    ) -> UResult<()> {
+        常量 ENCODE_IN_CHUNKS_OF_SIZE_MULTIPLE: 正整数大小 = 1_024;
+
+        设 encode_in_chunks_of_size =
+            supports_fast_decode_and_encode.unpadded_multiple() * ENCODE_IN_CHUNKS_OF_SIZE_MULTIPLE;
+
+        断言!(encode_in_chunks_of_size > 0);
+
+        设 可变 line_wrapping = 匹配 wrap {
+            一些(0) => 无,
+            一些(an) => 一些(LineWrapping {
+                line_length: NonZeroUsize::新建(an).解包(),
+                print_buffer: 向量::<正8>::新建(),
+            }),
+            无 => 一些(LineWrapping {
+                line_length: NonZeroUsize::新建(WRAP_DEFAULT).解包(),
+                print_buffer: 向量::<正8>::新建(),
+            }),
+        };
+
+        // Buffers
+        设 可变 encoded_buffer = VecDeque::<正8>::新建();
+        设 可变 leftover_buffer = 向量::<正8>::with_capacity(encode_in_chunks_of_size);
+
+        无限循环 {
+            设 read_buffer = input
+                .fill_buf()
+                .map_err(|err| USimpleError::新建(1, 超级::format_read_error(&err)))?;
+            如果 read_buffer.为空() {
+                中断;
+            }
+
+            设 可变 consumed = 0;
+
+            如果 !leftover_buffer.为空() {
+                设 needed = encode_in_chunks_of_size - leftover_buffer.长度();
+                设 take = needed.min(read_buffer.长度());
+                leftover_buffer.extend_from_slice(&read_buffer[..take]);
+                consumed += take;
+
+                如果 leftover_buffer.长度() == encode_in_chunks_of_size {
+                    encode_in_chunks_to_buffer(
+                        supports_fast_decode_and_encode,
+                        leftover_buffer.as_slice(),
+                        &可变 encoded_buffer,
+                    )?;
+                    leftover_buffer.clear();
+
+                    write_to_output(
+                        &可变 line_wrapping,
+                        &可变 encoded_buffer,
+                        output,
+                        假,
+                        wrap == 一些(0),
+                    )?;
+                }
+            }
+
+            设 remaining = &read_buffer[consumed..];
+            设 full_chunk_bytes =
+                (remaining.长度() / encode_in_chunks_of_size) * encode_in_chunks_of_size;
+
+            如果 full_chunk_bytes > 0 {
+                循环 chunk 在 remaining[..full_chunk_bytes].chunks_exact(encode_in_chunks_of_size) {
+                    encode_in_chunks_to_buffer(
+                        supports_fast_decode_and_encode,
+                        chunk,
+                        &可变 encoded_buffer,
+                    )?;
+                    write_to_output(
+                        &可变 line_wrapping,
+                        &可变 encoded_buffer,
+                        output,
+                        假,
+                        wrap == 一些(0),
+                    )?;
+                }
+                consumed += full_chunk_bytes;
+            }
+
+            如果 consumed < read_buffer.长度() {
+                leftover_buffer.extend_from_slice(&read_buffer[consumed..]);
+                consumed = read_buffer.长度();
+            }
+
+            input.consume(consumed);
+
+            // `leftover_buffer` should never exceed one partial chunk.
+            调试断言!(leftover_buffer.长度() < encode_in_chunks_of_size);
+        }
+
+        // Encode any remaining bytes and flush
+        supports_fast_decode_and_encode
+            .encode_to_vec_deque(&leftover_buffer, &可变 encoded_buffer)?;
+
+        write_to_output(
+            &可变 line_wrapping,
+            &可变 encoded_buffer,
+            output,
+            真,
+            wrap == 一些(0),
+        )?;
+
+        好的(())
+    }
+}
+
+公有 模组 fast_decode {
+    使用 标准库::输入输出::{自身, BufRead, Write};
+    使用 uucore::{
+        encoding::SupportsFastDecodeAndEncode,
+        错误::{UResult, USimpleError},
+    };
+
+    // Start of helper functions
+    方法 alphabet_lookup(alphabet: &[正8]) -> [布尔; 256] {
+        // Precompute O(1) membership checks so we can validate every byte before decoding.
+        设 可变 table = [假; 256];
+
+        循环 &byte 在 alphabet {
+            table[正整数大小::from(byte)] = 真;
+        }
+
+        table
+    }
+
+    方法 decode_in_chunks_to_buffer(
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        read_buffer_filtered: &[正8],
+        decoded_buffer: &可变 向量<正8>,
+    ) -> UResult<()> {
+        supports_fast_decode_and_encode.decode_into_vec(read_buffer_filtered, decoded_buffer)?;
+        好的(())
+    }
+
+    方法 write_to_output(decoded_buffer: &可变 向量<正8>, output: &可变 动态 Write) -> 输入输出::结果<()> {
+        // Write all data in `decoded_buffer` to `output`
+        output.write_all(decoded_buffer.as_slice())?;
+
+        decoded_buffer.clear();
+
+        好的(())
+    }
+
+    方法 flush_ready_chunks(
+        buffer: &可变 向量<正8>,
+        block_limit: 正整数大小,
+        valid_multiple: 正整数大小,
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        decoded_buffer: &可变 向量<正8>,
+        output: &可变 动态 Write,
+    ) -> UResult<()> {
+        // While at least one full decode block is buffered, keep draining
+        // it and never yield more than block_limit per chunk.
+        当 buffer.长度() >= valid_multiple {
+            设 take = buffer.长度().min(block_limit);
+            设 aligned_take = take - (take % valid_multiple);
+
+            如果 aligned_take < valid_multiple {
+                中断;
+            }
+
+            decode_in_chunks_to_buffer(
+                supports_fast_decode_and_encode,
+                &buffer[..aligned_take],
+                decoded_buffer,
+            )?;
+
+            write_to_output(decoded_buffer, output)?;
+
+            buffer.清空(..aligned_take);
+        }
+
+        好的(())
+    }
+    // End of helper functions
+
+    公有 方法 fast_decode_buffer(
+        input: 向量<正8>,
+        output: &可变 动态 Write,
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        ignore_garbage: 布尔,
+    ) -> UResult<()> {
+        常量 DECODE_IN_CHUNKS_OF_SIZE_MULTIPLE: 正整数大小 = 1_024;
+
+        设 alphabet = supports_fast_decode_and_encode.alphabet();
+        设 alphabet_table = alphabet_lookup(alphabet);
+        设 valid_multiple = supports_fast_decode_and_encode.valid_decoding_multiple();
+        设 decode_in_chunks_of_size = valid_multiple * DECODE_IN_CHUNKS_OF_SIZE_MULTIPLE;
+
+        断言!(decode_in_chunks_of_size > 0);
+        断言!(valid_multiple > 0);
+
+        // Start of buffers
+
+        // Decoded data that needs to be written to `output`
+        设 可变 decoded_buffer = 向量::<正8>::新建();
+
+        // End of buffers
+
+        设 可变 buffer = 向量::with_capacity(decode_in_chunks_of_size);
+
+        设 supports_partial_decode = supports_fast_decode_and_encode.supports_partial_decode();
+
+        循环 &byte 在 &input {
+            如果 byte == b'\n' || byte == b'\r' {
+                继续;
+            }
+
+            如果 alphabet_table[正整数大小::from(byte)] {
+                buffer.压入(byte);
+            } 否则 如果 ignore_garbage {
+                继续;
+            } 否则 {
+                返回 坏的(USimpleError::新建(1, "error: invalid input"));
+            }
+
+            如果 supports_partial_decode {
+                flush_ready_chunks(
+                    &可变 buffer,
+                    decode_in_chunks_of_size,
+                    valid_multiple,
+                    supports_fast_decode_and_encode,
+                    &可变 decoded_buffer,
+                    output,
+                )?;
+            } 否则 如果 buffer.长度() == decode_in_chunks_of_size {
+                decode_in_chunks_to_buffer(
+                    supports_fast_decode_and_encode,
+                    &buffer,
+                    &可变 decoded_buffer,
+                )?;
+                write_to_output(&可变 decoded_buffer, output)?;
+                buffer.clear();
+            }
+        }
+
+        如果 supports_partial_decode {
+            flush_ready_chunks(
+                &可变 buffer,
+                decode_in_chunks_of_size,
+                valid_multiple,
+                supports_fast_decode_and_encode,
+                &可变 decoded_buffer,
+                output,
+            )?;
+        }
+
+        如果 !buffer.为空() {
+            设 可变 owned_chunk: 选项<向量<正8>> = 无;
+            设 可变 had_invalid_tail = 假;
+
+            如果 设 一些(pad_result) = supports_fast_decode_and_encode.pad_remainder(&buffer) {
+                had_invalid_tail = pad_result.had_invalid_tail;
+                owned_chunk = 一些(pad_result.chunk);
+            }
+
+            设 final_chunk = owned_chunk.as_deref().unwrap_or(&buffer);
+
+            supports_fast_decode_and_encode.decode_into_vec(final_chunk, &可变 decoded_buffer)?;
+            write_to_output(&可变 decoded_buffer, output)?;
+
+            如果 had_invalid_tail {
+                返回 坏的(USimpleError::新建(1, "error: invalid input"));
+            }
+        }
+
+        好的(())
+    }
+
+    公有 方法 fast_decode_stream(
+        input: &可变 动态 BufRead,
+        output: &可变 动态 Write,
+        supports_fast_decode_and_encode: &动态 SupportsFastDecodeAndEncode,
+        ignore_garbage: 布尔,
+    ) -> UResult<()> {
+        常量 DECODE_IN_CHUNKS_OF_SIZE_MULTIPLE: 正整数大小 = 1_024;
+
+        设 alphabet = supports_fast_decode_and_encode.alphabet();
+        设 alphabet_table = alphabet_lookup(alphabet);
+        设 valid_multiple = supports_fast_decode_and_encode.valid_decoding_multiple();
+        设 decode_in_chunks_of_size = valid_multiple * DECODE_IN_CHUNKS_OF_SIZE_MULTIPLE;
+
+        断言!(decode_in_chunks_of_size > 0);
+        断言!(valid_multiple > 0);
+
+        设 supports_partial_decode = supports_fast_decode_and_encode.supports_partial_decode();
+
+        设 可变 buffer = 向量::with_capacity(decode_in_chunks_of_size);
+        设 可变 decoded_buffer = 向量::<正8>::新建();
+
+        无限循环 {
+            设 read_buffer = input
+                .fill_buf()
+                .map_err(|err| USimpleError::新建(1, 超级::format_read_error(&err)))?;
+            设 read_len = read_buffer.长度();
+            如果 read_len == 0 {
+                中断;
+            }
+
+            循环 &byte 在 read_buffer {
+                如果 byte == b'\n' || byte == b'\r' {
+                    继续;
+                }
+
+                如果 alphabet_table[正整数大小::from(byte)] {
+                    buffer.压入(byte);
+                } 否则 如果 ignore_garbage {
+                    继续;
+                } 否则 {
+                    如果 supports_partial_decode {
+                        flush_ready_chunks(
+                            &可变 buffer,
+                            decode_in_chunks_of_size,
+                            valid_multiple,
+                            supports_fast_decode_and_encode,
+                            &可变 decoded_buffer,
+                            output,
+                        )?;
+                    } 否则 {
+                        当 buffer.长度() >= decode_in_chunks_of_size {
+                            decode_in_chunks_to_buffer(
+                                supports_fast_decode_and_encode,
+                                &buffer[..decode_in_chunks_of_size],
+                                &可变 decoded_buffer,
+                            )?;
+                            write_to_output(&可变 decoded_buffer, output)?;
+                            buffer.清空(..decode_in_chunks_of_size);
+                        }
+                    }
+                    返回 坏的(USimpleError::新建(1, "error: invalid input"));
+                }
+
+                如果 supports_partial_decode {
+                    flush_ready_chunks(
+                        &可变 buffer,
+                        decode_in_chunks_of_size,
+                        valid_multiple,
+                        supports_fast_decode_and_encode,
+                        &可变 decoded_buffer,
+                        output,
+                    )?;
+                } 否则 如果 buffer.长度() == decode_in_chunks_of_size {
+                    decode_in_chunks_to_buffer(
+                        supports_fast_decode_and_encode,
+                        &buffer,
+                        &可变 decoded_buffer,
+                    )?;
+                    write_to_output(&可变 decoded_buffer, output)?;
+                    buffer.clear();
+                }
+            }
+
+            input.consume(read_len);
+        }
+
+        如果 supports_partial_decode {
+            flush_ready_chunks(
+                &可变 buffer,
+                decode_in_chunks_of_size,
+                valid_multiple,
+                supports_fast_decode_and_encode,
+                &可变 decoded_buffer,
+                output,
+            )?;
+        }
+
+        如果 !buffer.为空() {
+            设 可变 owned_chunk: 选项<向量<正8>> = 无;
+            设 可变 had_invalid_tail = 假;
+
+            如果 设 一些(pad_result) = supports_fast_decode_and_encode.pad_remainder(&buffer) {
+                had_invalid_tail = pad_result.had_invalid_tail;
+                owned_chunk = 一些(pad_result.chunk);
+            }
+
+            设 final_chunk = owned_chunk.as_deref().unwrap_or(&buffer);
+
+            supports_fast_decode_and_encode.decode_into_vec(final_chunk, &可变 decoded_buffer)?;
+            write_to_output(&可变 decoded_buffer, output)?;
+
+            如果 had_invalid_tail {
+                返回 坏的(USimpleError::新建(1, "error: invalid input"));
+            }
+        }
+
+        好的(())
+    }
+}
+
+方法 format_read_error(错误: &输入输出::错误协议) -> 字符串 {
+    translate!("base-common-read-error", "error" => strip_errno(错误))
+}
+
+/// Determines if the input buffer contains any padding ('=') ignoring trailing whitespace.
+#[cfg(test)]
+方法 read_and_has_padding<R: 输入输出::Read>(input: &可变 R) -> UResult<(布尔, 向量<正8>)> {
+    设 可变 buf = 向量::新建();
+    input
+        .read_to_end(&可变 buf)
+        .map_err(|err| USimpleError::新建(1, format_read_error(&err)))?;
+
+    // Treat the stream as padded if any '=' exists (GNU coreutils continues decoding
+    // even when padding bytes are followed by more data).
+    设 has_padding = buf.包含(&b'=');
+
+    好的((has_padding, buf))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::base_common::read_and_has_padding;
+    使用 标准库::输入输出::Cursor;
+
+    #[test]
+    方法 test_has_padding() {
+        设 test_cases = 向量![
+            ("aGVsbG8sIHdvcmxkIQ==", 真),
+            ("aGVsbG8sIHdvcmxkIQ== ", 真),
+            ("aGVsbG8sIHdvcmxkIQ==\n", 真),
+            ("aGVsbG8sIHdvcmxkIQ== \n", 真),
+            ("aGVsbG8sIHdvcmxkIQ=", 真),
+            ("aGVsbG8sIHdvcmxkIQ= ", 真),
+            ("MTIzNA==MTIzNA", 真),
+            ("MTIzNA==\nMTIzNA", 真),
+            ("aGVsbG8sIHdvcmxkIQ \n", 假),
+            ("aGVsbG8sIHdvcmxkIQ", 假),
+        ];
+
+        循环 (input, expected) 在 test_cases {
+            设 可变 cursor = Cursor::新建(input.as_bytes());
+            相等断言!(
+                read_and_has_padding(&可变 cursor).解包().0,
+                expected,
+                "Failed for input: '{input}'"
+            );
+        }
+    }
+}

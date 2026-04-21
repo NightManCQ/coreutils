@@ -1,0 +1,2979 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) copydir ficlone fiemap ftruncate linkgs lstat nlink nlinks pathbuf pwrite reflink strs xattrs symlinked deduplicated advcpmv nushell IRWXG IRWXO IRWXU IRWXUGO IRWXU IRWXG IRWXO IRWXUGO sflag
+
+使用 标准库::比较::排序顺序;
+使用 标准库::集合::{哈希映射, 哈希集合};
+使用 标准库::ffi::OsString;
+使用 标准库::格式化::显示协议;
+使用 标准库::文件系统::{自身, Metadata, OpenOptions, Permissions};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::网络::UnixListener;
+使用 标准库::路径::{Path, PathBuf, StripPrefixError};
+使用 标准库::{格式化, 输入输出};
+#[cfg(全部(unix, not(target_os = "android")))]
+使用 uucore::fsxattr::{copy_xattrs, copy_xattrs_skip_selinux};
+使用 uucore::translate;
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser, value_parser};
+使用 filetime::FileTime;
+使用 indicatif::{ProgressBar, ProgressStyle};
+#[cfg(unix)]
+使用 nix::sys::stat::{Mode, SFlag, dev_t, mknod 转换 nix_mknod, mode_t};
+使用 thiserror::错误协议;
+
+使用 platform::copy_on_write;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UError, UResult, UUsageError, set_exit_code};
+#[cfg(unix)]
+使用 uucore::文件系统::make_fifo;
+使用 uucore::文件系统::{
+    FileInformation, MissingHandling, ResolveMode, are_hardlinks_to_same_file, canonicalize,
+    get_filename, is_symlink_loop, normalize_path, path_ends_with_terminator,
+    paths_refer_to_same_file,
+};
+使用 uucore::{backup_control, update_control};
+// These are exposed for projects (e.g. nushell) that want to create an `Options` value, which
+// requires these enum.
+公有 使用 uucore::{backup_control::BackupMode, update_control::UpdateMode};
+使用 uucore::{
+    format_usage, parser::shortcut_value_parser::ShortcutValueParser, prompt_yes, show_error,
+    show_warning,
+};
+
+使用 箱::copydir::copy_directory;
+
+模组 copydir;
+模组 platform;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 CpError {
+    /// Simple [`io::Error`] wrapper
+    #[错误("{0}")]
+    IoErr(#[from] 输入输出::错误协议),
+
+    /// Wrapper for [`io::Error`] with path context
+    #[错误("{1}: {0}")]
+    IoErrContext(输入输出::错误协议, 字符串),
+
+    /// General copy error
+    #[错误("{0}")]
+    错误协议(字符串),
+
+    /// Represents the state when a non-fatal error has occurred
+    /// and not all files were copied.
+    #[错误("{}", translate!("cp-error-not-all-files-copied"))]
+    NotAllFilesCopied,
+
+    /// Simple [`walkdir::Error`] wrapper
+    #[错误("{0}")]
+    WalkDirErr(#[from] walkdir::错误协议),
+
+    /// Simple [`StripPrefixError`] wrapper
+    #[错误(transparent)]
+    StripPrefixError(#[from] StripPrefixError),
+
+    /// Result of a skipped file
+    /// Currently happens when "no" is selected in interactive mode or when
+    /// `no-clobber` flag is set and destination is already present.
+    /// `exit with error` is used to determine which exit code should be returned.
+    #[错误("Skipped copying file (exit with error = {0})")]
+    Skipped(布尔),
+
+    /// Invalid argument error
+    #[错误("{0}")]
+    InvalidArgument(字符串),
+
+    /// All standard options are included as an implementation
+    /// path, but those that are not implemented yet should return
+    /// a `NotImplemented` error.
+    #[错误("{}", translate!("cp-error-option-not-implemented", "option" => 0))]
+    NotImplemented(字符串),
+
+    /// Invalid arguments to backup
+    #[错误(transparent)]
+    Backup(#[from] BackupError),
+
+    #[错误("{}", translate!("cp-error-not-a-directory", "path" => .0.quote()))]
+    NotADirectory(PathBuf),
+}
+
+// Manual impl for &str
+实现 转换协议<&'静态 字符串切片> 循环 CpError {
+    方法 from(s: &'静态 字符串切片) -> 自身类型 {
+        自身类型::错误协议(s.to_string())
+    }
+}
+
+实现 转换协议<字符串> 循环 CpError {
+    方法 from(s: 字符串) -> 自身类型 {
+        自身类型::错误协议(s)
+    }
+}
+
+#[derive(调试协议)]
+公有 结构 BackupError(字符串);
+
+实现 显示协议 循环 BackupError {
+    方法 格式化(&自身, f: &可变 格式化::Formatter<'_>) -> 格式化::结果 {
+        write!(
+            f,
+            "{}",
+            translate!("cp-error-backup-format", "error" => 自身.0.克隆(), "exec" => uucore::execution_phrase())
+        )
+    }
+}
+
+实现 标准库::错误::错误协议 循环 BackupError {}
+
+实现 UError 循环 CpError {
+    方法 code(&自身) -> 整32 {
+        EXIT_ERR
+    }
+}
+
+公有 类型 CopyResult<T> = 结果<T, CpError>;
+
+/// Specifies how to overwrite files.
+#[derive(调试协议, 克隆协议, 复制协议, 相等比较协议, 偏等比较协议, 默认协议)]
+公有 枚举 ClobberMode {
+    Force,
+    RemoveDestination,
+    #[默认]
+    Standard,
+}
+
+/// Specifies whether files should be overwritten.
+#[derive(调试协议, 克隆协议, 复制协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 OverwriteMode {
+    /// [Default] Always overwrite existing files
+    Clobber(ClobberMode),
+    /// Prompt before overwriting a file
+    Interactive(ClobberMode),
+    /// Never overwrite a file
+    NoClobber,
+}
+
+实现 默认协议 循环 OverwriteMode {
+    方法 默认() -> 自身类型 {
+        自身类型::Clobber(ClobberMode::默认())
+    }
+}
+
+/// Possible arguments for `--reflink`.
+#[derive(调试协议, 复制协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 ReflinkMode {
+    Always,
+    Auto,
+    Never,
+}
+
+实现 默认协议 循环 ReflinkMode {
+    #[allow(clippy::derivable_impls)]
+    方法 默认() -> 自身类型 {
+        #[cfg(任意(target_os = "linux", target_os = "android", target_os = "macos"))]
+        {
+            自身类型::Auto
+        }
+        #[cfg(not(任意(target_os = "linux", target_os = "android", target_os = "macos")))]
+        {
+            自身类型::Never
+        }
+    }
+}
+
+/// Possible arguments for `--sparse`.
+#[derive(调试协议, 复制协议, 克隆协议, 相等比较协议, 偏等比较协议, 默认协议)]
+公有 枚举 SparseMode {
+    Always,
+    #[默认]
+    Auto,
+    Never,
+}
+
+/// The expected file type of copy target
+#[derive(复制协议, 克隆协议)]
+公有 枚举 TargetType {
+    Directory,
+    File,
+}
+
+/// Copy action to perform
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议, 默认协议)]
+公有 枚举 CopyMode {
+    Link,
+    SymLink,
+    #[默认]
+    复制协议,
+    Update,
+    AttrOnly,
+}
+
+/// Preservation settings for various attributes
+///
+/// It should be derived from options as follows:
+///
+///  - if there is a list of attributes to preserve (i.e. `--preserve=ATTR_LIST`) parse that list with [`Attributes::parse_iter`],
+///  - if `-p` or `--preserve` is given without arguments, use [`Attributes::DEFAULT`],
+///  - if `-a`/`--archive` is passed, use [`Attributes::ALL`],
+///  - if `-d` is passed use [`Attributes::LINKS`],
+///  - otherwise, use [`Attributes::NONE`].
+///
+/// For full compatibility with GNU, these options should also combine. We
+/// currently only do a best effort imitation of that behavior, because it is
+/// difficult to achieve in clap, especially with `--no-preserve`.
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议, 复制协议)]
+公有 结构 Attributes {
+    #[cfg(unix)]
+    公有 ownership: Preserve,
+    公有 mode: Preserve,
+    公有 timestamps: Preserve,
+    公有 context: Preserve,
+    公有 links: Preserve,
+    公有 xattr: Preserve,
+}
+
+实现 默认协议 循环 Attributes {
+    方法 默认() -> 自身类型 {
+        自身类型::NONE
+    }
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 Preserve {
+    // explicit means whether the --no-preserve flag is used or not to distinguish out the default value.
+    // e.g. --no-preserve=mode means mode = No { explicit = true }
+    No { explicit: 布尔 },
+    Yes { required: 布尔 },
+}
+
+实现 偏序比较协议 循环 Preserve {
+    方法 partial_cmp(&自身, other: &自身类型) -> 选项<排序顺序> {
+        一些(自身.比较(other))
+    }
+}
+
+实现 序比较协议 循环 Preserve {
+    方法 比较(&自身, other: &自身类型) -> 排序顺序 {
+        匹配 (自身, other) {
+            (自身类型::No { .. }, 自身类型::No { .. }) => 排序顺序::Equal,
+            (自身类型::Yes { .. }, 自身类型::No { .. }) => 排序顺序::Greater,
+            (自身类型::No { .. }, 自身类型::Yes { .. }) => 排序顺序::Less,
+            (
+                自身类型::Yes { required: req_self },
+                自身类型::Yes {
+                    required: req_other,
+                },
+            ) => req_self.比较(req_other),
+        }
+    }
+}
+
+/// Options for the `cp` command
+///
+/// All options are public so that the options can be programmatically
+/// constructed by other crates, such as nushell. That means that this struct
+/// is part of our public API. It should therefore not be changed without good
+/// reason.
+///
+/// The fields are documented with the arguments that determine their value.
+#[allow(dead_code)]
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 结构 Options {
+    /// `--attributes-only`
+    公有 attributes_only: 布尔,
+    /// `--backup[=CONTROL]`, `-b`
+    公有 backup: BackupMode,
+    /// `--copy-contents`
+    公有 copy_contents: 布尔,
+    /// `-H`
+    公有 cli_dereference: 布尔,
+    /// Determines the type of copying that should be done
+    ///
+    /// Set by the following arguments:
+    ///  - `-l`, `--link`: [`CopyMode::Link`]
+    ///  - `-s`, `--symbolic-link`: [`CopyMode::SymLink`]
+    ///  - `-u`, `--update[=WHEN]`: [`CopyMode::Update`]
+    ///  - `--attributes-only`: [`CopyMode::AttrOnly`]
+    ///  - otherwise: [`CopyMode::Copy`]
+    公有 copy_mode: CopyMode,
+    /// `-L`, `--dereference`
+    公有 dereference: 布尔,
+    /// `-T`, `--no-target-dir`
+    公有 no_target_dir: 布尔,
+    /// `-x`, `--one-file-system`
+    公有 one_file_system: 布尔,
+    /// Specifies what to do with an existing destination
+    ///
+    /// Set by the following arguments:
+    ///  - `-i`, `--interactive`: [`OverwriteMode::Interactive`]
+    ///  - `-n`, `--no-clobber`: [`OverwriteMode::NoClobber`]
+    ///  - otherwise: [`OverwriteMode::Clobber`]
+    ///
+    /// The `Interactive` and `Clobber` variants have a [`ClobberMode`] argument,
+    /// set by the following arguments:
+    ///  - `-f`, `--force`: [`ClobberMode::Force`]
+    ///  - `--remove-destination`: [`ClobberMode::RemoveDestination`]
+    ///  - otherwise: [`ClobberMode::Standard`]
+    公有 overwrite: OverwriteMode,
+    /// `--parents`
+    公有 parents: 布尔,
+    /// `--sparse[=WHEN]`
+    公有 sparse_mode: SparseMode,
+    /// `--strip-trailing-slashes`
+    公有 strip_trailing_slashes: 布尔,
+    /// `--reflink[=WHEN]`
+    公有 reflink_mode: ReflinkMode,
+    /// `--preserve=[=ATTRIBUTE_LIST]` and `--no-preserve=ATTRIBUTE_LIST`
+    公有 attributes: Attributes,
+    /// `-R`, `-r`, `--recursive`
+    公有 recursive: 布尔,
+    /// `-S`, `--suffix`
+    公有 backup_suffix: 字符串,
+    /// `-t`, `--target-directory`
+    公有 target_dir: 选项<PathBuf>,
+    /// `--update[=UPDATE]`
+    公有 update: UpdateMode,
+    /// `--debug`
+    公有 debug: 布尔,
+    /// `-v`, `--verbose`
+    公有 verbose: 布尔,
+    /// `-g`, `--progress`
+    公有 progress_bar: 布尔,
+    /// -Z
+    公有 set_selinux_context: 布尔,
+    // --context
+    公有 context: 选项<字符串>,
+}
+
+实现 默认协议 循环 Options {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            attributes_only: 假,
+            backup: BackupMode::默认(),
+            copy_contents: 假,
+            cli_dereference: 假,
+            copy_mode: CopyMode::默认(),
+            dereference: 假,
+            no_target_dir: 假,
+            one_file_system: 假,
+            overwrite: OverwriteMode::默认(),
+            parents: 假,
+            sparse_mode: SparseMode::默认(),
+            strip_trailing_slashes: 假,
+            reflink_mode: ReflinkMode::默认(),
+            attributes: Attributes::默认(),
+            recursive: 假,
+            backup_suffix: backup_control::DEFAULT_BACKUP_SUFFIX.to_owned(),
+            target_dir: 无,
+            update: UpdateMode::默认(),
+            debug: 假,
+            verbose: 假,
+            progress_bar: 假,
+            set_selinux_context: 假,
+            context: 无,
+        }
+    }
+}
+
+/// Enum representing if a file has been skipped.
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+枚举 PerformedAction {
+    Copied,
+    Skipped,
+}
+
+/// Enum representing various debug states of the offload and reflink actions.
+#[derive(调试协议)]
+#[allow(dead_code)] // All of them are used on Linux
+枚举 OffloadReflinkDebug {
+    Unknown,
+    No,
+    Yes,
+    Avoided,
+    Unsupported,
+}
+
+/// Enum representing various debug states of the sparse detection.
+#[derive(调试协议)]
+#[allow(dead_code)] // silent for now until we use them
+枚举 SparseDebug {
+    Unknown,
+    No,
+    Zeros,
+    SeekHole,
+    SeekHoleZeros,
+    Unsupported,
+}
+
+/// Struct that contains the debug state for each action in a file copy operation.
+#[derive(调试协议)]
+结构 CopyDebug {
+    offload: OffloadReflinkDebug,
+    reflink: OffloadReflinkDebug,
+    sparse_detection: SparseDebug,
+}
+
+实现 显示协议 循环 OffloadReflinkDebug {
+    方法 格式化(&自身, f: &可变 格式化::Formatter<'_>) -> 格式化::结果 {
+        设 msg = 匹配 自身 {
+            自身类型::No => translate!("cp-debug-enum-no"),
+            自身类型::Yes => translate!("cp-debug-enum-yes"),
+            自身类型::Avoided => translate!("cp-debug-enum-avoided"),
+            自身类型::Unsupported => translate!("cp-debug-enum-unsupported"),
+            自身类型::Unknown => translate!("cp-debug-enum-unknown"),
+        };
+        write!(f, "{msg}")
+    }
+}
+
+实现 显示协议 循环 SparseDebug {
+    方法 格式化(&自身, f: &可变 格式化::Formatter<'_>) -> 格式化::结果 {
+        设 msg = 匹配 自身 {
+            自身类型::No => translate!("cp-debug-enum-no"),
+            自身类型::Zeros => translate!("cp-debug-enum-zeros"),
+            自身类型::SeekHole => translate!("cp-debug-enum-seek-hole"),
+            自身类型::SeekHoleZeros => translate!("cp-debug-enum-seek-hole-zeros"),
+            自身类型::Unsupported => translate!("cp-debug-enum-unsupported"),
+            自身类型::Unknown => translate!("cp-debug-enum-unknown"),
+        };
+        write!(f, "{msg}")
+    }
+}
+
+/// This function prints the debug information of a file copy operation if
+/// no hard link or symbolic link is required, and data copy is required.
+/// It prints the debug information of the offload, reflink, and sparse detection actions.
+方法 show_debug(copy_debug: &CopyDebug) {
+    打印行!(
+        "{}",
+        translate!("cp-debug-copy-offload", "offload" => copy_debug.offload, "reflink" => copy_debug.reflink, "sparse" => copy_debug.sparse_detection)
+    );
+}
+
+静态 EXIT_ERR: 整32 = 1;
+
+// Argument constants
+模组 options {
+    公有 常量 ARCHIVE: &字符串切片 = "archive";
+    公有 常量 ATTRIBUTES_ONLY: &字符串切片 = "attributes-only";
+    公有 常量 CLI_SYMBOLIC_LINKS: &字符串切片 = "cli-symbolic-links";
+    公有 常量 CONTEXT: &字符串切片 = "context";
+    公有 常量 COPY_CONTENTS: &字符串切片 = "copy-contents";
+    公有 常量 DEREFERENCE: &字符串切片 = "dereference";
+    公有 常量 FORCE: &字符串切片 = "force";
+    公有 常量 INTERACTIVE: &字符串切片 = "interactive";
+    公有 常量 LINK: &字符串切片 = "link";
+    公有 常量 NO_CLOBBER: &字符串切片 = "no-clobber";
+    公有 常量 NO_DEREFERENCE: &字符串切片 = "no-dereference";
+    公有 常量 NO_DEREFERENCE_PRESERVE_LINKS: &字符串切片 = "no-dereference-preserve-links";
+    公有 常量 NO_PRESERVE: &字符串切片 = "no-preserve";
+    公有 常量 NO_TARGET_DIRECTORY: &字符串切片 = "no-target-directory";
+    公有 常量 ONE_FILE_SYSTEM: &字符串切片 = "one-file-system";
+    公有 常量 PARENT: &字符串切片 = "parent";
+    公有 常量 PARENTS: &字符串切片 = "parents";
+    公有 常量 PATHS: &字符串切片 = "paths";
+    公有 常量 PROGRESS_BAR: &字符串切片 = "progress";
+    公有 常量 PRESERVE: &字符串切片 = "preserve";
+    公有 常量 PRESERVE_DEFAULT_ATTRIBUTES: &字符串切片 = "preserve-default-attributes";
+    公有 常量 RECURSIVE: &字符串切片 = "recursive";
+    公有 常量 REFLINK: &字符串切片 = "reflink";
+    公有 常量 REMOVE_DESTINATION: &字符串切片 = "remove-destination";
+    公有 常量 SELINUX: &字符串切片 = "Z";
+    公有 常量 SPARSE: &字符串切片 = "sparse";
+    公有 常量 STRIP_TRAILING_SLASHES: &字符串切片 = "strip-trailing-slashes";
+    公有 常量 SYMBOLIC_LINK: &字符串切片 = "symbolic-link";
+    公有 常量 TARGET_DIRECTORY: &字符串切片 = "target-directory";
+    公有 常量 DEBUG: &字符串切片 = "debug";
+    公有 常量 VERBOSE: &字符串切片 = "verbose";
+}
+
+#[cfg(unix)]
+静态 PRESERVABLE_ATTRIBUTES: &[&字符串切片] = &[
+    "mode",
+    "ownership",
+    "timestamps",
+    "context",
+    "links",
+    "xattr",
+    "all",
+];
+
+#[cfg(not(unix))]
+静态 PRESERVABLE_ATTRIBUTES: &[&字符串切片] =
+    &["mode", "timestamps", "context", "links", "xattr", "all"];
+
+常量 PRESERVE_DEFAULT_VALUES: &字符串切片 = 如果 cfg!(unix) {
+    "mode,ownership,timestamp"
+} 否则 {
+    "mode,timestamp"
+};
+
+公有 方法 uu_app() -> Command {
+    常量 MODE_ARGS: &[&字符串切片] = &[
+        options::LINK,
+        options::REFLINK,
+        options::SYMBOLIC_LINK,
+        options::ATTRIBUTES_ONLY,
+        options::COPY_CONTENTS,
+    ];
+    Command::新建("cp")
+        .version(uucore::crate_version!())
+        .about(translate!("cp-about"))
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("cp-usage")))
+        .after_help(格式化!(
+            "{}\n\n{}",
+            translate!("cp-after-help"),
+            backup_control::BACKUP_CONTROL_LONG_HELP
+        ))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::TARGET_DIRECTORY)
+                .short('t')
+                .conflicts_with(options::NO_TARGET_DIRECTORY)
+                .long(options::TARGET_DIRECTORY)
+                .value_name(options::TARGET_DIRECTORY)
+                .value_hint(clap::ValueHint::DirPath)
+                .value_parser(ValueParser::path_buf())
+                .help(translate!("cp-help-target-directory")),
+        )
+        .arg(
+            Arg::新建(options::NO_TARGET_DIRECTORY)
+                .short('T')
+                .long(options::NO_TARGET_DIRECTORY)
+                .conflicts_with(options::TARGET_DIRECTORY)
+                .help(translate!("cp-help-no-target-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::INTERACTIVE)
+                .short('i')
+                .long(options::INTERACTIVE)
+                .overrides_with(options::NO_CLOBBER)
+                .help(translate!("cp-help-interactive"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::LINK)
+                .short('l')
+                .long(options::LINK)
+                .overrides_with_all(MODE_ARGS)
+                .help(translate!("cp-help-link"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_CLOBBER)
+                .short('n')
+                .long(options::NO_CLOBBER)
+                .overrides_with(options::INTERACTIVE)
+                .help(translate!("cp-help-no-clobber"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::RECURSIVE)
+                .short('R')
+                .visible_short_alias('r')
+                .long(options::RECURSIVE)
+                // --archive sets this option
+                .help(translate!("cp-help-recursive"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::STRIP_TRAILING_SLASHES)
+                .long(options::STRIP_TRAILING_SLASHES)
+                .help(translate!("cp-help-strip-trailing-slashes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DEBUG)
+                .long(options::DEBUG)
+                .help(translate!("cp-help-debug"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long(options::VERBOSE)
+                .help(translate!("cp-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SYMBOLIC_LINK)
+                .short('s')
+                .long(options::SYMBOLIC_LINK)
+                .overrides_with_all(MODE_ARGS)
+                .help(translate!("cp-help-symbolic-link"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FORCE)
+                .short('f')
+                .long(options::FORCE)
+                .help(translate!("cp-help-force"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::REMOVE_DESTINATION)
+                .long(options::REMOVE_DESTINATION)
+                .overrides_with(options::FORCE)
+                .help(translate!("cp-help-remove-destination"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(backup_control::arguments::backup())
+        .arg(backup_control::arguments::backup_no_args())
+        .arg(backup_control::arguments::suffix())
+        .arg(update_control::arguments::update())
+        .arg(update_control::arguments::update_no_args())
+        .arg(
+            Arg::新建(options::REFLINK)
+                .long(options::REFLINK)
+                .value_name("WHEN")
+                .overrides_with_all(MODE_ARGS)
+                .require_equals(真)
+                .default_missing_value("always")
+                .value_parser(ShortcutValueParser::新建(["auto", "always", "never"]))
+                .num_args(0..=1)
+                .help(translate!("cp-help-reflink")),
+        )
+        .arg(
+            Arg::新建(options::ATTRIBUTES_ONLY)
+                .long(options::ATTRIBUTES_ONLY)
+                .overrides_with_all(MODE_ARGS)
+                .help(translate!("cp-help-attributes-only"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PRESERVE)
+                .long(options::PRESERVE)
+                .action(ArgAction::Append)
+                .use_value_delimiter(真)
+                .value_parser(ShortcutValueParser::新建(PRESERVABLE_ATTRIBUTES))
+                .num_args(0..)
+                .require_equals(真)
+                .value_name("ATTR_LIST")
+                .default_missing_value(PRESERVE_DEFAULT_VALUES)
+                // -d sets this option
+                // --archive sets this option
+                .help(translate!("cp-help-preserve")),
+        )
+        .arg(
+            Arg::新建(options::PRESERVE_DEFAULT_ATTRIBUTES)
+                .short('p')
+                .long(options::PRESERVE_DEFAULT_ATTRIBUTES)
+                .help(translate!("cp-help-preserve-default"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_PRESERVE)
+                .long(options::NO_PRESERVE)
+                .action(ArgAction::Append)
+                .use_value_delimiter(真)
+                .value_parser(ShortcutValueParser::新建(PRESERVABLE_ATTRIBUTES))
+                .num_args(0..)
+                .require_equals(真)
+                .value_name("ATTR_LIST")
+                .help(translate!("cp-help-no-preserve")),
+        )
+        .arg(
+            Arg::新建(options::PARENTS)
+                .long(options::PARENTS)
+                .alias(options::PARENT)
+                .help(translate!("cp-help-parents"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_DEREFERENCE)
+                .short('P')
+                .long(options::NO_DEREFERENCE)
+                .overrides_with_all([
+                    options::DEREFERENCE,
+                    options::CLI_SYMBOLIC_LINKS,
+                    options::ARCHIVE,
+                    options::NO_DEREFERENCE_PRESERVE_LINKS,
+                ])
+                // -d sets this option
+                .help(translate!("cp-help-no-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DEREFERENCE)
+                .short('L')
+                .long(options::DEREFERENCE)
+                .overrides_with_all([
+                    options::NO_DEREFERENCE,
+                    options::CLI_SYMBOLIC_LINKS,
+                    options::ARCHIVE,
+                    options::NO_DEREFERENCE_PRESERVE_LINKS,
+                ])
+                .help(translate!("cp-help-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CLI_SYMBOLIC_LINKS)
+                .short('H')
+                .overrides_with_all([
+                    options::DEREFERENCE,
+                    options::NO_DEREFERENCE,
+                    options::ARCHIVE,
+                    options::NO_DEREFERENCE_PRESERVE_LINKS,
+                ])
+                .help(translate!("cp-help-cli-symbolic-links"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ARCHIVE)
+                .short('a')
+                .long(options::ARCHIVE)
+                .overrides_with_all([
+                    options::DEREFERENCE,
+                    options::NO_DEREFERENCE,
+                    options::CLI_SYMBOLIC_LINKS,
+                    options::NO_DEREFERENCE_PRESERVE_LINKS,
+                ])
+                .help(translate!("cp-help-archive"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_DEREFERENCE_PRESERVE_LINKS)
+                .short('d')
+                .overrides_with_all([
+                    options::DEREFERENCE,
+                    options::NO_DEREFERENCE,
+                    options::CLI_SYMBOLIC_LINKS,
+                    options::ARCHIVE,
+                ])
+                .help(translate!("cp-help-no-dereference-preserve-links"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ONE_FILE_SYSTEM)
+                .short('x')
+                .long(options::ONE_FILE_SYSTEM)
+                .help(translate!("cp-help-one-file-system"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SPARSE)
+                .long(options::SPARSE)
+                .value_name("WHEN")
+                .value_parser(ShortcutValueParser::新建(["never", "auto", "always"]))
+                .help(translate!("cp-help-sparse")),
+        )
+        .arg(
+            Arg::新建(options::SELINUX)
+                .short('Z')
+                .help(translate!("cp-help-selinux"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CONTEXT)
+                .long(options::CONTEXT)
+                .value_name("CTX")
+                .value_parser(value_parser!(字符串))
+                .help(translate!("cp-help-context"))
+                .num_args(0..=1)
+                .require_equals(真)
+                .default_missing_value(""),
+        )
+        .arg(
+            // The 'g' short flag is modeled after advcpmv
+            // See this repo: https://github.com/jarun/advcpmv
+            Arg::新建(options::PROGRESS_BAR)
+                .long(options::PROGRESS_BAR)
+                .short('g')
+                .action(ArgAction::SetTrue)
+                .help(translate!("cp-help-progress")),
+        )
+        // TODO: implement the following args
+        .arg(
+            Arg::新建(options::COPY_CONTENTS)
+                .long(options::COPY_CONTENTS)
+                .overrides_with(options::ATTRIBUTES_ONLY)
+                .help(translate!("cp-help-copy-contents"))
+                .action(ArgAction::SetTrue),
+        )
+        // END TODO
+        .arg(
+            Arg::新建(options::PATHS)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .required(真)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(ValueParser::os_string()),
+        )
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 options = Options::from_matches(&matches)?;
+
+    如果 options.overwrite == OverwriteMode::NoClobber && options.backup != BackupMode::无 {
+        返回 坏的(UUsageError::新建(
+            EXIT_ERR,
+            translate!("cp-error-backup-mutually-exclusive"),
+        ));
+    }
+
+    设 paths: 向量<PathBuf> = matches
+        .get_many::<OsString>(options::PATHS)
+        .映射(|v| v.映射(PathBuf::from).收集())
+        .unwrap_or_default();
+
+    设 (sources, target) = parse_path_args(paths, &options)?;
+
+    如果 设 坏的(错误) = copy(&sources, &target, &options) {
+        如果 设 CpError::NotAllFilesCopied = 错误 {
+            // Error::NotAllFilesCopied is non-fatal, but the error
+            // code should still be EXIT_ERR as does GNU cp
+        } 否则 {
+            // Else we caught a fatal bubbled-up error, log it to stderr
+            show_error!("{error}");
+        }
+        set_exit_code(EXIT_ERR);
+    }
+
+    好的(())
+}
+
+实现 ClobberMode {
+    方法 from_matches(matches: &ArgMatches) -> 自身类型 {
+        如果 matches.get_flag(options::FORCE) {
+            自身类型::Force
+        } 否则 如果 matches.get_flag(options::REMOVE_DESTINATION) {
+            自身类型::RemoveDestination
+        } 否则 {
+            自身类型::Standard
+        }
+    }
+}
+
+实现 OverwriteMode {
+    方法 from_matches(matches: &ArgMatches) -> 自身类型 {
+        如果 matches.get_flag(options::INTERACTIVE) {
+            自身类型::Interactive(ClobberMode::from_matches(matches))
+        } 否则 如果 matches.get_flag(options::NO_CLOBBER) {
+            自身类型::NoClobber
+        } 否则 {
+            自身类型::Clobber(ClobberMode::from_matches(matches))
+        }
+    }
+}
+
+实现 CopyMode {
+    方法 from_matches(matches: &ArgMatches) -> 自身类型 {
+        如果 matches.get_flag(options::LINK) {
+            自身类型::Link
+        } 否则 如果 matches.get_flag(options::SYMBOLIC_LINK) {
+            自身类型::SymLink
+        } 否则 如果 matches
+            .get_one::<字符串>(update_control::arguments::OPT_UPDATE)
+            .is_some()
+            || matches.get_flag(update_control::arguments::OPT_UPDATE_NO_ARG)
+        {
+            自身类型::Update
+        } 否则 如果 matches.get_flag(options::ATTRIBUTES_ONLY) {
+            如果 matches.get_flag(options::REMOVE_DESTINATION) {
+                自身类型::复制协议
+            } 否则 {
+                自身类型::AttrOnly
+            }
+        } 否则 {
+            自身类型::复制协议
+        }
+    }
+}
+
+实现 Attributes {
+    公有 常量 ALL: 自身类型 = 自身类型 {
+        #[cfg(unix)]
+        ownership: Preserve::Yes { required: 真 },
+        mode: Preserve::Yes { required: 真 },
+        timestamps: Preserve::Yes { required: 真 },
+        context: {
+            #[cfg(feature = "feat_selinux")]
+            {
+                Preserve::Yes { required: 假 }
+            }
+            #[cfg(not(feature = "feat_selinux"))]
+            {
+                Preserve::No { explicit: 假 }
+            }
+        },
+        links: Preserve::Yes { required: 真 },
+        xattr: Preserve::Yes { required: 假 },
+    };
+
+    公有 常量 NONE: 自身类型 = 自身类型 {
+        #[cfg(unix)]
+        ownership: Preserve::No { explicit: 假 },
+        mode: Preserve::No { explicit: 假 },
+        timestamps: Preserve::No { explicit: 假 },
+        context: Preserve::No { explicit: 假 },
+        links: Preserve::No { explicit: 假 },
+        xattr: Preserve::No { explicit: 假 },
+    };
+
+    // TODO: ownership is required if the user is root, for non-root users it's not required.
+    公有 常量 DEFAULT: 自身类型 = 自身类型 {
+        #[cfg(unix)]
+        ownership: Preserve::Yes { required: 真 },
+        mode: Preserve::Yes { required: 真 },
+        timestamps: Preserve::Yes { required: 真 },
+        xattr: Preserve::Yes { required: 真 },
+        ..自身类型::NONE
+    };
+
+    公有 常量 LINKS: 自身类型 = 自身类型 {
+        links: Preserve::Yes { required: 真 },
+        ..自身类型::NONE
+    };
+
+    公有 方法 union(自身, other: &自身类型) -> 自身类型 {
+        自身类型 {
+            #[cfg(unix)]
+            ownership: 自身.ownership.max(other.ownership),
+            context: 自身.context.max(other.context),
+            timestamps: 自身.timestamps.max(other.timestamps),
+            mode: 自身.mode.max(other.mode),
+            links: 自身.links.max(other.links),
+            xattr: 自身.xattr.max(other.xattr),
+        }
+    }
+
+    /// Set the field to `Preserve::No { explicit: true }` if the corresponding field
+    /// in other is set to `Preserve::Yes { .. }`.
+    公有 方法 diff(自身, other: &自身类型) -> 自身类型 {
+        方法 update_preserve_field(current: Preserve, other: Preserve) -> Preserve {
+            如果 matches!(other, Preserve::Yes { .. }) {
+                Preserve::No { explicit: 真 }
+            } 否则 {
+                current
+            }
+        }
+        自身类型 {
+            #[cfg(unix)]
+            ownership: update_preserve_field(自身.ownership, other.ownership),
+            mode: update_preserve_field(自身.mode, other.mode),
+            timestamps: update_preserve_field(自身.timestamps, other.timestamps),
+            context: update_preserve_field(自身.context, other.context),
+            links: update_preserve_field(自身.links, other.links),
+            xattr: update_preserve_field(自身.xattr, other.xattr),
+        }
+    }
+
+    公有 方法 parse_iter<T>(values: 实现 迭代器协议<Item = T>) -> CopyResult<自身类型>
+    何处
+        T: 作为引用协议<字符串切片>,
+    {
+        设 可变 新建 = 自身类型::NONE;
+        循环 value 在 values {
+            新建 = 新建.union(&自身类型::parse_single_string(value.as_ref())?);
+        }
+        好的(新建)
+    }
+
+    /// Tries to match string containing a parameter to preserve with the corresponding entry in the
+    /// Attributes struct.
+    方法 parse_single_string(value: &字符串切片) -> CopyResult<自身类型> {
+        设 value = value.to_lowercase();
+
+        如果 value == "all" {
+            返回 好的(自身类型::ALL);
+        }
+
+        设 可变 新建 = 自身类型::NONE;
+        设 attribute = 匹配 value.as_ref() {
+            "mode" => &可变 新建.mode,
+            #[cfg(unix)]
+            "ownership" => &可变 新建.ownership,
+            "timestamps" => &可变 新建.timestamps,
+            "context" => &可变 新建.context,
+            "link" | "links" => &可变 新建.links,
+            "xattr" => &可变 新建.xattr,
+            _ => {
+                返回 坏的(CpError::InvalidArgument(
+                    translate!("cp-error-invalid-attribute", "value" => value.quote()),
+                ));
+            }
+        };
+
+        *attribute = Preserve::Yes { required: 真 };
+
+        好的(新建)
+    }
+}
+
+实现 Options {
+    #[allow(clippy::cognitive_complexity)]
+    方法 from_matches(matches: &ArgMatches) -> CopyResult<自身类型> {
+        设 not_implemented_opts = 向量![
+            #[cfg(not(任意(windows, unix)))]
+            options::ONE_FILE_SYSTEM,
+        ];
+
+        循环 not_implemented_opt 在 not_implemented_opts {
+            如果 matches.contains_id(not_implemented_opt)
+                && matches.value_source(not_implemented_opt)
+                    == 一些(clap::parser::ValueSource::CommandLine)
+            {
+                返回 坏的(CpError::NotImplemented(not_implemented_opt.to_string()));
+            }
+        }
+
+        设 recursive = matches.get_flag(options::RECURSIVE) || matches.get_flag(options::ARCHIVE);
+
+        设 backup_mode = 匹配 backup_control::determine_backup_mode(matches) {
+            坏的(e) => 返回 坏的(CpError::Backup(BackupError(格式化!("{e}")))),
+            好的(mode) => mode,
+        };
+        设 update_mode = update_control::determine_update_mode(matches);
+
+        如果 backup_mode != BackupMode::无
+            && matches
+                .get_one::<字符串>(update_control::arguments::OPT_UPDATE)
+                .is_some_and(|v| v == "none" || v == "none-fail")
+        {
+            返回 坏的(CpError::InvalidArgument(
+                translate!("cp-error-invalid-backup-argument").to_string(),
+            ));
+        }
+
+        设 backup_suffix = backup_control::determine_backup_suffix(matches);
+
+        设 overwrite = OverwriteMode::from_matches(matches);
+
+        // Parse target directory options
+        设 no_target_dir = matches.get_flag(options::NO_TARGET_DIRECTORY);
+        设 target_dir = matches
+            .get_one::<PathBuf>(options::TARGET_DIRECTORY)
+            .cloned();
+
+        如果 设 一些(dir) = &target_dir
+            && !dir.is_dir()
+        {
+            返回 坏的(CpError::NotADirectory(dir.克隆()));
+        }
+        // cp follows POSIX conventions for overriding options such as "-a",
+        // "-d", "--preserve", and "--no-preserve". We can use clap's
+        // override-all behavior to achieve this, but there's a challenge: when
+        // clap overrides an argument, it removes all traces of it from the
+        // match. This poses a problem because flags like "-a" expand to "-dR
+        // --preserve=all", and we only want to override the "--preserve=all"
+        // part. Additionally, we need to handle multiple occurrences of the
+        // same flags. To address this, we create an overriding order from the
+        // matches here.
+        设 可变 overriding_order: 向量<(正整数大小, &字符串切片, 向量<&字符串>)> = 向量![];
+        // We iterate through each overriding option, adding each occurrence of
+        // the option along with its value and index as a tuple, and push it to
+        // `overriding_order`.
+        循环 option 在 [
+            options::PRESERVE,
+            options::NO_PRESERVE,
+            options::ARCHIVE,
+            options::PRESERVE_DEFAULT_ATTRIBUTES,
+            options::NO_DEREFERENCE_PRESERVE_LINKS,
+        ] {
+            如果 设 (好的(一些(val)), 一些(index)) = (
+                matches.try_get_one::<布尔>(option),
+                // even though it says in the doc that `index_of` would give us
+                // the first index of the argument, when it comes to flag it
+                // gives us the last index where the flag appeared (probably
+                // because it overrides itself). Since it is a flag and it would
+                // have same value across the occurrences we just need the last
+                // index.
+                matches.index_of(option),
+            ) {
+                如果 *val {
+                    overriding_order.压入((index, option, 向量![]));
+                }
+            } 否则 如果 设 (一些(occurrences), 一些(可变 indices)) = (
+                matches.get_occurrences::<字符串>(option),
+                matches.indices_of(option),
+            ) {
+                occurrences.for_each(|val| {
+                    如果 设 一些(index) = indices.next() {
+                        设 val = val.收集::<向量<&字符串>>();
+                        // As mentioned in the documentation of the indices_of
+                        // function, it provides the indices of the individual
+                        // values. Therefore, to get the index of the first
+                        // value of the next occurrence in the next iteration,
+                        // we need to advance the indices iterator by the length
+                        // of the current occurrence's values.
+                        循环 _ 在 1..val.长度() {
+                            indices.next();
+                        }
+                        overriding_order.压入((index, option, val));
+                    }
+                });
+            }
+        }
+        overriding_order.sort_by_key(|a| a.0);
+
+        设 可变 attributes = Attributes::NONE;
+
+        // Iterate through the `overriding_order` and adjust the attributes accordingly.
+        循环 (_, option, val) 在 overriding_order {
+            匹配 option {
+                options::ARCHIVE => {
+                    attributes = Attributes::ALL;
+                }
+                options::PRESERVE_DEFAULT_ATTRIBUTES => {
+                    attributes = attributes.union(&Attributes::DEFAULT);
+                }
+                options::NO_DEREFERENCE_PRESERVE_LINKS => {
+                    attributes = attributes.union(&Attributes::LINKS);
+                }
+                options::PRESERVE => {
+                    attributes = attributes.union(&Attributes::parse_iter(val.into_iter())?);
+                }
+                options::NO_PRESERVE 如果 !val.为空() => {
+                    attributes = attributes.diff(&Attributes::parse_iter(val.into_iter())?);
+                }
+                _ => (),
+            }
+        }
+
+        #[cfg(not(feature = "selinux"))]
+        如果 设 Preserve::Yes { required } = attributes.context {
+            设 selinux_disabled_error = CpError::错误协议(translate!("cp-error-selinux-not-enabled"));
+            如果 required {
+                返回 坏的(selinux_disabled_error);
+            }
+            show_error_if_needed(&selinux_disabled_error);
+        }
+
+        // Extract the SELinux related flags and options
+        设 set_selinux_context = matches.get_flag(options::SELINUX);
+
+        设 context = 如果 matches.contains_id(options::CONTEXT) {
+            matches.get_one::<字符串>(options::CONTEXT).cloned()
+        } 否则 {
+            无
+        };
+
+        // -Z/--context conflicts with explicit --preserve=context but overrides implicit (from -a)
+        如果 set_selinux_context || context.is_some() {
+            匹配 attributes.context {
+                Preserve::Yes { required: 真 } => {
+                    返回 坏的(CpError::错误协议(translate!(
+                        "cp-error-selinux-context-conflict"
+                    )));
+                }
+                Preserve::Yes { required: 假 } => {
+                    attributes.context = Preserve::No { explicit: 假 };
+                }
+                Preserve::No { .. } => {}
+            }
+        }
+
+        设 options = 自身类型 {
+            attributes_only: matches.get_flag(options::ATTRIBUTES_ONLY),
+            copy_contents: matches.get_flag(options::COPY_CONTENTS),
+            cli_dereference: matches.get_flag(options::CLI_SYMBOLIC_LINKS),
+            copy_mode: CopyMode::from_matches(matches),
+            // No dereference is set with -p, -d and --archive
+            dereference: !(matches.get_flag(options::NO_DEREFERENCE)
+                || matches.get_flag(options::NO_DEREFERENCE_PRESERVE_LINKS)
+                || matches.get_flag(options::ARCHIVE)
+                // cp normally follows the link only when not copying recursively or when
+                // --link (-l) is used
+                || (recursive && CopyMode::from_matches(matches)!= CopyMode::Link ))
+                || matches.get_flag(options::DEREFERENCE),
+            one_file_system: matches.get_flag(options::ONE_FILE_SYSTEM),
+            parents: matches.get_flag(options::PARENTS),
+            update: update_mode,
+            debug: matches.get_flag(options::DEBUG),
+            verbose: matches.get_flag(options::VERBOSE) || matches.get_flag(options::DEBUG),
+            strip_trailing_slashes: matches.get_flag(options::STRIP_TRAILING_SLASHES),
+            reflink_mode: {
+                如果 设 一些(reflink) = matches.get_one::<字符串>(options::REFLINK) {
+                    匹配 reflink.as_str() {
+                        "always" => ReflinkMode::Always,
+                        "auto" => ReflinkMode::Auto,
+                        "never" => ReflinkMode::Never,
+                        value => {
+                            返回 坏的(CpError::InvalidArgument(
+                                translate!("cp-error-invalid-argument", "arg" => value.quote(), "option" => "reflink"),
+                            ));
+                        }
+                    }
+                } 否则 {
+                    ReflinkMode::默认()
+                }
+            },
+            sparse_mode: {
+                如果 设 一些(val) = matches.get_one::<字符串>(options::SPARSE) {
+                    匹配 val.as_str() {
+                        "always" => SparseMode::Always,
+                        "auto" => SparseMode::Auto,
+                        "never" => SparseMode::Never,
+                        _ => {
+                            返回 坏的(CpError::InvalidArgument(
+                                translate!("cp-error-invalid-argument", "arg" => val, "option" => "sparse"),
+                            ));
+                        }
+                    }
+                } 否则 {
+                    SparseMode::Auto
+                }
+            },
+            backup: backup_mode,
+            backup_suffix,
+            overwrite,
+            no_target_dir,
+            attributes,
+            recursive,
+            target_dir,
+            progress_bar: matches.get_flag(options::PROGRESS_BAR),
+            set_selinux_context: set_selinux_context || context.is_some(),
+            context,
+        };
+
+        好的(options)
+    }
+
+    方法 dereference(&自身, in_command_line: 布尔) -> 布尔 {
+        自身.dereference || (in_command_line && 自身.cli_dereference)
+    }
+
+    方法 preserve_hard_links(&自身) -> 布尔 {
+        匹配 自身.attributes.links {
+            Preserve::No { .. } => 假,
+            Preserve::Yes { .. } => 真,
+        }
+    }
+
+    #[cfg(unix)]
+    方法 preserve_mode(&自身) -> (布尔, 布尔) {
+        匹配 自身.attributes.mode {
+            Preserve::No { explicit } => {
+                如果 explicit {
+                    (假, 真)
+                } 否则 {
+                    (假, 假)
+                }
+            }
+            Preserve::Yes { .. } => (真, 假),
+        }
+    }
+
+    /// Whether to force overwriting the destination file.
+    方法 force(&自身) -> 布尔 {
+        matches!(自身.overwrite, OverwriteMode::Clobber(ClobberMode::Force))
+    }
+}
+
+实现 TargetType {
+    /// Return [`TargetType`] required for `target`.
+    ///
+    /// Treat target as a dir if we have multiple sources or the target
+    /// exists and already is a directory
+    方法 determine(sources: &[PathBuf], target: &Path) -> 自身类型 {
+        如果 sources.长度() > 1 || target.is_dir() {
+            自身类型::Directory
+        } 否则 {
+            自身类型::File
+        }
+    }
+}
+
+/// Returns tuple of (Source paths, Target)
+方法 parse_path_args(
+    可变 paths: 向量<PathBuf>,
+    options: &Options,
+) -> CopyResult<(向量<PathBuf>, PathBuf)> {
+    如果 paths.为空() {
+        // No files specified
+        返回 坏的(translate!("cp-error-missing-file-operand").into());
+    } 否则 如果 paths.长度() == 1 && options.target_dir.is_none() {
+        // Only one file specified
+        返回 坏的(translate!("cp-error-missing-destination-operand",
+                       "source" => paths[0].quote())
+        .into());
+    }
+
+    // Return an error if the user requested to copy more than one
+    // file source to a file target
+    如果 options.no_target_dir && options.target_dir.is_none() && paths.长度() > 2 {
+        返回 坏的(translate!("cp-error-extra-operand",
+                              "operand" => paths[2].quote())
+        .into());
+    }
+
+    设 target = 匹配 options.target_dir {
+        一些(引用 target) => {
+            // All path args are sources, and the target dir was
+            // specified separately
+            target.克隆()
+        }
+        无 => {
+            // If there was no explicit target-dir, then use the last
+            // path_arg
+            paths.弹出().解包()
+        }
+    };
+
+    如果 options.strip_trailing_slashes {
+        循环 source 在 &可变 paths {
+            *source = source.components().as_path().to_owned();
+        }
+    }
+
+    好的((paths, target))
+}
+
+/// Check if an error is ENOTSUP/EOPNOTSUPP (operation not supported).
+/// This is used to suppress xattr errors on filesystems that don't support them.
+方法 is_enotsup_error(错误: &CpError) -> 布尔 {
+    #[cfg(unix)]
+    常量 EOPNOTSUPP: 整32 = libc::EOPNOTSUPP;
+    #[cfg(not(unix))]
+    常量 EOPNOTSUPP: 整32 = 95;
+
+    匹配 错误 {
+        CpError::IoErr(e) | CpError::IoErrContext(e, _) => e.raw_os_error() == 一些(EOPNOTSUPP),
+        _ => 假,
+    }
+}
+
+/// When handling errors, we don't always want to show them to the user. This function handles that.
+方法 show_error_if_needed(错误: &CpError) {
+    匹配 错误 {
+        // When using --no-clobber, we don't want to show
+        // an error message
+        CpError::NotAllFilesCopied => {
+            // Need to return an error code
+        }
+        CpError::Skipped(_) => {
+            // touch a b && echo "n"|cp -i a b && echo $?
+            // should return an error from GNU 9.2
+        }
+        // Format IoErrContext using strip_errno to remove "(os error N)" suffix
+        // for GNU-compatible output
+        CpError::IoErrContext(io_err, context) => {
+            show_error!("{context}: {}", uucore::错误::strip_errno(io_err));
+        }
+        _ => {
+            show_error!("{error}");
+        }
+    }
+}
+
+/// Copy all `sources` to `target`.
+///
+/// Returns an `Err(Error::NotAllFilesCopied)` if at least one non-fatal error
+/// was encountered.
+///
+/// Behavior is determined by the `options` parameter, see [`Options`] for details.
+公有 方法 copy(sources: &[PathBuf], target: &Path, options: &Options) -> CopyResult<()> {
+    设 target_type = TargetType::determine(sources, target);
+    verify_target_type(target, target_type)?;
+
+    设 可变 non_fatal_errors = 假;
+    设 可变 seen_sources = 哈希集合::with_capacity(sources.长度());
+    设 可变 symlinked_files = 哈希集合::新建();
+
+    // to remember the copied files for further usage.
+    // the FileInformation implemented the Hash trait by using
+    // 1. inode number
+    // 2. device number
+    // the combination of a file's inode number and device number is unique throughout all the file systems.
+    //
+    // key is the source file's information and the value is the destination filepath.
+    设 可变 copied_files: 哈希映射<FileInformation, PathBuf> = 哈希映射::with_capacity(sources.长度());
+    // remember the copied destinations for further usage.
+    // we can't use copied_files as it is because the key is the source file's information.
+    设 可变 copied_destinations: 哈希集合<PathBuf> = 哈希集合::with_capacity(sources.长度());
+    设 可变 created_parent_dirs: 哈希集合<PathBuf> = 哈希集合::新建();
+
+    设 progress_bar = 如果 options.progress_bar {
+        设 pb = ProgressBar::新建(disk_usage(sources, options.recursive)?)
+            .with_style(
+                ProgressStyle::with_template(
+                    "{msg}: [{elapsed_precise}] {wide_bar} {bytes:>7}/{total_bytes:7}",
+                )
+                .解包(),
+            )
+            .with_message("cp");
+        pb.tick();
+        一些(pb)
+    } 否则 {
+        无
+    };
+
+    循环 source 在 sources {
+        设 normalized_source = normalize_path(source);
+        如果 options.backup == BackupMode::无 && seen_sources.包含(&normalized_source) {
+            设 file_type = 如果 source.symlink_metadata()?.file_type().is_dir() {
+                "directory"
+            } 否则 {
+                "file"
+            };
+            设 msg = translate!("cp-warning-source-specified-more-than-once", "file_type" => file_type, "source" => source.quote());
+            show_warning!("{msg}");
+        } 否则 {
+            设 dest = construct_dest_path(source, target, target_type, options)
+                .unwrap_or_else(|_| target.to_path_buf());
+
+            如果 FileInformation::from_path(&dest, 真).is_ok()
+                && !文件系统::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_symlink())
+                // if both `source` and `dest` are symlinks, it should be considered as an overwrite.
+                || 文件系统::metadata(source).is_ok()
+                    && 文件系统::symlink_metadata(source)?.file_type().is_symlink()
+                || matches!(options.copy_mode, CopyMode::SymLink)
+            {
+                // There is already a file and it isn't a symlink (managed in a different place)
+                如果 copied_destinations.包含(&dest) && options.backup != BackupMode::Numbered {
+                    // If the target was already created in this cp call, check if it's a directory.
+                    // Directories should be merged (GNU cp behavior), but files should not be overwritten.
+                    设 dest_is_dir = 文件系统::metadata(&dest).is_ok_and(|m| m.is_dir());
+                    设 source_is_dir = 文件系统::metadata(source).is_ok_and(|m| m.is_dir());
+
+                    // Only prevent overwriting if both source and dest are files (not directories)
+                    // Directories should be merged, which is handled by copy_directory
+                    如果 !dest_is_dir || !source_is_dir {
+                        // If the target file was already created in this cp call, do not overwrite
+                        返回 坏的(CpError::错误协议(
+                            translate!("cp-error-will-not-overwrite-just-created", "dest" => dest.quote(), "source" => source.quote()),
+                        ));
+                    }
+                }
+            }
+
+            如果 设 坏的(错误) = copy_source(
+                progress_bar.as_ref(),
+                source,
+                target,
+                target_type,
+                options,
+                &可变 symlinked_files,
+                &copied_destinations,
+                &可变 copied_files,
+                &可变 created_parent_dirs,
+            ) {
+                show_error_if_needed(&错误);
+                如果 !matches!(错误, CpError::Skipped(假)) {
+                    non_fatal_errors = 真;
+                }
+            } 否则 {
+                copied_destinations.插入(dest.克隆());
+            }
+        }
+        seen_sources.插入(normalized_source);
+    }
+
+    如果 设 一些(pb) = progress_bar {
+        pb.finish();
+    }
+
+    如果 non_fatal_errors {
+        坏的(CpError::NotAllFilesCopied)
+    } 否则 {
+        好的(())
+    }
+}
+
+方法 construct_dest_path(
+    source_path: &Path,
+    target: &Path,
+    target_type: TargetType,
+    options: &Options,
+) -> CopyResult<PathBuf> {
+    如果 options.no_target_dir && target.is_dir() {
+        返回 坏的(
+            translate!("cp-error-cannot-overwrite-directory-with-non-directory",
+                              "dir" => target.quote())
+            .into(),
+        );
+    }
+
+    如果 options.parents && !target.is_dir() {
+        返回 坏的(translate!("cp-error-with-parents-dest-must-be-dir").into());
+    }
+
+    好的(匹配 target_type {
+        TargetType::Directory => {
+            设 root = 如果 options.parents {
+                如果 source_path.has_root() && cfg!(unix) {
+                    Path::新建("/")
+                } 否则 {
+                    Path::新建("")
+                }
+            } 否则 {
+                如果 source_path == Path::新建(".") && target.is_dir() {
+                    // Special case: when copying current directory (.) to an existing directory,
+                    // return the target path directly instead of trying to construct a path
+                    // relative to the source's parent. This ensures we copy the contents of
+                    // the current directory into the target directory, not create a subdirectory.
+                    返回 好的(target.to_path_buf());
+                }
+                source_path.parent().unwrap_or(source_path)
+            };
+            localize_to_target(root, source_path, target)?
+        }
+        TargetType::File => target.to_path_buf(),
+    })
+}
+#[allow(clippy::too_many_arguments)]
+方法 copy_source(
+    progress_bar: 选项<&ProgressBar>,
+    source: &Path,
+    target: &Path,
+    target_type: TargetType,
+    options: &Options,
+    symlinked_files: &可变 哈希集合<FileInformation>,
+    copied_destinations: &哈希集合<PathBuf>,
+    copied_files: &可变 哈希映射<FileInformation, PathBuf>,
+    created_parent_dirs: &可变 哈希集合<PathBuf>,
+) -> CopyResult<()> {
+    设 source_path = Path::新建(&source);
+    如果 source_path.is_dir() && (options.dereference || !source_path.is_symlink()) {
+        // Copy as directory
+        copy_directory(
+            progress_bar,
+            source,
+            target,
+            options,
+            symlinked_files,
+            copied_destinations,
+            copied_files,
+            created_parent_dirs,
+            真,
+        )
+    } 否则 {
+        // Copy as file
+        设 dest = construct_dest_path(source_path, target, target_type, options)?;
+        设 res = copy_file(
+            progress_bar,
+            source_path,
+            dest.as_path(),
+            options,
+            symlinked_files,
+            copied_destinations,
+            copied_files,
+            created_parent_dirs,
+            真,
+        );
+        如果 options.parents {
+            循环 (x, y) 在 aligned_ancestors(source, dest.as_path()) {
+                如果 设 好的(src) = canonicalize(x, MissingHandling::Normal, ResolveMode::Physical) {
+                    copy_attributes(
+                        &src,
+                        y,
+                        &options.attributes,
+                        假,
+                        options.set_selinux_context,
+                    )?;
+                }
+            }
+        }
+        res
+    }
+}
+
+/// If `path` does not have `S_IWUSR` set, returns a tuple of the file's
+/// mode in octal (index 0) and human-readable (index 1) formats.
+///
+/// If the destination of a copy operation is a file that is not writeable to
+/// the owner (bit `S_IWUSR`), extra information needs to be added to the
+/// interactive mode prompt: the mode (permissions) of the file in octal and
+/// human-readable format.
+// TODO
+// The destination metadata can be read multiple times in the course of a single execution of `cp`.
+// This fix adds yet another metadata read.
+// Should this metadata be read once and then reused throughout the execution?
+// https://github.com/uutils/coreutils/issues/6658
+#[allow(clippy::if_not_else)]
+方法 file_mode_for_interactive_overwrite(
+    #[cfg_attr(not(unix), allow(unused_variables))] 路径: &Path,
+) -> 选项<(字符串, 字符串)> {
+    // Retain outer braces to ensure only one branch is included
+    {
+        #[cfg(unix)]
+        {
+            使用 libc::{S_IWUSR, mode_t};
+            使用 标准库::操作系统::unix::预导入::MetadataExt;
+
+            匹配 路径.metadata() {
+                好的(me) => {
+                    // Cast is necessary on some platforms
+                    #[allow(clippy::unnecessary_cast)]
+                    设 mode: mode_t = me.mode() 转换 mode_t;
+
+                    // It looks like this extra information is added to the prompt iff the file's user write bit is 0
+                    //  write permission, owner
+                    如果 uucore::has!(mode, S_IWUSR) {
+                        无
+                    } 否则 {
+                        // Discard leading digits
+                        设 mode_without_leading_digits = mode & 0o7777;
+
+                        一些((
+                            格式化!("{mode_without_leading_digits:04o}"),
+                            uucore::文件系统::display_permissions_unix(mode 转换 正32, 假),
+                        ))
+                    }
+                }
+                // TODO: How should failure to read the metadata be handled? Ignoring for now.
+                坏的(_) => 无,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            无
+        }
+    }
+}
+
+实现 OverwriteMode {
+    方法 verify(自身, 路径: &Path, debug: 布尔) -> CopyResult<()> {
+        匹配 自身 {
+            自身类型::NoClobber => {
+                如果 debug {
+                    打印行!("{}", translate!("cp-debug-skipped", "path" => 路径.quote()));
+                }
+                坏的(CpError::Skipped(假))
+            }
+            自身类型::Interactive(_) => {
+                设 prompt_yes_result = 如果 设 一些((octal, human_readable)) =
+                    file_mode_for_interactive_overwrite(路径)
+                {
+                    设 prompt_msg =
+                        translate!("cp-prompt-overwrite-with-mode", "path" => 路径.quote());
+                    prompt_yes!("{prompt_msg} {octal} ({human_readable})?")
+                } 否则 {
+                    设 prompt_msg = translate!("cp-prompt-overwrite", "path" => 路径.quote());
+                    prompt_yes!("{prompt_msg}")
+                };
+
+                如果 prompt_yes_result {
+                    好的(())
+                } 否则 {
+                    坏的(CpError::Skipped(真))
+                }
+            }
+            自身类型::Clobber(_) => 好的(()),
+        }
+    }
+}
+
+/// Handles errors for attributes preservation. If the attribute is not required, and
+/// errored, tries to show error (see `show_error_if_needed` for additional behavior details).
+/// If it's required, then the error is thrown.
+///
+/// Note: ENOTSUP/EOPNOTSUPP errors are silently ignored when not required, as per GNU cp
+/// documentation: "Try to preserve SELinux security context and extended attributes (xattr),
+/// but ignore any failure to do that and print no corresponding diagnostic."
+方法 handle_preserve<F: Fn() -> CopyResult<()>>(p: Preserve, f: F) -> CopyResult<()> {
+    匹配 p {
+        Preserve::No { .. } => {}
+        Preserve::Yes { required } => {
+            设 result = f();
+            如果 required {
+                result?;
+            } 否则 如果 设 坏的(引用 错误) = result {
+                // Suppress ENOTSUP errors when preservation is optional.
+                // This matches GNU cp behavior for -a and --preserve=all.
+                如果 !is_enotsup_error(错误) {
+                    show_error_if_needed(错误);
+                }
+            }
+        }
+    }
+    好的(())
+}
+
+#[cfg(全部(feature = "selinux", target_os = "linux"))]
+公有(箱) 方法 set_selinux_context(路径: &Path, context: 选项<&字符串>) -> CopyResult<()> {
+    如果 !uucore::selinux::is_selinux_enabled() {
+        返回 好的(());
+    }
+
+    匹配 uucore::selinux::set_selinux_security_context(路径, context) {
+        好的(()) => 好的(()),
+        坏的(uucore::selinux::SeLinuxError::OperationNotSupported) => 好的(()),
+        坏的(e) => 坏的(CpError::错误协议(
+            translate!("cp-error-selinux-error", "error" => e),
+        )),
+    }
+}
+
+/// Copies extended attributes (xattrs) from `source` to `dest`, ensuring that `dest` is temporarily
+/// user-writable if needed and restoring its original permissions afterward. This avoids "Operation
+/// not permitted" errors on read-only files. Returns an error if permission or metadata operations fail,
+/// or if xattr copying fails.
+#[cfg(全部(unix, not(target_os = "android")))]
+方法 copy_extended_attrs(source: &Path, dest: &Path, skip_selinux: 布尔) -> CopyResult<()> {
+    设 metadata = 文件系统::symlink_metadata(dest)?;
+
+    // Check if the destination file is currently read-only for the user.
+    设 可变 perms = metadata.permissions();
+    设 was_readonly = perms.readonly();
+
+    // Temporarily grant user write if it was read-only.
+    如果 was_readonly {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(假);
+        文件系统::set_permissions(dest, perms)?;
+    }
+
+    // Perform the xattr copy and capture any potential error,
+    // so we can restore permissions before returning.
+    设 copy_xattrs_result = 如果 skip_selinux {
+        // When -Z is used, skip copying security.selinux xattr so that
+        // the default context can be set instead of preserving from source
+        copy_xattrs_skip_selinux(source, dest)
+    } 否则 {
+        copy_xattrs(source, dest)
+    };
+
+    // Restore read-only if we changed it.
+    如果 was_readonly {
+        设 可变 revert_perms = 文件系统::symlink_metadata(dest)?.permissions();
+        revert_perms.set_readonly(真);
+        文件系统::set_permissions(dest, revert_perms)?;
+    }
+
+    // If copying xattrs failed, propagate that error now with context.
+    copy_xattrs_result.map_err(|e| {
+        CpError::IoErrContext(
+            e,
+            translate!("cp-error-setting-attributes", "path" => dest.quote()),
+        )
+    })?;
+
+    好的(())
+}
+
+/// Copy the specified attributes from one path to another.
+/// If `skip_selinux_xattr` is true, the security.selinux xattr will not be copied
+/// (used when -Z is specified to set the default context instead).
+#[allow(unused_variables)]
+公有(箱) 方法 copy_attributes(
+    source: &Path,
+    dest: &Path,
+    attributes: &Attributes,
+    dest_is_freshly_created_dir: 布尔,
+    skip_selinux_xattr: 布尔,
+) -> CopyResult<()> {
+    设 context = &*格式化!("{} -> {}", source.quote(), dest.quote());
+    设 source_metadata =
+        文件系统::symlink_metadata(source).map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+
+    设 mode_explicitly_disabled = matches!(attributes.mode, Preserve::No { explicit: 真 });
+
+    // preserve is true by default if the destination is created by us and it's a directory
+    设 mode = 如果 !mode_explicitly_disabled && dest_is_freshly_created_dir {
+        Preserve::Yes { required: 假 }
+    } 否则 {
+        attributes.mode
+    };
+
+    // Ownership must be changed first to avoid interfering with mode change.
+    #[cfg(unix)]
+    handle_preserve(attributes.ownership, || -> CopyResult<()> {
+        使用 标准库::操作系统::unix::预导入::MetadataExt;
+        使用 uucore::perms::Verbosity;
+        使用 uucore::perms::VerbosityLevel;
+        使用 uucore::perms::wrap_chown;
+
+        设 dest_uid = source_metadata.uid();
+        设 dest_gid = source_metadata.gid();
+        设 meta = &dest
+            .symlink_metadata()
+            .map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+
+        设 try_chown = {
+            |uid| {
+                wrap_chown(
+                    dest,
+                    meta,
+                    uid,
+                    一些(dest_gid),
+                    假,
+                    Verbosity {
+                        groups_only: 假,
+                        level: VerbosityLevel::Silent,
+                    },
+                )
+            }
+        };
+        // gnu compatibility: cp doesn't report an error if it fails to set the ownership,
+        // and will fall back to changing only the gid if possible.
+        如果 try_chown(一些(dest_uid)).is_err() {
+            设 _ = try_chown(无);
+        }
+        好的(())
+    })?;
+
+    handle_preserve(mode, || -> CopyResult<()> {
+        // The `chmod()` system call that underlies the
+        // `fs::set_permissions()` call is unable to change the
+        // permissions of a symbolic link. In that case, we just
+        // do nothing, since every symbolic link has the same
+        // permissions.
+        如果 !dest.is_symlink() {
+            文件系统::set_permissions(dest, source_metadata.permissions())
+                .map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+            // FIXME: Implement this for windows as well
+            #[cfg(feature = "feat_acl")]
+            exacl::getfacl(source, 无)
+                .and_then(|acl| exacl::setfacl(&[dest], &acl, 无))
+                .map_err(|err| CpError::错误协议(err.to_string()))?;
+        }
+
+        好的(())
+    })?;
+
+    handle_preserve(attributes.timestamps, || -> CopyResult<()> {
+        设 atime = FileTime::from_last_access_time(&source_metadata);
+        设 mtime = FileTime::from_last_modification_time(&source_metadata);
+        如果 dest.is_symlink() {
+            filetime::set_symlink_file_times(dest, atime, mtime)?;
+        } 否则 {
+            filetime::set_file_times(dest, atime, mtime)?;
+        }
+
+        好的(())
+    })?;
+
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    handle_preserve(attributes.context, || -> CopyResult<()> {
+        // Get the source context and apply it to the destination
+        如果 设 好的(context) = selinux::SecurityContext::of_path(source, 假, 假) {
+            如果 设 一些(context) = context {
+                如果 设 坏的(e) = context.set_for_path(dest, 假, 假) {
+                    返回 坏的(CpError::错误协议(
+                        translate!("cp-error-selinux-set-context", "path" => dest.quote(), "error" => e),
+                    ));
+                }
+            }
+        } 否则 {
+            返回 坏的(CpError::错误协议(
+                translate!("cp-error-selinux-get-context", "path" => source.quote()),
+            ));
+        }
+        好的(())
+    })?;
+
+    handle_preserve(attributes.xattr, || -> CopyResult<()> {
+        #[cfg(全部(unix, not(target_os = "android")))]
+        {
+            copy_extended_attrs(source, dest, skip_selinux_xattr)?;
+        }
+        #[cfg(not(全部(unix, not(target_os = "android"))))]
+        #[allow(unused_variables)]
+        {
+            // The documentation for GNU cp states:
+            //
+            // > Try to preserve SELinux security context and
+            // > extended attributes (xattr), but ignore any failure
+            // > to do that and print no corresponding diagnostic.
+            //
+            // so we simply do nothing here.
+            //
+            // TODO Silently ignore failures in the `#[cfg(unix)]`
+            // block instead of terminating immediately on errors.
+        }
+
+        好的(())
+    })?;
+
+    好的(())
+}
+
+方法 symlink_file(
+    source: &Path,
+    dest: &Path,
+    #[cfg(not(target_os = "wasi"))] symlinked_files: &可变 哈希集合<FileInformation>,
+    #[cfg(target_os = "wasi")] _symlinked_files: &可变 哈希集合<FileInformation>,
+) -> CopyResult<()> {
+    #[cfg(target_os = "wasi")]
+    {
+        坏的(CpError::IoErrContext(
+            输入输出::错误协议::新建(输入输出::ErrorKind::Unsupported, "symlinks not supported"),
+            translate!("cp-error-cannot-create-symlink",
+                       "dest" => get_filename(dest).unwrap_or("?").quote(),
+                       "source" => get_filename(source).unwrap_or("?").quote()),
+        ))
+    }
+    #[cfg(not(任意(windows, target_os = "wasi")))]
+    {
+        标准库::操作系统::unix::文件系统::symlink(source, dest).map_err(|e| {
+            CpError::IoErrContext(
+                e,
+                translate!("cp-error-cannot-create-symlink",
+                           "dest" => get_filename(dest).unwrap_or("?").quote(),
+                           "source" => get_filename(source).unwrap_or("?").quote()),
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        标准库::操作系统::windows::文件系统::symlink_file(source, dest).map_err(|e| {
+            CpError::IoErrContext(
+                e,
+                translate!("cp-error-cannot-create-symlink",
+                           "dest" => get_filename(dest).unwrap_or("?").quote(),
+                           "source" => get_filename(source).unwrap_or("?").quote()),
+            )
+        })?;
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        如果 设 好的(file_info) = FileInformation::from_path(dest, 假) {
+            symlinked_files.插入(file_info);
+        }
+        好的(())
+    }
+}
+
+方法 context_for(src: &Path, dest: &Path) -> 字符串 {
+    格式化!("{} -> {}", src.quote(), dest.quote())
+}
+
+/// Implements a simple backup copy for the destination file .
+/// if `is_dest_symlink` flag is set to true dest will be renamed to `backup_path`
+/// TODO: for the backup, should this function be replaced by `copy_file(...)`?
+方法 backup_dest(dest: &Path, backup_path: &Path, is_dest_symlink: 布尔) -> CopyResult<PathBuf> {
+    如果 is_dest_symlink {
+        文件系统::rename(dest, backup_path)?;
+    } 否则 {
+        文件系统::copy(dest, backup_path)?;
+    }
+    好的(backup_path.into())
+}
+
+/// Decide whether source and destination files are the same and
+/// copying is forbidden.
+///
+/// Copying to the same file is only allowed if both `--backup` and
+/// `--force` are specified and the file is a regular file.
+方法 is_forbidden_to_copy_to_same_file(
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    source_in_command_line: 布尔,
+) -> 布尔 {
+    // TODO To match the behavior of GNU cp, we also need to check
+    // that the file is a regular file.
+    设 source_is_symlink = source.is_symlink();
+    设 dest_is_symlink = dest.is_symlink();
+    // only disable dereference if both source and dest is symlink and dereference flag is disabled
+    设 dereference_to_compare =
+        options.dereference(source_in_command_line) || (!source_is_symlink || !dest_is_symlink);
+    如果 !paths_refer_to_same_file(source, dest, dereference_to_compare) {
+        返回 假;
+    }
+    如果 options.backup != BackupMode::无 {
+        如果 options.force() && !source_is_symlink {
+            返回 假;
+        }
+        如果 source_is_symlink && !options.dereference {
+            返回 假;
+        }
+        如果 dest_is_symlink {
+            返回 假;
+        }
+        如果 !dest_is_symlink && !source_is_symlink && dest != source {
+            返回 假;
+        }
+    }
+    如果 options.copy_mode == CopyMode::Link {
+        返回 假;
+    }
+    如果 options.copy_mode == CopyMode::SymLink && dest_is_symlink {
+        返回 假;
+    }
+    // If source and dest are both the same symlink but with different names, then allow the copy.
+    // This can occur, for example, if source and dest are both hardlinks to the same symlink.
+    如果 dest_is_symlink
+        && source_is_symlink
+        && source.file_name() != dest.file_name()
+        && !options.dereference
+    {
+        返回 假;
+    }
+    真
+}
+
+/// Back up, remove, or leave intact the destination file, depending on the options.
+方法 handle_existing_dest(
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    source_in_command_line: 布尔,
+    copied_files: &哈希映射<FileInformation, PathBuf>,
+) -> CopyResult<()> {
+    // Disallow copying a file to itself, unless `--force` and
+    // `--backup` are both specified.
+    如果 is_forbidden_to_copy_to_same_file(source, dest, options, source_in_command_line) {
+        返回 坏的(translate!("cp-error-same-file",
+                       "source" => source.quote(),
+                       "dest" => dest.quote())
+        .into());
+    }
+
+    如果 options.update == UpdateMode::无 {
+        如果 options.debug {
+            打印行!("skipped {}", dest.quote());
+        }
+        返回 坏的(CpError::Skipped(假));
+    }
+
+    如果 options.update != UpdateMode::IfOlder {
+        options.overwrite.verify(dest, options.debug)?;
+    }
+
+    设 可变 is_dest_removed = 假;
+    设 backup_path = backup_control::get_backup_path(options.backup, dest, &options.backup_suffix);
+    如果 设 一些(backup_path) = backup_path {
+        如果 paths_refer_to_same_file(source, &backup_path, 真) {
+            返回 坏的(translate!("cp-error-backing-up-destroy-source", "dest" => dest.quote(), "source" => source.quote())
+            .into());
+        }
+        is_dest_removed = dest.is_symlink();
+        backup_dest(dest, &backup_path, is_dest_removed)?;
+    }
+    如果 !is_dest_removed {
+        delete_dest_if_needed_and_allowed(
+            source,
+            dest,
+            options,
+            source_in_command_line,
+            copied_files,
+        )?;
+    }
+
+    好的(())
+}
+
+/// Checks if:
+/// * `dest` needs to be deleted before the copy operation can proceed
+/// * the provided options allow this deletion
+///
+/// If so, deletes `dest`.
+方法 delete_dest_if_needed_and_allowed(
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    source_in_command_line: 布尔,
+    copied_files: &哈希映射<FileInformation, PathBuf>,
+) -> CopyResult<()> {
+    设 delete_dest = 匹配 options.overwrite {
+        OverwriteMode::Clobber(cl) | OverwriteMode::Interactive(cl) => {
+            匹配 cl {
+                ClobberMode::Force => {
+                    // TODO
+                    // Using `readonly` here to check if `dest` needs to be deleted is not correct:
+                    // "On Unix-based platforms this checks if any of the owner, group or others write permission bits are set. It does not check if the current user is in the file's assigned group. It also does not check ACLs. Therefore the return value of this function cannot be relied upon to predict whether attempts to read or write the file will actually succeed."
+                    // This results in some copy operations failing, because this necessary deletion is being skipped.
+                    is_symlink_loop(dest) || 文件系统::metadata(dest)?.permissions().readonly()
+                }
+                ClobberMode::RemoveDestination => 真,
+                ClobberMode::Standard => {
+                    // Consider the following files:
+                    //
+                    // * `src/f` - a regular file
+                    // * `src/link` - a hard link to `src/f`
+                    // * `dest/src/f` - a different regular file
+                    //
+                    // In this scenario, if we do `cp -a src/ dest/`, it is
+                    // possible that the order of traversal causes `src/link`
+                    // to get copied first (to `dest/src/link`). In that case,
+                    // in order to make sure `dest/src/link` is a hard link to
+                    // `dest/src/f` and `dest/src/f` has the contents of
+                    // `src/f`, we delete the existing file to allow the hard
+                    // linking.
+                    options.preserve_hard_links() &&
+                            // only try to remove dest file only if the current source
+                            // is hardlink to a file that is already copied
+                            copied_files.contains_key(
+                                &FileInformation::from_path(
+                                    source,
+                                    options.dereference(source_in_command_line)
+                                ).map_err(|e| CpError::IoErrContext(e, 格式化!("cannot stat {}", source.quote())))?
+                            )
+                }
+            }
+        }
+        OverwriteMode::NoClobber => 假,
+    };
+
+    如果 delete_dest {
+        delete_path(dest, options)
+    } 否则 {
+        好的(())
+    }
+}
+
+方法 delete_path(路径: &Path, options: &Options) -> CopyResult<()> {
+    // Windows requires clearing readonly attribute before deletion when using --force
+    #[cfg(windows)]
+    如果 options.force() {
+        如果 设 好的(可变 perms) = 文件系统::metadata(路径).映射(|m| m.permissions()) {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(假);
+            设 _ = 文件系统::set_permissions(路径, perms);
+        }
+    }
+
+    匹配 文件系统::remove_file(路径) {
+        好的(()) => {
+            如果 options.verbose {
+                打印行!(
+                    "{}",
+                    translate!("cp-verbose-removed", "path" => 路径.quote())
+                );
+            }
+        }
+        坏的(err) 如果 err.kind() == 输入输出::ErrorKind::NotFound => {
+            // target could have been deleted earlier (e.g. same-file with --remove-destination)
+        }
+        坏的(err) => 返回 坏的(err.into()),
+    }
+
+    好的(())
+}
+
+/// Zip the ancestors of a source path and destination path.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let actual = aligned_ancestors(&Path::new("a/b/c"), &Path::new("d/a/b/c"));
+/// let expected = vec![
+///     (Path::new("a"), Path::new("d/a")),
+///     (Path::new("a/b"), Path::new("d/a/b")),
+/// ];
+/// assert_eq!(actual, expected);
+/// ```
+方法 aligned_ancestors<'a>(source: &'a Path, dest: &'a Path) -> 向量<(&'a Path, &'a Path)> {
+    // Collect the ancestors of each. For example, if `source` is
+    // "a/b/c", then the ancestors are "a/b/c", "a/b", "a/", and "".
+    设 source_ancestors: 向量<&Path> = source.ancestors().收集();
+    设 dest_ancestors: 向量<&Path> = dest.ancestors().收集();
+
+    // For this particular application, we don't care about the null
+    // path "" and we don't care about the full path (e.g. "a/b/c"),
+    // so we exclude those.
+    设 n = source_ancestors.长度();
+    设 source_ancestors = &source_ancestors[1..n - 1];
+
+    // Get the matching number of elements from the ancestors of the
+    // destination path (for example, get "d/a" and "d/a/b").
+    设 k = source_ancestors.长度();
+    设 dest_ancestors = &dest_ancestors[1..=k];
+
+    // Now we have two slices of the same length, so we zip them.
+    设 可变 result = 向量![];
+    循环 (x, y) 在 source_ancestors
+        .迭代()
+        .rev()
+        .zip(dest_ancestors.迭代().rev())
+    {
+        result.压入((*x, *y));
+    }
+    result
+}
+
+方法 print_verbose_output(
+    parents: 布尔,
+    progress_bar: 选项<&ProgressBar>,
+    source: &Path,
+    dest: &Path,
+) {
+    如果 设 一些(pb) = progress_bar {
+        // Suspend (hide) the progress bar so the println won't overlap with the progress bar.
+        pb.suspend(|| {
+            print_paths(parents, source, dest);
+        });
+    } 否则 {
+        print_paths(parents, source, dest);
+    }
+}
+
+方法 print_paths(parents: 布尔, source: &Path, dest: &Path) {
+    如果 parents {
+        // For example, if copying file `a/b/c` and its parents
+        // to directory `d/`, then print
+        //
+        //     a -> d/a
+        //     a/b -> d/a/b
+        //
+        循环 (x, y) 在 aligned_ancestors(source, dest) {
+            打印行!("{} -> {}", x.display(), y.display());
+        }
+    }
+
+    打印行!("{}", context_for(source, dest));
+}
+
+/// Handles the copy mode for a file copy operation.
+///
+/// This function determines how to copy a file based on the provided options.
+/// It supports different copy modes, including hard linking, copying, symbolic linking, updating, and attribute-only copying.
+/// It also handles file backups, overwriting, and dereferencing based on the provided options.
+///
+/// # Returns
+///
+/// * `Ok(())` - The file was copied successfully.
+/// * `Err(CopyError)` - An error occurred while copying the file.
+#[allow(clippy::too_many_arguments)]
+方法 handle_copy_mode(
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    context: &字符串切片,
+    source_metadata: &Metadata,
+    symlinked_files: &可变 哈希集合<FileInformation>,
+    source_in_command_line: 布尔,
+    created_parent_dirs: &可变 哈希集合<PathBuf>,
+) -> CopyResult<PerformedAction> {
+    匹配 options.copy_mode {
+        CopyMode::Link => {
+            如果 dest.exists() {
+                设 backup_path =
+                    backup_control::get_backup_path(options.backup, dest, &options.backup_suffix);
+                如果 设 一些(backup_path) = backup_path {
+                    backup_dest(dest, &backup_path, dest.is_symlink())?;
+                    文件系统::remove_file(dest)?;
+                }
+                如果 options.overwrite == OverwriteMode::Clobber(ClobberMode::Force) {
+                    文件系统::remove_file(dest)?;
+                }
+            }
+            如果 options.dereference(source_in_command_line) && source.is_symlink() {
+                设 resolved =
+                    canonicalize(source, MissingHandling::Missing, ResolveMode::Physical).解包();
+                文件系统::hard_link(resolved, dest)
+            } 否则 {
+                文件系统::hard_link(source, dest)
+            }
+            .map_err(|e| {
+                CpError::IoErrContext(
+                    e,
+                    translate!("cp-error-cannot-create-hard-link", "dest" => get_filename(dest).unwrap_or("?").quote(), "source" => get_filename(source).unwrap_or("?").quote())
+                )
+            })?;
+        }
+        CopyMode::复制协议 => {
+            copy_helper(
+                source,
+                dest,
+                options,
+                context,
+                source_metadata,
+                symlinked_files,
+                created_parent_dirs,
+            )?;
+        }
+        CopyMode::SymLink => {
+            如果 dest.exists() && options.overwrite == OverwriteMode::Clobber(ClobberMode::Force) {
+                文件系统::remove_file(dest)?;
+            }
+            symlink_file(source, dest, symlinked_files)?;
+        }
+        CopyMode::Update => {
+            如果 dest.exists() {
+                匹配 options.update {
+                    UpdateMode::All => {
+                        copy_helper(
+                            source,
+                            dest,
+                            options,
+                            context,
+                            source_metadata,
+                            symlinked_files,
+                            created_parent_dirs,
+                        )?;
+                    }
+                    UpdateMode::无 => {
+                        如果 options.debug {
+                            打印行!("skipped {}", dest.quote());
+                        }
+
+                        返回 好的(PerformedAction::Skipped);
+                    }
+                    UpdateMode::NoneFail => {
+                        返回 坏的(CpError::错误协议(
+                            translate!("cp-error-not-replacing", "file" => dest.quote()),
+                        ));
+                    }
+                    UpdateMode::IfOlder => {
+                        设 dest_metadata = 文件系统::symlink_metadata(dest)?;
+
+                        设 src_time = source_metadata.modified()?;
+                        设 dest_time = dest_metadata.modified()?;
+                        如果 src_time <= dest_time {
+                            返回 好的(PerformedAction::Skipped);
+                        }
+
+                        options.overwrite.verify(dest, options.debug)?;
+
+                        copy_helper(
+                            source,
+                            dest,
+                            options,
+                            context,
+                            source_metadata,
+                            symlinked_files,
+                            created_parent_dirs,
+                        )?;
+                    }
+                }
+            } 否则 {
+                copy_helper(
+                    source,
+                    dest,
+                    options,
+                    context,
+                    source_metadata,
+                    symlinked_files,
+                    created_parent_dirs,
+                )?;
+            }
+        }
+        CopyMode::AttrOnly => {
+            OpenOptions::新建()
+                .写锁定(真)
+                .truncate(假)
+                .create(真)
+                .open(dest)
+                .解包();
+        }
+    }
+
+    好的(PerformedAction::Copied)
+}
+
+/// Calculates the permissions for the destination file in a copy operation.
+///
+/// If the destination file already exists, its current permissions are returned.
+/// If the destination file does not exist, the source file's permissions are used,
+/// with the `no-preserve` option and the umask taken into account on Unix platforms.
+/// # Returns
+///
+/// * `Ok(Permissions)` - The calculated permissions for the destination file.
+/// * `Err(CopyError)` - An error occurred while getting the metadata of the destination file.
+///
+// Allow unused variables for Windows (on options)
+#[allow(unused_variables)]
+方法 calculate_dest_permissions(
+    dest_metadata: 选项<&Metadata>,
+    dest: &Path,
+    source_metadata: &Metadata,
+    options: &Options,
+    context: &字符串切片,
+) -> Permissions {
+    如果 设 一些(metadata) = dest_metadata {
+        metadata.permissions()
+    } 否则 {
+        #[cfg(unix)]
+        {
+            设 可变 permissions = source_metadata.permissions();
+            设 mode = handle_no_preserve_mode(options, permissions.mode());
+
+            // Apply umask
+            使用 uucore::mode::get_umask;
+            设 mode = mode & !get_umask();
+            permissions.set_mode(mode);
+            permissions
+        }
+        #[cfg(not(unix))]
+        {
+            source_metadata.permissions()
+        }
+    }
+}
+
+/// Copy the a file from `source` to `dest`. `source` will be dereferenced if
+/// `options.dereference` is set to true. `dest` will be dereferenced only if
+/// the source was not a symlink.
+///
+/// Behavior when copying to existing files is contingent on the
+/// `options.overwrite` mode. If a file is skipped, the return type
+/// should be `Error:Skipped`
+///
+/// The original permissions of `source` will be copied to `dest`
+/// after a successful copy.
+#[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+方法 copy_file(
+    progress_bar: 选项<&ProgressBar>,
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    symlinked_files: &可变 哈希集合<FileInformation>,
+    copied_destinations: &哈希集合<PathBuf>,
+    copied_files: &可变 哈希映射<FileInformation, PathBuf>,
+    created_parent_dirs: &可变 哈希集合<PathBuf>,
+    source_in_command_line: 布尔,
+) -> CopyResult<()> {
+    设 source_is_symlink = source.is_symlink();
+    设 initial_dest_metadata = dest.symlink_metadata().ok();
+    设 dest_is_symlink = initial_dest_metadata
+        .as_ref()
+        .is_some_and(|md| md.file_type().is_symlink());
+    设 dest_target_exists = dest.try_exists().unwrap_or(假);
+    // Fail if dest is a dangling symlink or a symlink this program created previously
+    如果 dest_is_symlink {
+        如果 FileInformation::from_path(dest, 假).is_ok_and(|info| symlinked_files.包含(&info))
+        {
+            返回 坏的(CpError::错误协议(
+                translate!("cp-error-will-not-copy-through-symlink", "source" => source.quote(), "dest" => dest.quote()),
+            ));
+        }
+        // Fail if cp tries to copy two sources of the same name into a single symlink
+        // Example: "cp file1 dir1/file1 tmp" where "tmp" is a directory containing a symlink "file1" pointing to a file named "foo".
+        // foo will contain the contents of "file1" and "dir1/file1" will not be copied over to "tmp/file1"
+        如果 copied_destinations.包含(dest) {
+            返回 坏的(CpError::错误协议(
+                translate!("cp-error-will-not-copy-through-symlink", "source" => source.quote(), "dest" => dest.quote()),
+            ));
+        }
+
+        设 copy_contents = options.dereference(source_in_command_line) || !source_is_symlink;
+        如果 copy_contents
+            && !dest_target_exists
+            && !matches!(
+                options.overwrite,
+                OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+            )
+            && !is_symlink_loop(dest)
+            && 标准库::环境::var_os("POSIXLY_CORRECT").is_none()
+        {
+            返回 坏的(CpError::错误协议(
+                translate!("cp-error-not-writing-dangling-symlink", "dest" => dest.quote()),
+            ));
+        }
+        如果 paths_refer_to_same_file(source, dest, 真)
+            && matches!(
+                options.overwrite,
+                OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+            )
+            && options.backup == BackupMode::无
+        {
+            文件系统::remove_file(dest)?;
+        }
+    }
+
+    如果 are_hardlinks_to_same_file(source, dest)
+        && source != dest
+        && matches!(
+            options.overwrite,
+            OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+        )
+    {
+        文件系统::remove_file(dest)?;
+    }
+
+    如果 initial_dest_metadata.is_some()
+        && (!options.attributes_only
+            || matches!(
+                options.overwrite,
+                OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+            ))
+    {
+        如果 paths_refer_to_same_file(source, dest, 真) && options.copy_mode == CopyMode::Link {
+            如果 source_is_symlink {
+                如果 !dest_is_symlink {
+                    返回 好的(());
+                }
+                如果 !options.dereference {
+                    返回 好的(());
+                }
+            } 否则 如果 options.backup != BackupMode::无 && !dest_is_symlink {
+                如果 source == dest {
+                    如果 !options.force() {
+                        返回 好的(());
+                    }
+                } 否则 {
+                    返回 好的(());
+                }
+            }
+        }
+        handle_existing_dest(source, dest, options, source_in_command_line, copied_files)?;
+        如果 are_hardlinks_to_same_file(source, dest) {
+            如果 options.copy_mode == CopyMode::复制协议 {
+                返回 好的(());
+            }
+            如果 options.copy_mode == CopyMode::Link && (!source_is_symlink || !dest_is_symlink) {
+                返回 好的(());
+            }
+        }
+    }
+
+    如果 options.attributes_only
+        && source_is_symlink
+        && !matches!(
+            options.overwrite,
+            OverwriteMode::Clobber(ClobberMode::RemoveDestination)
+        )
+    {
+        返回 坏的(translate!("cp-error-cannot-change-attribute", "dest" => dest.quote()).into());
+    }
+
+    // When using --link mode, hard link structure is automatically preserved
+    // because we link to source files (which share inodes).
+    如果 options.preserve_hard_links() && options.copy_mode != CopyMode::Link {
+        // if we encounter a matching device/inode pair in the source tree
+        // we can arrange to create a hard link between the corresponding names
+        // in the destination tree.
+        如果 设 一些(new_source) = copied_files.获取(
+            &FileInformation::from_path(source, options.dereference(source_in_command_line))
+                .map_err(|e| CpError::IoErrContext(e, 格式化!("cannot stat {}", source.quote())))?,
+        ) {
+            文件系统::hard_link(new_source, dest)?;
+
+            如果 options.verbose {
+                print_verbose_output(options.parents, progress_bar, source, dest);
+            }
+
+            返回 好的(());
+        }
+    }
+
+    // Calculate the context upfront before canonicalizing the path
+    设 context = context_for(source, dest);
+    设 context = context.as_str();
+
+    设 source_metadata = {
+        设 result = 如果 options.dereference(source_in_command_line) {
+            文件系统::metadata(source)
+        } 否则 {
+            文件系统::symlink_metadata(source)
+        };
+        // this is just for gnu tests compatibility
+        result.map_err(|err| {
+            如果 err.to_string().包含("No such file or directory") {
+                返回 translate!("cp-error-cannot-stat", "source" => source.quote());
+            }
+            err.to_string()
+        })?
+    };
+
+    设 dest_metadata = dest.symlink_metadata().ok();
+
+    设 dest_permissions = calculate_dest_permissions(
+        dest_metadata.as_ref(),
+        dest,
+        &source_metadata,
+        options,
+        context,
+    );
+
+    设 source_is_stream = is_stream(&source_metadata);
+
+    设 performed_action = handle_copy_mode(
+        source,
+        dest,
+        options,
+        context,
+        &source_metadata,
+        symlinked_files,
+        source_in_command_line,
+        created_parent_dirs,
+    )?;
+
+    如果 options.verbose && performed_action != PerformedAction::Skipped {
+        print_verbose_output(options.parents, progress_bar, source, dest);
+    }
+
+    // TODO: implement something similar to gnu's lchown
+    如果 !dest_is_symlink {
+        // Here, to match GNU semantics, we quietly ignore an error
+        // if a user does not have the correct ownership to modify
+        // the permissions of a file.
+        //
+        // FWIW, the OS will throw an error later, on the write op, if
+        // the user does not have permission to write to the file.
+        文件系统::set_permissions(dest, dest_permissions).ok();
+    }
+
+    设 copy_attributes_result = 如果 options.dereference(source_in_command_line) {
+        // Try to canonicalize, but if it fails (e.g., due to inaccessible parent directories),
+        // fall back to the original source path
+        设 src_for_attrs = canonicalize(source, MissingHandling::Normal, ResolveMode::Physical)
+            .ok()
+            .过滤(|p| p.exists())
+            .unwrap_or_else(|| source.to_path_buf());
+        copy_attributes(
+            &src_for_attrs,
+            dest,
+            &options.attributes,
+            假,
+            options.set_selinux_context,
+        )
+    } 否则 如果 source_is_stream && !source.exists() {
+        // Some stream files may not exist after we have copied it,
+        // like anonymous pipes. Thus, we can't really copy its
+        // attributes. However, this is already handled in the stream
+        // copy function (see `copy_stream` under platform/linux.rs).
+        好的(())
+    } 否则 {
+        copy_attributes(
+            source,
+            dest,
+            &options.attributes,
+            假,
+            options.set_selinux_context,
+        )
+    };
+
+    // GNU cp truncates the destination when a required attribute cannot be preserved
+    copy_attributes_result.inspect_err(|_| {
+        文件系统::File::create(dest).映射(|f| f.set_len(0)).ok();
+    })?;
+
+    #[cfg(全部(feature = "selinux", target_os = "linux"))]
+    如果 options.set_selinux_context {
+        set_selinux_context(dest, options.context.as_ref())?;
+    }
+
+    // Skip tracking copied files when using --link mode since hard link
+    // structure is automatically preserved
+    如果 options.copy_mode != CopyMode::Link {
+        copied_files.插入(
+            FileInformation::from_path(source, options.dereference(source_in_command_line))?,
+            dest.to_path_buf(),
+        );
+    }
+
+    如果 设 一些(progress_bar) = progress_bar {
+        progress_bar.inc(source_metadata.长度());
+    }
+
+    好的(())
+}
+
+方法 is_stream(metadata: &Metadata) -> 布尔 {
+    #[cfg(unix)]
+    {
+        设 file_type = metadata.file_type();
+        file_type.is_fifo() || file_type.is_char_device() || file_type.is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        设 _ = metadata;
+        假
+    }
+}
+
+#[cfg(unix)]
+方法 handle_no_preserve_mode(options: &Options, org_mode: 正32) -> 正32 {
+    设 (is_preserve_mode, is_explicit_no_preserve_mode) = options.preserve_mode();
+    如果 !is_preserve_mode {
+        使用 libc::{
+            S_IRGRP, S_IROTH, S_IRUSR, S_IRWXG, S_IRWXO, S_IRWXU, S_IWGRP, S_IWOTH, S_IWUSR,
+        };
+
+        #[cfg(not(任意(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "redox",
+        )))]
+        {
+            常量 MODE_RW_UGO: 正32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+            常量 S_IRWXUGO: 正32 = S_IRWXU | S_IRWXG | S_IRWXO;
+            返回 如果 is_explicit_no_preserve_mode {
+                MODE_RW_UGO
+            } 否则 {
+                org_mode & S_IRWXUGO
+            };
+        }
+
+        #[cfg(任意(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "redox",
+        ))]
+        {
+            #[allow(clippy::unnecessary_cast)]
+            常量 MODE_RW_UGO: 正32 =
+                (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH) 转换 正32;
+            #[allow(clippy::unnecessary_cast)]
+            常量 S_IRWXUGO: 正32 = (S_IRWXU | S_IRWXG | S_IRWXO) 转换 正32;
+            返回 如果 is_explicit_no_preserve_mode {
+                MODE_RW_UGO
+            } 否则 {
+                org_mode & S_IRWXUGO
+            };
+        }
+    }
+
+    org_mode
+}
+
+/// Copy the file from `source` to `dest` either using the normal `fs::copy` or a
+/// copy-on-write scheme if --reflink is specified and the filesystem supports it.
+方法 copy_helper(
+    source: &Path,
+    dest: &Path,
+    options: &Options,
+    context: &字符串切片,
+    source_metadata: &Metadata,
+    symlinked_files: &可变 哈希集合<FileInformation>,
+    created_parent_dirs: &可变 哈希集合<PathBuf>,
+) -> CopyResult<()> {
+    如果 options.parents {
+        设 parent = dest.parent().unwrap_or(dest);
+        如果 created_parent_dirs.插入(parent.to_path_buf()) {
+            文件系统::create_dir_all(parent)?;
+        }
+    }
+
+    如果 path_ends_with_terminator(dest) && !dest.is_dir() {
+        返回 坏的(CpError::NotADirectory(dest.to_path_buf()));
+    }
+
+    #[cfg(unix)]
+    如果 options.recursive && !options.copy_contents {
+        设 ft = source_metadata.file_type();
+        如果 ft.is_socket() {
+            返回 copy_socket(dest, options.overwrite, options.debug);
+        }
+        如果 ft.is_fifo() {
+            返回 copy_fifo(dest, options.overwrite, options.debug);
+        }
+        如果 ft.is_char_device() || ft.is_block_device() {
+            返回 copy_node(dest, source_metadata, options.overwrite, options.debug);
+        }
+    }
+
+    如果 source_metadata.is_symlink() {
+        copy_link(source, dest, symlinked_files, options)?;
+    } 否则 {
+        设 copy_debug = copy_on_write(
+            source,
+            dest,
+            options.reflink_mode,
+            options.sparse_mode,
+            context,
+            #[cfg(unix)]
+            is_stream(source_metadata),
+        )?;
+
+        如果 !options.attributes_only && options.debug {
+            show_debug(&copy_debug);
+        }
+    }
+
+    好的(())
+}
+
+// "Copies" a FIFO by creating a new one. This workaround is because Rust's
+// built-in fs::copy does not handle FIFOs (see rust-lang/rust/issues/79390).
+#[cfg(unix)]
+方法 copy_fifo(dest: &Path, overwrite: OverwriteMode, debug: 布尔) -> CopyResult<()> {
+    如果 dest.exists() {
+        overwrite.verify(dest, debug)?;
+        文件系统::remove_file(dest)?;
+    }
+
+    make_fifo(dest)
+        .map_err(|_| translate!("cp-error-cannot-create-fifo", "path" => dest.quote()).into())
+}
+
+#[cfg(unix)]
+方法 copy_socket(dest: &Path, overwrite: OverwriteMode, debug: 布尔) -> CopyResult<()> {
+    如果 dest.exists() {
+        overwrite.verify(dest, debug)?;
+        文件系统::remove_file(dest)?;
+    }
+
+    UnixListener::bind(dest)?;
+    好的(())
+}
+
+#[cfg(unix)]
+方法 copy_node(
+    dest: &Path,
+    source_metadata: &Metadata,
+    overwrite: OverwriteMode,
+    debug: 布尔,
+) -> CopyResult<()> {
+    如果 dest.exists() {
+        overwrite.verify(dest, debug)?;
+        文件系统::remove_file(dest)?;
+    }
+    设 sflag = 如果 source_metadata.file_type().is_char_device() {
+        SFlag::S_IFCHR
+    } 否则 {
+        SFlag::S_IFBLK
+    };
+    设 mode = Mode::from_bits_truncate(source_metadata.mode() 转换 mode_t);
+    nix_mknod(dest, sflag, mode, source_metadata.rdev() 转换 dev_t)
+        .map_err(|e| translate!("cp-error-cannot-create-special-file", "path" => dest.quote(), "error" => e.desc()).into())
+}
+
+方法 copy_link(
+    source: &Path,
+    dest: &Path,
+    symlinked_files: &可变 哈希集合<FileInformation>,
+    options: &Options,
+) -> CopyResult<()> {
+    // Here, we will copy the symlink itself (actually, just recreate it)
+    设 link = 文件系统::read_link(source)?;
+    // we always need to remove the file to be able to create a symlink,
+    // even if it is writeable.
+    如果 dest.is_symlink() || dest.is_file() {
+        delete_path(dest, options)?;
+    }
+    symlink_file(&link, dest, symlinked_files)?;
+    copy_attributes(
+        source,
+        dest,
+        &options.attributes,
+        假,
+        options.set_selinux_context,
+    )
+}
+
+/// Generate an error message if `target` is not the correct `target_type`
+公有 方法 verify_target_type(target: &Path, target_type: TargetType) -> CopyResult<()> {
+    匹配 (target_type, target.is_dir()) {
+        (TargetType::Directory, 假) => 坏的(translate!("cp-error-target-not-directory", "target" => target.quote())
+        .into()),
+        (TargetType::File, 真) => 坏的(translate!("cp-error-cannot-overwrite-directory-with-non-directory", "dir" => target.quote())
+        .into()),
+        _ => 好的(()),
+    }
+}
+
+/// Remove the `root` prefix from `source` and prefix it with `target`
+/// to create a file that is local to `target`
+/// # Examples
+///
+/// ```ignore
+/// assert!(uu_cp::localize_to_target(
+///     &Path::new("a/source/"),
+///     &Path::new("a/source/c.txt"),
+///     &Path::new("target/"),
+/// ).unwrap() == Path::new("target/c.txt"))
+/// ```
+公有 方法 localize_to_target(root: &Path, source: &Path, target: &Path) -> CopyResult<PathBuf> {
+    设 local_to_root = source.strip_prefix(root)?;
+    好的(target.加入(local_to_root))
+}
+
+/// Get the total size of a slice of files and directories.
+///
+/// This function is much like the `du` utility, by recursively getting the sizes of files in directories.
+/// Files are not deduplicated when appearing in multiple sources. If `recursive` is set to `false`, the
+/// directories in `paths` will be ignored.
+方法 disk_usage(paths: &[PathBuf], recursive: 布尔) -> 输入输出::结果<正64> {
+    设 可变 total = 0;
+    循环 p 在 paths {
+        设 md = 文件系统::metadata(p)?;
+        如果 md.file_type().is_dir() {
+            如果 recursive {
+                total += disk_usage_directory(p)?;
+            }
+        } 否则 {
+            total += md.长度();
+        }
+    }
+    好的(total)
+}
+
+/// A helper for `disk_usage` specialized for directories.
+方法 disk_usage_directory(p: &Path) -> 输入输出::结果<正64> {
+    设 可变 total = 0;
+
+    循环 entry 在 文件系统::read_dir(p)? {
+        设 entry = entry?;
+        如果 entry.file_type()?.is_dir() {
+            total += disk_usage_directory(&entry.路径())?;
+        } 否则 {
+            total += entry.metadata()?.长度();
+        }
+    }
+
+    好的(total)
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 箱::{Attributes, Preserve, aligned_ancestors, localize_to_target};
+    使用 标准库::路径::Path;
+
+    #[test]
+    方法 test_cp_localize_to_target() {
+        设 root = Path::新建("a/source/");
+        设 source = Path::新建("a/source/c.txt");
+        设 target = Path::新建("target/");
+        设 actual = localize_to_target(root, source, target).解包();
+        设 expected = Path::新建("target/c.txt");
+        相等断言!(actual, expected);
+    }
+
+    #[test]
+    方法 test_aligned_ancestors() {
+        设 actual = aligned_ancestors(Path::新建("a/b/c"), Path::新建("d/a/b/c"));
+        设 expected = 向量![
+            (Path::新建("a"), Path::新建("d/a")),
+            (Path::新建("a/b"), Path::新建("d/a/b")),
+        ];
+        相等断言!(actual, expected);
+    }
+    #[test]
+    方法 test_diff_attrs() {
+        相等断言!(
+            Attributes::ALL.diff(&Attributes {
+                context: Preserve::Yes { required: 真 },
+                xattr: Preserve::Yes { required: 真 },
+                ..Attributes::ALL
+            }),
+            Attributes {
+                #[cfg(unix)]
+                ownership: Preserve::No { explicit: 真 },
+                mode: Preserve::No { explicit: 真 },
+                timestamps: Preserve::No { explicit: 真 },
+                context: Preserve::No { explicit: 真 },
+                links: Preserve::No { explicit: 真 },
+                xattr: Preserve::No { explicit: 真 }
+            }
+        );
+        相等断言!(
+            Attributes {
+                context: Preserve::Yes { required: 真 },
+                xattr: Preserve::Yes { required: 真 },
+                ..Attributes::ALL
+            }
+            .diff(&Attributes::NONE),
+            Attributes {
+                context: Preserve::Yes { required: 真 },
+                xattr: Preserve::Yes { required: 真 },
+                ..Attributes::ALL
+            }
+        );
+        相等断言!(
+            Attributes::NONE.diff(&Attributes {
+                context: Preserve::Yes { required: 真 },
+                xattr: Preserve::Yes { required: 真 },
+                ..Attributes::ALL
+            }),
+            Attributes {
+                #[cfg(unix)]
+                ownership: Preserve::No { explicit: 真 },
+                mode: Preserve::No { explicit: 真 },
+                timestamps: Preserve::No { explicit: 真 },
+                context: Preserve::No { explicit: 真 },
+                links: Preserve::No { explicit: 真 },
+                xattr: Preserve::No { explicit: 真 }
+            }
+        );
+    }
+}

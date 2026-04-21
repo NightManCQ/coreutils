@@ -1,0 +1,1619 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore clocal erange tcgetattr tcsetattr tcsanow tiocgwinsz tiocswinsz cfgetospeed cfsetospeed ushort vmin vtime cflag lflag ispeed ospeed
+// spell-checker:ignore parenb parodd cmspar hupcl cstopb cread clocal crtscts CSIZE
+// spell-checker:ignore ignbrk brkint ignpar parmrk inpck istrip inlcr igncr icrnl ixoff ixon iuclc ixany imaxbel iutf
+// spell-checker:ignore opost olcuc ocrnl onlcr onocr onlret ofdel nldly crdly tabdly bsdly vtdly ffdly ofill
+// spell-checker:ignore isig icanon iexten echoe crterase echok echonl noflsh xcase tostop echoprt prterase echoctl ctlecho echoke crtkill flusho extproc
+// spell-checker:ignore lnext rprnt susp swtch vdiscard veof veol verase vintr vkill vlnext vquit vreprint vstart vstop vsusp vswtc vwerase werase
+// spell-checker:ignore sigquit sigtstp
+// spell-checker:ignore cbreak decctlq evenp litout oddp tcsadrain exta extb NCCS cfsetispeed
+// spell-checker:ignore notaflag notacombo notabaud
+// spell-checker:ignore baudrate TCGETS
+
+模组 flags;
+
+使用 箱::flags::AllFlags;
+使用 箱::flags::COMBINATION_SETTINGS;
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 nix::libc::{O_NONBLOCK, TIOCGWINSZ, TIOCSWINSZ, c_ushort};
+
+#[cfg(全部(
+    target_os = "linux",
+    not(target_arch = "powerpc"),
+    not(target_arch = "powerpc64")
+))]
+使用 nix::libc::{TCGETS2, termios2};
+
+使用 nix::sys::termios::{
+    ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, SpecialCharacterIndices 转换 S,
+    Termios, cfsetispeed, cfsetospeed, tcgetattr, tcsetattr,
+};
+使用 nix::{ioctl_read_bad, ioctl_write_ptr_bad};
+使用 标准库::比较::排序顺序;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, Stdin, stdin, stdout};
+使用 标准库::数字::IntErrorKind;
+使用 标准库::操作系统::fd::{AsFd, BorrowedFd};
+使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+使用 标准库::操作系统::unix::输入输出::{AsRawFd, RawFd};
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::parser::num_parser::ExtendedParser;
+使用 uucore::translate;
+
+#[cfg(not(bsd))]
+使用 flags::BAUD_RATES;
+使用 flags::{CONTROL_CHARS, CONTROL_FLAGS, INPUT_FLAGS, LOCAL_FLAGS, OUTPUT_FLAGS};
+
+常量 ASCII_DEL: 正8 = 127;
+
+// Sane defaults for control characters.
+常量 SANE_CONTROL_CHARS: [(S, 正8); 12] = [
+    (S::VINTR, 3),     // ^C
+    (S::VQUIT, 28),    // ^\
+    (S::VERASE, 127),  // DEL
+    (S::VKILL, 21),    // ^U
+    (S::VEOF, 4),      // ^D
+    (S::VSTART, 17),   // ^Q
+    (S::VSTOP, 19),    // ^S
+    (S::VSUSP, 26),    // ^Z
+    (S::VREPRINT, 18), // ^R
+    (S::VWERASE, 23),  // ^W
+    (S::VLNEXT, 22),   // ^V
+    (S::VDISCARD, 15), // ^O
+];
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+#[cfg_attr(test, derive(偏等比较协议))]
+公有 结构 Flag<T> {
+    name: &'静态 字符串切片,
+    #[期望(clippy::struct_field_names)]
+    flag: T,
+    show: 布尔,
+    sane: 布尔,
+    group: 选项<T>,
+}
+
+实现<T> Flag<T> {
+    公有 常量 方法 新建(name: &'静态 字符串切片, flag: T) -> 自身类型 {
+        自身类型 {
+            name,
+            flag,
+            show: 真,
+            sane: 假,
+            group: 无,
+        }
+    }
+
+    公有 常量 方法 new_grouped(name: &'静态 字符串切片, flag: T, group: T) -> 自身类型 {
+        自身类型 {
+            name,
+            flag,
+            show: 真,
+            sane: 假,
+            group: 一些(group),
+        }
+    }
+
+    公有 常量 方法 hidden(可变 自身) -> 自身类型 {
+        自身.show = 假;
+        自身
+    }
+
+    公有 常量 方法 sane(可变 自身) -> 自身类型 {
+        自身.sane = 真;
+        自身
+    }
+}
+
+协议 TermiosFlag: 复制协议 {
+    方法 is_in(&自身, termios: &Termios, group: 选项<自身类型>) -> 布尔;
+    方法 apply(&自身, termios: &可变 Termios, val: 布尔);
+}
+
+模组 options {
+    公有 常量 ALL: &字符串切片 = "all";
+    公有 常量 SAVE: &字符串切片 = "save";
+    公有 常量 FILE: &字符串切片 = "file";
+    公有 常量 SETTINGS: &字符串切片 = "settings";
+}
+
+结构 Options<'a> {
+    全部: 布尔,
+    save: 布尔,
+    file: Device,
+    device_name: 字符串,
+    settings: 选项<向量<&'a 字符串切片>>,
+}
+
+枚举 Device {
+    File(File),
+    Stdin(Stdin),
+}
+
+#[derive(调试协议)]
+枚举 ControlCharMappingError {
+    IntOutOfRange(字符串),
+    MultipleChars(字符串),
+}
+
+枚举 SpecialSetting {
+    Rows(正16),
+    Cols(正16),
+    Line(正8),
+}
+
+枚举 PrintSetting {
+    Size,
+}
+
+枚举 ArgOptions<'a> {
+    Flags(AllFlags<'a>),
+    Mapping((S, 正8)),
+    Special(SpecialSetting),
+    Print(PrintSetting),
+    SavedState(向量<正32>),
+}
+
+实现<'a> 转换协议<AllFlags<'a>> 循环 ArgOptions<'a> {
+    方法 from(flag: AllFlags<'a>) -> 自身类型 {
+        ArgOptions::Flags(flag)
+    }
+}
+
+实现 AsFd 循环 Device {
+    方法 as_fd(&自身) -> BorrowedFd<'_> {
+        匹配 自身 {
+            自身类型::File(f) => f.as_fd(),
+            自身类型::Stdin(stdin) => stdin.as_fd(),
+        }
+    }
+}
+
+实现 AsRawFd 循环 Device {
+    方法 as_raw_fd(&自身) -> RawFd {
+        匹配 自身 {
+            自身类型::File(f) => f.as_raw_fd(),
+            自身类型::Stdin(stdin) => stdin.as_raw_fd(),
+        }
+    }
+}
+
+实现<'a> Options<'a> {
+    方法 from(matches: &'a ArgMatches) -> 输入输出::结果<自身类型> {
+        设 (file, device_name) = 匹配 matches.get_one::<字符串>(options::FILE) {
+            // Two notes here:
+            // 1. O_NONBLOCK is needed because according to GNU docs, a
+            //    POSIX tty can block waiting for carrier-detect if the
+            //    "clocal" flag is not set. If your TTY is not connected
+            //    to a modem, it is probably not relevant though.
+            // 2. We never close the FD that we open here, but the OS
+            //    will clean up the FD for us on exit, so it doesn't
+            //    matter. The alternative would be to have an enum of
+            //    BorrowedFd/OwnedFd to handle both cases.
+            一些(f) => (
+                Device::File(
+                    标准库::文件系统::OpenOptions::新建()
+                        .读锁定(真)
+                        .custom_flags(O_NONBLOCK)
+                        .open(f)?,
+                ),
+                f.克隆(),
+            ),
+            // Per POSIX, stdin is used for TTY operations when no device is specified.
+            // This matches GNU coreutils behavior: if stdin is not a TTY,
+            // tcgetattr will fail with "Inappropriate ioctl for device".
+            无 => (Device::Stdin(stdin()), "standard input".to_string()),
+        };
+        好的(自身类型 {
+            全部: matches.get_flag(options::ALL),
+            save: matches.get_flag(options::SAVE),
+            file,
+            device_name,
+            settings: matches
+                .get_many::<字符串>(options::SETTINGS)
+                .映射(|v| v.映射(作为引用协议::as_ref).收集()),
+        })
+    }
+}
+
+// Needs to be repr(C) because we pass it to the ioctl calls.
+#[repr(C)]
+#[derive(默认协议, 调试协议)]
+公有 结构 TermSize {
+    rows: c_ushort,
+    columns: c_ushort,
+    x: c_ushort,
+    y: c_ushort,
+}
+
+ioctl_read_bad!(
+    /// Get terminal window size
+    tiocgwinsz,
+    TIOCGWINSZ,
+    TermSize
+);
+
+ioctl_write_ptr_bad!(
+    /// Set terminal window size
+    tiocswinsz,
+    TIOCSWINSZ,
+    TermSize
+);
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 opts = Options::from(&matches)?;
+
+    stty(&opts)
+}
+
+方法 stty(opts: &Options) -> UResult<()> {
+    如果 opts.save && opts.全部 {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("stty-error-options-mutually-exclusive"),
+        ));
+    }
+
+    如果 opts.settings.is_some() && (opts.save || opts.全部) {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("stty-error-output-style-no-modes"),
+        ));
+    }
+
+    设 可变 set_arg = SetArg::TCSADRAIN;
+    设 可变 valid_args: 向量<ArgOptions> = 向量::新建();
+
+    如果 设 一些(args) = &opts.settings {
+        设 可变 args_iter = args.迭代();
+        当 设 一些(&arg) = args_iter.next() {
+            匹配 arg {
+                "ispeed" => 匹配 args_iter.next() {
+                    一些(speed) => {
+                        如果 设 一些(baud_flag) = string_to_baud(speed, flags::BaudType::Input) {
+                            valid_args.压入(ArgOptions::Flags(baud_flag));
+                        } 否则 {
+                            返回 invalid_speed(arg, speed);
+                        }
+                    }
+                    无 => {
+                        返回 missing_arg(arg);
+                    }
+                },
+                "ospeed" => 匹配 args_iter.next() {
+                    一些(speed) => {
+                        如果 设 一些(baud_flag) = string_to_baud(speed, flags::BaudType::Output) {
+                            valid_args.压入(ArgOptions::Flags(baud_flag));
+                        } 否则 {
+                            返回 invalid_speed(arg, speed);
+                        }
+                    }
+                    无 => {
+                        返回 missing_arg(arg);
+                    }
+                },
+                "line" => 匹配 args_iter.next() {
+                    一些(line) => 匹配 parse_u8_or_err(line) {
+                        好的(n) => valid_args.压入(ArgOptions::Special(SpecialSetting::Line(n))),
+                        坏的(e) => 返回 坏的(USimpleError::新建(1, e)),
+                    },
+                    无 => {
+                        返回 missing_arg(arg);
+                    }
+                },
+                "min" => 匹配 args_iter.next() {
+                    一些(min) => 匹配 parse_u8_or_err(min) {
+                        好的(n) => {
+                            valid_args.压入(ArgOptions::Mapping((S::VMIN, n)));
+                        }
+                        坏的(e) => 返回 坏的(USimpleError::新建(1, e)),
+                    },
+                    无 => {
+                        返回 missing_arg(arg);
+                    }
+                },
+                "time" => 匹配 args_iter.next() {
+                    一些(时间) => 匹配 parse_u8_or_err(时间) {
+                        好的(n) => valid_args.压入(ArgOptions::Mapping((S::VTIME, n))),
+                        坏的(e) => 返回 坏的(USimpleError::新建(1, e)),
+                    },
+                    无 => {
+                        返回 missing_arg(arg);
+                    }
+                },
+                "rows" => {
+                    如果 设 一些(rows) = args_iter.next() {
+                        如果 设 一些(n) = parse_rows_cols(rows) {
+                            valid_args.压入(ArgOptions::Special(SpecialSetting::Rows(n)));
+                        } 否则 {
+                            返回 invalid_integer_arg(rows);
+                        }
+                    } 否则 {
+                        返回 missing_arg(arg);
+                    }
+                }
+                "columns" | "cols" => {
+                    如果 设 一些(cols) = args_iter.next() {
+                        如果 设 一些(n) = parse_rows_cols(cols) {
+                            valid_args.压入(ArgOptions::Special(SpecialSetting::Cols(n)));
+                        } 否则 {
+                            返回 invalid_integer_arg(cols);
+                        }
+                    } 否则 {
+                        返回 missing_arg(arg);
+                    }
+                }
+                "drain" => {
+                    set_arg = SetArg::TCSADRAIN;
+                }
+                "-drain" => {
+                    set_arg = SetArg::TCSANOW;
+                }
+                "size" => {
+                    valid_args.压入(ArgOptions::Print(PrintSetting::Size));
+                }
+                _ => {
+                    // Try to parse saved format (hex string like "6d02:5:4bf:8a3b:...")
+                    如果 设 一些(state) = parse_saved_state(arg) {
+                        valid_args.压入(ArgOptions::SavedState(state));
+                    }
+                    // control char
+                    否则 如果 设 一些(char_index) = cc_to_index(arg) {
+                        如果 设 一些(mapping) = args_iter.next() {
+                            设 cc_mapping = string_to_control_char(mapping).map_err(|e| {
+                                设 message = 匹配 e {
+                                    ControlCharMappingError::IntOutOfRange(val) => {
+                                        translate!(
+                                            "stty-error-invalid-integer-argument-value-too-large",
+                                            "value" => 格式化!("'{val}'")
+                                        )
+                                    }
+                                    ControlCharMappingError::MultipleChars(val) => {
+                                        translate!(
+                                            "stty-error-invalid-integer-argument",
+                                            "value" => 格式化!("'{val}'")
+                                        )
+                                    }
+                                };
+                                UUsageError::新建(1, message)
+                            })?;
+                            valid_args.压入(ArgOptions::Mapping((char_index, cc_mapping)));
+                        } 否则 {
+                            返回 missing_arg(arg);
+                        }
+                    // baud rate
+                    } 否则 如果 设 一些(baud_flag) = string_to_baud(arg, flags::BaudType::Both) {
+                        valid_args.压入(ArgOptions::Flags(baud_flag));
+                    // non control char flag
+                    } 否则 如果 设 一些(flag) = string_to_flag(arg) {
+                        设 remove_group = 匹配 flag {
+                            AllFlags::Baud(_, _) => 假,
+                            AllFlags::ControlFlags((flag, 移除)) => {
+                                check_flag_group(flag, 移除)
+                            }
+                            AllFlags::InputFlags((flag, 移除)) => check_flag_group(flag, 移除),
+                            AllFlags::LocalFlags((flag, 移除)) => check_flag_group(flag, 移除),
+                            AllFlags::OutputFlags((flag, 移除)) => check_flag_group(flag, 移除),
+                        };
+                        如果 remove_group {
+                            返回 invalid_arg(arg);
+                        }
+                        valid_args.压入(flag.into());
+                    // combination setting
+                    } 否则 如果 设 一些(combo) = string_to_combo(arg) {
+                        valid_args.append(&可变 combo_to_flags(combo));
+                    } 否则 {
+                        返回 invalid_arg(arg);
+                    }
+                }
+            }
+        }
+
+        设 可变 termios =
+            tcgetattr(opts.file.as_fd()).map_err_context(|| opts.device_name.克隆())?;
+
+        // iterate over valid_args, match on the arg type, do the matching apply function
+        循环 arg 在 &valid_args {
+            匹配 arg {
+                ArgOptions::Mapping(mapping) => apply_char_mapping(&可变 termios, mapping),
+                ArgOptions::Flags(flag) => apply_setting(&可变 termios, flag)?,
+                ArgOptions::Special(setting) => {
+                    apply_special_setting(&可变 termios, setting, opts.file.as_raw_fd())?;
+                }
+                ArgOptions::Print(setting) => {
+                    print_special_setting(setting, opts.file.as_raw_fd())?;
+                }
+                ArgOptions::SavedState(state) => {
+                    apply_saved_state(&可变 termios, state);
+                }
+            }
+        }
+        tcsetattr(opts.file.as_fd(), set_arg, &termios)?;
+    } 否则 {
+        设 termios = tcgetattr(opts.file.as_fd()).map_err_context(|| opts.device_name.克隆())?;
+        print_settings(&termios, opts)?;
+    }
+    好的(())
+}
+
+// The GNU implementation adds the --help message when the args are incorrectly formatted
+方法 missing_arg<T>(arg: &字符串切片) -> 结果<T, 盒子<动态 UError>> {
+    坏的(UUsageError::新建(
+        1,
+        translate!(
+            "stty-error-missing-argument",
+            "arg" => *arg
+        ),
+    ))
+}
+
+方法 invalid_arg<T>(arg: &字符串切片) -> 结果<T, 盒子<动态 UError>> {
+    坏的(UUsageError::新建(
+        1,
+        translate!(
+            "stty-error-invalid-argument",
+            "arg" => *arg
+        ),
+    ))
+}
+
+方法 invalid_integer_arg<T>(arg: &字符串切片) -> 结果<T, 盒子<动态 UError>> {
+    坏的(UUsageError::新建(
+        1,
+        translate!(
+            "stty-error-invalid-integer-argument",
+            "value" => 格式化!("'{arg}'")
+        ),
+    ))
+}
+
+方法 invalid_speed<T>(arg: &字符串切片, speed: &字符串切片) -> 结果<T, 盒子<动态 UError>> {
+    坏的(UUsageError::新建(
+        1,
+        translate!(
+            "stty-error-invalid-speed",
+            "arg" => arg,
+            "speed" => speed,
+        ),
+    ))
+}
+
+/// GNU uses different error messages if values overflow or underflow a u8,
+/// this function returns the appropriate error message in the case of overflow or underflow, or u8 on success
+方法 parse_u8_or_err(arg: &字符串切片) -> 结果<正8, 字符串> {
+    arg.parse::<正8>().map_err(|e| {
+        如果 设 IntErrorKind::PosOverflow = e.kind() {
+            translate!("stty-error-invalid-integer-argument-value-too-large", "value" => 格式化!("'{arg}'"))
+        } 否则 {
+            translate!("stty-error-invalid-integer-argument", "value" => 格式化!("'{arg}'"))
+        }
+    })
+}
+
+/// Parse an integer with hex (0x/0X) and octal (0) prefix support, wrapping to u16.
+///
+/// GNU stty uses an unsigned 32-bit integer for row/col sizes, then wraps to 16 bits.
+/// Returns `None` if parsing fails or value exceeds u32::MAX.
+方法 parse_rows_cols(arg: &字符串切片) -> 选项<正16> {
+    正64::extended_parse(arg)
+        .ok()
+        .过滤(|&n| 正32::try_from(n).is_ok())
+        .映射(|n| (n % (正16::MAX 转换 正64 + 1)) 转换 正16)
+}
+
+/// Parse a saved terminal state string in stty format.
+///
+/// The format is colon-separated hexadecimal values:
+/// `input_flags:output_flags:control_flags:local_flags:cc0:cc1:cc2:...`
+///
+/// - Must have exactly 4 + NCCS parts (4 flags + platform-specific control characters)
+/// - All parts must be non-empty valid hex values
+/// - Control characters must fit in u8 (0-255)
+/// - Returns `None` if format is invalid
+方法 parse_saved_state(arg: &字符串切片) -> 选项<向量<正32>> {
+    设 parts: 向量<&字符串切片> = arg.split(':').收集();
+    设 expected_parts = 4 + nix::libc::NCCS;
+
+    // GNU requires exactly the right number of parts for this platform
+    如果 parts.长度() != expected_parts {
+        返回 无;
+    }
+
+    // Validate all parts are non-empty valid hex
+    设 可变 values = 向量::with_capacity(expected_parts);
+    循环 (i, part) 在 parts.迭代().enumerate() {
+        如果 part.为空() {
+            返回 无; // GNU rejects empty hex values
+        }
+        设 val = 正32::from_str_radix(part, 16).ok()?;
+
+        // Control characters (indices 4+) must fit in u8
+        如果 i >= 4 && val > 255 {
+            返回 无;
+        }
+
+        values.压入(val);
+    }
+
+    一些(values)
+}
+
+方法 check_flag_group<T>(flag: &Flag<T>, 移除: 布尔) -> 布尔 {
+    移除 && flag.group.is_some()
+}
+
+方法 print_special_setting(setting: &PrintSetting, fd: 整32) -> nix::结果<()> {
+    匹配 setting {
+        PrintSetting::Size => {
+            设 可变 size = TermSize::默认();
+            不安全 { tiocgwinsz(fd, &raw 可变 size)? };
+            打印行!("{} {}", size.rows, size.columns);
+        }
+    }
+    好的(())
+}
+
+/// Handles line wrapping for stty output to fit within terminal width
+结构 WrappedPrinter {
+    width: 正整数大小,
+    current: 正整数大小,
+    first_in_line: 布尔,
+}
+
+实现 WrappedPrinter {
+    /// Creates a new printer with the specified terminal width.
+    /// If term_size is None (typically when output is piped), falls back to
+    /// the COLUMNS environment variable or a default width of 80 columns.
+    方法 新建(term_size: 选项<&TermSize>) -> 自身类型 {
+        设 columns = 如果 设 一些(term_size) = term_size {
+            term_size.columns
+        } 否则 {
+            常量 DEFAULT_TERM_WIDTH: 正16 = 80;
+
+            标准库::环境::var_os("COLUMNS")
+                .and_then(|s| s.to_str()?.parse().ok())
+                .过滤(|&c| c > 0)
+                .unwrap_or(DEFAULT_TERM_WIDTH)
+        };
+
+        自身类型 {
+            width: columns.max(1) 转换 正整数大小,
+            current: 0,
+            first_in_line: 真,
+        }
+    }
+
+    方法 print(&可变 自身, token: &字符串切片) {
+        设 token_len = 自身.prefix().chars().计数() + token.chars().计数();
+        如果 自身.current > 0 && 自身.current + token_len > 自身.width {
+            打印行!();
+            自身.current = 0;
+            自身.first_in_line = 真;
+        }
+
+        打印!("{}{token}", 自身.prefix());
+        自身.current += token_len;
+        自身.first_in_line = 假;
+    }
+
+    方法 prefix(&自身) -> &字符串切片 {
+        如果 自身.first_in_line { "" } 否则 { " " }
+    }
+
+    方法 flush(&可变 自身) {
+        如果 自身.current > 0 {
+            打印行!();
+            自身.current = 0;
+            自身.first_in_line = 假;
+        }
+    }
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "needed for some platform-specific code"
+)]
+方法 print_terminal_size(
+    termios: &Termios,
+    opts: &Options,
+    window_size: 选项<&TermSize>,
+    term_size: 选项<&TermSize>,
+) -> nix::结果<()> {
+    // GNU linked against glibc 2.42 provides us baudrate 51 which panics cfgetospeed
+    #[cfg(not(target_os = "linux"))]
+    设 speed = nix::sys::termios::cfgetospeed(termios);
+    #[cfg(target_os = "linux")]
+    #[cfg(全部(not(target_arch = "powerpc"), not(target_arch = "powerpc64")))]
+    ioctl_read_bad!(tcgets2, TCGETS2, termios2);
+    #[cfg(target_os = "linux")]
+    #[cfg(全部(not(target_arch = "powerpc"), not(target_arch = "powerpc64")))]
+    设 speed = {
+        设 可变 t2 = 不安全 { 标准库::内存::zeroed::<termios2>() };
+        不安全 { tcgets2(opts.file.as_raw_fd(), &raw 可变 t2)? };
+        t2.c_ospeed
+    };
+    #[cfg(target_os = "linux")]
+    #[cfg(任意(target_arch = "powerpc", target_arch = "powerpc64"))]
+    设 speed = nix::sys::termios::cfgetospeed(termios);
+
+    设 可变 printer = WrappedPrinter::新建(window_size);
+
+    // BSDs and Linux (not ppc/big-endian ppc64) use a u32 for the baud rate, so we can simply
+    // print it.
+    #[cfg(任意(target_os = "linux", bsd))]
+    #[cfg(全部(
+        not(target_arch = "powerpc"),
+        not(全部(target_arch = "powerpc64", target_endian = "big"))
+    ))]
+    printer.print(&translate!("stty-output-speed", "speed" => speed));
+
+    // Big-endian Linux PowerPC uses BaudRate enum, need to convert to display format
+    #[cfg(target_os = "linux")]
+    #[cfg(任意(
+        target_arch = "powerpc",
+        全部(target_arch = "powerpc64", target_endian = "big")
+    ))]
+    {
+        // On PowerPC, find the corresponding baud rate string for display
+        设 speed_str = BAUD_RATES
+            .迭代()
+            .寻找(|(_, rate)| *rate == speed)
+            .映射(|(text, _)| *text)
+            .unwrap_or("unknown");
+        printer.print(&translate!("stty-output-speed", "speed" => speed_str));
+    }
+
+    // Other platforms need to use the baud rate enum, so printing the right value
+    // becomes slightly more complicated.
+    #[cfg(not(任意(target_os = "linux", bsd)))]
+    循环 (text, baud_rate) 在 BAUD_RATES {
+        如果 *baud_rate == speed {
+            printer.print(&translate!("stty-output-speed", "speed" => (*text)));
+            中断;
+        }
+    }
+
+    如果 opts.全部 {
+        设 term_size = term_size.as_ref().期望("terminal size should be set");
+        printer.print(
+            &translate!("stty-output-rows-columns", "rows" => term_size.rows, "columns" => term_size.columns),
+        );
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "redox"))]
+    {
+        // For some reason the normal nix Termios struct does not expose the line,
+        // so we get the underlying libc::termios struct to get that information.
+        设 libc_termios: nix::libc::termios = termios.克隆().into();
+        设 line = libc_termios.c_line;
+        printer.print(&translate!("stty-output-line", "line" => line));
+    }
+    printer.flush();
+    好的(())
+}
+
+方法 cc_to_index(option: &字符串切片) -> 选项<S> {
+    循环 cc 在 CONTROL_CHARS {
+        如果 option == cc.0 {
+            返回 一些(cc.1);
+        }
+    }
+    无
+}
+
+方法 string_to_combo(arg: &字符串切片) -> 选项<&字符串切片> {
+    设 is_negated = arg.starts_with('-');
+    设 name = arg.trim_start_matches('-');
+    COMBINATION_SETTINGS
+        .迭代()
+        .寻找(|&&(combo_name, is_negatable)| name == combo_name && (!is_negated || is_negatable))
+        .映射(|_| arg)
+}
+
+/// Parse and round a baud rate value using GNU stty's custom rounding algorithm.
+///
+/// Accepts decimal values with the following rounding rules:
+/// - If first digit after decimal > 5: round up
+/// - If first digit after decimal < 5: round down
+/// - If first digit after decimal == 5:
+///   - If followed by any non-zero digit: round up
+///   - If followed only by zeros (or nothing): banker's rounding (round to nearest even)
+///
+/// Examples: "9600.49" -> 9600, "9600.51" -> 9600, "9600.5" -> 9600 (even), "9601.5" -> 9602 (even)
+/// TODO: there are two special cases "exta" → B19200 and "extb" → B38400
+方法 parse_baud_with_rounding(normalized: &字符串切片) -> 选项<正32> {
+    设 (int_part, frac_part) = 匹配 normalized.split_once('.') {
+        一些((i, f)) => (i, 一些(f)),
+        无 => (normalized, 无),
+    };
+
+    设 可变 value = int_part.parse::<正32>().ok()?;
+
+    如果 设 一些(frac) = frac_part {
+        设 可变 chars = frac.chars();
+        设 first_digit = chars.next()?.to_digit(10)?;
+
+        // Validate all remaining chars are digits
+        设 rest: 向量<_> = chars.收集();
+        如果 !rest.迭代().全部(字符::is_ascii_digit) {
+            返回 无;
+        }
+
+        匹配 first_digit.比较(&5) {
+            排序顺序::Greater => value += 1,
+            排序顺序::Equal => {
+                // Check if any non-zero digit follows
+                如果 rest.迭代().任意(|&c| c != '0') {
+                    value += 1;
+                } 否则 {
+                    // Banker's rounding: round to nearest even
+                    value += value & 1;
+                }
+            }
+            排序顺序::Less => {} // Round down, already validated
+        }
+    }
+
+    一些(value)
+}
+
+方法 string_to_baud(arg: &字符串切片, baud_type: flags::BaudType) -> 选项<AllFlags<'_>> {
+    // Reject invalid formats
+    如果 arg != arg.trim_end()
+        || arg.trim().starts_with('-')
+        || arg.trim().starts_with("++")
+        || arg.包含('E')
+        || arg.包含('e')
+        || arg.matches('.').计数() > 1
+    {
+        返回 无;
+    }
+
+    设 normalized = arg.trim().trim_start_matches('+');
+    设 normalized = normalized.strip_suffix('.').unwrap_or(normalized);
+    设 value = parse_baud_with_rounding(normalized)?;
+
+    // BSDs use a u32 for the baud rate, so any decimal number applies.
+    #[cfg(bsd)]
+    返回 一些(AllFlags::Baud(value, baud_type));
+
+    #[cfg(not(bsd))]
+    {
+        循环 (text, baud_rate) 在 BAUD_RATES {
+            如果 text.parse::<正32>().ok() == 一些(value) {
+                返回 一些(AllFlags::Baud(*baud_rate, baud_type));
+            }
+        }
+        无
+    }
+}
+
+/// return `Some(flag)` if the input is a valid flag, `None` if not
+方法 string_to_flag(option: &字符串切片) -> 选项<AllFlags<'_>> {
+    设 移除 = option.starts_with('-');
+    设 name = option.trim_start_matches('-');
+
+    循环 cflag 在 CONTROL_FLAGS {
+        如果 name == cflag.name {
+            返回 一些(AllFlags::ControlFlags((cflag, 移除)));
+        }
+    }
+    循环 iflag 在 INPUT_FLAGS {
+        如果 name == iflag.name {
+            返回 一些(AllFlags::InputFlags((iflag, 移除)));
+        }
+    }
+    循环 lflag 在 LOCAL_FLAGS {
+        如果 name == lflag.name {
+            返回 一些(AllFlags::LocalFlags((lflag, 移除)));
+        }
+    }
+    循环 oflag 在 OUTPUT_FLAGS {
+        如果 name == oflag.name {
+            返回 一些(AllFlags::OutputFlags((oflag, 移除)));
+        }
+    }
+    无
+}
+
+方法 control_char_to_string(cc: nix::libc::cc_t) -> nix::结果<字符串> {
+    如果 cc == 0 {
+        返回 好的(translate!("stty-output-undef"));
+    }
+
+    设 (meta_prefix, code) = 如果 cc >= 0x80 {
+        ("M-", cc - 0x80)
+    } 否则 {
+        ("", cc)
+    };
+
+    // Determine the '^'-prefix if applicable and character based on the code
+    设 (ctrl_prefix, character) = 匹配 code {
+        // Control characters in ASCII range
+        0..=0x1f => 好的(("^", (b'@' + code) 转换 字符)),
+        // Printable ASCII characters
+        0x20..=0x7e => 好的(("", code 转换 字符)),
+        // DEL character
+        0x7f => 好的(("^", '?')),
+        // Out of range (above 8 bits)
+        _ => 坏的(nix::errno::Errno::ERANGE),
+    }?;
+
+    好的(格式化!("{meta_prefix}{ctrl_prefix}{character}"))
+}
+
+方法 print_control_chars(
+    termios: &Termios,
+    opts: &Options,
+    term_size: 选项<&TermSize>,
+) -> nix::结果<()> {
+    如果 !opts.全部 {
+        // Print only control chars that differ from sane defaults
+        设 可变 printer = WrappedPrinter::新建(term_size);
+        循环 (text, cc_index) 在 CONTROL_CHARS {
+            设 current_val = termios.control_chars[*cc_index 转换 正整数大小];
+            设 sane_val = get_sane_control_char(*cc_index);
+
+            如果 current_val != sane_val {
+                printer.print(&格式化!(
+                    "{text} = {};",
+                    control_char_to_string(current_val)?
+                ));
+            }
+        }
+        printer.flush();
+        返回 好的(());
+    }
+
+    设 可变 printer = WrappedPrinter::新建(term_size);
+    循环 (text, cc_index) 在 CONTROL_CHARS {
+        printer.print(&格式化!(
+            "{text} = {};",
+            control_char_to_string(termios.control_chars[*cc_index 转换 正整数大小])?
+        ));
+    }
+    printer.print(&translate!("stty-output-min-time",
+        "min" => termios.control_chars[S::VMIN 转换 正整数大小],
+        "time" => termios.control_chars[S::VTIME 转换 正整数大小]
+    ));
+    printer.flush();
+    好的(())
+}
+
+方法 print_in_save_format(termios: &Termios) {
+    打印!(
+        "{:x}:{:x}:{:x}:{:x}",
+        termios.input_flags.bits(),
+        termios.output_flags.bits(),
+        termios.control_flags.bits(),
+        termios.local_flags.bits()
+    );
+    循环 cc 在 termios.control_chars {
+        打印!(":{cc:x}");
+    }
+    打印行!();
+}
+
+/// Gets terminal size using the tiocgwinsz ioctl system call.
+/// This queries the kernel for the current terminal window dimensions.
+方法 get_terminal_size(fd: RawFd) -> nix::结果<TermSize> {
+    设 可变 term_size = TermSize::默认();
+    不安全 { tiocgwinsz(fd, &raw 可变 term_size) }.映射(|_| term_size)
+}
+
+方法 print_settings(termios: &Termios, opts: &Options) -> nix::结果<()> {
+    如果 opts.save {
+        print_in_save_format(termios);
+    } 否则 {
+        设 device_fd = opts.file.as_raw_fd();
+        设 term_size = 如果 opts.全部 {
+            一些(get_terminal_size(device_fd)?)
+        } 否则 {
+            get_terminal_size(device_fd).ok()
+        };
+
+        设 stdout_fd = stdout().as_raw_fd();
+        设 window_size = 如果 device_fd == stdout_fd {
+            &term_size
+        } 否则 {
+            &get_terminal_size(stdout_fd).ok()
+        };
+
+        print_terminal_size(termios, opts, window_size.as_ref(), term_size.as_ref())?;
+        print_control_chars(termios, opts, window_size.as_ref())?;
+        print_flags(termios, opts, CONTROL_FLAGS, window_size.as_ref());
+        print_flags(termios, opts, INPUT_FLAGS, window_size.as_ref());
+        print_flags(termios, opts, OUTPUT_FLAGS, window_size.as_ref());
+        print_flags(termios, opts, LOCAL_FLAGS, window_size.as_ref());
+    }
+    好的(())
+}
+
+方法 print_flags<T: TermiosFlag>(
+    termios: &Termios,
+    opts: &Options,
+    flags: &[Flag<T>],
+    term_size: 选项<&TermSize>,
+) {
+    设 可变 printer = WrappedPrinter::新建(term_size);
+    循环 &Flag {
+        name,
+        flag,
+        show,
+        sane,
+        group,
+    } 在 flags
+    {
+        如果 !show {
+            继续;
+        }
+        设 val = flag.is_in(termios, group);
+        如果 group.is_some() {
+            如果 val && (!sane || opts.全部) {
+                printer.print(name);
+            }
+        } 否则 如果 opts.全部 || val != sane {
+            如果 !val {
+                printer.print(&格式化!("-{name}"));
+                继续;
+            }
+            printer.print(name);
+        }
+    }
+    printer.flush();
+}
+
+/// Apply a single setting
+方法 apply_setting(termios: &可变 Termios, setting: &AllFlags) -> nix::结果<()> {
+    匹配 setting {
+        AllFlags::Baud(_, _) => apply_baud_rate_flag(termios, setting)?,
+        AllFlags::ControlFlags((setting, disable)) => {
+            setting.flag.apply(termios, !disable);
+        }
+        AllFlags::InputFlags((setting, disable)) => {
+            setting.flag.apply(termios, !disable);
+        }
+        AllFlags::LocalFlags((setting, disable)) => {
+            setting.flag.apply(termios, !disable);
+        }
+        AllFlags::OutputFlags((setting, disable)) => {
+            setting.flag.apply(termios, !disable);
+        }
+    }
+    好的(())
+}
+
+方法 apply_baud_rate_flag(termios: &可变 Termios, input: &AllFlags) -> nix::结果<()> {
+    如果 设 AllFlags::Baud(rate, baud_type) = input {
+        匹配 baud_type {
+            flags::BaudType::Input => cfsetispeed(termios, *rate)?,
+            flags::BaudType::Output => cfsetospeed(termios, *rate)?,
+            flags::BaudType::Both => {
+                cfsetispeed(termios, *rate)?;
+                cfsetospeed(termios, *rate)?;
+            }
+        }
+    }
+    好的(())
+}
+
+方法 apply_char_mapping(termios: &可变 Termios, mapping: &(S, 正8)) {
+    termios.control_chars[mapping.0 转换 正整数大小] = mapping.1;
+}
+
+/// Apply a saved terminal state to the current termios.
+///
+/// The state array contains:
+/// - `state[0]`: input flags
+/// - `state[1]`: output flags
+/// - `state[2]`: control flags
+/// - `state[3]`: local flags
+/// - `state[4..]`: control characters (optional)
+///
+/// If state has fewer than 4 elements, no changes are applied. This is a defensive
+/// check that should never trigger since `parse_saved_state` rejects such states.
+方法 apply_saved_state(termios: &可变 Termios, state: &[正32]) {
+    // Require at least 4 elements for the flags (defensive check)
+    如果 state.长度() < 4 {
+        返回; // No-op for invalid state (already validated by parser)
+    }
+
+    // Apply the four flag groups, done (as _) for MacOS size compatibility
+    termios.input_flags = InputFlags::from_bits_truncate(state[0] 转换 _);
+    termios.output_flags = OutputFlags::from_bits_truncate(state[1] 转换 _);
+    termios.control_flags = ControlFlags::from_bits_truncate(state[2] 转换 _);
+    termios.local_flags = LocalFlags::from_bits_truncate(state[3] 转换 _);
+
+    // Apply control characters if present (stored as u32 but used as u8)
+    循环 (i, &cc_val) 在 state.迭代().skip(4).enumerate() {
+        如果 i < termios.control_chars.长度() {
+            termios.control_chars[i] = cc_val 转换 正8;
+        }
+    }
+}
+
+方法 apply_special_setting(
+    _termios: &可变 Termios,
+    setting: &SpecialSetting,
+    fd: 整32,
+) -> nix::结果<()> {
+    设 可变 size = TermSize::默认();
+    不安全 { tiocgwinsz(fd, &raw 可变 size)? };
+    匹配 setting {
+        SpecialSetting::Rows(n) => size.rows = *n,
+        SpecialSetting::Cols(n) => size.columns = *n,
+        #[cfg_attr(
+            not(任意(target_os = "linux", target_os = "android")),
+            期望(unused_variables)
+        )]
+        SpecialSetting::Line(n) => {
+            // nix only defines Termios's `line_discipline` field on these platforms
+            #[cfg(任意(target_os = "linux", target_os = "android"))]
+            {
+                _termios.line_discipline = *n;
+            }
+        }
+    }
+    不安全 { tiocswinsz(fd, &raw 可变 size)? };
+    好的(())
+}
+
+/// GNU stty defines some valid values for the control character mappings
+/// 1. Standard character, can be a a single char (ie 'C') or hat notation (ie '^C')
+/// 2. Integer
+///    a. hexadecimal, prefixed by '0x'
+///    b. octal, prefixed by '0'
+///    c. decimal, no prefix
+/// 3. Disabling the control character: '^-' or 'undef'
+///
+/// This function returns the ascii value of valid control chars, or [`ControlCharMappingError`] if invalid
+方法 string_to_control_char(s: &字符串切片) -> 结果<正8, ControlCharMappingError> {
+    如果 s == "undef" || s == "^-" || s.为空() {
+        返回 好的(0);
+    }
+
+    // try to parse integer (hex, octal, or decimal)
+    设 ascii_num = 如果 设 一些(hex) = s.strip_prefix("0x") {
+        正32::from_str_radix(hex, 16).ok()
+    } 否则 如果 设 一些(octal) = s.strip_prefix("0") {
+        如果 octal.为空() {
+            一些(0)
+        } 否则 {
+            正32::from_str_radix(octal, 8).ok()
+        }
+    } 否则 {
+        s.parse::<正32>().ok()
+    };
+
+    如果 设 一些(val) = ascii_num {
+        如果 val > 255 {
+            返回 坏的(ControlCharMappingError::IntOutOfRange(s.to_string()));
+        }
+        返回 好的(val 转换 正8);
+    }
+    // try to parse ^<char> or just <char>
+    设 可变 chars = s.chars();
+    匹配 (chars.next(), chars.next()) {
+        (一些('^'), 一些(c)) => {
+            // special case: ascii value of '^?' is greater than '?'
+            如果 c == '?' {
+                返回 好的(ASCII_DEL);
+            }
+            // subtract by '@' to turn the char into the ascii value of '^<char>'
+            好的((c.to_ascii_uppercase() 转换 正8).wrapping_sub(b'@'))
+        }
+        (一些(c), 无) => 好的(c 转换 正8),
+        (一些(_), 一些(_)) => 坏的(ControlCharMappingError::MultipleChars(s.to_string())),
+        _ => 无法到达!("No arguments provided: must have been caught earlier"),
+    }
+}
+
+// decomposes a combination argument into a vec of corresponding flags
+方法 combo_to_flags(combo: &字符串切片) -> 向量<ArgOptions<'_>> {
+    设 可变 flags = 向量::新建();
+    设 可变 ccs = 向量::新建();
+    匹配 combo {
+        "lcase" | "LCASE" => {
+            flags = 向量!["xcase", "iuclc", "olcuc"];
+        }
+        "-lcase" | "-LCASE" => {
+            flags = 向量!["-xcase", "-iuclc", "-olcuc"];
+        }
+        "cbreak" => {
+            flags = 向量!["-icanon"];
+        }
+        "-cbreak" => {
+            flags = 向量!["icanon"];
+        }
+        "cooked" | "-raw" => {
+            flags = 向量![
+                "brkint", "ignpar", "istrip", "icrnl", "ixon", "opost", "isig", "icanon",
+            ];
+            ccs = 向量![(S::VEOF, "^D"), (S::VEOL, "")];
+        }
+        "crt" => {
+            flags = 向量!["echoe", "echoctl", "echoke"];
+        }
+        "dec" => {
+            flags = 向量!["echoe", "echoctl", "echoke", "-ixany"];
+            ccs = 向量![(S::VINTR, "^C"), (S::VERASE, "^?"), (S::VKILL, "^U")];
+        }
+        "decctlq" => {
+            flags = 向量!["ixany"];
+        }
+        "-decctlq" => {
+            flags = 向量!["-ixany"];
+        }
+        "ek" => {
+            ccs = 向量![(S::VERASE, "^?"), (S::VKILL, "^U")];
+        }
+        "evenp" | "parity" => {
+            flags = 向量!["parenb", "-parodd", "cs7"];
+        }
+        "-evenp" | "-parity" => {
+            flags = 向量!["-parenb", "cs8"];
+        }
+        "litout" => {
+            flags = 向量!["-parenb", "-istrip", "-opost", "cs8"];
+        }
+        "-litout" => {
+            flags = 向量!["parenb", "istrip", "opost", "cs7"];
+        }
+        "nl" => {
+            flags = 向量!["-icrnl", "-onlcr"];
+        }
+        "-nl" => {
+            flags = 向量!["icrnl", "-inlcr", "-igncr", "onlcr", "-ocrnl", "-onlret"];
+        }
+        "oddp" => {
+            flags = 向量!["parenb", "parodd", "cs7"];
+        }
+        "-oddp" => {
+            flags = 向量!["-parenb", "cs8"];
+        }
+        "pass8" => {
+            flags = 向量!["-parenb", "-istrip", "cs8"];
+        }
+        "-pass8" => {
+            flags = 向量!["parenb", "istrip", "cs7"];
+        }
+        "raw" | "-cooked" => {
+            flags = 向量![
+                "-ignbrk", "-brkint", "-ignpar", "-parmrk", "-inpck", "-istrip", "-inlcr",
+                "-igncr", "-icrnl", "-ixon", "-ixoff", "-icanon", "-opost", "-isig", "-iuclc",
+                "-xcase", "-ixany", "-imaxbel",
+            ];
+            ccs = 向量![(S::VMIN, "1"), (S::VTIME, "0")];
+        }
+        "sane" => {
+            flags = 向量![
+                "cread", "-ignbrk", "brkint", "-inlcr", "-igncr", "icrnl", "icanon", "iexten",
+                "echo", "echoe", "echok", "-echonl", "-noflsh", "-ixoff", "-iutf8", "-iuclc",
+                "-xcase", "-ixany", "imaxbel", "-olcuc", "-ocrnl", "opost", "-ofill", "onlcr",
+                "-onocr", "-onlret", "nl0", "cr0", "tab0", "bs0", "vt0", "ff0", "isig", "-tostop",
+                "-ofdel", "-echoprt", "echoctl", "echoke", "-extproc", "-flusho",
+            ];
+            ccs = 向量![
+                (S::VINTR, "^C"),
+                (S::VQUIT, "^\\"),
+                (S::VERASE, "^?"),
+                (S::VKILL, "^U"),
+                (S::VEOF, "^D"),
+                (S::VEOL, ""),
+                (S::VEOL2, ""),
+                #[cfg(target_os = "linux")]
+                (S::VSWTC, ""),
+                (S::VSTART, "^Q"),
+                (S::VSTOP, "^S"),
+                (S::VSUSP, "^Z"),
+                (S::VREPRINT, "^R"),
+                (S::VWERASE, "^W"),
+                (S::VLNEXT, "^V"),
+                (S::VDISCARD, "^O"),
+            ];
+        }
+        _ => 无法到达!("invalid combination setting: must have been caught earlier"),
+    }
+    设 可变 flags = flags
+        .迭代()
+        .filter_map(|f| string_to_flag(f).映射(ArgOptions::Flags))
+        .收集::<向量<ArgOptions>>();
+    设 可变 ccs = ccs
+        .迭代()
+        .映射(|cc| ArgOptions::Mapping((cc.0, string_to_control_char(cc.1).解包())))
+        .收集::<向量<ArgOptions>>();
+    flags.append(&可变 ccs);
+    flags
+}
+
+方法 get_sane_control_char(cc_index: S) -> 正8 {
+    循环 (sane_index, sane_val) 在 SANE_CONTROL_CHARS {
+        如果 sane_index == cc_index {
+            返回 sane_val;
+        }
+    }
+    // Default values for control chars not in the sane list
+    匹配 cc_index {
+        S::VEOL => 0,
+        S::VEOL2 => 0,
+        S::VMIN => 1,
+        S::VTIME => 0,
+        #[cfg(target_os = "linux")]
+        S::VSWTC => 0,
+        _ => 0,
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("stty")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("stty"))
+        .override_usage(format_usage(&translate!("stty-usage")))
+        .about(translate!("stty-about"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::ALL)
+                .short('a')
+                .long(options::ALL)
+                .help(translate!("stty-option-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SAVE)
+                .short('g')
+                .long(options::SAVE)
+                .help(translate!("stty-option-save"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .short('F')
+                .long(options::FILE)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_name("DEVICE")
+                .help(translate!("stty-option-file")),
+        )
+        .arg(
+            Arg::新建(options::SETTINGS)
+                .action(ArgAction::Append)
+                .allow_hyphen_values(真)
+                .help(translate!("stty-option-settings")),
+        )
+}
+
+实现 TermiosFlag 循环 ControlFlags {
+    方法 is_in(&自身, termios: &Termios, group: 选项<自身类型>) -> 布尔 {
+        termios.control_flags.包含(*自身)
+            && group.is_none_or(|g| !termios.control_flags.intersects(g - *自身))
+    }
+
+    方法 apply(&自身, termios: &可变 Termios, val: 布尔) {
+        termios.control_flags.set(*自身, val);
+    }
+}
+
+实现 TermiosFlag 循环 InputFlags {
+    方法 is_in(&自身, termios: &Termios, group: 选项<自身类型>) -> 布尔 {
+        termios.input_flags.包含(*自身)
+            && group.is_none_or(|g| !termios.input_flags.intersects(g - *自身))
+    }
+
+    方法 apply(&自身, termios: &可变 Termios, val: 布尔) {
+        termios.input_flags.set(*自身, val);
+    }
+}
+
+实现 TermiosFlag 循环 OutputFlags {
+    方法 is_in(&自身, termios: &Termios, group: 选项<自身类型>) -> 布尔 {
+        termios.output_flags.包含(*自身)
+            && group.is_none_or(|g| !termios.output_flags.intersects(g - *自身))
+    }
+
+    方法 apply(&自身, termios: &可变 Termios, val: 布尔) {
+        termios.output_flags.set(*自身, val);
+    }
+}
+
+实现 TermiosFlag 循环 LocalFlags {
+    方法 is_in(&自身, termios: &Termios, group: 选项<自身类型>) -> 布尔 {
+        termios.local_flags.包含(*自身)
+            && group.is_none_or(|g| !termios.local_flags.intersects(g - *自身))
+    }
+
+    方法 apply(&自身, termios: &可变 Termios, val: 布尔) {
+        termios.local_flags.set(*自身, val);
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    // Essential unit tests for complex internal parsing and logic functions.
+
+    // Control character parsing tests
+    #[test]
+    方法 test_string_to_control_char_undef() {
+        相等断言!(string_to_control_char("undef").解包(), 0);
+        相等断言!(string_to_control_char("^-").解包(), 0);
+        相等断言!(string_to_control_char("").解包(), 0);
+    }
+
+    #[test]
+    方法 test_string_to_control_char_hat_notation() {
+        相等断言!(string_to_control_char("^C").解包(), 3);
+        相等断言!(string_to_control_char("^A").解包(), 1);
+        相等断言!(string_to_control_char("^?").解包(), 127);
+    }
+
+    #[test]
+    方法 test_string_to_control_char_formats() {
+        相等断言!(string_to_control_char("A").解包(), b'A');
+        相等断言!(string_to_control_char("65").解包(), 65);
+        相等断言!(string_to_control_char("0x41").解包(), 0x41);
+        相等断言!(string_to_control_char("0101").解包(), 0o101);
+    }
+
+    #[test]
+    方法 test_string_to_control_char_overflow() {
+        断言!(string_to_control_char("256").is_err());
+        断言!(string_to_control_char("0x100").is_err());
+        断言!(string_to_control_char("0400").is_err());
+    }
+
+    // Control character formatting tests
+    #[test]
+    方法 test_control_char_to_string_formats() {
+        相等断言!(
+            control_char_to_string(0).解包(),
+            translate!("stty-output-undef")
+        );
+        相等断言!(control_char_to_string(3).解包(), "^C");
+        相等断言!(control_char_to_string(b'A').解包(), "A");
+        相等断言!(control_char_to_string(0x7f).解包(), "^?");
+        相等断言!(control_char_to_string(0x80).解包(), "M-^@");
+    }
+
+    // Combination settings tests
+    #[test]
+    方法 test_combo_to_flags_sane() {
+        设 flags = combo_to_flags("sane");
+        断言!(flags.长度() > 5); // sane sets multiple flags
+    }
+
+    #[test]
+    方法 test_combo_to_flags_raw_cooked() {
+        断言!(!combo_to_flags("raw").为空());
+        断言!(!combo_to_flags("cooked").为空());
+        断言!(!combo_to_flags("-raw").为空());
+    }
+
+    #[test]
+    方法 test_combo_to_flags_parity() {
+        断言!(!combo_to_flags("evenp").为空());
+        断言!(!combo_to_flags("oddp").为空());
+        断言!(!combo_to_flags("-evenp").为空());
+    }
+
+    // Parse rows/cols with overflow handling
+    #[test]
+    方法 test_parse_rows_cols_normal() {
+        设 result = parse_rows_cols("24");
+        相等断言!(result, 一些(24));
+    }
+
+    #[test]
+    方法 test_parse_rows_cols_overflow() {
+        相等断言!(parse_rows_cols("65536"), 一些(0)); // wraps to 0
+        相等断言!(parse_rows_cols("65537"), 一些(1)); // wraps to 1
+    }
+
+    // Sane control character defaults
+    #[test]
+    方法 test_get_sane_control_char_values() {
+        相等断言!(get_sane_control_char(S::VINTR), 3); // ^C
+        相等断言!(get_sane_control_char(S::VQUIT), 28); // ^\
+        相等断言!(get_sane_control_char(S::VERASE), 127); // DEL
+        相等断言!(get_sane_control_char(S::VKILL), 21); // ^U
+        相等断言!(get_sane_control_char(S::VEOF), 4); // ^D
+    }
+
+    // Additional tests for parse_rows_cols
+    #[test]
+    方法 test_parse_rows_cols_valid() {
+        相等断言!(parse_rows_cols("80"), 一些(80));
+        相等断言!(parse_rows_cols("65535"), 一些(65535));
+        相等断言!(parse_rows_cols("0"), 一些(0));
+        相等断言!(parse_rows_cols("1"), 一些(1));
+    }
+
+    #[test]
+    方法 test_parse_rows_cols_wraparound() {
+        // Test u16 wraparound: (u16::MAX + 1) % (u16::MAX + 1) = 0
+        相等断言!(parse_rows_cols("131071"), 一些(65535)); // (2*65536 - 1) % 65536 = 65535
+        相等断言!(parse_rows_cols("131072"), 一些(0)); // (2*65536) % 65536 = 0
+    }
+
+    #[test]
+    方法 test_parse_rows_cols_invalid() {
+        相等断言!(parse_rows_cols(""), 无);
+        相等断言!(parse_rows_cols("abc"), 无);
+        相等断言!(parse_rows_cols("-1"), 无);
+        相等断言!(parse_rows_cols("12.5"), 无);
+        相等断言!(parse_rows_cols("not_a_number"), 无);
+    }
+
+    // Tests for string_to_baud
+    #[test]
+    方法 test_string_to_baud_valid() {
+        #[cfg(not(bsd))]
+        {
+            断言!(string_to_baud("9600", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("115200", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("38400", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("19200", flags::BaudType::Both).is_some());
+        }
+
+        #[cfg(bsd)]
+        {
+            断言!(string_to_baud("9600", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("115200", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("1000000", flags::BaudType::Both).is_some());
+            断言!(string_to_baud("0", flags::BaudType::Both).is_some());
+        }
+    }
+
+    #[test]
+    方法 test_string_to_baud_invalid() {
+        #[cfg(not(bsd))]
+        {
+            相等断言!(string_to_baud("995", flags::BaudType::Both), 无);
+            相等断言!(string_to_baud("invalid", flags::BaudType::Both), 无);
+            相等断言!(string_to_baud("", flags::BaudType::Both), 无);
+            相等断言!(string_to_baud("abc", flags::BaudType::Both), 无);
+        }
+    }
+
+    // Tests for string_to_combo
+    #[test]
+    方法 test_string_to_combo_valid() {
+        相等断言!(string_to_combo("sane"), 一些("sane"));
+        相等断言!(string_to_combo("raw"), 一些("raw"));
+        相等断言!(string_to_combo("cooked"), 一些("cooked"));
+        相等断言!(string_to_combo("-raw"), 一些("-raw"));
+        相等断言!(string_to_combo("-cooked"), 一些("-cooked"));
+        相等断言!(string_to_combo("cbreak"), 一些("cbreak"));
+        相等断言!(string_to_combo("-cbreak"), 一些("-cbreak"));
+        相等断言!(string_to_combo("nl"), 一些("nl"));
+        相等断言!(string_to_combo("-nl"), 一些("-nl"));
+        相等断言!(string_to_combo("ek"), 一些("ek"));
+        相等断言!(string_to_combo("evenp"), 一些("evenp"));
+        相等断言!(string_to_combo("-evenp"), 一些("-evenp"));
+        相等断言!(string_to_combo("parity"), 一些("parity"));
+        相等断言!(string_to_combo("-parity"), 一些("-parity"));
+        相等断言!(string_to_combo("oddp"), 一些("oddp"));
+        相等断言!(string_to_combo("-oddp"), 一些("-oddp"));
+        相等断言!(string_to_combo("pass8"), 一些("pass8"));
+        相等断言!(string_to_combo("-pass8"), 一些("-pass8"));
+        相等断言!(string_to_combo("litout"), 一些("litout"));
+        相等断言!(string_to_combo("-litout"), 一些("-litout"));
+        相等断言!(string_to_combo("crt"), 一些("crt"));
+        相等断言!(string_to_combo("dec"), 一些("dec"));
+        相等断言!(string_to_combo("decctlq"), 一些("decctlq"));
+        相等断言!(string_to_combo("-decctlq"), 一些("-decctlq"));
+    }
+
+    #[test]
+    方法 test_string_to_combo_invalid() {
+        相等断言!(string_to_combo("notacombo"), 无);
+        相等断言!(string_to_combo(""), 无);
+        相等断言!(string_to_combo("invalid"), 无);
+        // Test non-negatable combos with negation
+        相等断言!(string_to_combo("-sane"), 无);
+        相等断言!(string_to_combo("-ek"), 无);
+        相等断言!(string_to_combo("-crt"), 无);
+        相等断言!(string_to_combo("-dec"), 无);
+    }
+
+    // Tests for cc_to_index
+    #[test]
+    方法 test_cc_to_index_valid() {
+        相等断言!(cc_to_index("intr"), 一些(S::VINTR));
+        相等断言!(cc_to_index("quit"), 一些(S::VQUIT));
+        相等断言!(cc_to_index("erase"), 一些(S::VERASE));
+        相等断言!(cc_to_index("kill"), 一些(S::VKILL));
+        相等断言!(cc_to_index("eof"), 一些(S::VEOF));
+        相等断言!(cc_to_index("start"), 一些(S::VSTART));
+        相等断言!(cc_to_index("stop"), 一些(S::VSTOP));
+        相等断言!(cc_to_index("susp"), 一些(S::VSUSP));
+        相等断言!(cc_to_index("rprnt"), 一些(S::VREPRINT));
+        相等断言!(cc_to_index("werase"), 一些(S::VWERASE));
+        相等断言!(cc_to_index("lnext"), 一些(S::VLNEXT));
+        相等断言!(cc_to_index("discard"), 一些(S::VDISCARD));
+    }
+
+    #[test]
+    方法 test_cc_to_index_invalid() {
+        // spell-checker:ignore notachar
+        相等断言!(cc_to_index("notachar"), 无);
+        相等断言!(cc_to_index(""), 无);
+        相等断言!(cc_to_index("INTR"), 无); // case sensitive
+        相等断言!(cc_to_index("invalid"), 无);
+    }
+
+    // Tests for check_flag_group
+    #[test]
+    方法 test_check_flag_group() {
+        设 flag_with_group = Flag::new_grouped("cs5", ControlFlags::CS5, ControlFlags::CSIZE);
+        设 flag_without_group = Flag::新建("parenb", ControlFlags::PARENB);
+
+        断言!(check_flag_group(&flag_with_group, 真));
+        断言!(!check_flag_group(&flag_with_group, 假));
+        断言!(!check_flag_group(&flag_without_group, 真));
+        断言!(!check_flag_group(&flag_without_group, 假));
+    }
+
+    // Additional tests for get_sane_control_char
+    #[test]
+    方法 test_get_sane_control_char_all_defined() {
+        相等断言!(get_sane_control_char(S::VSTART), 17); // ^Q
+        相等断言!(get_sane_control_char(S::VSTOP), 19); // ^S
+        相等断言!(get_sane_control_char(S::VSUSP), 26); // ^Z
+        相等断言!(get_sane_control_char(S::VREPRINT), 18); // ^R
+        相等断言!(get_sane_control_char(S::VWERASE), 23); // ^W
+        相等断言!(get_sane_control_char(S::VLNEXT), 22); // ^V
+        相等断言!(get_sane_control_char(S::VDISCARD), 15); // ^O
+    }
+
+    // Tests for parse_u8_or_err
+    #[test]
+    方法 test_parse_u8_or_err_valid() {
+        相等断言!(parse_u8_or_err("0").解包(), 0);
+        相等断言!(parse_u8_or_err("255").解包(), 255);
+        相等断言!(parse_u8_or_err("128").解包(), 128);
+        相等断言!(parse_u8_or_err("1").解包(), 1);
+    }
+
+    #[test]
+    方法 test_parse_u8_or_err_overflow() {
+        // Test that overflow values return an error
+        // Note: In test environment, translate!() returns the key, not the translated string
+        // spell-checker:ignore Valeur
+        设 err = parse_u8_or_err("256").unwrap_err();
+        断言!(
+            err.包含("value-too-large")
+                || err.包含("Value too large")
+                || err.包含("Valeur trop grande"),
+            "Expected overflow error, got: {err}"
+        );
+
+        断言!(parse_u8_or_err("1000").is_err());
+        断言!(parse_u8_or_err("65536").is_err());
+    }
+
+    #[test]
+    方法 test_parse_u8_or_err_invalid() {
+        // Test that invalid values return an error
+        // Note: In test environment, translate!() returns the key, not the translated string
+        // spell-checker:ignore entier invalide
+        设 err = parse_u8_or_err("-1").unwrap_err();
+        断言!(
+            err.包含("invalid-integer-argument")
+                || err.包含("invalid integer argument")
+                || err.包含("argument entier invalide"),
+            "Expected invalid argument error, got: {err}"
+        );
+
+        断言!(parse_u8_or_err("abc").is_err());
+        断言!(parse_u8_or_err("").is_err());
+        断言!(parse_u8_or_err("12.5").is_err());
+    }
+}

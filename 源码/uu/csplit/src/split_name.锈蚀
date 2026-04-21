@@ -1,0 +1,249 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (regex) diuox
+
+使用 uucore::format::{Format, FormatError, num_format::UnsignedInt};
+
+使用 箱::csplit_error::CsplitError;
+
+/// Computes the filename of a split, taking into consideration a possible user-defined suffix
+/// format.
+公有 结构 SplitName {
+    prefix: 向量<正8>,
+    format: Format<UnsignedInt, 正64>,
+}
+
+实现 SplitName {
+    /// Creates a new [`SplitName`] with the given user-defined options:
+    /// - `prefix_opt` specifies a prefix for all splits.
+    /// - `format_opt` specifies a custom format for the suffix part of the filename, using the
+    ///   `sprintf` format notation.
+    /// - `n_digits_opt` defines the width of the split number.
+    ///
+    /// # Caveats
+    ///
+    /// If `prefix_opt` and `format_opt` are defined, and the `format_opt` has some string appearing
+    /// before the conversion pattern (e.g., "here-%05d"), then it is appended to the passed prefix
+    /// via `prefix_opt`.
+    ///
+    /// If `n_digits_opt` and `format_opt` are defined, then width defined in `format_opt` is
+    /// taken.
+    公有 方法 新建(
+        prefix_opt: 选项<字符串>,
+        format_opt: 选项<字符串>,
+        n_digits_opt: 选项<字符串>,
+    ) -> 结果<自身类型, CsplitError> {
+        // get the prefix
+        设 prefix = prefix_opt.unwrap_or_else(|| "xx".to_string());
+
+        // the width for the split offset
+        设 n_digits = n_digits_opt
+            .映射(|opt| {
+                opt.parse::<正整数大小>()
+                    .map_err(|_| CsplitError::InvalidNumber(opt))
+            })
+            .transpose()?
+            .unwrap_or(2);
+
+        设 format_string = format_opt.unwrap_or_else(|| 格式化!("%0{n_digits}u"));
+
+        设 format = 匹配 Format::<UnsignedInt, 正64>::parse(format_string) {
+            好的(format) => 好的(format),
+            坏的(FormatError::TooManySpecs(_)) => 坏的(CsplitError::SuffixFormatTooManyPercents),
+            坏的(_) => 坏的(CsplitError::SuffixFormatIncorrect),
+        }?;
+
+        好的(自身类型 {
+            prefix: prefix.as_bytes().to_owned(),
+            format,
+        })
+    }
+
+    /// Returns the filename of the i-th split.
+    公有 方法 获取(&自身, n: 正整数大小) -> 字符串 {
+        设 可变 v = 自身.prefix.克隆();
+        自身.format.格式化(&可变 v, n 转换 正64).解包();
+        字符串::from_utf8_lossy(&v).to_string()
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    // spell-checker:ignore (path) xxcst
+
+    使用 超级::*;
+
+    #[test]
+    方法 invalid_number() {
+        设 split_name = SplitName::新建(无, 无, 一些(字符串::from("bad")));
+        匹配 split_name {
+            坏的(CsplitError::InvalidNumber(_)) => (),
+            _ => 恐慌!("should fail with InvalidNumber"),
+        }
+    }
+
+    #[test]
+    方法 invalid_suffix_format1() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("no conversion string")), 无);
+        匹配 split_name {
+            坏的(CsplitError::SuffixFormatIncorrect) => (),
+            _ => 恐慌!("should fail with SuffixFormatIncorrect"),
+        }
+    }
+
+    #[test]
+    方法 invalid_suffix_format2() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("%042a")), 无);
+        匹配 split_name {
+            坏的(CsplitError::SuffixFormatIncorrect) => (),
+            _ => 恐慌!("should fail with SuffixFormatIncorrect"),
+        }
+    }
+
+    #[test]
+    方法 default_formatter() {
+        设 split_name = SplitName::新建(无, 无, 无).解包();
+        相等断言!(split_name.获取(2), "xx02");
+    }
+
+    #[test]
+    方法 default_formatter_with_prefix() {
+        设 split_name = SplitName::新建(一些(字符串::from("aaa")), 无, 无).解包();
+        相等断言!(split_name.获取(2), "aaa02");
+    }
+
+    #[test]
+    方法 default_formatter_with_width() {
+        设 split_name = SplitName::新建(无, 无, 一些(字符串::from("5"))).解包();
+        相等断言!(split_name.获取(2), "xx00002");
+    }
+
+    #[test]
+    方法 no_padding_decimal() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%d-")), 无).解包();
+        相等断言!(split_name.获取(2), "xxcst-2-");
+    }
+
+    #[test]
+    方法 zero_padding_decimal1() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03d-")), 无).解包();
+        相等断言!(split_name.获取(2), "xxcst-002-");
+    }
+
+    #[test]
+    方法 zero_padding_decimal2() {
+        设 split_name = SplitName::新建(
+            一些(字符串::from("pre-")),
+            一些(字符串::from("cst-%03d-post")),
+            无,
+        )
+        .解包();
+        相等断言!(split_name.获取(2), "pre-cst-002-post");
+    }
+
+    #[test]
+    方法 zero_padding_decimal3() {
+        设 split_name = SplitName::新建(
+            无,
+            一些(字符串::from("cst-%03d-")),
+            一些(字符串::from("42")),
+        )
+        .解包();
+        相等断言!(split_name.获取(2), "xxcst-002-");
+    }
+
+    #[test]
+    方法 zero_padding_decimal4() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03i-")), 无).解包();
+        相等断言!(split_name.获取(2), "xxcst-002-");
+    }
+
+    #[test]
+    方法 zero_padding_decimal5() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03u-")), 无).解包();
+        相等断言!(split_name.获取(2), "xxcst-002-");
+    }
+
+    #[test]
+    方法 zero_padding_octal() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03o-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-052-");
+    }
+
+    #[test]
+    方法 zero_padding_lower_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03x-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-02a-");
+    }
+
+    #[test]
+    方法 zero_padding_upper_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%03X-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-02A-");
+    }
+
+    #[test]
+    方法 alternate_form_octal() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%#10o-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-       052-");
+    }
+
+    #[test]
+    方法 alternate_form_lower_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%#10x-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-      0x2a-");
+    }
+
+    #[test]
+    方法 alternate_form_upper_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%#10X-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-      0X2A-");
+    }
+
+    #[test]
+    方法 left_adjusted_decimal1() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10d-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-42        -");
+    }
+
+    #[test]
+    方法 left_adjusted_decimal2() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10i-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-42        -");
+    }
+
+    #[test]
+    方法 left_adjusted_decimal3() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10u-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-42        -");
+    }
+
+    #[test]
+    方法 left_adjusted_octal() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10o-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-52        -");
+    }
+
+    #[test]
+    方法 left_adjusted_lower_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10x-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-2a        -");
+    }
+
+    #[test]
+    方法 left_adjusted_upper_hex() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("cst-%-10X-")), 无).解包();
+        相等断言!(split_name.获取(42), "xxcst-2A        -");
+    }
+
+    #[test]
+    方法 too_many_percent() {
+        设 split_name = SplitName::新建(无, 一些(字符串::from("%02d-%-3x")), 无);
+        匹配 split_name {
+            坏的(CsplitError::SuffixFormatTooManyPercents) => (),
+            _ => 恐慌!("should fail with SuffixFormatTooManyPercents"),
+        }
+    }
+}

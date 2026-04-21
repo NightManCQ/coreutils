@@ -1,0 +1,19 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 cfg_aliases::cfg_aliases;
+
+方法 主函数() {
+    cfg_aliases! {
+        bsd: { 任意(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ) },
+    }
+}

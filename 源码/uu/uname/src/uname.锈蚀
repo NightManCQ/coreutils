@@ -1,0 +1,217 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (API) nodename osname sysname (options) mnrsv mnrsvo
+
+使用 标准库::ffi::{OsStr, OsString};
+
+使用 clap::{Arg, ArgAction, Command};
+使用 platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
+使用 uucore::display::println_verbatim;
+使用 uucore::translate;
+使用 uucore::{
+    错误::{UResult, USimpleError},
+    format_usage,
+};
+
+公有 模组 options {
+    公有 静态 ALL: &字符串切片 = "all";
+    公有 静态 KERNEL_NAME: &字符串切片 = "kernel-name";
+    公有 静态 NODENAME: &字符串切片 = "nodename";
+    公有 静态 KERNEL_VERSION: &字符串切片 = "kernel-version";
+    公有 静态 KERNEL_RELEASE: &字符串切片 = "kernel-release";
+    公有 静态 MACHINE: &字符串切片 = "machine";
+    公有 静态 PROCESSOR: &字符串切片 = "processor";
+    公有 静态 HARDWARE_PLATFORM: &字符串切片 = "hardware-platform";
+    公有 静态 OS: &字符串切片 = "operating-system";
+}
+
+公有 结构 UNameOutput {
+    公有 kernel_name: 选项<OsString>,
+    公有 nodename: 选项<OsString>,
+    公有 kernel_release: 选项<OsString>,
+    公有 kernel_version: 选项<OsString>,
+    公有 machine: 选项<OsString>,
+    公有 操作系统: 选项<OsString>,
+    公有 processor: 选项<OsString>,
+    公有 hardware_platform: 选项<OsString>,
+}
+
+实现 UNameOutput {
+    方法 display(&自身) -> OsString {
+        [
+            自身.kernel_name.as_ref(),
+            自身.nodename.as_ref(),
+            自身.kernel_release.as_ref(),
+            自身.kernel_version.as_ref(),
+            自身.machine.as_ref(),
+            自身.processor.as_ref(),
+            自身.hardware_platform.as_ref(),
+            自身.操作系统.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .映射(OsString::as_os_str)
+        .收集::<向量<_>>()
+        .加入(OsStr::新建(" "))
+    }
+
+    公有 方法 新建(opts: &Options) -> UResult<自身类型> {
+        设 uname = PlatformInfo::新建()
+            .map_err(|_e| USimpleError::新建(1, translate!("uname-error-cannot-get-system-name")))?;
+        设 none = !(opts.全部
+            || opts.kernel_name
+            || opts.nodename
+            || opts.kernel_release
+            || opts.kernel_version
+            || opts.machine
+            || opts.操作系统
+            || opts.processor
+            || opts.hardware_platform);
+
+        设 kernel_name =
+            (opts.kernel_name || opts.全部 || none).then(|| uname.sysname().to_owned());
+
+        设 nodename = (opts.nodename || opts.全部).then(|| uname.nodename().to_owned());
+
+        设 kernel_release = (opts.kernel_release || opts.全部).then(|| uname.release().to_owned());
+
+        设 kernel_version = (opts.kernel_version || opts.全部).then(|| uname.version().to_owned());
+
+        设 machine = (opts.machine || opts.全部).then(|| uname.machine().to_owned());
+
+        设 操作系统 = (opts.操作系统 || opts.全部).then(|| uname.osname().to_owned());
+
+        // This option is unsupported on modern Linux systems
+        // See: https://lists.gnu.org/archive/html/bug-coreutils/2005-09/msg00063.html
+        设 processor = opts.processor.then(|| translate!("uname-unknown").into());
+
+        // This option is unsupported on modern Linux systems
+        // See: https://lists.gnu.org/archive/html/bug-coreutils/2005-09/msg00063.html
+        设 hardware_platform = opts
+            .hardware_platform
+            .then(|| translate!("uname-unknown").into());
+
+        好的(自身类型 {
+            kernel_name,
+            nodename,
+            kernel_release,
+            kernel_version,
+            machine,
+            操作系统,
+            processor,
+            hardware_platform,
+        })
+    }
+}
+
+公有 结构 Options {
+    公有 全部: 布尔,
+    公有 kernel_name: 布尔,
+    公有 nodename: 布尔,
+    公有 kernel_version: 布尔,
+    公有 kernel_release: 布尔,
+    公有 machine: 布尔,
+    公有 processor: 布尔,
+    公有 hardware_platform: 布尔,
+    公有 操作系统: 布尔,
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 options = Options {
+        全部: matches.get_flag(options::ALL),
+        kernel_name: matches.get_flag(options::KERNEL_NAME),
+        nodename: matches.get_flag(options::NODENAME),
+        kernel_release: matches.get_flag(options::KERNEL_RELEASE),
+        kernel_version: matches.get_flag(options::KERNEL_VERSION),
+        machine: matches.get_flag(options::MACHINE),
+        processor: matches.get_flag(options::PROCESSOR),
+        hardware_platform: matches.get_flag(options::HARDWARE_PLATFORM),
+        操作系统: matches.get_flag(options::OS),
+    };
+    设 output = UNameOutput::新建(&options)?;
+    println_verbatim(output.display().as_os_str())
+        .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("uname")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("uname"))
+        .about(translate!("uname-about"))
+        .override_usage(format_usage(&translate!("uname-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::ALL)
+                .short('a')
+                .long(options::ALL)
+                .help(translate!("uname-help-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::KERNEL_NAME)
+                .short('s')
+                .long(options::KERNEL_NAME)
+                .alias("sysname") // Obsolescent option in GNU uname
+                .help(translate!("uname-help-kernel-name"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NODENAME)
+                .short('n')
+                .long(options::NODENAME)
+                .help(translate!("uname-help-nodename"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::KERNEL_RELEASE)
+                .short('r')
+                .long(options::KERNEL_RELEASE)
+                .alias("release") // Obsolescent option in GNU uname
+                .help(translate!("uname-help-kernel-release"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::KERNEL_VERSION)
+                .short('v')
+                .long(options::KERNEL_VERSION)
+                .help(translate!("uname-help-kernel-version"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::MACHINE)
+                .short('m')
+                .long(options::MACHINE)
+                .help(translate!("uname-help-machine"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OS)
+                .short('o')
+                .long(options::OS)
+                .help(translate!("uname-help-os"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PROCESSOR)
+                .short('p')
+                .long(options::PROCESSOR)
+                .help(translate!("uname-help-processor"))
+                .action(ArgAction::SetTrue)
+                .hide(真),
+        )
+        .arg(
+            Arg::新建(options::HARDWARE_PLATFORM)
+                .short('i')
+                .long(options::HARDWARE_PLATFORM)
+                .help(translate!("uname-help-hardware-platform"))
+                .action(ArgAction::SetTrue)
+                .hide(真),
+        )
+}

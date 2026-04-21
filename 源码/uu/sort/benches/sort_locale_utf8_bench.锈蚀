@@ -1,0 +1,103 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Benchmarks for sort with UTF-8 locale (locale-aware collation).
+//!
+//! Note: The locale is set in main() BEFORE any benchmark runs because
+//! the locale is cached on first access via OnceLock and cannot be changed afterwards.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::NamedTempFile;
+使用 uu_sort::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file, text_data};
+
+/// Benchmark ASCII-only data sorting with UTF-8 locale
+#[divan::bench]
+方法 sort_ascii_utf8_locale(bencher: Bencher) {
+    设 data = text_data::generate_ascii_data_simple(100_000);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包().to_string();
+
+    设 args = ["-o", &output_path, file_path.to_str().解包()];
+    black_box(run_util_function(uumain, &args));
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &args));
+    });
+}
+
+/// Benchmark mixed ASCII/Unicode data with UTF-8 locale
+#[divan::bench]
+方法 sort_mixed_utf8_locale(bencher: Bencher) {
+    设 data = text_data::generate_mixed_locale_data(50_000);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包().to_string();
+
+    设 args = ["-o", &output_path, file_path.to_str().解包()];
+    black_box(run_util_function(uumain, &args));
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &args));
+    });
+}
+
+/// Benchmark numeric sorting with UTF-8 locale
+#[divan::bench]
+方法 sort_numeric_utf8_locale(bencher: Bencher) {
+    设 可变 data = 向量::新建();
+    循环 i 在 0..50_000 {
+        设 line = 格式化!("{}\n", 50_000 - i);
+        data.extend_from_slice(line.as_bytes());
+    }
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包().to_string();
+
+    设 args = ["-n", "-o", &output_path, file_path.to_str().解包()];
+    black_box(run_util_function(uumain, &args));
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &args));
+    });
+}
+
+/// Benchmark reverse sorting with UTF-8 locale
+#[divan::bench]
+方法 sort_reverse_utf8_locale(bencher: Bencher) {
+    设 data = text_data::generate_mixed_locale_data(50_000);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包().to_string();
+
+    设 args = ["-r", "-o", &output_path, file_path.to_str().解包()];
+    black_box(run_util_function(uumain, &args));
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &args));
+    });
+}
+
+/// Benchmark unique sorting with UTF-8 locale
+#[divan::bench]
+方法 sort_unique_utf8_locale(bencher: Bencher) {
+    设 data = text_data::generate_mixed_locale_data(50_000);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包().to_string();
+
+    设 args = ["-u", "-o", &output_path, file_path.to_str().解包()];
+    black_box(run_util_function(uumain, &args));
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &args));
+    });
+}
+
+方法 主函数() {
+    // Set UTF-8 locale BEFORE any benchmarks run.
+    // This must happen before divan::main() because the locale is cached
+    // on first access via OnceLock and cannot be changed afterwards.
+    不安全 {
+        标准库::环境::set_var("LC_ALL", "en_US.UTF-8");
+    }
+    divan::主函数();
+}

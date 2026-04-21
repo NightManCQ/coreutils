@@ -1,0 +1,415 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore extendedbigdecimal
+
+//! `printf`-style formatting
+//!
+//! Rust has excellent formatting capabilities, but the coreutils require very
+//! specific formatting that needs to work exactly like the GNU utilities.
+//! Naturally, the GNU behavior is based on the C `printf` functionality.
+//!
+//! Additionally, we need support for escape sequences for the `printf` utility.
+//!
+//! The [`printf`] and [`sprintf`] functions closely match the behavior of the
+//! corresponding C functions: the former renders a formatted string
+//! to stdout, the latter renders to a new [`String`] object.
+//!
+//! There are three kinds of parsing that we might want to do:
+//!
+//!  1. Parse only `printf` directives (for e.g. `seq`, `dd`)
+//!  2. Parse only escape sequences (for e.g. `echo`)
+//!  3. Parse both `printf` specifiers and escape sequences (for e.g. `printf`)
+//!
+//! This module aims to combine all three use cases. An iterator parsing each
+//! of these cases is provided by [`parse_spec_only`], [`parse_escape_only`]
+//! and [`parse_spec_and_escape`], respectively.
+//!
+//! There is a special [`Format`] type, which can be used to parse a format
+//! string containing exactly one directive and does not use any `*` in that
+//! directive. This format can be printed in a type-safe manner without failing
+//! (modulo IO errors).
+
+模组 argument;
+模组 escape;
+公有 模组 human;
+公有 模组 num_format;
+模组 spec;
+
+公有 使用 自身::escape::{EscapedChar, OctalParsing};
+使用 箱::extendedbigdecimal::ExtendedBigDecimal;
+公有 使用 argument::{FormatArgument, FormatArguments};
+
+使用 自身::{escape::parse_escape_code, num_format::Formatter};
+使用 箱::{NonUtf8OsStrError, 错误::UError};
+公有 使用 spec::Spec;
+使用 标准库::{
+    错误::错误协议,
+    格式化::显示协议,
+    输入输出::{Write, stdout},
+    标记::PhantomData,
+    操作符::ControlFlow,
+};
+
+使用 os_display::Quotable;
+
+#[derive(调试协议)]
+公有 枚举 FormatError {
+    SpecError(向量<正8>),
+    IoError(标准库::输入输出::错误协议),
+    NoMoreArguments,
+    InvalidArgument(FormatArgument),
+    TooManySpecs(向量<正8>),
+    NeedAtLeastOneSpec(向量<正8>),
+    WrongSpecType,
+    InvalidPrecision(字符串),
+    /// The format specifier ends with a %, as in `%f%`.
+    EndsWithPercent(向量<正8>),
+    /// The escape sequence `\x` appears without a literal hexadecimal value.
+    MissingHex,
+    /// The hexadecimal characters represent a code point that cannot represent a
+    /// Unicode character (e.g., a surrogate code point)
+    InvalidCharacter(字符, 向量<正8>),
+    InvalidEncoding(NonUtf8OsStrError),
+}
+
+实现 错误协议 循环 FormatError {}
+实现 UError 循环 FormatError {}
+
+实现 转换协议<标准库::输入输出::错误协议> 循环 FormatError {
+    方法 from(value: 标准库::输入输出::错误协议) -> 自身类型 {
+        自身类型::IoError(value)
+    }
+}
+
+实现 转换协议<NonUtf8OsStrError> 循环 FormatError {
+    方法 from(value: NonUtf8OsStrError) -> 自身类型 {
+        自身类型::InvalidEncoding(value)
+    }
+}
+
+实现 显示协议 循环 FormatError {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::SpecError(s) => write!(
+                f,
+                "%{}: invalid conversion specification",
+                字符串::from_utf8_lossy(s)
+            ),
+            自身类型::TooManySpecs(s) => write!(
+                f,
+                "format '{}' has too many % directives",
+                字符串::from_utf8_lossy(s)
+            ),
+            自身类型::NeedAtLeastOneSpec(s) => write!(
+                f,
+                "format '{}' has no % directive",
+                字符串::from_utf8_lossy(s)
+            ),
+            自身类型::EndsWithPercent(s) => {
+                write!(f, "format {} ends in %", 字符串::from_utf8_lossy(s).quote())
+            }
+            自身类型::InvalidPrecision(precision) => write!(f, "invalid precision: '{precision}'"),
+            // TODO: Error message below needs some work
+            自身类型::WrongSpecType => write!(f, "wrong % directive type was given"),
+            自身类型::IoError(e) => write!(f, "write error: {e}"),
+            自身类型::NoMoreArguments => write!(f, "no more arguments"),
+            自身类型::InvalidArgument(_) => write!(f, "invalid argument"),
+            自身类型::MissingHex => write!(f, "missing hexadecimal number in escape"),
+            自身类型::InvalidCharacter(escape_char, digits) => write!(
+                f,
+                "invalid universal character name \\{escape_char}{}",
+                字符串::from_utf8_lossy(digits)
+            ),
+            自身类型::InvalidEncoding(no) => no.格式化(f),
+        }
+    }
+}
+
+/// Maximum width for formatting to prevent memory allocation panics.
+/// Rust's formatter will panic when trying to allocate memory for very large widths.
+/// This limit is somewhat arbitrary but should be well above any practical use case
+/// while still preventing formatter panics.
+常量 MAX_FORMAT_WIDTH: 正整数大小 = 1_000_000;
+
+/// Check if a width is too large for formatting.
+/// Returns an error if the width exceeds MAX_FORMAT_WIDTH.
+方法 check_width(width: 正整数大小) -> 标准库::输入输出::结果<()> {
+    如果 width > MAX_FORMAT_WIDTH {
+        坏的(标准库::输入输出::错误协议::新建(
+            标准库::输入输出::ErrorKind::OutOfMemory,
+            "formatting width too large",
+        ))
+    } 否则 {
+        好的(())
+    }
+}
+
+/// A single item to format
+公有 枚举 FormatItem<C: FormatChar> {
+    /// A format specifier
+    Spec(Spec),
+    /// A single character
+    Char(C),
+}
+
+公有 协议 FormatChar {
+    方法 写锁定(&自身, writer: 实现 Write) -> 标准库::输入输出::结果<ControlFlow<()>>;
+}
+
+实现 FormatChar 循环 正8 {
+    方法 写锁定(&自身, 可变 writer: 实现 Write) -> 标准库::输入输出::结果<ControlFlow<()>> {
+        writer.write_all(&[*自身])?;
+        好的(ControlFlow::Continue(()))
+    }
+}
+
+实现 FormatChar 循环 EscapedChar {
+    方法 写锁定(&自身, 可变 writer: 实现 Write) -> 标准库::输入输出::结果<ControlFlow<()>> {
+        匹配 自身 {
+            自身类型::Byte(c) => {
+                writer.write_all(&[*c])?;
+            }
+            自身类型::Char(c) => {
+                write!(writer, "{c}")?;
+            }
+            自身类型::Backslash(c) => {
+                writer.write_all(&[b'\\', *c])?;
+            }
+            自身类型::End => 返回 好的(ControlFlow::Break(())),
+        }
+        好的(ControlFlow::Continue(()))
+    }
+}
+
+实现<C: FormatChar> FormatItem<C> {
+    公有 方法 写锁定(
+        &自身,
+        writer: 实现 Write,
+        args: &可变 FormatArguments,
+    ) -> 结果<ControlFlow<()>, FormatError> {
+        匹配 自身 {
+            自身类型::Spec(spec) => spec.写锁定(writer, args)?,
+            自身类型::Char(c) => 返回 c.写锁定(writer).map_err(FormatError::IoError),
+        }
+        好的(ControlFlow::Continue(()))
+    }
+}
+
+/// Parse a format string containing % directives and escape sequences
+公有 方法 parse_spec_and_escape(
+    格式化: &[正8],
+) -> 实现 迭代器协议<Item = 结果<FormatItem<EscapedChar>, FormatError>> + '_ {
+    设 可变 current = 格式化;
+    标准库::迭代::from_fn(移动 || 匹配 current {
+        [] => 无,
+        [b'%', b'%', rest @ ..] => {
+            current = rest;
+            一些(好的(FormatItem::Char(EscapedChar::Byte(b'%'))))
+        }
+        [b'%', rest @ ..] => {
+            current = rest;
+            设 spec = 匹配 Spec::parse(&可变 current) {
+                好的(spec) => spec,
+                坏的(切片) => 返回 一些(坏的(FormatError::SpecError(切片.to_vec()))),
+            };
+            一些(好的(FormatItem::Spec(spec)))
+        }
+        [b'\\', rest @ ..] => {
+            current = rest;
+            一些(parse_escape_code(&可变 current, OctalParsing::默认()).映射(FormatItem::Char))
+        }
+        [c, rest @ ..] => {
+            current = rest;
+            一些(好的(FormatItem::Char(EscapedChar::Byte(*c))))
+        }
+    })
+}
+
+/// Parse a format string containing % directives
+公有 方法 parse_spec_only(
+    格式化: &[正8],
+) -> 实现 迭代器协议<Item = 结果<FormatItem<正8>, FormatError>> + '_ {
+    设 可变 current = 格式化;
+    标准库::迭代::from_fn(移动 || 匹配 current {
+        [] => 无,
+        [b'%'] => 一些(坏的(FormatError::EndsWithPercent(格式化.to_vec()))),
+        [b'%', b'%', rest @ ..] => {
+            current = rest;
+            一些(好的(FormatItem::Char(b'%')))
+        }
+        [b'%', rest @ ..] => {
+            current = rest;
+            设 spec = 匹配 Spec::parse(&可变 current) {
+                好的(spec) => spec,
+                坏的(切片) => 返回 一些(坏的(FormatError::SpecError(切片.to_vec()))),
+            };
+            一些(好的(FormatItem::Spec(spec)))
+        }
+        [c, rest @ ..] => {
+            current = rest;
+            一些(好的(FormatItem::Char(*c)))
+        }
+    })
+}
+
+/// Parse a format string containing escape sequences
+公有 方法 parse_escape_only(
+    格式化: &[正8],
+    zero_octal_parsing: OctalParsing,
+) -> 实现 迭代器协议<Item = EscapedChar> + '_ {
+    设 可变 current = 格式化;
+    标准库::迭代::from_fn(移动 || 匹配 current {
+        [] => 无,
+        [b'\\', rest @ ..] => {
+            current = rest;
+            一些(
+                parse_escape_code(&可变 current, zero_octal_parsing)
+                    .unwrap_or(EscapedChar::Backslash(b'x')),
+            )
+        }
+        [c, rest @ ..] => {
+            current = rest;
+            一些(EscapedChar::Byte(*c))
+        }
+    })
+}
+
+/// Write a formatted string to stdout.
+///
+/// `format_string` contains the template and `args` contains the
+/// arguments to render into the template.
+///
+/// See also [`sprintf`], which creates a new formatted [`String`].
+///
+/// # Examples
+///
+/// ```rust
+/// use uucore::format::{printf, FormatArgument};
+///
+/// printf("hello %s", &[FormatArgument::String("world".into())]).unwrap();
+/// // prints "hello world"
+/// ```
+公有 方法 printf<'a>(
+    format_string: 实现 作为引用协议<[正8]>,
+    arguments: 实现 转换为迭代器协议<Item = &'a FormatArgument>,
+) -> 结果<(), FormatError> {
+    printf_writer(stdout(), format_string, arguments)
+}
+
+方法 printf_writer<'a>(
+    可变 writer: 实现 Write,
+    format_string: 实现 作为引用协议<[正8]>,
+    args: 实现 转换为迭代器协议<Item = &'a FormatArgument>,
+) -> 结果<(), FormatError> {
+    设 args = args.into_iter().cloned().收集::<向量<_>>();
+    设 可变 args = FormatArguments::新建(&args);
+    循环 item 在 parse_spec_only(format_string.as_ref()) {
+        如果 item?.写锁定(&可变 writer, &可变 args)?.is_break() {
+            中断;
+        }
+    }
+    好的(())
+}
+
+/// Create a new formatted string.
+///
+/// `format_string` contains the template and `args` contains the
+/// arguments to render into the template.
+///
+/// See also [`printf`], which prints to stdout.
+///
+/// # Examples
+///
+/// ```rust
+/// use uucore::format::{sprintf, FormatArgument};
+///
+/// let s = sprintf("hello %s", &[FormatArgument::String("world".into())]).unwrap();
+/// let s = std::str::from_utf8(&s).unwrap();
+/// assert_eq!(s, "hello world");
+/// ```
+公有 方法 sprintf<'a>(
+    format_string: 实现 作为引用协议<[正8]>,
+    arguments: 实现 转换为迭代器协议<Item = &'a FormatArgument>,
+) -> 结果<向量<正8>, FormatError> {
+    设 可变 writer = 向量::新建();
+    printf_writer(&可变 writer, format_string, arguments)?;
+    好的(writer)
+}
+
+/// A format for a single numerical value of type T
+///
+/// This is used by `seq` and `csplit`. It can be constructed with [`Format::from_formatter`]
+/// or [`Format::parse`] and can write a value with [`Format::fmt`].
+///
+/// [`Format::parse`] can only accept a single specification without any asterisk parameters.
+/// If it does get more specifications, it will return an error.
+公有 结构 Format<F: Formatter<T>, T> {
+    prefix: 向量<正8>,
+    suffix: 向量<正8>,
+    formatter: F,
+    _marker: PhantomData<T>,
+}
+
+实现<F: Formatter<T>, T> Format<F, T> {
+    公有 方法 from_formatter(formatter: F) -> 自身类型 {
+        自身类型 {
+            prefix: 向量::<正8>::新建(),
+            suffix: 向量::<正8>::新建(),
+            formatter,
+            _marker: PhantomData,
+        }
+    }
+
+    公有 方法 parse(format_string: 实现 作为引用协议<[正8]>) -> 结果<自身类型, FormatError> {
+        设 可变 迭代 = parse_spec_only(format_string.as_ref());
+
+        设 可变 prefix = 向量::新建();
+        设 可变 spec = 无;
+        循环 item 在 &可变 迭代 {
+            匹配 item? {
+                FormatItem::Spec(s) => {
+                    spec = 一些(s);
+                    中断;
+                }
+                FormatItem::Char(c) => prefix.压入(c),
+            }
+        }
+
+        设 一些(spec) = spec 否则 {
+            返回 坏的(FormatError::NeedAtLeastOneSpec(
+                format_string.as_ref().to_vec(),
+            ));
+        };
+
+        设 formatter = F::try_from_spec(spec)?;
+
+        设 可变 suffix = 向量::新建();
+        循环 item 在 &可变 迭代 {
+            匹配 item {
+                // If the `format_string` is of the form `%f%f` or
+                // `%f%`, then return an error.
+                好的(FormatItem::Spec(_)) | 坏的(FormatError::EndsWithPercent(_)) => {
+                    返回 坏的(FormatError::TooManySpecs(format_string.as_ref().to_vec()));
+                }
+                好的(FormatItem::Char(c)) => suffix.压入(c),
+                坏的(e) => 返回 坏的(e),
+            }
+        }
+
+        好的(自身类型 {
+            prefix,
+            suffix,
+            formatter,
+            _marker: PhantomData,
+        })
+    }
+
+    公有 方法 格式化(&自身, 可变 w: 实现 Write, f: T) -> 标准库::输入输出::结果<()> {
+        w.write_all(&自身.prefix)?;
+        自身.formatter.格式化(&可变 w, f)?;
+        w.write_all(&自身.suffix)?;
+        好的(())
+    }
+}

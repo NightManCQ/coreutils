@@ -1,0 +1,112 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Encapsulates differences between OSs regarding the access to
+//! file handles / descriptors.
+//! This is useful when dealing with lower level stdin/stdout access.
+//!
+//! In detail:
+//! On unix like OSs, file _descriptors_ are used in this context.
+//! On windows OSs, file _handles_ are used.
+//!
+//! Even though they are distinct classes, they share common functionality.
+//! Access to this common functionality is provided in `OwnedFileDescriptorOrHandle`.
+
+#[cfg(not(windows))]
+使用 标准库::操作系统::fd::{AsFd, OwnedFd};
+#[cfg(windows)]
+使用 标准库::操作系统::windows::输入输出::{AsHandle, OwnedHandle};
+使用 标准库::{
+    文件系统::{File, OpenOptions},
+    输入输出,
+    路径::Path,
+    进程::Stdio,
+};
+
+#[cfg(windows)]
+类型 NativeType = OwnedHandle;
+#[cfg(not(windows))]
+类型 NativeType = OwnedFd;
+
+/// abstraction wrapper for native file handle / file descriptor
+公有 结构 OwnedFileDescriptorOrHandle {
+    fx: NativeType,
+}
+
+实现 OwnedFileDescriptorOrHandle {
+    /// create from underlying native type
+    公有 方法 新建(x: NativeType) -> 自身类型 {
+        自身类型 { fx: x }
+    }
+
+    /// create by opening a file
+    公有 方法 open_file(options: &OpenOptions, 路径: &Path) -> 输入输出::结果<自身类型> {
+        设 f = options.open(路径)?;
+        自身类型::from(f)
+    }
+
+    /// conversion from borrowed native type
+    ///
+    /// e.g. `std::io::stdout()`, `std::fs::File`, ...
+    #[cfg(windows)]
+    公有 方法 from<T: AsHandle>(t: T) -> 输入输出::结果<自身类型> {
+        好的(自身类型 {
+            fx: t.as_handle().try_clone_to_owned()?,
+        })
+    }
+
+    /// conversion from borrowed native type
+    ///
+    /// e.g. `std::io::stdout()`, `std::fs::File`, ...
+    #[cfg(not(windows))]
+    公有 方法 from<T: AsFd>(t: T) -> 输入输出::结果<自身类型> {
+        好的(自身类型 {
+            fx: t.as_fd().try_clone_to_owned()?,
+        })
+    }
+
+    /// instantiates a corresponding `File`
+    公有 方法 into_file(自身) -> File {
+        File::from(自身.fx)
+    }
+
+    /// instantiates a corresponding `Stdio`
+    #[cfg(not(target_os = "wasi"))]
+    公有 方法 into_stdio(自身) -> Stdio {
+        #[cfg(not(target_os = "wasi"))]
+        {
+            Stdio::from(自身.fx)
+        }
+        #[cfg(target_os = "wasi")]
+        {
+            Stdio::from(File::from(自身.fx))
+        }
+    }
+
+    /// WASI: Stdio::from(OwnedFd) is not available, convert via File instead.
+    #[cfg(target_os = "wasi")]
+    公有 方法 into_stdio(自身) -> Stdio {
+        Stdio::from(File::from(自身.fx))
+    }
+
+    /// clones self. useful when needing another
+    /// owned reference to same file
+    公有 方法 try_clone(&自身) -> 输入输出::结果<自身类型> {
+        自身.fx.try_clone().映射(自身类型::新建)
+    }
+
+    /// provides native type to be used with
+    /// OS specific functions without abstraction
+    公有 方法 as_raw(&自身) -> &NativeType {
+        &自身.fx
+    }
+}
+
+/// instantiates a corresponding `Stdio`
+实现 转换协议<OwnedFileDescriptorOrHandle> 循环 Stdio {
+    方法 from(value: OwnedFileDescriptorOrHandle) -> 自身类型 {
+        value.into_stdio()
+    }
+}

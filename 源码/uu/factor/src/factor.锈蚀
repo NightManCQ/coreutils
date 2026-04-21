@@ -1,0 +1,276 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore funcs newtype
+
+使用 标准库::集合::BTreeMap;
+使用 标准库::格式化::显示协议;
+使用 标准库::输入输出::BufRead;
+使用 标准库::输入输出::{自身, Write, stdin, stdout};
+使用 标准库::迭代::once;
+使用 标准库::数字::IntErrorKind;
+
+使用 clap::{Arg, ArgAction, Command};
+使用 memchr::memchr3_iter;
+使用 num_bigint::BigUint;
+使用 num_prime::nt_funcs::{factorize64, factorize128, factors};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError, set_exit_code};
+使用 uucore::translate;
+使用 uucore::{format_usage, show_error, show_if_err};
+
+模组 options {
+    公有 静态 EXPONENTS: &字符串切片 = "exponents";
+    公有 静态 HELP: &字符串切片 = "help";
+    公有 静态 NUMBER: &字符串切片 = "NUMBER";
+}
+
+常量 LF: 正8 = b'\n';
+常量 CR: 正8 = b'\r';
+常量 DELIM_SPACE: 正8 = b' ';
+常量 DELIM_TAB: 正8 = b'\t';
+常量 DELIM_NULL: 正8 = b'\0';
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议)]
+枚举 Number {
+    U64(正64),
+    U128(正128),
+    BigUint(BigUint),
+}
+
+方法 write_factors_str(
+    num_str: &[正8],
+    w: &可变 输入输出::BufWriter<实现 Write>,
+    print_exponents: 布尔,
+) -> UResult<()> {
+    设 parsed = parse_num(num_str);
+    show_if_err!(&parsed);
+    设 好的(x) = parsed 否则 {
+        // return Ok(). it's non-fatal and we should try the next number.
+        返回 好的(());
+    };
+
+    匹配 x {
+        // use num_prime's factorize64 algorithm for u64 integers
+        Number::U64(x) 如果 x > 1 => write_result(w, &x, factorize64(x), print_exponents),
+        Number::U64(x) => write_result(w, &x, BTreeMap::<正64, 正整数大小>::新建(), print_exponents),
+        // use num_prime's factorize128 algorithm for u128 integers
+        Number::U128(x) => write_result(w, &x, factorize128(x), print_exponents),
+        // use num_prime's fallible factorization for anything greater than u128::MAX
+        Number::BigUint(x) => {
+            设 (prime_factors, remaining) = factors(x.克隆(), 无);
+            如果 remaining.is_some() {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("factor-error-factorization-incomplete"),
+                ));
+            }
+            write_result(w, &x, prime_factors, print_exponents)
+        }
+    }
+    .map_err_context(|| translate!("factor-error-write-error"))
+}
+
+方法 parse_num(切片: &[正8]) -> UResult<Number> {
+    设 err_invalid = |s: &字符串切片, force_quoting| {
+        设 数字 = 如果 force_quoting {
+            s.quote() // Force quoting if there are invalid characters.
+        } 否则 {
+            s.maybe_quote()
+        };
+        USimpleError::新建(
+            1,
+            格式化!("warning: {num}: {}", translate!("factor-error-invalid-int")),
+        )
+    };
+    设 数字 = 字符串切片::from_utf8(切片).map_err(|_| err_invalid(&NumError(切片).to_string(), 真))?;
+
+    匹配 数字.parse::<正64>() {
+        好的(x) => 返回 好的(Number::U64(x)),
+        // If overflown, attempt a greater width
+        坏的(e) 如果 matches!(e.kind(), IntErrorKind::PosOverflow) => {}
+        坏的(_) => 返回 坏的(err_invalid(数字, 假)),
+    }
+
+    匹配 数字.parse::<正128>() {
+        好的(x) => 返回 好的(Number::U128(x)),
+        // If overflown, attempt a greater width
+        坏的(e) 如果 matches!(e.kind(), IntErrorKind::PosOverflow) => {}
+        坏的(_) => 返回 坏的(err_invalid(数字, 假)),
+    }
+
+    数字.parse::<BigUint>()
+        .映射(Number::BigUint)
+        .map_err(|_| err_invalid(数字, 假))
+}
+
+/// This is a newtype wrapper over a potentially malformed UTF-8
+/// string of a number, which has an optimized [`Display`] impl
+/// matching GNU's formatting. This can be removed in favor of
+/// the C quoting in uucore once support for byte slices is added.
+#[repr(transparent)]
+结构 NumError<'a>(&'a [正8]);
+
+实现 显示协议 循环 NumError<'_> {
+    /// This function formats the valid string segments and displays
+    /// the invalid ones as escaped octal, like GNU. For example, the
+    /// (escaped) string "\xFFabc\x1C" is formatted as "\377abc\034".
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 字符串切片::from_utf8(自身.0) {
+            好的(s) => write!(f, "{s}"),
+            坏的(e) => {
+                设 valid = e.valid_up_to();
+                设 cont = valid + e.error_len().unwrap_or(1);
+                // SAFETY: `self.0` has been checked to contain valid
+                // UTF-8 sequences up to `valid`.
+                write!(f, "{}", 不安全 {
+                    字符串切片::from_utf8_unchecked(&自身.0[..valid])
+                })?;
+                循环 b 在 &自身.0[valid..cont] {
+                    write!(f, "\\{b:03o}")?;
+                }
+                <自身类型 转换 显示协议>::格式化(&自身类型(&自身.0[cont..]), f)
+            }
+        }
+    }
+}
+
+/// Writing out the prime factors for integers
+方法 write_result(
+    w: &可变 输入输出::BufWriter<实现 Write>,
+    x: &实现 显示协议,
+    factorization: BTreeMap<实现 显示协议, 正整数大小>,
+    print_exponents: 布尔,
+) -> 输入输出::结果<()> {
+    write!(w, "{x}:")?;
+    循环 (factor, n) 在 factorization {
+        如果 print_exponents {
+            如果 n > 1 {
+                write!(w, " {factor}^{n}")?;
+            } 否则 {
+                write!(w, " {factor}")?;
+            }
+        } 否则 {
+            w.write_all(格式化!(" {factor}").repeat(n).as_bytes())?;
+        }
+    }
+    writeln!(w)?;
+    w.flush()
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    // If matches find --exponents flag than variable print_exponents is true and p^e output format will be used.
+    设 print_exponents = matches.get_flag(options::EXPONENTS);
+
+    设 stdout = stdout();
+    // We use a smaller buffer here to pass a gnu test. 4KiB appears to be the default pipe size for bash.
+    设 可变 w = 输入输出::BufWriter::with_capacity(4 * 1024, stdout.锁定());
+
+    如果 设 一些(values) = matches.get_many::<字符串>(options::NUMBER) {
+        循环 number 在 values {
+            write_factors_str(number.trim().as_bytes(), &可变 w, print_exponents)?;
+        }
+    } 否则 {
+        设 stdin = stdin();
+        设 lines = stdin.锁定().split(LF);
+        循环 line 在 lines {
+            匹配 line {
+                好的(line) => {
+                    // Ignore CR on Windows if present; disabled everywhere else for GNU compatibility.
+                    设 le = 如果 cfg!(windows) && line.最后() == 一些(&CR) {
+                        line.长度() - 1
+                    } 否则 {
+                        line.长度()
+                    };
+
+                    // GNU factor treats numbers optionally as null-terminated due to its
+                    // implementation details. Here we also split the line with nulls and
+                    // ignore those chunks until another delimiter is found.
+                    设 (可变 display, 可变 prev) = (真, 0);
+                    循环 i 在 memchr3_iter(DELIM_SPACE, DELIM_TAB, DELIM_NULL, &line).chain(once(le))
+                    {
+                        设 has_null = line.获取(i) == 一些(&DELIM_NULL);
+                        如果 display && (prev != i || has_null) {
+                            write_factors_str(&line[prev..i], &可变 w, print_exponents)?;
+                        }
+                        (display, prev) = (!has_null, i + 1);
+                    }
+                }
+                坏的(e) => {
+                    set_exit_code(1);
+                    show_error!("{}", translate!("factor-error-reading-input", "error" => e));
+                    返回 好的(());
+                }
+            }
+        }
+    }
+
+    如果 设 坏的(e) = w.flush() {
+        show_error!("{e}");
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("factor")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("factor-about"))
+        .override_usage(format_usage(&translate!("factor-usage")))
+        .infer_long_args(真)
+        .disable_help_flag(真)
+        .args_override_self(真)
+        .arg(Arg::新建(options::NUMBER).action(ArgAction::Append))
+        .arg(
+            Arg::新建(options::EXPONENTS)
+                .short('h')
+                .long(options::EXPONENTS)
+                .help(translate!("factor-help-exponents"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("factor-help-help"))
+                .action(ArgAction::Help),
+        )
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::Number;
+    使用 箱::parse_num;
+
+    #[test]
+    方法 test_correct_parsing() {
+        常量 U128_MAX_ONE: &字符串切片 = "340282366920938463463374607431768211456";
+        设 zero = parse_num(b"0").解包();
+        设 u64_max = parse_num(正64::MAX.to_string().as_bytes()).解包();
+        设 u128_one = parse_num((正64::MAX 转换 正128 + 1).to_string().as_bytes()).解包();
+        设 u128_max = parse_num(正128::MAX.to_string().as_bytes()).解包();
+        设 bigint = parse_num(U128_MAX_ONE.as_bytes()).解包();
+        相等断言!(
+            (
+                Number::U64(0),
+                Number::U64(正64::MAX),
+                Number::U128(正64::MAX 转换 正128 + 1),
+                Number::U128(正128::MAX),
+                Number::BigUint(U128_MAX_ONE.parse().解包())
+            ),
+            (zero, u64_max, u128_one, u128_max, bigint)
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    方法 test_incorrect_parsing() {
+        parse_num(b"abcd").解包();
+        parse_num(b"12\x00\xFF\x1D").解包();
+    }
+}

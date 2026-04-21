@@ -1,0 +1,33 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::文件系统;
+使用 标准库::路径::Path;
+使用 uucore::translate;
+
+/// chmod a file or directory on UNIX.
+///
+/// Adapted from mkdir.rs.  Handles own error printing.
+///
+#[cfg(任意(unix, target_os = "redox"))]
+公有 方法 chmod(路径: &Path, mode: 正32) -> 结果<(), ()> {
+    使用 标准库::操作系统::unix::文件系统::PermissionsExt;
+    使用 uucore::{display::Quotable, show_error};
+    文件系统::set_permissions(路径, 文件系统::Permissions::from_mode(mode)).map_err(|err| {
+        show_error!(
+            "{}",
+            translate!("install-error-chmod-failed-detailed", "path" => 路径.maybe_quote(), "error" => err)
+        );
+    })
+}
+
+/// chmod a file or directory on Windows.
+///
+/// Adapted from mkdir.rs.
+///
+#[cfg(windows)]
+公有 方法 chmod(路径: &Path, mode: 正32) -> 结果<(), ()> {
+    // chmod on Windows only sets the readonly flag, which isn't even honored on directories
+    好的(())
+}

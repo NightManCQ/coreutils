@@ -1,0 +1,433 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 超级::options;
+使用 clap::ArgMatches;
+使用 uucore::translate;
+
+/// Abstraction for getopts
+公有 协议 CommandLineOpts {
+    /// returns all command line parameters which do not belong to an option.
+    方法 inputs(&自身) -> 向量<&字符串切片>;
+    /// tests if any of the specified options is present.
+    方法 opts_present(&自身, _: &[&字符串切片]) -> 布尔;
+}
+
+/// Implementation for `getopts`
+实现 CommandLineOpts 循环 ArgMatches {
+    方法 inputs(&自身) -> 向量<&字符串切片> {
+        自身.get_many::<字符串>(options::FILENAME)
+            .映射(|values| values.映射(字符串::as_str).收集())
+            .unwrap_or_default()
+    }
+
+    方法 opts_present(&自身, opts: &[&字符串切片]) -> 布尔 {
+        opts.迭代()
+            .任意(|opt| 自身.value_source(opt) == 一些(clap::parser::ValueSource::CommandLine))
+    }
+}
+
+/// Contains the Input filename(s) with an optional offset.
+///
+/// `FileNames` is used for one or more file inputs ("-" = stdin)
+/// `FileAndOffset` is used for a single file input, with an offset
+/// and an optional label. Offset and label are specified in bytes.
+/// `FileAndOffset` will be only used if an offset is specified,
+/// but it might be 0.
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+公有 枚举 CommandLineInputs {
+    FileNames(向量<字符串>),
+    FileAndOffset((字符串, 正64, 选项<正64>)),
+}
+
+/// Interprets the command line inputs of od.
+///
+/// Returns either an unspecified number of filenames.
+/// Or it will return a single filename, with an offset and optional label.
+/// Offset and label are specified in bytes.
+/// '-' is used as filename if stdin is meant. This is also returned if
+/// there is no input, as stdin is the default input.
+公有 方法 parse_inputs(matches: &动态 CommandLineOpts) -> 结果<CommandLineInputs, 字符串> {
+    设 可变 input_strings = matches.inputs();
+
+    如果 matches.opts_present(&["traditional"]) {
+        返回 parse_inputs_traditional(&input_strings);
+    }
+
+    // test if command line contains: [file] <offset>
+    // fall-through if no (valid) offset is found
+    如果 input_strings.长度() == 1 || input_strings.长度() == 2 {
+        // if any of the options -A, -j, -N, -t, -v or -w are present there is no offset
+        如果 !matches.opts_present(&[
+            options::ADDRESS_RADIX,
+            options::READ_BYTES,
+            options::SKIP_BYTES,
+            options::FORMAT,
+            options::OUTPUT_DUPLICATES,
+            options::WIDTH,
+        ]) {
+            // test if the last input can be parsed as an offset.
+            设 offset = parse_offset_operand(input_strings[input_strings.长度() - 1]);
+            匹配 offset {
+                好的(n) => {
+                    // if there is just 1 input (stdin), an offset must start with '+'
+                    如果 input_strings.长度() == 1 && input_strings[0].starts_with('+') {
+                        返回 好的(CommandLineInputs::FileAndOffset(("-".to_string(), n, 无)));
+                    }
+                    如果 input_strings.长度() == 2 {
+                        返回 好的(CommandLineInputs::FileAndOffset((
+                            input_strings[0].to_string(),
+                            n,
+                            无,
+                        )));
+                    }
+                }
+                坏的(e) => {
+                    // If it's an overflow error, propagate it
+                    // Otherwise, treat it as a filename
+                    设 err = 标准库::输入输出::错误协议::from_raw_os_error(libc::ERANGE);
+                    设 msg = err.to_string();
+                    设 expected_msg = msg.split(" (os error").next().unwrap_or(&msg).to_string();
+
+                    如果 e == expected_msg {
+                        返回 坏的(格式化!("{}: {e}", input_strings[input_strings.长度() - 1]));
+                    }
+                }
+            }
+        }
+    }
+
+    如果 input_strings.为空() {
+        input_strings.压入("-");
+    }
+    好的(CommandLineInputs::FileNames(
+        input_strings.迭代().映射(|&s| s.to_string()).收集(),
+    ))
+}
+
+/// interprets inputs when --traditional is on the command line
+///
+/// normally returns `CommandLineInputs::FileAndOffset`, but if no offset is found,
+/// it returns `CommandLineInputs::FileNames` (also to differentiate from the offset == 0)
+公有 方法 parse_inputs_traditional(input_strings: &[&字符串切片]) -> 结果<CommandLineInputs, 字符串> {
+    匹配 input_strings.长度() {
+        0 => 好的(CommandLineInputs::FileNames(向量!["-".to_string()])),
+        1 => {
+            设 offset0 = parse_offset_operand(input_strings[0]);
+            好的(匹配 offset0 {
+                好的(n) => CommandLineInputs::FileAndOffset(("-".to_string(), n, 无)),
+                _ => CommandLineInputs::FileNames(
+                    input_strings.迭代().映射(|&s| s.to_string()).收集(),
+                ),
+            })
+        }
+        2 => {
+            设 offset0 = parse_offset_operand(input_strings[0]);
+            设 offset1 = parse_offset_operand(input_strings[1]);
+            匹配 (offset0, offset1) {
+                (好的(n), 好的(m)) => 好的(CommandLineInputs::FileAndOffset((
+                    "-".to_string(),
+                    n,
+                    一些(m),
+                ))),
+                (_, 好的(m)) => 好的(CommandLineInputs::FileAndOffset((
+                    input_strings[0].to_string(),
+                    m,
+                    无,
+                ))),
+                (_, 坏的(e)) => 坏的(格式化!("{}: {e}", input_strings[1])),
+            }
+        }
+        3 => {
+            设 offset = parse_offset_operand(input_strings[1]);
+            设 label = parse_offset_operand(input_strings[2]);
+            匹配 (offset, label) {
+                (好的(n), 好的(m)) => 好的(CommandLineInputs::FileAndOffset((
+                    input_strings[0].to_string(),
+                    n,
+                    一些(m),
+                ))),
+                (坏的(e), _) => 坏的(格式化!("{}: {e}", input_strings[1])),
+                (_, 坏的(e)) => 坏的(格式化!("{}: {e}", input_strings[2])),
+            }
+        }
+        _ => 坏的(translate!("od-error-too-many-inputs", "input" => input_strings[3])),
+    }
+}
+
+/// parses format used by offset and label on the command line
+公有 方法 parse_offset_operand(s: &字符串切片) -> 结果<正64, 字符串> {
+    如果 s.为空() {
+        返回 坏的(translate!("od-error-parse-failed"));
+    }
+
+    如果 s.包含(' ') {
+        返回 坏的(translate!("od-error-parse-failed"));
+    }
+
+    如果 s.starts_with("++") || s.starts_with("+-") {
+        返回 坏的(translate!("od-error-parse-failed"));
+    }
+
+    // Reject strings starting with "-" (negative numbers not allowed)
+    如果 s.starts_with('-') {
+        返回 坏的(translate!("od-error-parse-failed"));
+    }
+
+    设 可变 start = 0;
+    设 可变 长度 = s.长度();
+    设 可变 radix = 8;
+    设 可变 multiply = 1;
+
+    如果 s.starts_with('+') {
+        start += 1;
+    }
+
+    如果 s[start..长度].starts_with("0x") || s[start..长度].starts_with("0X") {
+        start += 2;
+        radix = 16;
+    } 否则 {
+        如果 s[start..长度].ends_with('b') {
+            长度 -= 1;
+            multiply = 512;
+        }
+        如果 s[start..长度].ends_with('.') {
+            长度 -= 1;
+            radix = 10;
+        }
+    }
+
+    // Check if the substring is empty after processing prefixes/suffixes
+    如果 start >= 长度 {
+        返回 坏的(translate!("od-error-parse-failed"));
+    }
+
+    匹配 正64::from_str_radix(&s[start..长度], radix) {
+        好的(i) => {
+            // Check for overflow during multiplication
+            如果 设 一些(result) = i.checked_mul(multiply) {
+                好的(result)
+            } 否则 {
+                设 err = 标准库::输入输出::错误协议::from_raw_os_error(libc::ERANGE);
+                设 msg = err.to_string();
+                // Strip "(os error N)" if present to match Perl's $!
+                设 msg = msg.split(" (os error").next().unwrap_or(&msg).to_string();
+                坏的(msg)
+            }
+        }
+        坏的(e) => {
+            // Distinguish between overflow and parse failure
+            // from_str_radix returns IntErrorKind::PosOverflow for overflow
+            使用 标准库::数字::IntErrorKind;
+            匹配 e.kind() {
+                IntErrorKind::PosOverflow => {
+                    设 err = 标准库::输入输出::错误协议::from_raw_os_error(libc::ERANGE);
+                    设 msg = err.to_string();
+                    设 msg = msg.split(" (os error").next().unwrap_or(&msg).to_string();
+                    坏的(msg)
+                }
+                _ => 坏的(translate!("od-error-parse-failed")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 箱::uu_app;
+
+    #[test]
+    方法 test_parse_inputs_normal() {
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["-".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["-".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "-"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["file1".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "file1"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["file1".to_string(), "file2".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "file1", "file2"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量![
+                "-".to_string(),
+                "file1".to_string(),
+                "file2".to_string(),
+            ]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "-", "file1", "file2"])).解包()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_parse_inputs_with_offset() {
+        // offset is found without filename, so stdin will be used.
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("-".to_string(), 8, 无)),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "+10"])).解包()
+        );
+
+        // offset must start with "+" if no input is specified.
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["10".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "10"])).解包()
+        );
+
+        // offset is not valid, so it is considered a filename.
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["+10a".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "+10a"])).解包()
+        );
+
+        // if -j is included in the command line, there cannot be an offset.
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["+10".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "-j10", "+10"])).解包()
+        );
+
+        // if -v is included in the command line, there cannot be an offset.
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["+10".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "-o", "-v", "+10"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("file1".to_string(), 8, 无)),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "file1", "+10"])).解包()
+        );
+
+        // offset does not need to start with "+" if a filename is included.
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("file1".to_string(), 8, 无)),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "file1", "10"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["file1".to_string(), "+10a".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "file1", "+10a"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["file1".to_string(), "+10".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "-j10", "file1", "+10"])).解包()
+        );
+
+        // offset must be last on the command line
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["+10".to_string(), "file1".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "+10", "file1"])).解包()
+        );
+    }
+
+    #[test]
+    方法 test_parse_inputs_traditional() {
+        // it should not return FileAndOffset to signal no offset was entered on the command line.
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["-".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional"])).解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileNames(向量!["file1".to_string()]),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "file1"])).解包()
+        );
+
+        // offset does not need to start with a +
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("-".to_string(), 8, 无)),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "10"])).解包()
+        );
+
+        // valid offset and valid label
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("-".to_string(), 8, 一些(8))),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "10", "10"]))
+                .解包()
+        );
+
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("file1".to_string(), 8, 无)),
+            parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "file1", "10"]))
+                .解包()
+        );
+
+        // only one file is allowed, it must be the first
+        parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "10", "file1"]))
+            .unwrap_err();
+
+        相等断言!(
+            CommandLineInputs::FileAndOffset(("file1".to_string(), 8, 一些(8))),
+            parse_inputs(&uu_app().get_matches_from(向量![
+                "od",
+                "--traditional",
+                "file1",
+                "10",
+                "10"
+            ]))
+            .解包()
+        );
+
+        parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "10", "file1", "10"]))
+            .unwrap_err();
+
+        parse_inputs(&uu_app().get_matches_from(向量!["od", "--traditional", "10", "10", "file1"]))
+            .unwrap_err();
+
+        parse_inputs(&uu_app().get_matches_from(向量![
+            "od",
+            "--traditional",
+            "10",
+            "10",
+            "10",
+            "10",
+        ]))
+        .unwrap_err();
+    }
+
+    方法 parse_offset_operand_str(s: &字符串切片) -> 结果<正64, 字符串> {
+        parse_offset_operand(&字符串::from(s))
+    }
+
+    #[test]
+    方法 test_parse_offset_operand_invalid() {
+        parse_offset_operand_str("").unwrap_err();
+        parse_offset_operand_str("a").unwrap_err();
+        parse_offset_operand_str("+").unwrap_err();
+        parse_offset_operand_str("+b").unwrap_err();
+        parse_offset_operand_str("0x1.").unwrap_err();
+        parse_offset_operand_str("0x1.b").unwrap_err();
+        parse_offset_operand_str("-").unwrap_err();
+        parse_offset_operand_str("-1").unwrap_err();
+        parse_offset_operand_str("1e10").unwrap_err();
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_parse_offset_operand() {
+        相等断言!(8, parse_offset_operand_str("10").解包()); // default octal
+        相等断言!(0, parse_offset_operand_str("0").解包());
+        相等断言!(8, parse_offset_operand_str("+10").解包()); // optional leading '+'
+        相等断言!(16, parse_offset_operand_str("0x10").解包()); // hex
+        相等断言!(16, parse_offset_operand_str("0X10").解包()); // hex
+        相等断言!(16, parse_offset_operand_str("+0X10").解包()); // hex
+        相等断言!(10, parse_offset_operand_str("10.").解包()); // decimal
+        相等断言!(10, parse_offset_operand_str("+10.").解包()); // decimal
+        相等断言!(4096, parse_offset_operand_str("10b").解包()); // b suffix = *512
+        相等断言!(4096, parse_offset_operand_str("+10b").解包()); // b suffix = *512
+        相等断言!(5120, parse_offset_operand_str("10.b").解包()); // b suffix = *512
+        相等断言!(5120, parse_offset_operand_str("+10.b").解包()); // b suffix = *512
+        相等断言!(267, parse_offset_operand_str("0x10b").解包()); // hex
+    }
+}

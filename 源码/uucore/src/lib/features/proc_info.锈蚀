@@ -1,0 +1,522 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore exitstatus cmdline kworker pgrep pwait snice procps
+// spell-checker:ignore egid euid gettid ppid
+
+//! Set of functions to manage IDs
+//!
+//! This module provide [`ProcessInformation`] and [`TerminalType`] and corresponding
+//! functions for obtaining process information.
+//!
+//! And also provide [`walk_process`] function to collecting all the information of
+//! processes in current system.
+//!
+//! Utilities that rely on this module:
+//! `pgrep` (TBD)
+//! `pwait` (TBD)
+//! `snice` (TBD)
+//!
+
+// This file is currently flagged as dead code, because it isn't used anywhere
+// in the codebase. It may be useful in the future though, so we decide to keep
+// it.
+// The code was originally written in procps
+// (https://github.com/uutils/procps/blob/main/src/uu/pgrep/src/process.rs)
+// but was eventually moved here.
+// See https://github.com/uutils/coreutils/pull/6932 for discussion.
+#![allow(dead_code)]
+
+使用 箱::features::tty::Teletype;
+
+使用 标准库::哈希::哈希协议;
+使用 标准库::{
+    集合::哈希映射,
+    格式化::{自身, 显示协议, Formatter},
+    文件系统, 输入输出,
+    路径::PathBuf,
+    引用计数::Rc,
+};
+
+使用 walkdir::{DirEntry, WalkDir};
+
+/// State or process
+#[derive(调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 RunState {
+    ///`R`, running
+    Running,
+    ///`S`, sleeping
+    Sleeping,
+    ///`D`, sleeping in an uninterruptible wait
+    UninterruptibleWait,
+    ///`Z`, zombie
+    Zombie,
+    ///`T`, traced or stopped
+    Stopped,
+}
+
+实现 显示协议 循环 RunState {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        匹配 自身 {
+            自身类型::Running => write!(f, "R"),
+            自身类型::Sleeping => write!(f, "S"),
+            自身类型::UninterruptibleWait => write!(f, "D"),
+            自身类型::Zombie => write!(f, "Z"),
+            自身类型::Stopped => write!(f, "T"),
+        }
+    }
+}
+
+实现 TryFrom<字符> 循环 RunState {
+    类型 错误协议 = 输入输出::错误协议;
+
+    方法 try_from(value: 字符) -> 结果<自身类型, 自身类型::错误协议> {
+        匹配 value {
+            'R' => 好的(自身类型::Running),
+            'S' => 好的(自身类型::Sleeping),
+            'D' => 好的(自身类型::UninterruptibleWait),
+            'Z' => 好的(自身类型::Zombie),
+            'T' => 好的(自身类型::Stopped),
+            _ => 坏的(输入输出::ErrorKind::InvalidInput.into()),
+        }
+    }
+}
+
+实现 TryFrom<&字符串切片> 循环 RunState {
+    类型 错误协议 = 输入输出::错误协议;
+
+    方法 try_from(value: &字符串切片) -> 结果<自身类型, 自身类型::错误协议> {
+        如果 value.长度() != 1 {
+            返回 坏的(输入输出::ErrorKind::InvalidInput.into());
+        }
+
+        自身类型::try_from(
+            value
+                .chars()
+                .nth(0)
+                .ok_or::<输入输出::错误协议>(输入输出::ErrorKind::InvalidInput.into())?,
+        )
+    }
+}
+
+实现 TryFrom<字符串> 循环 RunState {
+    类型 错误协议 = 输入输出::错误协议;
+
+    方法 try_from(value: 字符串) -> 结果<自身类型, 自身类型::错误协议> {
+        自身类型::try_from(value.as_str())
+    }
+}
+
+实现 TryFrom<&字符串> 循环 RunState {
+    类型 错误协议 = 输入输出::错误协议;
+
+    方法 try_from(value: &字符串) -> 结果<自身类型, 自身类型::错误协议> {
+        自身类型::try_from(value.as_str())
+    }
+}
+
+/// Process ID and its information
+#[derive(调试协议, 克隆协议, 默认协议, 偏等比较协议, 相等比较协议)]
+公有 结构 ProcessInformation {
+    公有 pid: 正整数大小,
+    公有 cmdline: 字符串,
+
+    inner_status: 字符串,
+    inner_stat: 字符串,
+
+    /// Processed `/proc/self/status` file
+    cached_status: 选项<Rc<哈希映射<字符串, 字符串>>>,
+    /// Processed `/proc/self/stat` file
+    cached_stat: 选项<Rc<向量<字符串>>>,
+
+    cached_start_time: 选项<正64>,
+
+    cached_thread_ids: 选项<Rc<向量<正整数大小>>>,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+枚举 UidGid {
+    Uid,
+    Gid,
+}
+
+实现 ProcessInformation {
+    /// Try new with pid path such as `/proc/self`
+    ///
+    /// # Error
+    ///
+    /// If the files in path cannot be parsed into [ProcessInformation],
+    /// it almost caused by wrong filesystem structure.
+    ///
+    /// - [The /proc Filesystem](https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories)
+    公有 方法 try_new(value: PathBuf) -> 结果<自身类型, 输入输出::错误协议> {
+        设 dir_append = |可变 路径: PathBuf, 字符串切片: 字符串| {
+            路径.压入(字符串切片);
+            路径
+        };
+
+        设 value = 如果 value.is_symlink() {
+            文件系统::read_link(value)?
+        } 否则 {
+            value
+        };
+
+        设 pid = {
+            value
+                .迭代()
+                .next_back()
+                .ok_or(输入输出::ErrorKind::Other)?
+                .to_str()
+                .ok_or(输入输出::ErrorKind::InvalidData)?
+                .parse::<正整数大小>()
+                .map_err(|_| 输入输出::ErrorKind::InvalidData)?
+        };
+        设 cmdline = 文件系统::read_to_string(dir_append(value.克隆(), "cmdline".into()))?
+            .replace('\0', " ")
+            .trim_end()
+            .into();
+
+        好的(自身类型 {
+            pid,
+            cmdline,
+            inner_status: 文件系统::read_to_string(dir_append(value.克隆(), "status".into()))?,
+            inner_stat: 文件系统::read_to_string(dir_append(value, "stat".into()))?,
+            ..默认协议::默认()
+        })
+    }
+
+    公有 方法 proc_status(&自身) -> &字符串切片 {
+        &自身.inner_status
+    }
+
+    公有 方法 proc_stat(&自身) -> &字符串切片 {
+        &自身.inner_stat
+    }
+
+    /// Collect information from `/proc/<pid>/status` file
+    公有 方法 status(&可变 自身) -> Rc<哈希映射<字符串, 字符串>> {
+        如果 设 一些(c) = &自身.cached_status {
+            返回 Rc::克隆(c);
+        }
+
+        设 result = 自身
+            .inner_status
+            .lines()
+            .filter_map(|it| it.split_once(':'))
+            .映射(|it| (it.0.to_string(), it.1.trim_start().to_string()))
+            .收集::<哈希映射<_, _>>();
+
+        设 result = Rc::新建(result);
+        自身.cached_status = 一些(Rc::克隆(&result));
+        Rc::克隆(&result)
+    }
+
+    /// Collect information from `/proc/<pid>/stat` file
+    公有 方法 stat(&可变 自身) -> Rc<向量<字符串>> {
+        如果 设 一些(c) = &自身.cached_stat {
+            返回 Rc::克隆(c);
+        }
+
+        设 result: 向量<_> = stat_split(&自身.inner_stat);
+
+        设 result = Rc::新建(result);
+        自身.cached_stat = 一些(Rc::克隆(&result));
+        Rc::克隆(&result)
+    }
+
+    /// Fetch start time from [ProcessInformation::cached_stat]
+    ///
+    /// - [The /proc Filesystem: Table 1-4](https://docs.kernel.org/filesystems/proc.html#id10)
+    公有 方法 start_time(&可变 自身) -> 结果<正64, 输入输出::错误协议> {
+        如果 设 一些(时间) = 自身.cached_start_time {
+            返回 好的(时间);
+        }
+
+        // Kernel doc: https://docs.kernel.org/filesystems/proc.html#process-specific-subdirectories
+        // Table 1-4
+        设 时间 = 自身
+            .stat()
+            .获取(21)
+            .ok_or(输入输出::ErrorKind::InvalidData)?
+            .parse::<正64>()
+            .map_err(|_| 输入输出::ErrorKind::InvalidData)?;
+
+        自身.cached_start_time = 一些(时间);
+
+        好的(时间)
+    }
+
+    公有 方法 ppid(&可变 自身) -> 结果<正64, 输入输出::错误协议> {
+        // the PPID is the fourth field in /proc/<PID>/stat
+        // (https://www.kernel.org/doc/html/latest/filesystems/proc.html#id10)
+        自身.stat()
+            .获取(3)
+            .ok_or(输入输出::ErrorKind::InvalidData)?
+            .parse::<正64>()
+            .map_err(|_| 输入输出::ErrorKind::InvalidData.into())
+    }
+
+    方法 get_uid_or_gid_field(&可变 自身, field: UidGid, index: 正整数大小) -> 结果<正32, 输入输出::错误协议> {
+        自身.status()
+            .获取(&格式化!("{field:?}"))
+            .ok_or(输入输出::ErrorKind::InvalidData)?
+            .split_whitespace()
+            .nth(index)
+            .ok_or(输入输出::ErrorKind::InvalidData)?
+            .parse::<正32>()
+            .map_err(|_| 输入输出::ErrorKind::InvalidData.into())
+    }
+
+    公有 方法 uid(&可变 自身) -> 结果<正32, 输入输出::错误协议> {
+        自身.get_uid_or_gid_field(UidGid::Uid, 0)
+    }
+
+    公有 方法 euid(&可变 自身) -> 结果<正32, 输入输出::错误协议> {
+        自身.get_uid_or_gid_field(UidGid::Uid, 1)
+    }
+
+    公有 方法 gid(&可变 自身) -> 结果<正32, 输入输出::错误协议> {
+        自身.get_uid_or_gid_field(UidGid::Gid, 0)
+    }
+
+    公有 方法 egid(&可变 自身) -> 结果<正32, 输入输出::错误协议> {
+        自身.get_uid_or_gid_field(UidGid::Gid, 1)
+    }
+
+    /// Fetch run state from [ProcessInformation::cached_stat]
+    ///
+    /// - [The /proc Filesystem: Table 1-4](https://docs.kernel.org/filesystems/proc.html#id10)
+    ///
+    /// # Error
+    ///
+    /// If parsing failed, this function will return [io::ErrorKind::InvalidInput]
+    公有 方法 run_state(&可变 自身) -> 结果<RunState, 输入输出::错误协议> {
+        RunState::try_from(自身.stat().获取(2).解包().as_str())
+    }
+
+    /// This function will scan the `/proc/<pid>/fd` directory
+    ///
+    /// If the process does not belong to any terminal and mismatched permission,
+    /// the result will contain [TerminalType::Unknown].
+    ///
+    /// Otherwise [TerminalType::Unknown] does not appear in the result.
+    公有 方法 tty(&自身) -> Teletype {
+        设 路径 = PathBuf::from(格式化!("/proc/{}/fd", 自身.pid));
+
+        设 好的(result) = 文件系统::read_dir(路径) 否则 {
+            返回 Teletype::Unknown;
+        };
+
+        循环 dir 在 result.flatten().过滤(|it| it.路径().is_symlink()) {
+            如果 设 好的(路径) = 文件系统::read_link(dir.路径()) {
+                如果 设 好的(tty) = Teletype::try_from(路径) {
+                    返回 tty;
+                }
+            }
+        }
+
+        Teletype::Unknown
+    }
+
+    公有 方法 thread_ids(&可变 自身) -> Rc<向量<正整数大小>> {
+        如果 设 一些(c) = &自身.cached_thread_ids {
+            返回 Rc::克隆(c);
+        }
+
+        设 thread_ids_dir = 格式化!("/proc/{}/task", 自身.pid);
+        设 result = Rc::新建(
+            WalkDir::新建(thread_ids_dir)
+                .min_depth(1)
+                .max_depth(1)
+                .follow_links(假)
+                .into_iter()
+                .flatten()
+                .flat_map(|it| {
+                    it.路径()
+                        .file_name()
+                        .and_then(|it| it.to_str())
+                        .and_then(|it| it.parse::<正整数大小>().ok())
+                })
+                .收集::<向量<_>>(),
+        );
+
+        自身.cached_thread_ids = 一些(Rc::克隆(&result));
+        Rc::克隆(&result)
+    }
+}
+实现 TryFrom<DirEntry> 循环 ProcessInformation {
+    类型 错误协议 = 输入输出::错误协议;
+
+    方法 try_from(value: DirEntry) -> 结果<自身类型, 自身类型::错误协议> {
+        设 value = value.into_path();
+
+        自身类型::try_new(value)
+    }
+}
+
+实现 哈希协议 循环 ProcessInformation {
+    方法 哈希<H: 标准库::哈希::Hasher>(&自身, state: &可变 H) {
+        // Make it faster.
+        自身.pid.哈希(state);
+        自身.inner_status.哈希(state);
+        自身.inner_stat.哈希(state);
+    }
+}
+
+/// Parsing `/proc/self/stat` file.
+///
+/// In some case, the first pair (and the only one pair) will contains whitespace,
+/// so if we want to parse it, we have to write new algorithm.
+///
+/// TODO: If possible, test and use regex to replace this algorithm.
+方法 stat_split(stat: &字符串切片) -> 向量<字符串> {
+    设 stat = 字符串::from(stat);
+
+    设 可变 buf = 字符串::with_capacity(stat.长度());
+
+    设 l = stat.寻找('(');
+    设 r = stat.寻找(')');
+    设 content = 如果 设 (一些(l), 一些(r)) = (l, r) {
+        设 replaced = stat[(l + 1)..r].replace(' ', "$$");
+
+        buf.push_str(&stat[..l]);
+        buf.push_str(&replaced);
+        buf.push_str(&stat[(r + 1)..stat.长度()]);
+
+        &buf
+    } 否则 {
+        &stat
+    };
+
+    content
+        .split_whitespace()
+        .映射(|it| it.replace("$$", " "))
+        .收集()
+}
+
+/// Iterating pid in current system
+公有 方法 walk_process() -> 实现 迭代器协议<Item = ProcessInformation> {
+    WalkDir::新建("/proc/")
+        .max_depth(1)
+        .follow_links(假)
+        .into_iter()
+        .flatten()
+        .过滤(|it| it.路径().is_dir())
+        .flat_map(ProcessInformation::try_from)
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 箱::features::tty::Teletype;
+    使用 标准库::{集合::哈希集合, 字符串切片::FromStr};
+
+    #[test]
+    方法 test_run_state_conversion() {
+        相等断言!(RunState::try_from("R").解包(), RunState::Running);
+        相等断言!(RunState::try_from("S").解包(), RunState::Sleeping);
+        相等断言!(
+            RunState::try_from("D").解包(),
+            RunState::UninterruptibleWait
+        );
+        相等断言!(RunState::try_from("T").解包(), RunState::Stopped);
+        相等断言!(RunState::try_from("Z").解包(), RunState::Zombie);
+
+        断言!(RunState::try_from("G").is_err());
+        断言!(RunState::try_from("Rg").is_err());
+    }
+
+    方法 current_pid() -> 正整数大小 {
+        // Direct read link of /proc/self.
+        // It's result must be current programs pid.
+        文件系统::read_link("/proc/self")
+            .解包()
+            .to_str()
+            .解包()
+            .parse::<正整数大小>()
+            .解包()
+    }
+
+    #[test]
+    方法 test_walk_pid() {
+        设 current_pid = current_pid();
+
+        设 寻找 = walk_process().寻找(|it| it.pid == current_pid);
+
+        断言!(寻找.is_some());
+    }
+
+    #[test]
+    方法 test_pid_entry() {
+        设 current_pid = current_pid();
+
+        设 pid_entry = ProcessInformation::try_new(
+            PathBuf::from_str(&格式化!("/proc/{current_pid}")).解包(),
+        )
+        .解包();
+
+        设 result = WalkDir::新建(格式化!("/proc/{current_pid}/fd"))
+            .into_iter()
+            .flatten()
+            .映射(DirEntry::into_path)
+            .flat_map(|it| it.read_link())
+            .flat_map(Teletype::try_from)
+            .收集::<哈希集合<_>>();
+
+        // In CI environments or when running without a terminal, there may be no TTY
+        如果 result.为空() {
+            相等断言!(pid_entry.tty(), Teletype::Unknown);
+        } 否则 {
+            相等断言!(result.长度(), 1);
+            相等断言!(
+                pid_entry.tty(),
+                向量::from_iter(result.into_iter()).first().解包().克隆()
+            );
+        }
+    }
+
+    #[test]
+    方法 test_thread_ids() {
+        设 main_tid = 不安全 { libc::gettid() };
+        标准库::线程::生成(移动 || {
+            设 可变 pid_entry = ProcessInformation::try_new(
+                PathBuf::from_str(&格式化!("/proc/{}", current_pid())).解包(),
+            )
+            .解包();
+            设 thread_ids = pid_entry.thread_ids();
+
+            断言!(thread_ids.包含(&(main_tid 转换 正整数大小)));
+
+            设 new_thread_tid = 不安全 { libc::gettid() };
+            断言!(thread_ids.包含(&(new_thread_tid 转换 正整数大小)));
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_stat_split() {
+        设 case = "32 (idle_inject/3) S 2 0 0 0 -1 69238848 0 0 0 0 0 0 0 0 -51 0 1 0 34 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 3 50 1 0 0 0 0 0 0 0 0 0 0 0";
+        相等断言!(stat_split(case)[1], "idle_inject/3");
+
+        设 case = "3508 (sh) S 3478 3478 3478 0 -1 4194304 67 0 0 0 0 0 0 0 20 0 1 0 11911 2961408 238 18446744073709551615 94340156948480 94340157028757 140736274114368 0 0 0 0 4096 65538 1 0 0 17 8 0 0 0 0 0 94340157054704 94340157059616 94340163108864 140736274122780 140736274122976 140736274122976 140736274124784 0";
+        相等断言!(stat_split(case)[1], "sh");
+
+        设 case = "47246 (kworker /10:1-events) I 2 0 0 0 -1 69238880 0 0 0 0 17 29 0 0 20 0 1 0 1396260 0 0 18446744073709551615 0 0 0 0 0 0 0 2147483647 0 0 0 0 17 10 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        相等断言!(stat_split(case)[1], "kworker /10:1-events");
+    }
+
+    #[test]
+    方法 test_uid_gid() {
+        设 可变 pid_entry = ProcessInformation::try_new(
+            PathBuf::from_str(&格式化!("/proc/{}", current_pid())).解包(),
+        )
+        .解包();
+        相等断言!(pid_entry.uid().解包(), 箱::进程::getuid());
+        相等断言!(pid_entry.euid().解包(), 箱::进程::geteuid());
+        相等断言!(pid_entry.gid().解包(), 箱::进程::getgid());
+        相等断言!(pid_entry.egid().解包(), 箱::进程::getegid());
+    }
+}

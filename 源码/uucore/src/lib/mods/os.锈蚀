@@ -1,0 +1,44 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (path) osrelease
+
+//! Test if the program is running under WSL
+//! ref: <https://github.com/microsoft/WSL/issues/4555> @@ <https://archive.is/dP0bz>
+
+/// Test if the program is running under WSL version 1
+公有 方法 is_wsl_1() -> 布尔 {
+    #[cfg(target_os = "linux")]
+    {
+        如果 is_wsl_2() {
+            返回 假;
+        }
+        如果 设 好的(b) = 标准库::文件系统::读锁定("/proc/sys/kernel/osrelease") {
+            如果 设 好的(s) = 标准库::字符串切片::from_utf8(&b) {
+                设 a = s.to_ascii_lowercase();
+                返回 a.包含("microsoft") || a.包含("wsl");
+            }
+        }
+    }
+    假
+}
+
+/// Test if the program is running under WSL version 2
+公有 方法 is_wsl_2() -> 布尔 {
+    #[cfg(target_os = "linux")]
+    {
+        如果 设 好的(b) = 标准库::文件系统::读锁定("/proc/sys/kernel/osrelease") {
+            如果 设 好的(s) = 标准库::字符串切片::from_utf8(&b) {
+                设 a = s.to_ascii_lowercase();
+                返回 a.包含("wsl2");
+            }
+        }
+    }
+    假
+}
+
+/// Test if the program is running under WSL
+公有 方法 is_wsl() -> 布尔 {
+    is_wsl_1() || is_wsl_2()
+}

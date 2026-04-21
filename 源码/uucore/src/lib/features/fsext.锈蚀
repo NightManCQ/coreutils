@@ -1,0 +1,1219 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Set of functions to manage file systems
+
+// spell-checker:ignore DATETIME getmntinfo subsecond (fs) cifs smbfs
+
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+常量 LINUX_MTAB: &字符串切片 = "/etc/mtab";
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+常量 LINUX_MOUNTINFO: &字符串切片 = "/proc/self/mountinfo";
+#[cfg(全部(unix, not(任意(target_os = "aix", target_os = "redox"))))]
+静态 MOUNT_OPT_BIND: &字符串切片 = "bind";
+#[cfg(windows)]
+常量 MAX_PATH: 正整数大小 = 266;
+#[cfg(windows)]
+静态 EXIT_ERR: 整32 = 1;
+
+#[cfg(任意(
+    target_os = "freebsd",
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+使用 箱::os_str_from_bytes;
+#[cfg(windows)]
+使用 箱::show_warning;
+
+#[cfg(not(target_os = "wasi"))]
+使用 标准库::ffi::OsStr;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+#[cfg(windows)]
+使用 标准库::操作系统::windows::ffi::OsStrExt;
+#[cfg(windows)]
+使用 windows_sys::Win32::{
+    Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceW, GetDriveTypeW,
+        GetVolumeInformationW, GetVolumePathNamesForVolumeNameW, QueryDosDeviceW,
+    },
+    System::WindowsProgramming::DRIVE_REMOTE,
+};
+
+#[cfg(windows)]
+#[allow(non_snake_case)]
+方法 LPWSTR2String(buf: &[正16]) -> 字符串 {
+    设 长度 = buf.迭代().position(|&n| n == 0).解包();
+    字符串::from_utf16(&buf[..长度]).解包()
+}
+
+#[cfg(windows)]
+方法 to_nul_terminated_wide_string(s: 实现 作为引用协议<OsStr>) -> 向量<正16> {
+    s.as_ref()
+        .encode_wide()
+        .chain(一些(0))
+        .收集::<向量<正16>>()
+}
+
+#[cfg(unix)]
+使用 libc::{
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, mode_t, strerror,
+};
+#[cfg(unix)]
+使用 标准库::ffi::{CStr, CString};
+#[cfg(not(target_os = "wasi"))]
+使用 标准库::输入输出::错误协议 转换 IOError;
+#[cfg(unix)]
+使用 标准库::内存;
+#[cfg(windows)]
+使用 标准库::路径::Path;
+使用 标准库::时间::SystemTime;
+#[cfg(unix)]
+使用 标准库::时间::UNIX_EPOCH;
+使用 标准库::{borrow::Cow, ffi::OsString};
+
+使用 标准库::文件系统::Metadata;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+#[cfg(unix)]
+使用 标准库::时间::持续时间;
+
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+公有 使用 libc::statfs 转换 StatFs;
+#[cfg(任意(
+    target_os = "aix",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+    target_os = "illumos",
+    target_os = "solaris",
+    target_os = "redox",
+    target_os = "cygwin",
+))]
+公有 使用 libc::statvfs 转换 StatFs;
+
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+))]
+公有 使用 libc::statfs 转换 statfs_fn;
+#[cfg(任意(
+    target_os = "aix",
+    target_os = "netbsd",
+    target_os = "illumos",
+    target_os = "solaris",
+    target_os = "dragonfly",
+    target_os = "redox",
+    target_os = "cygwin",
+))]
+公有 使用 libc::statvfs 转换 statfs_fn;
+
+#[derive(调试协议, 复制协议, 克隆协议)]
+公有 枚举 MetadataTimeField {
+    Modification,
+    Access,
+    Change,
+    Birth,
+}
+
+实现 转换协议<&字符串切片> 循环 MetadataTimeField {
+    /// Get a `MetadataTimeField` from a string, we expect the value
+    /// to come from clap, and be constrained there (e.g. if Modification is
+    /// not supported), and the default branch should not be reached.
+    方法 from(value: &字符串切片) -> 自身类型 {
+        匹配 value {
+            "ctime" | "status" => 自身类型::Change,
+            "access" | "atime" | "use" => 自身类型::Access,
+            "mtime" | "modification" => 自身类型::Modification,
+            "birth" | "creation" => 自身类型::Birth,
+            // below should never happen as clap already restricts the values.
+            _ => 无法到达!("Invalid metadata time field."),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[期望(
+    clippy::unnecessary_wraps,
+    reason = "fn sig must match on all platforms"
+)]
+方法 metadata_get_change_time(md: &Metadata) -> 选项<SystemTime> {
+    设 可变 st = UNIX_EPOCH;
+    设 (secs, nsecs) = (md.ctime(), md.ctime_nsec());
+    如果 secs >= 0 {
+        st += 持续时间::from_secs(secs 转换 正64);
+    } 否则 {
+        st -= 持续时间::from_secs(-secs 转换 正64);
+    }
+    如果 nsecs >= 0 {
+        st += 持续时间::from_nanos(nsecs 转换 正64);
+    } 否则 {
+        // Probably never the case, but cover just in case.
+        st -= 持续时间::from_nanos(-nsecs 转换 正64);
+    }
+    一些(st)
+}
+
+#[cfg(not(unix))]
+方法 metadata_get_change_time(_md: &Metadata) -> 选项<SystemTime> {
+    // Not available.
+    无
+}
+
+公有 方法 metadata_get_time(md: &Metadata, md_time: MetadataTimeField) -> 选项<SystemTime> {
+    匹配 md_time {
+        MetadataTimeField::Change => metadata_get_change_time(md),
+        MetadataTimeField::Modification => md.modified().ok(),
+        MetadataTimeField::Access => md.accessed().ok(),
+        MetadataTimeField::Birth => md.created().ok(),
+    }
+}
+
+// TODO: Types for this struct are probably mostly wrong. Possibly, most of them
+// should be OsString.
+#[derive(调试协议, 克隆协议)]
+公有 结构 MountInfo {
+    /// Stores `volume_name` in windows platform and `dev_id` in unix platform
+    公有 dev_id: 字符串,
+    公有 dev_name: 字符串,
+    公有 fs_type: 字符串,
+    公有 mount_root: OsString,
+    公有 mount_dir: OsString,
+    /// We only care whether this field contains "bind"
+    公有 mount_option: 字符串,
+    公有 remote: 布尔,
+    公有 dummy: 布尔,
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+方法 replace_special_chars(s: &[正8]) -> 向量<正8> {
+    使用 bstr::ByteSlice;
+
+    // Replace
+    //
+    // * ASCII space with a regular space character,
+    // * \011 ASCII horizontal tab with a tab character,
+    // * ASCII backslash with an actual backslash character.
+    //
+    s.replace(r"\040", " ")
+        .replace(r"\011", "	")
+        .replace(r"\134", r"\")
+}
+
+impl MountInfo {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+    fn new(file_name: &str, raw: &[&[u8]]) -> Option<Self> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dev_name;
+        let fs_type;
+        let mount_root;
+        let mount_dir;
+        let mount_option;
+
+        match file_name {
+            // spell-checker:ignore (word) noatime
+            // Format: 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+            // "man proc" for more details
+            LINUX_MOUNTINFO => {
+                const FIELDS_OFFSET: usize = 6;
+                let after_fields = raw[FIELDS_OFFSET..]
+                    .iter()
+                    .position(|c| *c == b"-")
+                    .unwrap()
+                    + FIELDS_OFFSET
+                    + 1;
+                dev_name = String::from_utf8_lossy(raw[after_fields + 1]).to_string();
+                fs_type = String::from_utf8_lossy(raw[after_fields]).to_string();
+                mount_root = OsStr::from_bytes(raw[3]).to_owned();
+                mount_dir = OsString::from_vec(replace_special_chars(raw[4]));
+                mount_option = String::from_utf8_lossy(raw[5]).to_string();
+            }
+            LINUX_MTAB => {
+                dev_name = String::from_utf8_lossy(raw[0]).to_string();
+                fs_type = String::from_utf8_lossy(raw[2]).to_string();
+                mount_root = OsString::new();
+                mount_dir = OsString::from_vec(replace_special_chars(raw[1]));
+                mount_option = String::from_utf8_lossy(raw[3]).to_string();
+            }
+            _ => return None,
+        }
+
+        let dev_id = mount_dev_id(&mount_dir);
+        let dummy = is_dummy_filesystem(&fs_type, &mount_option);
+        let remote = is_remote_filesystem(&dev_name, &fs_type);
+
+        Some(Self {
+            dev_id,
+            dev_name,
+            fs_type,
+            mount_root,
+            mount_dir,
+            mount_option,
+            remote,
+            dummy,
+        })
+    }
+
+    #[cfg(windows)]
+    fn new(mut volume_name: String) -> Option<Self> {
+        let mut dev_name_buf = [0u16; MAX_PATH];
+        volume_name.pop();
+        unsafe {
+            QueryDosDeviceW(
+                OsStr::new(&volume_name)
+                    .encode_wide()
+                    .chain(Some(0))
+                    .skip(4)
+                    .collect::<Vec<u16>>()
+                    .as_ptr(),
+                dev_name_buf.as_mut_ptr(),
+                dev_name_buf.len() as u32,
+            )
+        };
+        volume_name.push('\\');
+        let dev_name = LPWSTR2String(&dev_name_buf);
+
+        let mut mount_root_buf = [0u16; MAX_PATH];
+        let success = unsafe {
+            let volume_name = to_nul_terminated_wide_string(&volume_name);
+            GetVolumePathNamesForVolumeNameW(
+                volume_name.as_ptr(),
+                mount_root_buf.as_mut_ptr(),
+                mount_root_buf.len() as u32,
+                ptr::null_mut(),
+            )
+        };
+        if 0 == success {
+            // TODO: support the case when `GetLastError()` returns `ERROR_MORE_DATA`
+            return None;
+        }
+        // TODO: This should probably call `OsString::from_wide`, but unclear if
+        // terminating zeros need to be striped first.
+        let mount_root = LPWSTR2String(&mount_root_buf);
+
+        let mut fs_type_buf = [0u16; MAX_PATH];
+        let success = unsafe {
+            let mount_root = to_nul_terminated_wide_string(&mount_root);
+            GetVolumeInformationW(
+                mount_root.as_ptr(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                fs_type_buf.as_mut_ptr(),
+                fs_type_buf.len() as u32,
+            )
+        };
+        let fs_type = if 0 == success {
+            None
+        } else {
+            Some(LPWSTR2String(&fs_type_buf))
+        };
+        let remote = DRIVE_REMOTE
+            == unsafe {
+                let mount_root = to_nul_terminated_wide_string(&mount_root);
+                GetDriveTypeW(mount_root.as_ptr())
+            };
+        Some(Self {
+            dev_id: volume_name,
+            dev_name,
+            fs_type: fs_type.unwrap_or_default(),
+            mount_root: mount_root.into(), // TODO: We should figure out how to keep an OsString here.
+            mount_dir: OsString::new(),
+            mount_option: String::new(),
+            remote,
+            dummy: false,
+        })
+    }
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+impl From<StatFs> for MountInfo {
+    fn from(statfs: StatFs) -> Self {
+        let dev_name = unsafe {
+            // spell-checker:disable-next-line
+            CStr::from_ptr(statfs.f_mntfromname.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let fs_type = unsafe {
+            // spell-checker:disable-next-line
+            CStr::from_ptr(statfs.f_fstypename.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mount_dir_bytes = unsafe {
+            // spell-checker:disable-next-line
+            CStr::from_ptr(statfs.f_mntonname.as_ptr()).to_bytes()
+        };
+        let mount_dir = os_str_from_bytes(mount_dir_bytes).unwrap().into_owned();
+
+        let dev_id = mount_dev_id(&mount_dir);
+        let dummy = is_dummy_filesystem(&fs_type, "");
+        let remote = is_remote_filesystem(&dev_name, &fs_type);
+
+        Self {
+            dev_id,
+            dev_name,
+            fs_type,
+            mount_dir,
+            mount_root: OsString::new(),
+            mount_option: String::new(),
+            remote,
+            dummy,
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn is_dummy_filesystem(fs_type: &str, mount_option: &str) -> bool {
+    // spell-checker:disable
+    match fs_type {
+        "autofs" | "proc" | "subfs"
+        // for Linux 2.6/3.x
+        | "debugfs" | "devpts" | "fusectl" | "mqueue" | "rpc_pipefs" | "sysfs"
+        // FreeBSD, Linux 2.4
+        | "devfs"
+        // for NetBSD 3.0
+        | "kernfs"
+        // for Irix 6.5
+        | "ignore"
+        // Linux initial root filesystem
+        | "rootfs"
+        // Binary format support pseudo-filesystem
+        | "binfmt_misc" => true,
+        _ => fs_type == "none"
+            && !mount_option.contains(MOUNT_OPT_BIND)
+    }
+    // spell-checker:enable
+}
+
+#[cfg(all(unix, not(any(target_os = "aix", target_os = "redox"))))]
+fn is_remote_filesystem(dev_name: &str, fs_type: &str) -> bool {
+    dev_name.find(':').is_some()
+        || (dev_name.starts_with("//") && fs_type == "smbfs" || fs_type == "cifs")
+        || dev_name == "-hosts"
+}
+
+#[cfg(全部(unix, not(任意(target_os = "aix", target_os = "redox"))))]
+方法 mount_dev_id(mount_dir: &OsStr) -> 字符串 {
+    使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+    如果 设 好的(stat) = 标准库::文件系统::metadata(mount_dir) {
+        // Why do we cast this to i32?
+        (stat.dev() 转换 整32).to_string()
+    } 否则 {
+        字符串::新建()
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+使用 箱::错误::UResult;
+#[cfg(任意(
+    target_os = "freebsd",
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "windows"
+))]
+使用 箱::错误::USimpleError;
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+使用 标准库::文件系统::File;
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+使用 标准库::输入输出::{BufRead, BufReader};
+#[cfg(任意(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "windows",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+使用 标准库::指针;
+#[cfg(任意(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+使用 标准库::切片;
+
+/// Read file system list.
+#[cfg(not(target_os = "wasi"))]
+公有 方法 read_fs_list() -> UResult<向量<MountInfo>> {
+    #[cfg(任意(target_os = "linux", target_os = "android", target_os = "cygwin"))]
+    {
+        设 (file_name, f) = File::open(LINUX_MOUNTINFO)
+            .映射(|f| (LINUX_MOUNTINFO, f))
+            .or_else(|_| File::open(LINUX_MTAB).映射(|f| (LINUX_MTAB, f)))?;
+        设 reader = BufReader::新建(f);
+        好的(reader
+            .split(b'\n')
+            .map_while(结果::ok)
+            .filter_map(|line| {
+                设 raw_data = line.split(|c| *c == b' ').收集::<向量<&[正8]>>();
+                MountInfo::新建(file_name, &raw_data)
+            })
+            .收集::<向量<_>>())
+    }
+    #[cfg(任意(
+        target_os = "freebsd",
+        target_vendor = "apple",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        设 可变 mount_buffer_ptr: *可变 StatFs = 指针::null_mut();
+        设 长度 = 不安全 { libc::getmntinfo(&raw 可变 mount_buffer_ptr, 1_i32) };
+        如果 长度 < 0 {
+            返回 坏的(USimpleError::新建(1, "getmntinfo() failed"));
+        }
+        设 mounts = 不安全 { 切片::from_raw_parts(mount_buffer_ptr, 长度 转换 正整数大小) };
+        好的(mounts
+            .迭代()
+            .映射(|m| MountInfo::from(*m))
+            .收集::<向量<_>>())
+    }
+    #[cfg(windows)]
+    {
+        设 可变 volume_name_buf = [0正16; MAX_PATH];
+        // As recommended in the MS documentation, retrieve the first volume before the others
+        设 find_handle =
+            不安全 { FindFirstVolumeW(volume_name_buf.as_mut_ptr(), volume_name_buf.长度() 转换 正32) };
+        如果 INVALID_HANDLE_VALUE == find_handle {
+            设 os_err = IOError::last_os_error();
+            设 msg = 格式化!("FindFirstVolumeW failed: {os_err}");
+            返回 坏的(USimpleError::新建(EXIT_ERR, msg));
+        }
+        设 可变 mounts = 向量::<MountInfo>::新建();
+        无限循环 {
+            设 volume_name = LPWSTR2String(&volume_name_buf);
+            如果 !volume_name.starts_with("\\\\?\\") || !volume_name.ends_with('\\') {
+                show_warning!("A bad path was skipped: {volume_name}");
+                继续;
+            }
+            如果 设 一些(m) = MountInfo::新建(volume_name) {
+                mounts.压入(m);
+            }
+            如果 0 == 不安全 {
+                FindNextVolumeW(
+                    find_handle,
+                    volume_name_buf.as_mut_ptr(),
+                    volume_name_buf.长度() 转换 正32,
+                )
+            } {
+                设 err = IOError::last_os_error();
+                如果 err.raw_os_error() != 一些(ERROR_NO_MORE_FILES 转换 整32) {
+                    设 msg = 格式化!("FindNextVolumeW failed: {err}");
+                    返回 坏的(USimpleError::新建(EXIT_ERR, msg));
+                }
+                中断;
+            }
+        }
+        不安全 {
+            FindVolumeClose(find_handle);
+        }
+        好的(mounts)
+    }
+    #[cfg(任意(
+        target_os = "aix",
+        target_os = "redox",
+        target_os = "illumos",
+        target_os = "solaris",
+    ))]
+    {
+        // No method to read mounts on these platforms
+        好的(向量::新建())
+    }
+}
+
+/// Read file system list.
+#[cfg(target_os = "wasi")]
+公有 方法 read_fs_list() -> 向量<MountInfo> {
+    // No method to read mounts on WASI
+    向量::新建()
+}
+
+#[derive(调试协议, 克隆协议)]
+公有 结构 FsUsage {
+    公有 blocksize: 正64,
+    公有 blocks: 正64,
+    公有 bfree: 正64,
+    公有 bavail: 正64,
+    公有 bavail_top_bit_set: 布尔,
+    公有 files: 正64,
+    公有 ffree: 正64,
+}
+
+实现 FsUsage {
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)]
+    公有 方法 新建(statvfs: StatFs) -> 自身类型 {
+        {
+            #[cfg(全部(
+                not(任意(target_os = "freebsd", target_os = "openbsd")),
+                target_pointer_width = "64"
+            ))]
+            返回 自身类型 {
+                blocksize: statvfs.f_bsize 转换 正64, // or `statvfs.f_frsize` ?
+                blocks: statvfs.f_blocks,
+                bfree: statvfs.f_bfree,
+                bavail: statvfs.f_bavail,
+                bavail_top_bit_set: ((statvfs.f_bavail) & (1正64.rotate_right(1))) != 0,
+                files: statvfs.f_files,
+                ffree: statvfs.f_ffree,
+            };
+            #[cfg(全部(
+                not(任意(target_os = "freebsd", target_os = "openbsd")),
+                not(target_pointer_width = "64")
+            ))]
+            返回 自身类型 {
+                blocksize: statvfs.f_bsize 转换 正64, // or `statvfs.f_frsize` ?
+                blocks: statvfs.f_blocks.into(),
+                bfree: statvfs.f_bfree.into(),
+                bavail: statvfs.f_bavail.into(),
+                bavail_top_bit_set: ((statvfs.f_bavail 转换 正64) & (1正64.rotate_right(1))) != 0,
+                files: statvfs.f_files.into(),
+                ffree: statvfs.f_ffree.into(),
+            };
+            #[cfg(target_os = "freebsd")]
+            返回 自身类型 {
+                blocksize: statvfs.f_bsize, // or `statvfs.f_frsize` ?
+                blocks: statvfs.f_blocks,
+                bfree: statvfs.f_bfree,
+                bavail: statvfs.f_bavail.try_into().解包(),
+                bavail_top_bit_set: ((TryInto::<正64>::try_into(statvfs.f_bavail).解包())
+                    & (1正64.rotate_right(1)))
+                    != 0,
+                files: statvfs.f_files,
+                ffree: statvfs.f_ffree.try_into().解包(),
+            };
+            #[cfg(target_os = "openbsd")]
+            返回 自身类型 {
+                blocksize: statvfs.f_bsize.into(),
+                blocks: statvfs.f_blocks,
+                bfree: statvfs.f_bfree,
+                bavail: statvfs.f_bavail.try_into().解包(),
+                bavail_top_bit_set: ((TryInto::<正64>::try_into(statvfs.f_bavail).解包())
+                    & (1正64.rotate_right(1)))
+                    != 0,
+                files: statvfs.f_files,
+                ffree: statvfs.f_ffree,
+            };
+        }
+    }
+    #[cfg(windows)]
+    公有 方法 新建(路径: &Path) -> UResult<自身类型> {
+        设 可变 root_path = [0正16; MAX_PATH];
+        设 success = 不安全 {
+            设 路径 = to_nul_terminated_wide_string(路径);
+            GetVolumePathNamesForVolumeNameW(
+                //path_utf8.as_ptr(),
+                路径.as_ptr(),
+                root_path.as_mut_ptr(),
+                root_path.长度() 转换 正32,
+                指针::null_mut(),
+            )
+        };
+        如果 0 == success {
+            设 msg = 格式化!(
+                "GetVolumePathNamesForVolumeNameW failed: {}",
+                IOError::last_os_error()
+            );
+            返回 坏的(USimpleError::新建(EXIT_ERR, msg));
+        }
+
+        设 可变 sectors_per_cluster = 0;
+        设 可变 bytes_per_sector = 0;
+        设 可变 number_of_free_clusters = 0;
+        设 可变 total_number_of_clusters = 0;
+
+        不安全 {
+            设 路径 = to_nul_terminated_wide_string(路径);
+            GetDiskFreeSpaceW(
+                路径.as_ptr(),
+                &raw 可变 sectors_per_cluster,
+                &raw 可变 bytes_per_sector,
+                &raw 可变 number_of_free_clusters,
+                &raw 可变 total_number_of_clusters,
+            );
+        }
+
+        设 bytes_per_cluster = sectors_per_cluster 转换 正64 * bytes_per_sector 转换 正64;
+        好的(自身类型 {
+            // f_bsize      File system block size.
+            blocksize: bytes_per_cluster,
+            // f_blocks - Total number of blocks on the file system, in units of f_frsize.
+            // frsize =     Fundamental file system block size (fragment size).
+            blocks: total_number_of_clusters 转换 正64,
+            //  Total number of free blocks.
+            bfree: number_of_free_clusters 转换 正64,
+            //  Total number of free blocks available to non-privileged processes.
+            bavail: 0,
+            bavail_top_bit_set: ((bytes_per_sector 转换 正64) & (1正64.rotate_right(1))) != 0,
+            // Total number of file nodes (inodes) on the file system.
+            files: 0, // Not available on windows
+            // Total number of free file nodes (inodes).
+            ffree: 0, // Meaningless on Windows
+        })
+    }
+}
+
+#[cfg(unix)]
+公有 协议 FsMeta {
+    方法 fs_type(&自身) -> 整64;
+    方法 io_size(&自身) -> 正64;
+    方法 block_size(&自身) -> 整64;
+    方法 total_blocks(&自身) -> 正64;
+    方法 free_blocks(&自身) -> 正64;
+    方法 avail_blocks(&自身) -> 正64;
+    方法 total_file_nodes(&自身) -> 正64;
+    方法 free_file_nodes(&自身) -> 正64;
+    方法 fsid(&自身) -> 正64;
+    方法 namelen(&自身) -> 正64;
+}
+
+#[cfg(unix)]
+实现 FsMeta 循环 StatFs {
+    方法 block_size(&自身) -> 整64 {
+        #[cfg(全部(
+            not(target_env = "musl"),
+            not(target_vendor = "apple"),
+            not(target_os = "aix"),
+            not(target_os = "android"),
+            not(target_os = "freebsd"),
+            not(target_os = "netbsd"),
+            not(target_os = "openbsd"),
+            not(target_os = "illumos"),
+            not(target_os = "solaris"),
+            not(target_os = "redox"),
+            not(target_arch = "s390x"),
+            not(target_os = "cygwin"),
+            target_pointer_width = "64"
+        ))]
+        返回 自身.f_bsize;
+        #[cfg(全部(
+            not(target_env = "musl"),
+            not(target_os = "freebsd"),
+            not(target_os = "netbsd"),
+            not(target_os = "redox"),
+            not(target_os = "cygwin"),
+            任意(
+                target_arch = "s390x",
+                target_vendor = "apple",
+                全部(target_os = "android", target_pointer_width = "32"),
+                target_os = "openbsd",
+                not(target_pointer_width = "64")
+            )
+        ))]
+        返回 自身.f_bsize.into();
+        #[cfg(任意(
+            target_env = "musl",
+            target_os = "aix",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+            target_os = "redox",
+            target_os = "cygwin",
+            全部(target_os = "android", target_pointer_width = "64"),
+        ))]
+        返回 自身.f_bsize.try_into().解包();
+    }
+    方法 total_blocks(&自身) -> 正64 {
+        #[cfg(target_pointer_width = "64")]
+        返回 自身.f_blocks;
+        #[cfg(not(target_pointer_width = "64"))]
+        返回 自身.f_blocks.into();
+    }
+    方法 free_blocks(&自身) -> 正64 {
+        #[cfg(target_pointer_width = "64")]
+        返回 自身.f_bfree;
+        #[cfg(not(target_pointer_width = "64"))]
+        返回 自身.f_bfree.into();
+    }
+    方法 avail_blocks(&自身) -> 正64 {
+        #[cfg(全部(
+            not(target_os = "freebsd"),
+            not(target_os = "openbsd"),
+            target_pointer_width = "64"
+        ))]
+        返回 自身.f_bavail;
+        #[cfg(全部(
+            not(target_os = "freebsd"),
+            not(target_os = "openbsd"),
+            not(target_pointer_width = "64")
+        ))]
+        返回 自身.f_bavail.into();
+        #[cfg(任意(target_os = "freebsd", target_os = "openbsd"))]
+        返回 自身.f_bavail.try_into().解包();
+    }
+    方法 total_file_nodes(&自身) -> 正64 {
+        #[cfg(target_pointer_width = "64")]
+        返回 自身.f_files;
+        #[cfg(not(target_pointer_width = "64"))]
+        返回 自身.f_files.into();
+    }
+    方法 free_file_nodes(&自身) -> 正64 {
+        #[cfg(全部(not(target_os = "freebsd"), target_pointer_width = "64"))]
+        返回 自身.f_ffree;
+        #[cfg(全部(not(target_os = "freebsd"), not(target_pointer_width = "64")))]
+        返回 自身.f_ffree.into();
+        #[cfg(target_os = "freebsd")]
+        返回 自身.f_ffree.try_into().解包();
+    }
+    #[cfg(任意(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    ))]
+    方法 fs_type(&自身) -> 整64 {
+        #[cfg(全部(
+            not(target_env = "musl"),
+            not(target_vendor = "apple"),
+            not(target_os = "android"),
+            not(target_os = "freebsd"),
+            not(target_arch = "s390x"),
+            target_pointer_width = "64"
+        ))]
+        返回 自身.f_type;
+        #[cfg(全部(
+            not(target_env = "musl"),
+            任意(
+                target_vendor = "apple",
+                全部(target_os = "android", target_pointer_width = "32"),
+                target_os = "freebsd",
+                target_arch = "s390x",
+                not(target_pointer_width = "64")
+            )
+        ))]
+        返回 自身.f_type.into();
+        #[cfg(任意(
+            target_env = "musl",
+            全部(target_os = "android", target_pointer_width = "64"),
+        ))]
+        返回 自身.f_type.try_into().解包();
+    }
+    #[cfg(not(任意(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd"
+    )))]
+    方法 fs_type(&自身) -> 整64 {
+        // FIXME: statvfs doesn't have an equivalent, so we need to do something else
+        未实现!()
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    #[allow(clippy::unnecessary_cast)]
+    方法 io_size(&自身) -> 正64 {
+        自身.f_frsize 转换 正64
+    }
+    #[cfg(任意(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd"))]
+    #[allow(clippy::unnecessary_cast)]
+    方法 io_size(&自身) -> 正64 {
+        #[cfg(target_os = "freebsd")]
+        返回 自身.f_iosize;
+        #[cfg(not(target_os = "freebsd"))]
+        返回 自身.f_iosize 转换 正64;
+    }
+    // XXX: dunno if this is right
+    #[cfg(not(任意(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "netbsd"
+    )))]
+    方法 io_size(&自身) -> 正64 {
+        自身.f_bsize 转换 正64
+    }
+
+    // Linux, SunOS, HP-UX, 4.4BSD, FreeBSD have a system call statfs() that returns
+    // a struct statfs, containing a fsid_t f_fsid, where fsid_t is defined
+    // as struct { int val[2];  }
+    //
+    // Solaris, Irix and POSIX have a system call statvfs(2) that returns a
+    // struct statvfs, containing an  unsigned  long  f_fsid
+    #[cfg(任意(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "openbsd"
+    ))]
+    方法 fsid(&自身) -> 正64 {
+        // Use type inference to determine the type of f_fsid
+        // (libc::__fsid_t on Android, libc::fsid_t on other platforms)
+        设 f_fsid = 自身.f_fsid;
+        设 f_fsid: [正32; 2] = 不安全 { 内存::transmute(f_fsid) };
+        ((正64::from(f_fsid[0])) << 32) | 正64::from(f_fsid[1])
+    }
+    #[cfg(not(任意(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "openbsd"
+    )))]
+    #[allow(clippy::unnecessary_cast)]
+    方法 fsid(&自身) -> 正64 {
+        自身.f_fsid 转换 正64
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    方法 namelen(&自身) -> 正64 {
+        自身.f_namelen 转换 正64
+    }
+    #[cfg(target_vendor = "apple")]
+    方法 namelen(&自身) -> 正64 {
+        1024
+    }
+    #[cfg(任意(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    #[allow(clippy::unnecessary_cast)]
+    方法 namelen(&自身) -> 正64 {
+        自身.f_namemax 转换 正64 // spell-checker:disable-line
+    }
+    // XXX: should everything just use statvfs?
+    #[cfg(not(任意(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    方法 namelen(&自身) -> 正64 {
+        自身.f_namemax 转换 正64 // spell-checker:disable-line
+    }
+}
+
+#[cfg(unix)]
+公有 方法 statfs(路径: &OsStr) -> 结果<StatFs, 字符串> {
+    #[cfg(unix)]
+    设 p = 路径.as_bytes();
+    #[cfg(not(unix))]
+    设 p = 路径.into_string().解包();
+
+    匹配 CString::新建(p) {
+        好的(p) => {
+            设 可变 buffer: StatFs = 不安全 { 内存::zeroed() };
+            不安全 {
+                如果 statfs_fn(p.as_ptr(), &raw 可变 buffer) == 0 {
+                    好的(buffer)
+                } 否则 {
+                    设 errno = IOError::last_os_error().raw_os_error().unwrap_or(0);
+                    坏的(CStr::from_ptr(strerror(errno))
+                        .to_str()
+                        .map_err(|_| "Error message contains invalid UTF-8".to_owned())?
+                        .to_owned())
+                }
+            }
+        }
+        坏的(e) => 坏的(e.to_string()),
+    }
+}
+
+#[cfg(unix)]
+公有 方法 pretty_filetype(mode: mode_t, size: 正64) -> 字符串 {
+    匹配 mode & S_IFMT {
+        S_IFREG => {
+            如果 size == 0 {
+                "regular empty file"
+            } 否则 {
+                "regular file"
+            }
+        }
+        S_IFDIR => "directory",
+        S_IFLNK => "symbolic link",
+        S_IFCHR => "character special file",
+        S_IFBLK => "block special file",
+        S_IFIFO => "fifo",
+        S_IFSOCK => "socket",
+        // TODO: Other file types
+        _ => 返回 格式化!("weird file ({:07o})", mode & S_IFMT),
+    }
+    .to_owned()
+}
+
+公有 方法 pretty_fstype<'a>(fstype: 整64) -> Cow<'a, 字符串切片> {
+    // spell-checker:disable
+    匹配 fstype {
+        0x6163_6673 => "acfs".into(),
+        0xADF5 => "adfs".into(),
+        0xADFF => "affs".into(),
+        0x5346_414F => "afs".into(),
+        0x0904_1934 => "anon-inode FS".into(),
+        0x6175_6673 => "aufs".into(),
+        0x0187 => "autofs".into(),
+        0x4246_5331 => "befs".into(),
+        0x6264_6576 => "bdevfs".into(),
+        0xCA45_1A4E => "bcachefs".into(),
+        0x1BAD_FACE => "bfs".into(),
+        0xCAFE_4A11 => "bpf_fs".into(),
+        0x4249_4E4D => "binfmt_misc".into(),
+        0x9123_683E => "btrfs".into(),
+        0x7372_7279 => "btrfs_test".into(),
+        0x00C3_6400 => "ceph".into(),
+        0x0027_E0EB => "cgroupfs".into(),
+        0x6367_7270 => "cgroup2fs".into(),
+        0xFF53_4D42 => "cifs".into(),
+        0x7375_7245 => "coda".into(),
+        0x012F_F7B7 => "coh".into(),
+        0x6265_6570 => "configfs".into(),
+        0x28CD_3D45 => "cramfs".into(),
+        0x453D_CD28 => "cramfs-wend".into(),
+        0x6462_6720 => "debugfs".into(),
+        0x1373 => "devfs".into(),
+        0x1CD1 => "devpts".into(),
+        0xF15F => "ecryptfs".into(),
+        0xDE5E_81E4 => "efivarfs".into(),
+        0x0041_4A53 => "efs".into(),
+        0x5DF5 => "exofs".into(),
+        0x137D => "ext".into(),
+        0xEF53 => "ext2/ext3".into(),
+        0xEF51 => "ext2".into(),
+        0xF2F5_2010 => "f2fs".into(),
+        0x4006 => "fat".into(),
+        0x1983_0326 => "fhgfs".into(),
+        0x6573_5546 => "fuseblk".into(),
+        0x6573_5543 => "fusectl".into(),
+        0x0BAD_1DEA => "futexfs".into(),
+        0x0116_1970 => "gfs/gfs2".into(),
+        0x4750_4653 => "gpfs".into(),
+        0x4244 => "hfs".into(),
+        0x482B => "hfs+".into(),
+        0x4858 => "hfsx".into(),
+        0x00C0_FFEE => "hostfs".into(),
+        0xF995_E849 => "hpfs".into(),
+        0x9584_58F6 => "hugetlbfs".into(),
+        0x1130_7854 => "inodefs".into(),
+        0x0131_11A8 => "ibrix".into(),
+        0x2BAD_1DEA => "inotifyfs".into(),
+        0x9660 => "isofs".into(),
+        0x4004 => "isofs".into(),
+        0x4000 => "isofs".into(),
+        0x07C0 => "jffs".into(),
+        0x72B6 => "jffs2".into(),
+        0x3153_464A => "jfs".into(),
+        0x6B41_4653 => "k-afs".into(),
+        0xC97E_8168 => "logfs".into(),
+        0x0BD0_0BD0 => "lustre".into(),
+        0x5346_314D => "m1fs".into(),
+        0x137F => "minix".into(),
+        0x138F => "minix (30 char.)".into(),
+        0x2468 => "minix v2".into(),
+        0x2478 => "minix v2 (30 char.)".into(),
+        0x4D5A => "minix3".into(),
+        0x1980_0202 => "mqueue".into(),
+        0x4D44 => "msdos".into(),
+        0x564C => "novell".into(),
+        0x6969 => "nfs".into(),
+        0x6E66_7364 => "nfsd".into(),
+        0x3434 => "nilfs".into(),
+        0x6E73_6673 => "nsfs".into(),
+        0x5346_544E => "ntfs".into(),
+        0x9FA1 => "openprom".into(),
+        0x7461_636F => "ocfs2".into(),
+        0x794C_7630 => "overlayfs".into(),
+        0xAAD7_AAEA => "panfs".into(),
+        0x5049_5045 => "pipefs".into(),
+        0x7C7C_6673 => "prl_fs".into(),
+        0x9FA0 => "proc".into(),
+        0x6165_676C => "pstorefs".into(),
+        0x002F => "qnx4".into(),
+        0x6819_1122 => "qnx6".into(),
+        0x8584_58F6 => "ramfs".into(),
+        0x5265_4973 => "reiserfs".into(),
+        0x7275 => "romfs".into(),
+        0x6759_6969 => "rpc_pipefs".into(),
+        0x7363_6673 => "securityfs".into(),
+        0xF97C_FF8C => "selinux".into(),
+        0x4341_5D53 => "smackfs".into(),
+        0x517B => "smb".into(),
+        0xFE53_4D42 => "smb2".into(),
+        0xBEEF_DEAD => "snfs".into(),
+        0x534F_434B => "sockfs".into(),
+        0x7371_7368 => "squashfs".into(),
+        0x6265_6572 => "sysfs".into(),
+        0x012F_F7B6 => "sysv2".into(),
+        0x012F_F7B5 => "sysv4".into(),
+        0x0102_1994 => "tmpfs".into(),
+        0x7472_6163 => "tracefs".into(),
+        0x2405_1905 => "ubifs".into(),
+        0x1501_3346 => "udf".into(),
+        0x0001_1954 => "ufs".into(),
+        0x5419_0100 => "ufs".into(),
+        0x9FA2 => "usbdevfs".into(),
+        0x0102_1997 => "v9fs".into(),
+        0xBACB_ACBC => "vmhgfs".into(),
+        0xA501_FCF5 => "vxfs".into(),
+        0x565A_4653 => "vzfs".into(),
+        0x5346_4846 => "wslfs".into(),
+        0xABBA_1974 => "xenfs".into(),
+        0x012F_F7B4 => "xenix".into(),
+        0x5846_5342 => "xfs".into(),
+        0x012F_D16D => "xia".into(),
+        0x2FC1_2FC1 => "zfs".into(),
+        0xDE => "zfs".into(),
+        other => 格式化!("UNKNOWN ({other:#x})").into(),
+    }
+    // spell-checker:enable
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    #[cfg(unix)]
+    方法 test_file_type() {
+        相等断言!("block special file", pretty_filetype(S_IFBLK, 0));
+        相等断言!("character special file", pretty_filetype(S_IFCHR, 0));
+        相等断言!("regular file", pretty_filetype(S_IFREG, 1));
+        相等断言!("regular empty file", pretty_filetype(S_IFREG, 0));
+        相等断言!("weird file (0000000)", pretty_filetype(0, 0));
+    }
+
+    #[test]
+    方法 test_fs_type() {
+        // spell-checker:disable
+        相等断言!("ext2/ext3", pretty_fstype(0xEF53));
+        相等断言!("tmpfs", pretty_fstype(0x0102_1994));
+        相等断言!("nfs", pretty_fstype(0x6969));
+        相等断言!("btrfs", pretty_fstype(0x9123_683e));
+        相等断言!("xfs", pretty_fstype(0x5846_5342));
+        相等断言!("zfs", pretty_fstype(0x2FC1_2FC1));
+        相等断言!("ntfs", pretty_fstype(0x5346_544e));
+        相等断言!("fat", pretty_fstype(0x4006));
+        相等断言!("UNKNOWN (0x1234)", pretty_fstype(0x1234));
+        // spell-checker:enable
+    }
+
+    #[test]
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    方法 test_mountinfo() {
+        // spell-checker:ignore (word) relatime
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &b"106 109 253:6 / /mnt rw,relatime - xfs /dev/fs0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(info.mount_root, "/");
+        相等断言!(info.mount_dir, "/mnt");
+        相等断言!(info.mount_option, "rw,relatime");
+        相等断言!(info.fs_type, "xfs");
+        相等断言!(info.dev_name, "/dev/fs0");
+
+        // Test parsing with different amounts of optional fields.
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &b"106 109 253:6 / /mnt rw,relatime master:1 - xfs /dev/fs0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(info.fs_type, "xfs");
+        相等断言!(info.dev_name, "/dev/fs0");
+
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &b"106 109 253:6 / /mnt rw,relatime master:1 shared:2 - xfs /dev/fs0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(info.fs_type, "xfs");
+        相等断言!(info.dev_name, "/dev/fs0");
+    }
+
+    #[test]
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    方法 test_mountinfo_dir_special_chars() {
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &br"317 61 7:0 / /mnt/f\134\040\011oo rw,relatime shared:641 - ext4 /dev/loop0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(info.mount_dir, r"/mnt/f\ 	oo");
+
+        设 info = MountInfo::新建(
+            LINUX_MTAB,
+            &br"/dev/loop0 /mnt/f\134\040\011oo ext4 rw,relatime 0 0"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(info.mount_dir, r"/mnt/f\ 	oo");
+    }
+
+    #[test]
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    方法 test_mountinfo_dir_non_unicode() {
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &b"317 61 7:0 / /mnt/some-\xc0-dir-\xf3 rw,relatime shared:641 - ext4 /dev/loop0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        相等断言!(
+            info.mount_dir,
+            箱::os_str_from_bytes(b"/mnt/some-\xc0-dir-\xf3").解包()
+        );
+
+        设 info = MountInfo::新建(
+            LINUX_MOUNTINFO,
+            &b"317 61 7:0 / /mnt/some-\\040-dir-\xf3 rw,relatime shared:641 - ext4 /dev/loop0 rw"
+                .split(|c| *c == b' ')
+                .收集::<向量<_>>(),
+        )
+        .解包();
+
+        // Note that the \040 above will have been substituted by a space.
+        相等断言!(
+            info.mount_dir,
+            箱::os_str_from_bytes(b"/mnt/some- -dir-\xf3").解包()
+        );
+    }
+
+    #[test]
+    #[cfg(全部(unix, not(target_os = "redox")))]
+    // spell-checker:ignore (word) binfmt
+    方法 test_binfmt_misc_is_dummy() {
+        使用 超级::is_dummy_filesystem;
+        断言!(is_dummy_filesystem("binfmt_misc", ""));
+    }
+}

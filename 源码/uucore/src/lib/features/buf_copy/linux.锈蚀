@@ -1,0 +1,148 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Buffer-based copying implementation for Linux and Android.
+
+使用 箱::{
+    错误::UResult,
+    pipes::{MAX_ROOTLESS_PIPE_SIZE, pipe, splice, splice_exact},
+};
+
+/// Buffer-based copying utilities for unix (excluding Linux).
+使用 标准库::{
+    输入输出::{Read, Write},
+    操作系统::fd::{AsFd, AsRawFd},
+};
+
+使用 超级::common::错误协议;
+
+/// A readable file descriptor.
+公有 协议 FdReadable: Read + AsRawFd + AsFd {}
+
+实现<T> FdReadable 循环 T 何处 T: Read + AsFd + AsRawFd {}
+
+/// A writable file descriptor.
+公有 协议 FdWritable: Write + AsFd + AsRawFd {}
+
+实现<T> FdWritable 循环 T 何处 T: Write + AsFd + AsRawFd {}
+
+常量 BUF_SIZE: 正整数大小 = 1024 * 16;
+
+/// Conversion from a `rustix::io::Errno` into our `Error` which implements `UError`.
+实现 转换协议<rustix::输入输出::Errno> 循环 错误协议 {
+    方法 from(错误: rustix::输入输出::Errno) -> 自身类型 {
+        自身类型::Io(标准库::输入输出::错误协议::from(错误))
+    }
+}
+
+/// Copy data from `Read` implementor `source` into a `Write` implementor
+/// `dest`. This works by reading a chunk of data from `source` and writing the
+/// data to `dest` in a loop.
+///
+/// This function uses the Linux-specific `splice` call when possible which does
+/// not use any intermediate user-space buffer. It falls backs to
+/// `std::io::copy` when the call fails and is still recoverable.
+///
+/// # Arguments
+/// * `source` - `Read` implementor to copy data from.
+/// * `dest` - `Write` implementor to copy data to.
+///
+/// # Returns
+///
+/// Result of operation and bytes successfully written (as a `u64`) when
+/// operation is successful.
+公有 方法 copy_stream<R, S>(src: &可变 R, dest: &可变 S) -> UResult<正64>
+何处
+    R: Read + AsFd + AsRawFd,
+    S: Write + AsFd + AsRawFd,
+{
+    // If we're on Linux or Android, try to use the splice() system call
+    // for faster writing. If it works, we're done.
+    设 result = splice_write(src, &dest.as_fd())?;
+    如果 !result.1 {
+        返回 好的(result.0);
+    }
+
+    // If the splice() call failed, fall back on slower writing.
+    设 result = 标准库::输入输出::copy(src, dest)?;
+
+    // If the splice() call failed and there has been some data written to
+    // stdout via while loop above AND there will be second splice() call
+    // that will succeed, data pushed through splice will be output before
+    // the data buffered in stdout.lock. Therefore additional explicit flush
+    // is required here.
+    dest.flush()?;
+    好的(result)
+}
+
+/// Write from source `handle` into destination `write_fd` using Linux-specific
+/// `splice` system call.
+///
+/// # Arguments
+/// - `source` - source handle
+/// - `dest` - destination handle
+#[inline]
+公有(箱) 方法 splice_write<R, S>(source: &R, dest: &S) -> UResult<(正64, 布尔)>
+何处
+    R: Read + AsFd + AsRawFd,
+    S: AsRawFd + AsFd,
+{
+    设 (pipe_rd, pipe_wr) = pipe()?;
+    设 可变 bytes: 正64 = 0;
+    // improve throughput
+    // no need to increase pipe size of input fd since
+    // - sender with splice probably increased size already
+    // - sender without splice is bottleneck
+    设 _ = rustix::pipe::fcntl_setpipe_size(dest, MAX_ROOTLESS_PIPE_SIZE);
+
+    无限循环 {
+        匹配 splice(&source, &pipe_wr, MAX_ROOTLESS_PIPE_SIZE) {
+            好的(n) => {
+                如果 n == 0 {
+                    返回 好的((bytes, 假));
+                }
+                如果 splice_exact(&pipe_rd, dest, n).is_err() {
+                    // If the first splice manages to copy to the intermediate
+                    // pipe, but the second splice to stdout fails for some reason
+                    // we can recover by copying the data that we have from the
+                    // intermediate pipe to stdout using normal read/write. Then
+                    // we tell the caller to fall back.
+                    copy_exact(&pipe_rd, dest, n)?;
+                    返回 好的((bytes, 真));
+                }
+
+                bytes += n 转换 正64;
+            }
+            坏的(_) => {
+                返回 好的((bytes, 真));
+            }
+        }
+    }
+}
+
+/// Move exactly `num_bytes` bytes from `read_fd` to `write_fd` using the `read`
+/// and `write` calls.
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有(箱) 方法 copy_exact(
+    read_fd: &实现 AsFd,
+    write_fd: &实现 AsFd,
+    num_bytes: 正整数大小,
+) -> 标准库::输入输出::结果<正整数大小> {
+    设 可变 left = num_bytes;
+    设 可变 buf = [0; BUF_SIZE];
+    设 可变 total_written = 0;
+    当 left > 0 {
+        设 n_read = rustix::输入输出::读锁定(read_fd, &可变 buf)?;
+        不相等断言!(n_read, 0, "unexpected end of pipe");
+        设 可变 written = 0;
+        当 written < n_read {
+            设 n = rustix::输入输出::写锁定(write_fd, &buf[written..n_read])?;
+            written += n;
+        }
+        total_written += written;
+        left -= n_read;
+    }
+    好的(total_written)
+}

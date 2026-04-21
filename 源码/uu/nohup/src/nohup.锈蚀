@@ -1,0 +1,195 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) SIGHUP cproc vprocmgr homeout
+
+使用 clap::{Arg, ArgAction, Command};
+使用 libc::{SIG_IGN, SIGHUP, dup2, signal};
+使用 标准库::环境;
+使用 标准库::文件系统::{File, OpenOptions};
+使用 标准库::输入输出::{错误协议, ErrorKind, IsTerminal};
+使用 标准库::操作系统::unix::预导入::*;
+使用 标准库::操作系统::unix::进程::CommandExt;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::进程;
+使用 标准库::同步::LazyLock;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UError, UResult, set_exit_code};
+使用 uucore::translate;
+使用 uucore::{format_usage, show_error};
+
+静态 NOHUP_OUT: &字符串切片 = "nohup.out";
+// exit codes that match the GNU implementation
+静态 EXIT_CANCELED: 整32 = 125;
+静态 EXIT_CANNOT_INVOKE: 整32 = 126;
+静态 EXIT_ENOENT: 整32 = 127;
+静态 POSIX_NOHUP_FAILURE: 整32 = 127;
+
+模组 options {
+    公有 常量 CMD: &字符串切片 = "cmd";
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 NohupError {
+    #[错误("{}", translate!("nohup-error-cannot-detach"))]
+    CannotDetach,
+
+    #[错误("{}", translate!("nohup-error-cannot-replace", "name" => (*_0), "err" => _1))]
+    CannotReplace(&'静态 字符串切片, #[source] 错误协议),
+
+    #[错误("{}", translate!("nohup-error-open-failed", "path" => NOHUP_OUT.quote(), "err" => _1))]
+    OpenFailed(整32, #[source] 错误协议),
+
+    #[错误("{}", translate!("nohup-error-open-failed-both", "first_path" => NOHUP_OUT.quote(), "first_err" => _1, "second_path" => _2.quote(), "second_err" => _3))]
+    OpenFailed2(整32, #[source] 错误协议, 字符串, 错误协议),
+}
+
+实现 UError 循环 NohupError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::OpenFailed(code, _) | 自身类型::OpenFailed2(code, _, _, _) => *code,
+            _ => 2,
+        }
+    }
+}
+
+静态 FAILURE_CODE: LazyLock<整32> = LazyLock::新建(|| {
+    如果 环境::var_os("POSIXLY_CORRECT").is_some() {
+        POSIX_NOHUP_FAILURE
+    } 否则 {
+        EXIT_CANCELED
+    }
+});
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result_with_exit_code(
+        uu_app(),
+        args,
+        *FAILURE_CODE,
+    )?;
+
+    replace_fds()?;
+
+    不安全 { signal(SIGHUP, SIG_IGN) };
+
+    如果 不安全 { !_vprocmgr_detach_from_console(0).is_null() } {
+        返回 坏的(NohupError::CannotDetach.into());
+    }
+    #[allow(clippy::unwrap_used, reason = "set as required by clap")]
+    设 可变 cmd_iter = matches.get_many::<字符串>(options::CMD).解包();
+    #[allow(clippy::unwrap_used, reason = "set as required by clap")]
+    设 cmd = cmd_iter.next().解包();
+    设 args: 向量<&字符串> = cmd_iter.收集();
+
+    设 err = 进程::Command::新建(cmd).args(args).exec();
+
+    匹配 err.kind() {
+        ErrorKind::NotFound => set_exit_code(EXIT_ENOENT),
+        _ => set_exit_code(EXIT_CANNOT_INVOKE),
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("nohup")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("nohup"))
+        .about(translate!("nohup-about"))
+        .after_help(translate!("nohup-after-help"))
+        .override_usage(format_usage(&translate!("nohup-usage")))
+        .arg(
+            Arg::新建(options::CMD)
+                .hide(真)
+                .required(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::CommandName),
+        )
+        .trailing_var_arg(真)
+        .infer_long_args(真)
+}
+
+方法 replace_fds() -> UResult<()> {
+    如果 标准库::输入输出::stdin().is_terminal() {
+        设 new_stdin = File::open(Path::新建("/dev/null"))
+            .map_err(|e| NohupError::CannotReplace("STDIN", e))?;
+        如果 不安全 { dup2(new_stdin.as_raw_fd(), 0) } != 0 {
+            返回 坏的(NohupError::CannotReplace("STDIN", 错误协议::last_os_error()).into());
+        }
+    }
+
+    如果 标准库::输入输出::stdout().is_terminal() {
+        设 new_stdout = find_stdout()?;
+        设 fd = new_stdout.as_raw_fd();
+
+        如果 不安全 { dup2(fd, 1) } != 1 {
+            返回 坏的(NohupError::CannotReplace("STDOUT", 错误协议::last_os_error()).into());
+        }
+    }
+
+    如果 标准库::输入输出::stderr().is_terminal() && 不安全 { dup2(1, 2) } != 2 {
+        返回 坏的(NohupError::CannotReplace("STDERR", 错误协议::last_os_error()).into());
+    }
+    好的(())
+}
+
+方法 find_stdout() -> UResult<File> {
+    匹配 OpenOptions::新建()
+        .create(真)
+        .append(真)
+        .open(Path::新建(NOHUP_OUT))
+    {
+        好的(t) => {
+            show_error!(
+                "{}",
+                translate!("nohup-ignoring-input-appending-output", "path" => NOHUP_OUT.quote())
+            );
+            好的(t)
+        }
+        坏的(e1) => {
+            设 好的(home) = 环境::var("HOME") 否则 {
+                返回 坏的(NohupError::OpenFailed(*FAILURE_CODE, e1).into());
+            };
+            设 可变 homeout = PathBuf::from(home);
+            homeout.压入(NOHUP_OUT);
+            设 homeout_str = homeout.to_str().解包();
+            匹配 OpenOptions::新建().create(真).append(真).open(&homeout) {
+                好的(t) => {
+                    show_error!(
+                        "{}",
+                        translate!("nohup-ignoring-input-appending-output", "path" => homeout_str.quote())
+                    );
+                    好的(t)
+                }
+                坏的(e2) => {
+                    坏的(
+                        NohupError::OpenFailed2(*FAILURE_CODE, e1, homeout_str.to_string(), e2)
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+不安全 外部 "C" {
+    方法 _vprocmgr_detach_from_console(flags: 正32) -> *常量 libc::c_int;
+}
+
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "netbsd"
+))]
+/// # Safety
+/// This function is unsafe because it dereferences a raw pointer.
+不安全 方法 _vprocmgr_detach_from_console(_: 正32) -> *常量 libc::c_int {
+    标准库::指针::null()
+}

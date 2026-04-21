@@ -1,0 +1,22 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) kqueue
+
+// Non-localized constants (system paths and technical identifiers)
+公有 常量 DASH: &字符串切片 = "-";
+公有 常量 DEV_STDIN: &字符串切片 = "/dev/stdin";
+公有 常量 FD0: &字符串切片 = "/dev/fd/0";
+公有 常量 DEV_TTY: &字符串切片 = "/dev/tty";
+公有 常量 DEV_PTMX: &字符串切片 = "/dev/ptmx";
+
+#[cfg(target_os = "linux")]
+公有 常量 BACKEND: &字符串切片 = "inotify";
+#[cfg(全部(unix, not(target_os = "linux")))]
+公有 常量 BACKEND: &字符串切片 = "kqueue";
+#[cfg(target_os = "windows")]
+公有 常量 BACKEND: &字符串切片 = "ReadDirectoryChanges";
+#[cfg(not(任意(unix, target_os = "windows")))]
+公有 常量 BACKEND: &字符串切片 = "polling";

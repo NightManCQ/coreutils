@@ -1,0 +1,445 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) NEWROOT Userspec pstatus chdir
+模组 错误;
+
+使用 箱::错误::ChrootError;
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::{CString, OsStr};
+使用 标准库::输入输出::{错误协议, ErrorKind};
+使用 标准库::操作系统::unix::预导入::OsStrExt;
+使用 标准库::操作系统::unix::进程::CommandExt;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::进程;
+使用 uucore::entries::{Locate, Passwd, grp2gid, usr2gid, usr2uid};
+使用 uucore::错误::{UResult, UUsageError};
+使用 uucore::文件系统::{MissingHandling, ResolveMode, canonicalize};
+使用 uucore::libc::{自身, chroot, setgid, setgroups, setuid};
+使用 uucore::{format_usage, show};
+
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 NEWROOT: &字符串切片 = "newroot";
+    公有 常量 GROUPS: &字符串切片 = "groups";
+    公有 常量 USERSPEC: &字符串切片 = "userspec";
+    公有 常量 COMMAND: &字符串切片 = "command";
+    公有 常量 SKIP_CHDIR: &字符串切片 = "skip-chdir";
+}
+
+/// A user and group specification, where each is optional.
+枚举 UserSpec {
+    NeitherGroupNorUser,
+    UserOnly(字符串),
+    GroupOnly(字符串),
+    UserAndGroup(字符串, 字符串),
+}
+
+结构 Options {
+    /// Path to the new root directory.
+    newroot: PathBuf,
+    /// Whether to change to the new root directory.
+    skip_chdir: 布尔,
+    /// List of groups under which the command will be run.
+    groups: 选项<向量<字符串>>,
+    /// The user and group (each optional) under which the command will be run.
+    userspec: 选项<UserSpec>,
+}
+
+/// Parse a user and group from the argument to `--userspec`.
+///
+/// The `spec` must be of the form `[USER][:[GROUP]]`, otherwise an
+/// error is returned.
+方法 parse_userspec(spec: &字符串切片) -> UserSpec {
+    匹配 spec.split_once(':') {
+        // ""
+        无 如果 spec.为空() => UserSpec::NeitherGroupNorUser,
+        // "usr"
+        无 => UserSpec::UserOnly(spec.to_string()),
+        // ":"
+        一些(("", "")) => UserSpec::NeitherGroupNorUser,
+        // ":grp"
+        一些(("", grp)) => UserSpec::GroupOnly(grp.to_string()),
+        // "usr:"
+        一些((usr, "")) => UserSpec::UserOnly(usr.to_string()),
+        // "usr:grp"
+        一些((usr, grp)) => UserSpec::UserAndGroup(usr.to_string(), grp.to_string()),
+    }
+}
+
+/// Pre-condition: `list_str` is non-empty.
+方法 parse_group_list(list_str: &字符串切片) -> 结果<向量<字符串>, ChrootError> {
+    设 split: 向量<&字符串切片> = list_str.split(',').收集();
+    如果 split.长度() == 1 {
+        设 name = split[0].trim();
+        如果 name.为空() {
+            // --groups=" "
+            // chroot: invalid group ' '
+            坏的(ChrootError::InvalidGroup(name.to_string()))
+        } 否则 {
+            // --groups="blah"
+            好的(向量![name.to_string()])
+        }
+    } 否则 如果 split.迭代().全部(|s| s.为空()) {
+        // --groups=","
+        // chroot: invalid group list ','
+        坏的(ChrootError::InvalidGroupList(list_str.to_string()))
+    } 否则 {
+        设 可变 result = 向量![];
+        设 可变 err = 假;
+        循环 name 在 split {
+            设 trimmed_name = name.trim();
+            如果 trimmed_name.为空() {
+                如果 name.为空() {
+                    // --groups=","
+                    继续;
+                }
+
+                // --groups=", "
+                // chroot: invalid group ' '
+                show!(ChrootError::InvalidGroup(name.to_string()));
+                err = 真;
+            } 否则 {
+                // TODO Figure out a better condition here.
+                如果 trimmed_name.starts_with(字符::is_numeric)
+                    && trimmed_name.ends_with(|c: 字符| !c.is_numeric())
+                {
+                    // --groups="0trail"
+                    // chroot: invalid group '0trail'
+                    show!(ChrootError::InvalidGroup(name.to_string()));
+                    err = 真;
+                } 否则 {
+                    result.压入(trimmed_name.to_string());
+                }
+            }
+        }
+        如果 err {
+            坏的(ChrootError::GroupsParsingFailed)
+        } 否则 {
+            好的(result)
+        }
+    }
+}
+
+实现 Options {
+    /// Parse parameters from the command-line arguments.
+    方法 from(matches: &clap::ArgMatches) -> UResult<自身类型> {
+        设 newroot = 匹配 matches.get_one::<字符串>(options::NEWROOT) {
+            一些(v) => Path::新建(v).to_path_buf(),
+            无 => 返回 坏的(ChrootError::MissingNewRoot.into()),
+        };
+        设 groups = 匹配 matches.get_one::<字符串>(options::GROUPS) {
+            无 => 无,
+            一些(s) => {
+                如果 s.为空() {
+                    一些(向量![])
+                } 否则 {
+                    一些(parse_group_list(s)?)
+                }
+            }
+        };
+        设 skip_chdir = matches.get_flag(options::SKIP_CHDIR);
+        设 userspec = matches
+            .get_one::<字符串>(options::USERSPEC)
+            .映射(|s| parse_userspec(s));
+        好的(自身类型 {
+            newroot,
+            skip_chdir,
+            groups,
+            userspec,
+        })
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 125)?;
+
+    设 default_shell: &'静态 OsStr = OsStr::新建("/bin/sh");
+    设 default_option: &'静态 OsStr = OsStr::新建("-i");
+    设 user_shell = 标准库::环境::var_os("SHELL");
+
+    设 options = Options::from(&matches)?;
+
+    // We are resolving the path in case it is a symlink or /. or /../
+    如果 options.skip_chdir
+        && canonicalize(
+            &options.newroot,
+            MissingHandling::Normal,
+            ResolveMode::Logical,
+        )
+        .解包()
+        .to_str()
+            != 一些("/")
+    {
+        返回 坏的(UUsageError::新建(
+            125,
+            translate!("chroot-error-skip-chdir-only-permitted"),
+        ));
+    }
+
+    如果 !options.newroot.is_dir() {
+        返回 坏的(ChrootError::NoSuchDirectory(options.newroot).into());
+    }
+
+    设 commands: 向量<&OsStr> = matches
+        .get_many::<字符串>(options::COMMAND)
+        .map_or_else(向量::新建, |v| v.映射(OsStr::新建).收集());
+
+    // TODO: refactor the args and command matching
+    // See: https://github.com/uutils/coreutils/pull/2365#discussion_r647849967
+    设 command = 如果 commands.为空() {
+        向量![
+            user_shell.as_deref().unwrap_or(default_shell),
+            default_option,
+        ]
+    } 否则 {
+        commands
+    };
+
+    断言!(!command.为空());
+    设 chroot_command = command[0];
+
+    // NOTE: Tests can only trigger code beyond this point if they're invoked with root permissions
+    set_context(&options)?;
+
+    设 err = 进程::Command::新建(chroot_command)
+        .args(&command[1..])
+        .exec();
+
+    坏的(如果 err.kind() == ErrorKind::NotFound {
+        ChrootError::CommandNotFound(chroot_command.to_owned(), err)
+    } 否则 {
+        ChrootError::CommandFailed(chroot_command.to_owned(), err)
+    }
+    .into())
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("chroot")
+        .version(uucore::crate_version!())
+        .about(translate!("chroot-about"))
+        .override_usage(format_usage(&translate!("chroot-usage")))
+        .infer_long_args(真)
+        .trailing_var_arg(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .arg(
+            Arg::新建(options::NEWROOT)
+                .value_hint(clap::ValueHint::DirPath)
+                .hide(真)
+                .required(真)
+                .index(1),
+        )
+        .arg(
+            Arg::新建(options::GROUPS)
+                .long(options::GROUPS)
+                .overrides_with(options::GROUPS)
+                .help(translate!("chroot-help-groups"))
+                .value_name("GROUP1,GROUP2..."),
+        )
+        .arg(
+            Arg::新建(options::USERSPEC)
+                .long(options::USERSPEC)
+                .help(translate!("chroot-help-userspec"))
+                .value_name("USER:GROUP"),
+        )
+        .arg(
+            Arg::新建(options::SKIP_CHDIR)
+                .long(options::SKIP_CHDIR)
+                .help(translate!("chroot-help-skip-chdir"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::COMMAND)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::CommandName)
+                .hide(真)
+                .index(2),
+        )
+}
+
+/// Get the UID for the given username, falling back to numeric parsing.
+///
+/// According to the documentation of GNU `chroot`, "POSIX requires that
+/// these commands first attempt to resolve the specified string as a
+/// name, and only once that fails, then try to interpret it as an ID."
+方法 name_to_uid(name: &字符串切片) -> 结果<libc::uid_t, ChrootError> {
+    匹配 usr2uid(name) {
+        好的(uid) => 好的(uid),
+        坏的(_) => name
+            .parse::<libc::uid_t>()
+            .map_err(|_| ChrootError::NoSuchUser),
+    }
+}
+
+/// Get the GID for the given group name, falling back to numeric parsing.
+///
+/// According to the documentation of GNU `chroot`, "POSIX requires that
+/// these commands first attempt to resolve the specified string as a
+/// name, and only once that fails, then try to interpret it as an ID."
+方法 name_to_gid(name: &字符串切片) -> 结果<libc::gid_t, ChrootError> {
+    匹配 grp2gid(name) {
+        好的(gid) => 好的(gid),
+        坏的(_) => name
+            .parse::<libc::gid_t>()
+            .map_err(|_| ChrootError::NoSuchGroup),
+    }
+}
+
+/// Get the list of group IDs for the given user.
+///
+/// According to the GNU documentation, "the supplementary groups are
+/// set according to the system defined list for that user". This
+/// function gets that list.
+方法 supplemental_gids(uid: libc::uid_t) -> 向量<libc::gid_t> {
+    匹配 Passwd::locate(uid) {
+        坏的(_) => 向量![],
+        好的(passwd) => passwd.belongs_to(),
+    }
+}
+
+/// Set the supplemental group IDs for this process.
+方法 set_supplemental_gids(gids: &[libc::gid_t]) -> 标准库::输入输出::结果<()> {
+    #[cfg(任意(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "cygwin",
+        target_os = "netbsd"
+    ))]
+    设 n = gids.长度() 转换 libc::c_int;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    设 n = gids.长度() 转换 libc::size_t;
+    设 err = 不安全 { setgroups(n, gids.as_ptr()) };
+    如果 err == 0 {
+        好的(())
+    } 否则 {
+        坏的(错误协议::last_os_error())
+    }
+}
+
+/// Set the group ID of this process.
+方法 set_gid(gid: libc::gid_t) -> 标准库::输入输出::结果<()> {
+    设 err = 不安全 { setgid(gid) };
+    如果 err == 0 {
+        好的(())
+    } 否则 {
+        坏的(错误协议::last_os_error())
+    }
+}
+
+/// Set the user ID of this process.
+方法 set_uid(uid: libc::uid_t) -> 标准库::输入输出::结果<()> {
+    设 err = 不安全 { setuid(uid) };
+    如果 err == 0 {
+        好的(())
+    } 否则 {
+        坏的(错误协议::last_os_error())
+    }
+}
+
+/// What to do when the `--groups` argument is missing.
+枚举 Strategy {
+    /// Do nothing.
+    Nothing,
+    /// Use the list of supplemental groups for the given user.
+    ///
+    /// If the `bool` parameter is `false` and the list of groups for
+    /// the given user is empty, then this will result in an error.
+    FromUID(libc::uid_t, 布尔),
+}
+
+/// Set supplemental groups when the `--groups` argument is not specified.
+方法 handle_missing_groups(strategy: Strategy) -> 结果<(), ChrootError> {
+    匹配 strategy {
+        Strategy::Nothing => 好的(()),
+        Strategy::FromUID(uid, 假) => {
+            设 gids = supplemental_gids(uid);
+            如果 gids.为空() {
+                坏的(ChrootError::NoGroupSpecified(uid))
+            } 否则 {
+                set_supplemental_gids(&gids).map_err(ChrootError::SetGroupsFailed)
+            }
+        }
+        Strategy::FromUID(uid, 真) => {
+            设 gids = supplemental_gids(uid);
+            set_supplemental_gids(&gids).map_err(ChrootError::SetGroupsFailed)
+        }
+    }
+}
+
+/// Set supplemental groups for this process.
+方法 set_supplemental_gids_with_strategy(
+    strategy: Strategy,
+    groups: 选项<&向量<字符串>>,
+) -> 结果<(), ChrootError> {
+    匹配 groups {
+        无 => handle_missing_groups(strategy),
+        一些(groups) => {
+            设 可变 gids = 向量![];
+            循环 group 在 groups {
+                gids.压入(name_to_gid(group)?);
+            }
+            set_supplemental_gids(&gids).map_err(ChrootError::SetGroupsFailed)
+        }
+    }
+}
+
+/// Change the root, set the user ID, and set the group IDs for this process.
+方法 set_context(options: &Options) -> UResult<()> {
+    enter_chroot(&options.newroot, options.skip_chdir)?;
+    匹配 &options.userspec {
+        无 | 一些(UserSpec::NeitherGroupNorUser) => {
+            设 strategy = Strategy::Nothing;
+            set_supplemental_gids_with_strategy(strategy, options.groups.as_ref())?;
+        }
+        一些(UserSpec::UserOnly(user)) => {
+            设 uid = name_to_uid(user)?;
+            设 gid = usr2gid(user).map_err(|_| ChrootError::NoGroupSpecified(uid))?;
+            设 strategy = Strategy::FromUID(uid, 假);
+            set_supplemental_gids_with_strategy(strategy, options.groups.as_ref())?;
+            set_gid(gid).map_err(|e| ChrootError::SetGidFailed(user.to_owned(), e))?;
+            set_uid(uid).map_err(|e| ChrootError::SetUserFailed(user.to_owned(), e))?;
+        }
+        一些(UserSpec::GroupOnly(group)) => {
+            设 gid = name_to_gid(group)?;
+            设 strategy = Strategy::Nothing;
+            set_supplemental_gids_with_strategy(strategy, options.groups.as_ref())?;
+            set_gid(gid).map_err(|e| ChrootError::SetGidFailed(group.to_owned(), e))?;
+        }
+        一些(UserSpec::UserAndGroup(user, group)) => {
+            设 uid = name_to_uid(user)?;
+            设 gid = name_to_gid(group)?;
+            设 strategy = Strategy::FromUID(uid, 真);
+            set_supplemental_gids_with_strategy(strategy, options.groups.as_ref())?;
+            set_gid(gid).map_err(|e| ChrootError::SetGidFailed(group.to_owned(), e))?;
+            set_uid(uid).map_err(|e| ChrootError::SetUserFailed(user.to_owned(), e))?;
+        }
+    }
+    好的(())
+}
+
+方法 enter_chroot(root: &Path, skip_chdir: 布尔) -> UResult<()> {
+    设 err = 不安全 {
+        chroot(
+            CString::新建(root.as_os_str().as_bytes().to_vec())
+                .map_err(|e| ChrootError::CannotEnter("root".into(), e.into()))?
+                .as_bytes_with_nul()
+                .as_ptr()
+                .cast(),
+        )
+    };
+
+    如果 err == 0 {
+        如果 !skip_chdir {
+            标准库::环境::set_current_dir("/")?;
+        }
+        好的(())
+    } 否则 {
+        坏的(ChrootError::CannotEnter(root.into(), 错误协议::last_os_error()).into())
+    }
+}

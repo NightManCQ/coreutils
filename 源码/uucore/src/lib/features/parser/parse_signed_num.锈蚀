@@ -1,0 +1,228 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Parser for signed numeric arguments used by head, tail, and similar utilities.
+//!
+//! These utilities accept arguments like `-5`, `+10`, `-100K` where the leading
+//! sign indicates different behavior (e.g., "first N" vs "last N" vs "starting from N").
+
+使用 超级::parse_size::{ParseSizeError, parse_size_u64, parse_size_u64_max};
+
+/// The sign prefix found on a numeric argument.
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 SignPrefix {
+    /// Plus sign prefix (e.g., "+10")
+    Plus,
+    /// Minus sign prefix (e.g., "-10")
+    Minus,
+}
+
+/// A parsed signed numeric argument.
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 结构 SignedNum {
+    /// The numeric value
+    公有 value: 正64,
+    /// The sign prefix that was present, if any
+    公有 sign: 选项<SignPrefix>,
+}
+
+实现 SignedNum {
+    /// Returns true if the value is zero.
+    公有 方法 is_zero(&自身) -> 布尔 {
+        自身.value == 0
+    }
+
+    /// Returns true if a plus sign was present.
+    公有 方法 has_plus(&自身) -> 布尔 {
+        自身.sign == 一些(SignPrefix::Plus)
+    }
+
+    /// Returns true if a minus sign was present.
+    公有 方法 has_minus(&自身) -> 布尔 {
+        自身.sign == 一些(SignPrefix::Minus)
+    }
+}
+
+/// Parse a signed numeric argument, clamping to u64::MAX on overflow.
+///
+/// This function parses strings like "10", "+5K", "-100M" where:
+/// - The optional leading `+` or `-` indicates direction/behavior
+/// - The number can have size suffixes (K, M, G, etc.)
+///
+/// # Arguments
+/// * `src` - The string to parse
+///
+/// # Returns
+/// * `Ok(SignedNum)` - The parsed value and sign
+/// * `Err(ParseSizeError)` - If the string cannot be parsed
+///
+/// # Examples
+/// ```ignore
+/// use uucore::parser::parse_signed_num::parse_signed_num_max;
+///
+/// let result = parse_signed_num_max("10").unwrap();
+/// assert_eq!(result.value, 10);
+/// assert_eq!(result.sign, None);
+///
+/// let result = parse_signed_num_max("+5K").unwrap();
+/// assert_eq!(result.value, 5 * 1024);
+/// assert_eq!(result.sign, Some(SignPrefix::Plus));
+///
+/// let result = parse_signed_num_max("-100").unwrap();
+/// assert_eq!(result.value, 100);
+/// assert_eq!(result.sign, Some(SignPrefix::Minus));
+/// ```
+公有 方法 parse_signed_num_max(src: &字符串切片) -> 结果<SignedNum, ParseSizeError> {
+    设 (sign, size_string) = strip_sign_prefix(src);
+
+    // Empty string after stripping sign is an error
+    如果 size_string.为空() {
+        返回 坏的(ParseSizeError::ParseFailure(src.to_string()));
+    }
+
+    // Remove leading zeros so size is interpreted as decimal, not octal
+    设 trimmed = size_string.trim_start_matches('0');
+    设 value = 如果 trimmed.为空() {
+        // All zeros (e.g., "000" or "0")
+        0
+    } 否则 {
+        parse_size_u64_max(trimmed)?
+    };
+
+    好的(SignedNum { value, sign })
+}
+
+/// Parse a signed numeric argument, returning error on overflow.
+///
+/// Same as [`parse_signed_num_max`] but returns an error instead of clamping
+/// when the value overflows u64.
+///
+/// Note: On parse failure, this returns an error with the raw string (without quotes)
+/// to allow callers to format the error message as needed.
+公有 方法 parse_signed_num(src: &字符串切片) -> 结果<SignedNum, ParseSizeError> {
+    设 (sign, size_string) = strip_sign_prefix(src);
+
+    // Empty string after stripping sign is an error
+    如果 size_string.为空() {
+        返回 坏的(ParseSizeError::ParseFailure(src.to_string()));
+    }
+
+    // Use parse_size_u64 but on failure, create our own error with the raw string
+    // (without quotes) so callers can format it as needed
+    设 value = parse_size_u64(size_string)
+        .map_err(|_| ParseSizeError::ParseFailure(size_string.to_string()))?;
+
+    好的(SignedNum { value, sign })
+}
+
+/// Strip the sign prefix from a string and return both the sign and remaining string.
+方法 strip_sign_prefix(src: &字符串切片) -> (选项<SignPrefix>, &字符串切片) {
+    设 trimmed = src.trim();
+
+    如果 设 一些(rest) = trimmed.strip_prefix('+') {
+        (一些(SignPrefix::Plus), rest)
+    } 否则 如果 设 一些(rest) = trimmed.strip_prefix('-') {
+        (一些(SignPrefix::Minus), rest)
+    } 否则 {
+        (无, trimmed)
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_no_sign() {
+        设 result = parse_signed_num_max("10").解包();
+        相等断言!(result.value, 10);
+        相等断言!(result.sign, 无);
+        断言!(!result.has_plus());
+        断言!(!result.has_minus());
+    }
+
+    #[test]
+    方法 test_plus_sign() {
+        设 result = parse_signed_num_max("+10").解包();
+        相等断言!(result.value, 10);
+        相等断言!(result.sign, 一些(SignPrefix::Plus));
+        断言!(result.has_plus());
+        断言!(!result.has_minus());
+    }
+
+    #[test]
+    方法 test_minus_sign() {
+        设 result = parse_signed_num_max("-10").解包();
+        相等断言!(result.value, 10);
+        相等断言!(result.sign, 一些(SignPrefix::Minus));
+        断言!(!result.has_plus());
+        断言!(result.has_minus());
+    }
+
+    #[test]
+    方法 test_with_suffix() {
+        设 result = parse_signed_num_max("+5K").解包();
+        相等断言!(result.value, 5 * 1024);
+        断言!(result.has_plus());
+
+        设 result = parse_signed_num_max("-2M").解包();
+        相等断言!(result.value, 2 * 1024 * 1024);
+        断言!(result.has_minus());
+    }
+
+    #[test]
+    方法 test_zero() {
+        设 result = parse_signed_num_max("0").解包();
+        相等断言!(result.value, 0);
+        断言!(result.is_zero());
+
+        设 result = parse_signed_num_max("+0").解包();
+        相等断言!(result.value, 0);
+        断言!(result.is_zero());
+        断言!(result.has_plus());
+
+        设 result = parse_signed_num_max("-0").解包();
+        相等断言!(result.value, 0);
+        断言!(result.is_zero());
+        断言!(result.has_minus());
+    }
+
+    #[test]
+    方法 test_leading_zeros() {
+        设 result = parse_signed_num_max("007").解包();
+        相等断言!(result.value, 7);
+
+        设 result = parse_signed_num_max("+007").解包();
+        相等断言!(result.value, 7);
+        断言!(result.has_plus());
+
+        设 result = parse_signed_num_max("000").解包();
+        相等断言!(result.value, 0);
+    }
+
+    #[test]
+    方法 test_whitespace() {
+        设 result = parse_signed_num_max("  10  ").解包();
+        相等断言!(result.value, 10);
+
+        设 result = parse_signed_num_max("  +10  ").解包();
+        相等断言!(result.value, 10);
+        断言!(result.has_plus());
+    }
+
+    #[test]
+    方法 test_overflow_max() {
+        // Should clamp to u64::MAX instead of error
+        设 result = parse_signed_num_max("99999999999999999999999999").解包();
+        相等断言!(result.value, 正64::MAX);
+    }
+
+    #[test]
+    方法 test_invalid() {
+        断言!(parse_signed_num_max("").is_err());
+        断言!(parse_signed_num_max("abc").is_err());
+        断言!(parse_signed_num_max("++10").is_err());
+    }
+}

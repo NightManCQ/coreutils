@@ -1,0 +1,77 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Traits and implementations for iterating over lines in a file-like object.
+//!
+//! This module provides a [`WordCountable`] trait and implementations
+//! for some common file-like objects. Use the [`WordCountable::buffered`]
+//! method to get an iterator over lines of a file-like object.
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, Read, StdinLock};
+
+#[cfg(unix)]
+使用 标准库::操作系统::fd::{AsFd, AsRawFd};
+
+#[cfg(unix)]
+公有 协议 WordCountable: AsFd + AsRawFd + Read {
+    类型 Buffered: BufRead;
+    方法 buffered(自身) -> 自身类型::Buffered;
+    方法 inner_file(&可变 自身) -> 选项<&可变 File>;
+}
+
+#[cfg(全部(not(unix), not(target_os = "wasi")))]
+公有 协议 WordCountable: Read {
+    类型 Buffered: BufRead;
+    方法 buffered(自身) -> 自身类型::Buffered;
+    方法 inner_file(&可变 自身) -> 选项<&可变 File>;
+}
+
+#[cfg(target_os = "wasi")]
+公有 协议 WordCountable: Read {
+    类型 Buffered: BufRead;
+    方法 buffered(自身) -> 自身类型::Buffered;
+}
+
+#[cfg(not(target_os = "wasi"))]
+实现 WordCountable 循环 StdinLock<'_> {
+    类型 Buffered = 自身类型;
+
+    方法 buffered(自身) -> 自身类型::Buffered {
+        自身
+    }
+    方法 inner_file(&可变 自身) -> 选项<&可变 File> {
+        无
+    }
+}
+
+#[cfg(target_os = "wasi")]
+实现 WordCountable 循环 StdinLock<'_> {
+    类型 Buffered = 自身类型;
+
+    方法 buffered(自身) -> 自身类型::Buffered {
+        自身
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+实现 WordCountable 循环 File {
+    类型 Buffered = BufReader<自身类型>;
+
+    方法 buffered(自身) -> 自身类型::Buffered {
+        BufReader::新建(自身)
+    }
+
+    方法 inner_file(&可变 自身) -> 选项<&可变 File> {
+        一些(自身)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+实现 WordCountable 循环 File {
+    类型 Buffered = BufReader<自身类型>;
+
+    方法 buffered(自身) -> 自身类型::Buffered {
+        BufReader::新建(自身)
+    }
+}

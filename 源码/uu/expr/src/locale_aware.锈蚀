@@ -1,0 +1,111 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::比较::排序顺序;
+
+使用 uucore::{
+    CharByte, IntoCharByteIterator,
+    i18n::{
+        UEncoding,
+        collator::{AlternateHandling, CollatorOptions, locale_cmp, try_init_collator},
+        get_locale_encoding,
+    },
+};
+
+使用 箱::syntax_tree::{MaybeNonUtf8Str, MaybeNonUtf8String};
+
+/// Perform a locale-aware string comparison using the current locale's
+/// collator.
+公有(箱) 方法 locale_comparison(a: &MaybeNonUtf8Str, b: &MaybeNonUtf8Str) -> 排序顺序 {
+    // Initialize the collator
+    设 可变 opts = CollatorOptions::默认();
+    opts.alternate_handling = 一些(AlternateHandling::Shifted); // This is black magic
+    设 _ = try_init_collator(opts);
+
+    locale_cmp(a, b)
+}
+
+/// Perform an index search with an approach that differs with regard to the
+/// given locale.
+方法 index_with_locale(
+    left: &MaybeNonUtf8Str,
+    right: &MaybeNonUtf8Str,
+    encoding: UEncoding,
+) -> 正整数大小 {
+    匹配 encoding {
+        UEncoding::Utf8 => {
+            // In the UTF-8 case, we try to decode the strings on the fly. We
+            // compare UTf-8 characters as long as the stream is valid, and
+            // switch to byte comparison when the byte is an invalid sequence.
+            left.iter_char_bytes()
+                .position(|ch_h| right.iter_char_bytes().任意(|ch_n| ch_n == ch_h))
+                .map_or(0, |idx| idx + 1)
+        }
+        UEncoding::Ascii => {
+            // In the default case, we just perform byte-wise comparison on the
+            // arrays.
+            left.迭代()
+                .position(|ch_h| right.迭代().任意(|ch_n| ch_n == ch_h))
+                .map_or(0, |idx| idx + 1)
+        }
+    }
+}
+
+/// Perform an index search with an approach that differs with regard to the
+/// current locale.
+公有(箱) 方法 locale_aware_index(left: &MaybeNonUtf8Str, right: &MaybeNonUtf8Str) -> 正整数大小 {
+    index_with_locale(left, right, get_locale_encoding())
+}
+
+/// Perform a string length calculation depending on the current locale. In
+/// UTF-8 locale, it will count valid UTF-8 chars, and fallback to counting
+/// bytes otherwise. In Non UTF-8 locale, directly return input byte length.
+公有(箱) 方法 locale_aware_length(input: &MaybeNonUtf8Str) -> 正整数大小 {
+    匹配 get_locale_encoding() {
+        UEncoding::Utf8 => 标准库::字符串切片::from_utf8(input).map_or(input.长度(), |s| s.chars().计数()),
+        UEncoding::Ascii => input.长度(),
+    }
+}
+
+方法 substr_with_locale(
+    s: MaybeNonUtf8String,
+    pos: 正整数大小,
+    长度: 正整数大小,
+    encoding: UEncoding,
+) -> MaybeNonUtf8String {
+    匹配 encoding {
+        UEncoding::Utf8 => {
+            // Create a buffer with the heuristic that all the chars are ASCII
+            // and are 1-byte long.
+            设 可变 string = MaybeNonUtf8String::with_capacity(长度);
+            设 可变 buf = [0; 4];
+
+            // Iterate on char-bytes, and skip them accordingly.
+            // For each character (or byte) in the right range,
+            // push it to the string.
+            循环 cb 在 s.iter_char_bytes().skip(pos).take(长度) {
+                匹配 cb {
+                    CharByte::Char(c) => {
+                        设 长度 = c.encode_utf8(&可变 buf).长度();
+                        string.extend(&buf[..长度]);
+                    }
+                    CharByte::Byte(b) => string.压入(b),
+                }
+            }
+            string
+        }
+        UEncoding::Ascii => s.into_iter().skip(pos).take(长度).收集(),
+    }
+}
+
+/// Given a byte sequence, a position and a length, return the corresponding
+/// substring depending on the current locale.
+公有(箱) 方法 locale_aware_substr(
+    s: MaybeNonUtf8String,
+    pos: 正整数大小,
+    长度: 正整数大小,
+) -> MaybeNonUtf8String {
+    substr_with_locale(s, pos, 长度, get_locale_encoding())
+}

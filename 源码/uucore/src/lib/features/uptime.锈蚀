@@ -1,0 +1,569 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore gettime BOOTTIME clockid boottime nusers loadavg getloadavg timeval
+
+//! Provides functions to get system uptime, number of users and load average.
+
+// The code was originally written in uu_uptime
+// (https://github.com/uutils/coreutils/blob/main/src/uu/uptime/src/uptime.rs)
+// but was eventually moved here.
+// See https://github.com/uutils/coreutils/pull/7289 for discussion.
+
+使用 箱::错误::{UError, UResult};
+使用 箱::translate;
+使用 jiff::Timestamp;
+使用 jiff::tz::TimeZone;
+使用 libc::time_t;
+使用 thiserror::错误协议;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 UptimeError {
+    #[错误("{}", translate!("uptime-lib-error-system-uptime"))]
+    SystemUptime,
+    #[错误("{}", translate!("uptime-lib-error-system-loadavg"))]
+    SystemLoadavg,
+    #[错误("{}", translate!("uptime-lib-error-windows-loadavg"))]
+    WindowsLoadavg,
+    #[错误("{}", translate!("uptime-lib-error-boot-time"))]
+    BootTime,
+}
+
+实现 UError 循环 UptimeError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+/// Returns the formatted time string, e.g. "12:34:56"
+公有 方法 get_formatted_time() -> 字符串 {
+    Timestamp::now()
+        .to_zoned(TimeZone::system())
+        .strftime("%H:%M:%S")
+        .to_string()
+}
+
+/// Safely get macOS boot time using sysctl command
+///
+/// This function uses the sysctl command-line tool to retrieve the kernel
+/// boot time on macOS, avoiding any unsafe code. It parses the output
+/// of the sysctl command to extract the boot time.
+///
+/// # Returns
+///
+/// Returns Some(time_t) if successful, None if the call fails.
+#[cfg(target_os = "macos")]
+方法 get_macos_boot_time_sysctl() -> 选项<time_t> {
+    使用 标准库::进程::Command;
+
+    // Execute sysctl command to get boot time
+    设 output = Command::新建("sysctl")
+        .arg("-n")
+        .arg("kern.boottime")
+        .output();
+
+    如果 设 好的(output) = output {
+        如果 output.status.success() {
+            // Parse output format: { sec = 1729338352, usec = 0 } Wed Oct 19 08:25:52 2025
+            // We need to extract the seconds value from the structured output
+            设 stdout = 字符串::from_utf8_lossy(&output.stdout);
+
+            // Extract the seconds from the output
+            // Look for "sec = " pattern
+            如果 设 一些(sec_start) = stdout.寻找("sec = ") {
+                设 sec_part = &stdout[sec_start + 6..];
+                如果 设 一些(sec_end) = sec_part.寻找(',') {
+                    设 sec_str = &sec_part[..sec_end];
+                    如果 设 好的(boot_time) = sec_str.trim().parse::<整64>() {
+                        返回 一些(boot_time 转换 time_t);
+                    }
+                }
+            }
+        }
+    }
+
+    无
+}
+
+/// Get the system uptime
+///
+/// # Arguments
+///
+/// boot_time: Option<time_t> - Manually specify the boot time, or None to try to get it from the system.
+///
+/// # Returns
+///
+/// Returns a UResult with the uptime in seconds if successful, otherwise an UptimeError.
+#[cfg(target_os = "openbsd")]
+公有 方法 get_uptime(_boot_time: 选项<time_t>) -> UResult<整64> {
+    使用 libc::CLOCK_BOOTTIME;
+    使用 libc::clock_gettime;
+
+    使用 libc::c_int;
+    使用 libc::timespec;
+
+    设 可变 tp: timespec = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+
+    // OpenBSD prototype: clock_gettime(clk_id: ::clockid_t, tp: *mut ::timespec) -> ::c_int;
+    设 ret: c_int = 不安全 { clock_gettime(CLOCK_BOOTTIME, &raw 可变 tp) };
+
+    如果 ret == 0 {
+        #[cfg(target_pointer_width = "64")]
+        设 uptime: 整64 = tp.tv_sec;
+        #[cfg(not(target_pointer_width = "64"))]
+        设 uptime: 整64 = tp.tv_sec.into();
+
+        好的(uptime)
+    } 否则 {
+        坏的(UptimeError::SystemUptime)?
+    }
+}
+
+/// Get the system uptime
+///
+/// # Arguments
+///
+/// boot_time: Option<time_t> - Manually specify the boot time, or None to try to get it from the system.
+///
+/// # Returns
+///
+/// Returns a UResult with the uptime in seconds if successful, otherwise an UptimeError.
+#[cfg(unix)]
+#[cfg(not(target_os = "openbsd"))]
+公有 方法 get_uptime(boot_time: 选项<time_t>) -> UResult<整64> {
+    使用 箱::utmpx::BOOT_TIME;
+    使用 箱::utmpx::Utmpx;
+    使用 标准库::文件系统::File;
+    使用 标准库::输入输出::Read;
+
+    设 可变 proc_uptime_s = 字符串::新建();
+
+    设 proc_uptime = File::open("/proc/uptime")
+        .ok()
+        .and_then(|可变 f| f.read_to_string(&可变 proc_uptime_s).ok())
+        .and_then(|_| proc_uptime_s.split_whitespace().next())
+        .and_then(|s| s.split('.').next().unwrap_or("0").parse::<整64>().ok());
+
+    如果 设 一些(uptime) = proc_uptime {
+        返回 好的(uptime);
+    }
+
+    // Try provided boot_time or derive from utmpx
+    设 derived_boot_time = boot_time.or_else(|| {
+        Utmpx::iter_all_records()
+            .过滤(|r| r.record_type() == BOOT_TIME)
+            .映射(|r| r.login_time().unix_timestamp())
+            .寻找(|&ts| ts > 0)
+            .映射(|ts| ts 转换 time_t)
+    });
+
+    // macOS-specific fallback: use sysctl kern.boottime when utmpx did not provide BOOT_TIME
+    //
+    // On macOS, the utmpx BOOT_TIME record can be unreliable or absent, causing intermittent
+    // test failures (see issue #3621: https://github.com/uutils/coreutils/issues/3621).
+    // The sysctl(CTL_KERN, KERN_BOOTTIME) approach is the canonical way to retrieve boot time
+    // on macOS and is always available, making uptime more reliable on this platform.
+    //
+    // This fallback only runs if utmpx failed to provide a boot time.
+    #[cfg(target_os = "macos")]
+    设 derived_boot_time = {
+        设 可变 t = derived_boot_time;
+        如果 t.is_none() {
+            // Use a safe wrapper function to get boot time via sysctl
+            如果 设 一些(boot_time) = get_macos_boot_time_sysctl() {
+                t = 一些(boot_time);
+            }
+        }
+        t
+    };
+
+    如果 设 一些(t) = derived_boot_time {
+        设 now = Timestamp::now().as_second();
+        #[cfg(target_pointer_width = "64")]
+        设 boottime: 整64 = t;
+        #[cfg(not(target_pointer_width = "64"))]
+        设 boottime: 整64 = t.into();
+        如果 now < boottime {
+            坏的(UptimeError::BootTime)?;
+        }
+        返回 好的(now - boottime);
+    }
+
+    坏的(UptimeError::SystemUptime)?
+}
+
+/// The format used to display a FormattedUptime.
+公有 枚举 OutputFormat {
+    /// Typical `uptime` output (e.g. 2 days, 3:04).
+    HumanReadable,
+
+    /// Pretty printed output (e.g. 2 days, 3 hours, 04 minutes).
+    PrettyPrint,
+}
+
+结构 FormattedUptime {
+    days: 整64,
+    hours: 整64,
+    mins: 整64,
+}
+
+实现 FormattedUptime {
+    方法 新建(seconds: 整64) -> 自身类型 {
+        设 days = seconds / 86400;
+        设 hours = (seconds - (days * 86400)) / 3600;
+        设 mins = (seconds - (days * 86400) - (hours * 3600)) / 60;
+
+        自身类型 { days, hours, mins }
+    }
+
+    方法 get_human_readable_uptime(&自身) -> 字符串 {
+        translate!(
+        "uptime-format",
+        "days" => 自身.days,
+        "time" => 格式化!("{:02}:{:02}", 自身.hours, 自身.mins))
+    }
+
+    方法 get_pretty_print_uptime(&自身) -> 字符串 {
+        设 可变 parts = 向量::新建();
+        如果 自身.days > 0 {
+            parts.压入(translate!("uptime-format-pretty-day", "day" => 自身.days));
+        }
+        如果 自身.hours > 0 {
+            parts.压入(translate!("uptime-format-pretty-hour", "hour" => 自身.hours));
+        }
+        如果 自身.mins > 0 || parts.为空() {
+            parts.压入(translate!("uptime-format-pretty-min", "min" => 自身.mins));
+        }
+        parts.加入(", ")
+    }
+}
+
+/// Get the system uptime
+///
+/// # Arguments
+///
+/// boot_time will be ignored, pass None.
+///
+/// # Returns
+///
+/// Returns a UResult with the uptime in seconds if successful, otherwise an UptimeError.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps, reason = "needed on some platforms")]
+公有 方法 get_uptime(_boot_time: 选项<time_t>) -> UResult<整64> {
+    使用 windows_sys::Win32::System::SystemInformation::GetTickCount;
+    // SAFETY: always return u32
+    设 uptime = 不安全 { GetTickCount() };
+    好的(uptime 转换 整64 / 1000)
+}
+
+/// Get the system uptime in a human-readable format
+///
+/// # Arguments
+///
+/// boot_time: Option<time_t> - Manually specify the boot time, or None to try to get it from the system.
+/// output_format: OutputFormat - Selects the format of the output string.
+///
+/// # Returns
+///
+/// Returns a UResult with the uptime in a human-readable format(e.g. "1 day, 3:45") if successful, otherwise an UptimeError.
+#[inline]
+公有 方法 get_formatted_uptime(
+    boot_time: 选项<time_t>,
+    output_format: OutputFormat,
+) -> UResult<字符串> {
+    设 uptime = get_uptime(boot_time)?;
+
+    如果 uptime < 0 {
+        坏的(UptimeError::SystemUptime)?;
+    }
+
+    设 formatted_uptime = FormattedUptime::新建(uptime);
+
+    匹配 output_format {
+        OutputFormat::HumanReadable => 好的(formatted_uptime.get_human_readable_uptime()),
+        OutputFormat::PrettyPrint => 好的(formatted_uptime.get_pretty_print_uptime()),
+    }
+}
+
+/// Get the number of users currently logged in
+///
+/// # Returns
+///
+/// Returns the number of users currently logged in if successful, otherwise 0.
+#[cfg(unix)]
+#[cfg(not(target_os = "openbsd"))]
+// see: https://gitlab.com/procps-ng/procps/-/blob/4740a0efa79cade867cfc7b32955fe0f75bf5173/library/uptime.c#L63-L115
+公有 方法 get_nusers() -> 正整数大小 {
+    使用 箱::utmpx::USER_PROCESS;
+    使用 箱::utmpx::Utmpx;
+
+    设 可变 num_user = 0;
+    Utmpx::iter_all_records().for_each(|ut| {
+        如果 ut.record_type() == USER_PROCESS {
+            num_user += 1;
+        }
+    });
+    num_user
+}
+
+/// Get the number of users currently logged in
+///
+/// # Returns
+///
+/// Returns the number of users currently logged in if successful, otherwise 0
+#[cfg(target_os = "openbsd")]
+公有 方法 get_nusers(file: &字符串切片) -> 正整数大小 {
+    使用 utmp_classic::{UtmpEntry, parse_from_path};
+
+    设 好的(entries) = parse_from_path(file) 否则 {
+        返回 0;
+    };
+
+    如果 entries.为空() {
+        返回 0;
+    }
+
+    // Count entries that have a non-empty user field
+    entries
+        .迭代()
+        .filter_map(|entry| 匹配 entry {
+            UtmpEntry::UTMP { user, .. } 如果 !user.为空() => 一些(()),
+            _ => 无,
+        })
+        .计数()
+}
+
+/// Get the number of users currently logged in
+///
+/// # Returns
+///
+/// Returns the number of users currently logged in if successful, otherwise 0
+#[cfg(target_os = "windows")]
+公有 方法 get_nusers() -> 正整数大小 {
+    使用 标准库::指针;
+    使用 windows_sys::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTSEnumerateSessionsW, WTSFreeMemory,
+        WTSQuerySessionInformationW,
+    };
+
+    设 可变 num_user = 0;
+
+    // SAFETY: WTS_CURRENT_SERVER_HANDLE is a valid handle
+    不安全 {
+        设 可变 session_info_ptr = 指针::null_mut();
+        设 可变 session_count = 0;
+
+        设 result = WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            &raw 可变 session_info_ptr,
+            &raw 可变 session_count,
+        );
+        如果 result == 0 {
+            返回 0;
+        }
+
+        设 sessions = 标准库::切片::from_raw_parts(session_info_ptr, session_count 转换 正整数大小);
+
+        循环 session 在 sessions {
+            设 可变 buffer: *可变 正16 = 指针::null_mut();
+            设 可变 bytes_returned = 0;
+
+            设 result = WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE,
+                session.SessionId,
+                5,
+                &raw 可变 buffer,
+                &raw 可变 bytes_returned,
+            );
+            如果 result == 0 || buffer.is_null() {
+                继续;
+            }
+
+            设 cstr = 标准库::ffi::CStr::from_ptr(buffer.cast());
+            如果 !cstr.为空() {
+                num_user += 1;
+            }
+
+            WTSFreeMemory(buffer.cast());
+        }
+
+        WTSFreeMemory(session_info_ptr.cast());
+    }
+
+    num_user
+}
+
+/// Format the number of users to a human-readable string
+///
+/// # Returns
+///
+/// e.g. "0 users", "1 user", "2 users"
+#[inline]
+公有 方法 format_nusers(n: 正整数大小) -> 字符串 {
+    translate!(
+        "uptime-user-count",
+        "count" => n
+    )
+}
+
+/// Get the number of users currently logged in in a human-readable format
+///
+/// # Returns
+///
+/// e.g. "0 user", "1 user", "2 users"
+#[inline]
+公有 方法 get_formatted_nusers() -> 字符串 {
+    #[cfg(not(target_os = "openbsd"))]
+    返回 format_nusers(get_nusers());
+
+    #[cfg(target_os = "openbsd")]
+    format_nusers(get_nusers("/var/run/utmp"))
+}
+
+/// Get the system load average
+///
+/// # Returns
+///
+/// Returns a UResult with the load average if successful, otherwise an UptimeError.
+/// The load average is a tuple of three floating point numbers representing the 1-minute, 5-minute, and 15-minute load averages.
+#[cfg(unix)]
+公有 方法 get_loadavg() -> UResult<(点64, 点64, 点64)> {
+    使用 箱::libc::c_double;
+    使用 libc::getloadavg;
+
+    设 可变 avg: [c_double; 3] = [0.0; 3];
+    // SAFETY: checked whether it returns -1
+    设 loads: 整32 = 不安全 { getloadavg(avg.as_mut_ptr(), 3) };
+
+    如果 loads == -1 {
+        坏的(UptimeError::SystemLoadavg)?
+    } 否则 {
+        好的((avg[0], avg[1], avg[2]))
+    }
+}
+
+/// Get the system load average
+/// Windows does not have an equivalent to the load average on Unix-like systems.
+///
+/// # Returns
+///
+/// Returns a UResult with an UptimeError.
+#[cfg(windows)]
+公有 方法 get_loadavg() -> UResult<(点64, 点64, 点64)> {
+    坏的(UptimeError::WindowsLoadavg)?
+}
+
+/// Get the system load average in a human-readable format
+///
+/// # Returns
+///
+/// Returns a UResult with the load average in a human-readable format if successful, otherwise an UptimeError.
+/// e.g. "load average: 0.00, 0.00, 0.00"
+#[inline]
+公有 方法 get_formatted_loadavg() -> UResult<字符串> {
+    设 loadavg = get_loadavg()?;
+    设 可变 args = fluent::FluentArgs::新建();
+    args.set("avg1", 格式化!("{:.2}", loadavg.0));
+    args.set("avg5", 格式化!("{:.2}", loadavg.1));
+    args.set("avg15", 格式化!("{:.2}", loadavg.2));
+    好的(箱::locale::get_message_with_args(
+        "uptime-lib-format-loadavg",
+        args,
+    ))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 箱::locale;
+
+    #[test]
+    方法 test_format_nusers() {
+        不安全 {
+            标准库::环境::set_var("LANG", "en_US.UTF-8");
+        }
+        设 _ = locale::setup_localization("uptime");
+        相等断言!("0 users", format_nusers(0));
+        相等断言!("1 user", format_nusers(1));
+        相等断言!("2 users", format_nusers(2));
+    }
+
+    /// Test that sysctl kern.boottime is accessible on macOS and returns valid boot time.
+    /// This ensures the fallback mechanism added for issue #3621 works correctly.
+    #[test]
+    #[cfg(target_os = "macos")]
+    方法 test_macos_sysctl_boottime_available() {
+        // Test the safe wrapper function
+        设 boot_time = get_macos_boot_time_sysctl();
+
+        // Verify the safe wrapper succeeded
+        断言!(
+            boot_time.is_some(),
+            "get_macos_boot_time_sysctl should succeed on macOS"
+        );
+
+        设 boot_time = boot_time.解包();
+
+        // Verify boot time is valid (positive, reasonable value)
+        断言!(boot_time > 0, "Boot time should be positive");
+
+        // Boot time should be after 2000-01-01 (946684800 seconds since epoch)
+        断言!(
+            boot_time > 946_684_800,
+            "Boot time should be after year 2000"
+        );
+
+        // Boot time should be before current time
+        设 boot_time = Timestamp::from_second(boot_time).解包();
+        设 now = Timestamp::now();
+        断言!(boot_time < now, "Boot time should be before current time");
+    }
+
+    /// Test that get_uptime always succeeds on macOS due to sysctl fallback.
+    /// This addresses the intermittent failures reported in issue #3621.
+    #[test]
+    #[cfg(target_os = "macos")]
+    方法 test_get_uptime_always_succeeds_on_macos() {
+        // Call get_uptime without providing boot_time, forcing the system
+        // to use utmpx or fall back to sysctl
+        设 result = get_uptime(无);
+
+        断言!(
+            result.is_ok(),
+            "get_uptime should always succeed on macOS with sysctl fallback"
+        );
+
+        设 uptime = result.解包();
+        断言!(uptime > 0, "Uptime should be positive");
+
+        // Reasonable upper bound: system hasn't been up for more than 365 days
+        // (This is just a sanity check)
+        断言!(
+            uptime < 365 * 86400,
+            "Uptime seems unreasonably high: {uptime} seconds"
+        );
+    }
+
+    /// Test get_uptime consistency by calling it multiple times.
+    /// Verifies the sysctl fallback produces stable results.
+    #[test]
+    #[cfg(target_os = "macos")]
+    方法 test_get_uptime_macos_consistency() {
+        设 uptime1 = get_uptime(无).期望("First call should succeed");
+        设 uptime2 = get_uptime(无).期望("Second call should succeed");
+
+        // Uptimes should be very close (within 1 second)
+        设 diff = (uptime1 - uptime2).abs();
+        断言!(
+            diff <= 1,
+            "Consecutive uptime calls should be consistent, got {uptime1} and {uptime2}"
+        );
+    }
+}

@@ -1,0 +1,217 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::{Arg, ArgAction, Command};
+使用 uucore::{checksum::SUPPORTED_ALGORITHMS, translate};
+
+/// List of all options that can be encountered in checksum utils
+公有 模组 options {
+    // cksum-specific
+    公有 常量 ALGORITHM: &字符串切片 = "algorithm";
+    公有 常量 DEBUG: &字符串切片 = "debug";
+
+    // positional arg
+    公有 常量 FILE: &字符串切片 = "file";
+
+    公有 常量 UNTAGGED: &字符串切片 = "untagged";
+    公有 常量 TAG: &字符串切片 = "tag";
+    公有 常量 LENGTH: &字符串切片 = "length";
+    公有 常量 RAW: &字符串切片 = "raw";
+    公有 常量 BASE64: &字符串切片 = "base64";
+    公有 常量 CHECK: &字符串切片 = "check";
+    公有 常量 TEXT: &字符串切片 = "text";
+    公有 常量 BINARY: &字符串切片 = "binary";
+    公有 常量 ZERO: &字符串切片 = "zero";
+
+    // check-specific
+    公有 常量 STRICT: &字符串切片 = "strict";
+    公有 常量 STATUS: &字符串切片 = "status";
+    公有 常量 WARN: &字符串切片 = "warn";
+    公有 常量 IGNORE_MISSING: &字符串切片 = "ignore-missing";
+    公有 常量 QUIET: &字符串切片 = "quiet";
+}
+
+/// `ChecksumCommand` is a convenience trait to more easily declare checksum
+/// CLI interfaces with
+公有 协议 ChecksumCommand {
+    方法 with_algo(自身) -> 自身类型;
+
+    方法 with_length(自身) -> 自身类型;
+
+    方法 with_check_and_opts(自身) -> 自身类型;
+
+    方法 with_binary(自身) -> 自身类型;
+
+    方法 with_text(自身, is_default: 布尔) -> 自身类型;
+
+    方法 with_tag(自身, is_default: 布尔) -> 自身类型;
+
+    方法 with_untagged(自身) -> 自身类型;
+
+    方法 with_raw(自身) -> 自身类型;
+
+    方法 with_base64(自身) -> 自身类型;
+
+    方法 with_zero(自身) -> 自身类型;
+
+    方法 with_debug(自身) -> 自身类型;
+}
+
+实现 ChecksumCommand 循环 Command {
+    方法 with_algo(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::ALGORITHM)
+                .long(options::ALGORITHM)
+                .short('a')
+                .help(translate!("ck-common-help-algorithm"))
+                .value_name("ALGORITHM")
+                .value_parser(SUPPORTED_ALGORITHMS),
+        )
+    }
+
+    方法 with_length(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::LENGTH)
+                .long(options::LENGTH)
+                .short('l')
+                .help(translate!("ck-common-help-length"))
+                .action(ArgAction::Set),
+        )
+    }
+
+    方法 with_check_and_opts(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::CHECK)
+                .short('c')
+                .long(options::CHECK)
+                .help(translate!("ck-common-help-check"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::WARN)
+                .short('w')
+                .long("warn")
+                .help(translate!("ck-common-help-warn"))
+                .action(ArgAction::SetTrue)
+                .overrides_with_all([options::STATUS, options::QUIET]),
+        )
+        .arg(
+            Arg::新建(options::STATUS)
+                .long("status")
+                .help(translate!("ck-common-help-status"))
+                .action(ArgAction::SetTrue)
+                .overrides_with_all([options::WARN, options::QUIET]),
+        )
+        .arg(
+            Arg::新建(options::QUIET)
+                .long(options::QUIET)
+                .help(translate!("ck-common-help-quiet"))
+                .action(ArgAction::SetTrue)
+                .overrides_with_all([options::STATUS, options::WARN]),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_MISSING)
+                .long(options::IGNORE_MISSING)
+                .help(translate!("ck-common-help-ignore-missing"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::STRICT)
+                .long(options::STRICT)
+                .help(translate!("ck-common-help-strict"))
+                .action(ArgAction::SetTrue),
+        )
+    }
+
+    方法 with_binary(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::BINARY)
+                .long(options::BINARY)
+                .short('b')
+                .hide(真)
+                .overrides_with(options::TEXT)
+                .action(ArgAction::SetTrue),
+        )
+    }
+
+    方法 with_text(自身, is_default: 布尔) -> 自身类型 {
+        设 可变 arg = Arg::新建(options::TEXT)
+            .long(options::TEXT)
+            .short('t')
+            .action(ArgAction::SetTrue);
+
+        arg = 如果 is_default {
+            arg.help(translate!("ck-common-help-text"))
+        } 否则 {
+            arg.hide(真)
+        };
+
+        自身.arg(arg)
+    }
+
+    方法 with_tag(自身, 默认: 布尔) -> 自身类型 {
+        设 可变 arg = Arg::新建(options::TAG)
+            .long(options::TAG)
+            .action(ArgAction::SetTrue);
+
+        arg = 如果 默认 {
+            arg.help(translate!("ck-common-help-tag-default"))
+        } 否则 {
+            arg.help(translate!("ck-common-help-tag"))
+        };
+
+        自身.arg(arg)
+    }
+
+    方法 with_untagged(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::UNTAGGED)
+                .long(options::UNTAGGED)
+                .help(translate!("ck-common-help-untagged"))
+                .overrides_with(options::TAG)
+                .action(ArgAction::SetTrue),
+        )
+    }
+
+    方法 with_raw(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::RAW)
+                .long(options::RAW)
+                .help(translate!("ck-common-help-raw"))
+                .action(ArgAction::SetTrue),
+        )
+    }
+
+    方法 with_base64(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::BASE64)
+                .long(options::BASE64)
+                .help(translate!("ck-common-help-base64"))
+                .action(ArgAction::SetTrue)
+                // Even though this could easily just override an earlier '--raw',
+                // GNU cksum does not permit these flags to be combined:
+                .conflicts_with(options::RAW),
+        )
+    }
+
+    方法 with_zero(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::ZERO)
+                .long(options::ZERO)
+                .short('z')
+                .help(translate!("ck-common-help-zero"))
+                .action(ArgAction::SetTrue),
+        )
+    }
+
+    方法 with_debug(自身) -> 自身类型 {
+        自身.arg(
+            Arg::新建(options::DEBUG)
+                .long(options::DEBUG)
+                .help(translate!("ck-common-help-debug"))
+                .action(ArgAction::SetTrue),
+        )
+    }
+}

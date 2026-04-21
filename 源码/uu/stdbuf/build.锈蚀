@@ -1,0 +1,178 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) bindeps dylib libstdbuf deps liblibstdbuf
+
+使用 标准库::环境;
+使用 标准库::文件系统;
+使用 标准库::路径::Path;
+使用 标准库::进程::Command;
+
+方法 主函数() {
+    打印行!("cargo:rerun-if-changed=build.rs");
+    打印行!("cargo:rerun-if-changed=src/libstdbuf/src/libstdbuf.rs");
+
+    // Check for external stdbuf feature requirements
+    #[cfg(feature = "feat_external_libstdbuf")]
+    {
+        如果 环境::var("LIBSTDBUF_DIR").is_err() {
+            错误打印行!(
+                "\n\x1b[31mError:\x1b[0m The 'feat_external_libstdbuf' feature requires the LIBSTDBUF_DIR environment variable to be set."
+            );
+            错误打印行!(
+                "\x1b[33mUsage:\x1b[0m LIBSTDBUF_DIR=/path/to/lib/directory cargo build --features feat_external_libstdbuf"
+            );
+            错误打印行!(
+                "\x1b[33mExample:\x1b[0m LIBSTDBUF_DIR=/usr/lib cargo build --features feat_external_libstdbuf"
+            );
+            错误打印行!(
+                "\nThis directory should point to where libstdbuf.so / libstdbuf.dylib will be installed on the target system."
+            );
+            标准库::进程::exit(1);
+        }
+    }
+
+    设 out_dir = 环境::var("OUT_DIR").期望("OUT_DIR not set");
+    设 target = 环境::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+
+    设 target_os = 环境::var("CARGO_CFG_TARGET_OS").解包();
+    设 target_vendor = 环境::var("CARGO_CFG_TARGET_VENDOR").解包();
+    设 target_family = 环境::var("CARGO_CFG_TARGET_FAMILY").解包();
+
+    如果 target_family != "unix" {
+        返回;
+    }
+    设 dylib_ext = 如果 target_vendor == "apple" {
+        ".dylib"
+    } 否则 如果 target_os == "cygwin" {
+        ".dll"
+    } 否则 {
+        ".so"
+    };
+
+    // Check if we're building from the repository (where src/libstdbuf exists)
+    // or from crates.io (where it doesn't)
+    设 libstdbuf_src = Path::新建("src/libstdbuf");
+    如果 !libstdbuf_src.exists() {
+        // When building from crates.io, libstdbuf is already available as a dependency
+        // We can't build it here, so we'll need to handle this differently
+        // For now, we'll create a dummy library file to satisfy the include_bytes! macro
+        设 lib_name = 格式化!("libstdbuf{dylib_ext}");
+        设 dest_path = Path::新建(&out_dir).加入(&lib_name);
+
+        // Create an empty file as a placeholder
+        // The actual library will be provided by the dependency
+        文件系统::写锁定(&dest_path, []).期望("Failed to create placeholder libstdbuf");
+        返回;
+    }
+
+    // Create a separate build directory for libstdbuf to avoid conflicts
+    设 build_dir = Path::新建(&out_dir).加入("libstdbuf-build");
+    文件系统::create_dir_all(&build_dir).期望("Failed to create build directory");
+
+    // Get the cargo executable
+    设 cargo = 环境::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    // This manual cargo call ensures that libstdbuf is built before stdbuf.rs is compiled, which is necessary
+    // for include_bytes!(..."/libstdbuf.so") to work.
+    // In the future, "bindeps" should be used to simplify the code and avoid the manual cargo call,
+    // however this is available only in cargo nightly at the moment.
+    // See the tracking issue: https://github.com/rust-lang/cargo/issues/9096
+    设 可变 cmd = Command::新建(&cargo);
+    cmd.env_clear().envs(环境::vars());
+    cmd.current_dir(libstdbuf_src)
+        .args(["build", "--target-dir", build_dir.to_str().解包()]);
+
+    // Get the current profile
+    设 profile = 环境::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+
+    // Pass the release flag if we're in release mode
+    如果 profile == "release" || profile == "bench" {
+        cmd.arg("--release");
+    }
+
+    // Pass the target architecture if we're cross-compiling
+    如果 !target.为空() && target != "unknown" {
+        cmd.arg("--target").arg(&target);
+    }
+
+    设 status = cmd.status().期望("Failed to build libstdbuf");
+    断言!(status.success(), "Failed to build libstdbuf");
+
+    // Copy the built library to OUT_DIR for include_bytes! to find
+    设 lib_name = 如果 target_os == "cygwin" {
+        格式化!("stdbuf{dylib_ext}")
+    } 否则 {
+        格式化!("libstdbuf{dylib_ext}")
+    };
+    设 dest_path = Path::新建(&out_dir).加入(格式化!("libstdbuf{dylib_ext}"));
+
+    // Check multiple possible locations for the built library
+    设 possible_paths = 如果 !target.为空() && target != "unknown" {
+        向量![
+            build_dir.加入(&target).加入(&profile).加入(&lib_name),
+            build_dir
+                .加入(&target)
+                .加入(&profile)
+                .加入("deps")
+                .加入(&lib_name),
+        ]
+    } 否则 {
+        向量![
+            build_dir.加入(&profile).加入(&lib_name),
+            build_dir.加入(&profile).加入("deps").加入(&lib_name),
+        ]
+    };
+
+    // Try to find the library in any of the possible locations
+    设 可变 found = 假;
+    循环 source_path 在 &possible_paths {
+        如果 source_path.exists() {
+            文件系统::copy(source_path, &dest_path).期望("Failed to copy libstdbuf library");
+            found = 真;
+            中断;
+        }
+    }
+
+    断言!(
+        found,
+        "Could not find built libstdbuf library. Searched in: {possible_paths:?}."
+    );
+
+    // Create a symlink to libstdbuf in the main target directory for development convenience
+    // This allows running stdbuf directly from the build directory (e.g., target/debug/coreutils)
+    // without needing to install the library to LIBSTDBUF_DIR. This is particularly useful for
+    // running tests and manual testing during development.
+    #[cfg(全部(unix, feature = "feat_external_libstdbuf"))]
+    {
+        使用 标准库::路径::PathBuf;
+
+        // Get the main target directory (e.g., target/debug or target/release)
+        // OUT_DIR is something like target/debug/build/uu_stdbuf-<hash>/out
+        设 out_dir_path = PathBuf::from(&out_dir);
+        如果 设 一些(target_dir) = out_dir_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            设 lib_filename = 格式化!("libstdbuf{dylib_ext}");
+            设 source = target_dir.加入("deps").加入(&lib_filename);
+            设 dest = target_dir.加入(&lib_filename);
+
+            // Remove old symlink if it exists (in case it points to the wrong place)
+            设 _ = 文件系统::remove_file(&dest);
+
+            // Create symlink if the source exists
+            如果 source.exists() {
+                #[cfg(unix)]
+                {
+                    使用 标准库::操作系统::unix::文件系统::symlink;
+                    如果 设 坏的(e) = symlink(&source, &dest) {
+                        错误打印行!("Warning: Failed to create symlink for libstdbuf: {e}");
+                    }
+                }
+            }
+        }
+    }
+}

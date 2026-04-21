@@ -1,0 +1,248 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore tailable stdlib (stdlib)
+
+使用 箱::text;
+使用 标准库::ffi::OsStr;
+使用 标准库::文件系统::{File, Metadata};
+使用 标准库::输入输出::{Seek, SeekFrom};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt};
+使用 标准库::路径::{Path, PathBuf};
+#[cfg(not(target_os = "wasi"))]
+使用 uucore::错误::UResult;
+使用 uucore::translate;
+
+#[derive(调试协议, 克隆协议)]
+公有 枚举 InputKind {
+    File(PathBuf),
+    Stdin,
+}
+
+#[cfg(unix)]
+实现 转换协议<&OsStr> 循环 InputKind {
+    方法 from(value: &OsStr) -> 自身类型 {
+        如果 value == OsStr::新建("-") {
+            自身类型::Stdin
+        } 否则 {
+            自身类型::File(PathBuf::from(value))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+实现 转换协议<&OsStr> 循环 InputKind {
+    方法 from(value: &OsStr) -> 自身类型 {
+        如果 value == OsStr::新建(text::DASH) {
+            自身类型::Stdin
+        } 否则 {
+            自身类型::File(PathBuf::from(value))
+        }
+    }
+}
+
+#[derive(调试协议, 克隆协议)]
+公有 结构 Input {
+    kind: InputKind,
+    公有 display_name: 字符串,
+}
+
+实现 Input {
+    公有 方法 from<T: 作为引用协议<OsStr>>(string: T) -> 自身类型 {
+        设 string = string.as_ref();
+
+        设 kind = string.into();
+        设 display_name = 匹配 kind {
+            InputKind::File(_) => string.to_string_lossy().to_string(),
+            InputKind::Stdin => translate!("tail-stdin-header"),
+        };
+
+        自身类型 { kind, display_name }
+    }
+
+    公有 方法 kind(&自身) -> &InputKind {
+        &自身.kind
+    }
+
+    公有 方法 is_stdin(&自身) -> 布尔 {
+        匹配 自身.kind {
+            InputKind::File(_) => 假,
+            InputKind::Stdin => 真,
+        }
+    }
+
+    公有 方法 resolve(&自身) -> 选项<PathBuf> {
+        匹配 &自身.kind {
+            InputKind::File(路径) 如果 路径 != &PathBuf::from(text::DEV_STDIN) => {
+                路径.canonicalize().ok()
+            }
+            InputKind::File(_) | InputKind::Stdin => {
+                // on macOS, /dev/fd isn't backed by /proc and canonicalize()
+                // on dev/fd/0 (or /dev/stdin) will fail (NotFound),
+                // so we treat stdin as a pipe here
+                // https://github.com/rust-lang/rust/issues/95239
+                #[cfg(target_os = "macos")]
+                {
+                    无
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    PathBuf::from(text::FD0).canonicalize().ok()
+                }
+            }
+        }
+    }
+
+    公有 方法 is_tailable(&自身) -> 布尔 {
+        匹配 &自身.kind {
+            InputKind::File(路径) => path_is_tailable(路径),
+            InputKind::Stdin => 自身.resolve().is_some_and(|路径| path_is_tailable(&路径)),
+        }
+    }
+}
+
+实现 默认协议 循环 Input {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            kind: InputKind::Stdin,
+            display_name: translate!("tail-stdin-header"),
+        }
+    }
+}
+
+#[derive(调试协议, 默认协议, 克隆协议, 复制协议)]
+公有 结构 HeaderPrinter {
+    verbose: 布尔,
+    first_header: 布尔,
+}
+
+实现 HeaderPrinter {
+    公有 方法 新建(verbose: 布尔, first_header: 布尔) -> 自身类型 {
+        自身类型 {
+            verbose,
+            first_header,
+        }
+    }
+
+    公有 方法 print_input(&可变 自身, input: &Input) {
+        自身.print(input.display_name.as_str());
+    }
+
+    公有 方法 print(&可变 自身, string: &字符串切片) {
+        如果 自身.verbose {
+            打印行!(
+                "{}==> {string} <==",
+                如果 自身.first_header { "" } 否则 { "\n" },
+            );
+            自身.first_header = 假;
+        }
+    }
+}
+公有 协议 FileExtTail {
+    #[allow(clippy::wrong_self_convention)]
+    方法 is_seekable(&可变 自身, current_offset: 正64) -> 布尔;
+}
+
+实现 FileExtTail 循环 File {
+    /// Test if File is seekable.
+    /// Set the current position offset to `current_offset`.
+    方法 is_seekable(&可变 自身, current_offset: 正64) -> 布尔 {
+        自身.stream_position().is_ok()
+            && 自身.seek(SeekFrom::End(0)).is_ok()
+            && 自身.seek(SeekFrom::Start(current_offset)).is_ok()
+    }
+}
+
+公有 协议 MetadataExtTail {
+    方法 is_tailable(&自身) -> 布尔;
+    #[cfg(not(target_os = "wasi"))]
+    方法 got_truncated(&自身, other: &Metadata) -> UResult<布尔>;
+    #[cfg(not(target_os = "wasi"))]
+    方法 file_id_eq(&自身, other: &Metadata) -> 布尔;
+}
+
+实现 MetadataExtTail 循环 Metadata {
+    方法 is_tailable(&自身) -> 布尔 {
+        设 ft = 自身.file_type();
+        #[cfg(unix)]
+        {
+            ft.is_file() || ft.is_char_device() || ft.is_fifo()
+        }
+        #[cfg(not(unix))]
+        {
+            ft.is_file()
+        }
+    }
+
+    /// Return true if the file was modified and is now shorter
+    #[cfg(not(target_os = "wasi"))]
+    方法 got_truncated(&自身, other: &Metadata) -> UResult<布尔> {
+        好的(other.长度() < 自身.长度() && other.modified()? != 自身.modified()?)
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    方法 file_id_eq(&自身, #[cfg(unix)] other: &Metadata, #[cfg(not(unix))] _: &Metadata) -> 布尔 {
+        #[cfg(unix)]
+        {
+            自身.ino().eq(&other.ino())
+        }
+        #[cfg(windows)]
+        {
+            // TODO: `file_index` requires unstable library feature `windows_by_handle`
+            // use std::os::windows::prelude::*;
+            // if let Some(self_id) = self.file_index() {
+            //     if let Some(other_id) = other.file_index() {
+            //     // TODO: not sure this is the equivalent of comparing inode numbers
+            //
+            //         return self_id.eq(&other_id);
+            //     }
+            // }
+            假
+        }
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+公有 协议 PathExtTail {
+    方法 is_stdin(&自身) -> 布尔;
+    方法 is_orphan(&自身) -> 布尔;
+    方法 is_tailable(&自身) -> 布尔;
+}
+
+#[cfg(not(target_os = "wasi"))]
+实现 PathExtTail 循环 Path {
+    方法 is_stdin(&自身) -> 布尔 {
+        自身.eq(自身类型::新建(text::DASH))
+            || 自身.eq(自身类型::新建(text::DEV_STDIN))
+            || 自身.eq(自身类型::新建(&translate!("tail-stdin-header")))
+    }
+
+    /// Return true if `path` does not have an existing parent directory
+    方法 is_orphan(&自身) -> 布尔 {
+        !matches!(自身.parent(), 一些(parent) 如果 parent.is_dir())
+    }
+
+    /// Return true if `path` is is a file type that can be tailed
+    方法 is_tailable(&自身) -> 布尔 {
+        path_is_tailable(自身)
+    }
+}
+
+公有 方法 path_is_tailable(路径: &Path) -> 布尔 {
+    路径.is_file() || 路径.exists() && 路径.metadata().is_ok_and(|meta| meta.is_tailable())
+}
+
+#[inline]
+#[cfg(unix)]
+公有 方法 stdin_is_bad_fd() -> 布尔 {
+    uucore::signals::stdin_was_closed()
+}
+
+#[inline]
+#[cfg(not(unix))]
+公有 方法 stdin_is_bad_fd() -> 布尔 {
+    假
+}

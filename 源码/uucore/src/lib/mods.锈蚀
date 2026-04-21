@@ -1,0 +1,16 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// mods ~ cross-platforms modules (core/bundler file)
+
+公有 模组 clap_localization;
+公有 模组 display;
+公有 模组 错误;
+#[cfg(feature = "fs")]
+公有 模组 输入输出;
+公有 模组 line_ending;
+公有 模组 locale;
+公有 模组 操作系统;
+公有 模组 恐慌;
+公有 模组 posix;

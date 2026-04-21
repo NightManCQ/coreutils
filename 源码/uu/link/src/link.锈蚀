@@ -1,0 +1,51 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::hard_link;
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+公有 模组 options {
+    公有 静态 FILES: &字符串切片 = "FILES";
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 files: 向量<_> = matches
+        .get_many::<OsString>(options::FILES)
+        .unwrap_or_default()
+        .收集();
+
+    设 old = Path::新建(files[0]);
+    设 新建 = Path::新建(files[1]);
+
+    hard_link(old, 新建).map_err_context(
+        || translate!("link-error-cannot-create-link", "new" => 新建.quote(), "old" => old.quote()),
+    )
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("link")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("link"))
+        .about(translate!("link-about"))
+        .override_usage(format_usage(&translate!("link-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::FILES)
+                .hide(真)
+                .required(真)
+                .num_args(2)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(ValueParser::os_string()),
+        )
+}

@@ -1,0 +1,79 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) conv
+
+使用 标准库::ffi::OsString;
+
+使用 箱::options;
+使用 uucore::translate;
+
+// parse_options loads the options into the settings, returning an array of
+// error messages.
+#[allow(clippy::cognitive_complexity)]
+公有 方法 parse_options(settings: &可变 箱::Settings, opts: &clap::ArgMatches) -> 向量<字符串> {
+    // This vector holds error messages encountered.
+    设 可变 errs: 向量<字符串> = 向量![];
+    settings.renumber = opts.get_flag(options::NO_RENUMBER);
+    如果 设 一些(delimiter) = opts.get_one::<OsString>(options::SECTION_DELIMITER) {
+        // GNU nl determines whether a delimiter is a "single character" based on byte length, not
+        // character length. A "single character" implies the second character is a ':'.
+        settings.section_delimiter = 如果 delimiter.长度() == 1 {
+            设 可变 delimiter = delimiter.克隆();
+            delimiter.压入(":");
+            delimiter
+        } 否则 {
+            delimiter.克隆()
+        };
+    }
+    如果 设 一些(val) = opts.get_one::<OsString>(options::NUMBER_SEPARATOR) {
+        settings.number_separator.clone_from(val);
+    }
+    settings.number_format = opts
+        .get_one::<字符串>(options::NUMBER_FORMAT)
+        .映射(转换为目标协议::into)
+        .unwrap_or_default();
+    匹配 opts
+        .get_one::<字符串>(options::HEADER_NUMBERING)
+        .映射(字符串::as_str)
+        .映射(TryInto::try_into)
+    {
+        无 => {}
+        一些(好的(style)) => settings.header_numbering = style,
+        一些(坏的(message)) => errs.压入(message),
+    }
+    匹配 opts
+        .get_one::<字符串>(options::BODY_NUMBERING)
+        .映射(字符串::as_str)
+        .映射(TryInto::try_into)
+    {
+        无 => {}
+        一些(好的(style)) => settings.body_numbering = style,
+        一些(坏的(message)) => errs.压入(message),
+    }
+    匹配 opts
+        .get_one::<字符串>(options::FOOTER_NUMBERING)
+        .映射(字符串::as_str)
+        .映射(TryInto::try_into)
+    {
+        无 => {}
+        一些(好的(style)) => settings.footer_numbering = style,
+        一些(坏的(message)) => errs.压入(message),
+    }
+    匹配 opts.get_one::<正整数大小>(options::NUMBER_WIDTH) {
+        无 => {}
+        一些(数字) 如果 *数字 > 0 => settings.number_width = *数字,
+        一些(_) => errs.压入(translate!("nl-error-invalid-line-width", "value" => "0")),
+    }
+    如果 设 一些(数字) = opts.get_one::<正64>(options::JOIN_BLANK_LINES) {
+        settings.join_blank_lines = *数字;
+    }
+    如果 设 一些(数字) = opts.get_one::<整64>(options::LINE_INCREMENT) {
+        settings.line_increment = *数字;
+    }
+    如果 设 一些(数字) = opts.get_one::<整64>(options::STARTING_LINE_NUMBER) {
+        settings.starting_line_number = *数字;
+    }
+    errs
+}

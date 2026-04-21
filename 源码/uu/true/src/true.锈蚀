@@ -1,0 +1,58 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::Write;
+使用 uucore::{crate_version, translate};
+
+// uucore::main does not support no-result
+公有 方法 uumain(可变 args: 实现 uucore::Args) -> 整32 {
+    // skip binary name
+    设 (一些(flag), 无) = (args.nth(1), args.next()) 否则 {
+        返回 0;
+    };
+
+    设 错误 = 如果 flag == "--help" {
+        uu_app().print_help()
+    } 否则 如果 flag == "--version" {
+        // avoid uu_app for smaller binary size
+        writeln!(标准库::输入输出::stdout(), "true {}", crate_version!())
+    } 否则 {
+        返回 0;
+    };
+
+    如果 设 坏的(print_fail) = 错误
+        && print_fail.kind() != 标准库::输入输出::ErrorKind::BrokenPipe
+    {
+        // Try to display this error.
+        设 _ = writeln!(标准库::输入输出::stderr(), "true: {print_fail}");
+        // Mirror GNU options. When failing to print warnings or version flags, then we exit
+        // with FAIL. This avoids allocation some error information which may result in yet
+        // other types of failure.
+        返回 1;
+    }
+    0
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("true")
+        .version(crate_version!())
+        .help_template(uucore::localized_help_template("true"))
+        .about(translate!("true-about"))
+        // We provide our own help and version options, to ensure maximum compatibility with GNU.
+        .disable_help_flag(真)
+        .disable_version_flag(真)
+        .arg(
+            Arg::新建("help")
+                .long("help")
+                .help(translate!("true-help-text"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建("version")
+                .long("version")
+                .help(translate!("true-version-text"))
+                .action(ArgAction::Version),
+        )
+}

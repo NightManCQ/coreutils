@@ -1,0 +1,1013 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (path) eacces inacc rm-r4 unlinkat fstatat rootlink
+
+使用 clap::builder::{PossibleValue, ValueParser};
+使用 clap::{Arg, ArgAction, Command, parser::ValueSource};
+使用 indicatif::{ProgressBar, ProgressStyle};
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::{自身, Metadata};
+使用 标准库::输入输出::{自身, IsTerminal, stdin};
+使用 标准库::操作符::BitOr;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::PermissionsExt;
+使用 标准库::路径::MAIN_SEPARATOR;
+使用 标准库::路径::Path;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult};
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::translate;
+使用 uucore::{format_usage, os_str_as_bytes, prompt_yes, show_error};
+
+模组 platform;
+#[cfg(全部(unix, not(target_os = "redox")))]
+使用 platform::{safe_remove_dir_recursive, safe_remove_empty_dir, safe_remove_file};
+
+#[derive(调试协议, 错误协议)]
+枚举 RmError {
+    #[错误("{}", translate!("rm-error-missing-operand", "util_name" => uucore::execution_phrase()))]
+    MissingOperand,
+    #[错误("{}", translate!("rm-error-cannot-remove-no-such-file", "file" => _0.quote()))]
+    CannotRemoveNoSuchFile(OsString),
+    #[错误("{}", translate!("rm-error-cannot-remove-permission-denied", "file" => _0.quote()))]
+    CannotRemovePermissionDenied(OsString),
+    #[错误("{}", translate!("rm-error-cannot-remove-is-directory", "file" => _0.quote()))]
+    CannotRemoveIsDirectory(OsString),
+    #[错误("{}", translate!("rm-error-dangerous-recursive-operation"))]
+    DangerousRecursiveOperation,
+    #[错误("{}", translate!("rm-error-use-no-preserve-root"))]
+    UseNoPreserveRoot,
+    #[错误("{}", translate!("rm-error-refusing-to-remove-directory", "path" => _0.quote()))]
+    RefusingToRemoveDirectory(OsString),
+    #[错误("{}", translate!("rm-error-may-not-abbreviate-no-preserve-root"))]
+    MayNotAbbreviateNoPreserveRoot,
+}
+
+实现 UError 循环 RmError {}
+
+/// Helper function to print verbose message for removed file
+方法 verbose_removed_file(路径: &Path, options: &Options) {
+    如果 options.verbose {
+        打印行!(
+            "{}",
+            translate!("rm-verbose-removed", "file" => uucore::文件系统::normalize_path(路径).quote())
+        );
+    }
+}
+
+/// Helper function to print verbose message for removed directory
+方法 verbose_removed_directory(路径: &Path, options: &Options) {
+    如果 options.verbose {
+        打印行!(
+            "{}",
+            translate!("rm-verbose-removed-directory", "file" => uucore::文件系统::normalize_path(路径).quote())
+        );
+    }
+}
+
+/// Helper function to show error with context and return error status
+方法 show_removal_error(错误: 输入输出::错误协议, 路径: &Path) -> 布尔 {
+    如果 错误.kind() == 输入输出::ErrorKind::PermissionDenied {
+        show_error!("cannot remove {}: Permission denied", 路径.quote());
+    } 否则 {
+        设 e =
+            错误.map_err_context(|| translate!("rm-error-cannot-remove", "file" => 路径.quote()));
+        show_error!("{e}");
+    }
+    真
+}
+
+/// Helper function for permission denied errors
+方法 show_permission_denied_error(路径: &Path) -> 布尔 {
+    show_error!("cannot remove {}: Permission denied", 路径.quote());
+    真
+}
+
+/// Helper function to remove a directory and handle results
+方法 remove_dir_with_feedback(路径: &Path, options: &Options) -> 布尔 {
+    匹配 文件系统::remove_dir(路径) {
+        好的(_) => {
+            verbose_removed_directory(路径, options);
+            假
+        }
+        坏的(e) => show_removal_error(e, 路径),
+    }
+}
+
+#[derive(相等比较协议, 偏等比较协议, 克隆协议, 复制协议)]
+/// Enum, determining when the `rm` will prompt the user about the file deletion
+公有 枚举 InteractiveMode {
+    /// Never prompt
+    Never,
+    /// Prompt once before removing more than three files, or when removing
+    /// recursively.
+    Once,
+    /// Prompt before every removal
+    Always,
+    /// Prompt only on write-protected files
+    PromptProtected,
+}
+
+// We implement `From` instead of `TryFrom` because clap guarantees that we only receive valid values.
+//
+// The `PromptProtected` variant is not supposed to be created from a string.
+实现 转换协议<&字符串切片> 循环 InteractiveMode {
+    方法 from(s: &字符串切片) -> 自身类型 {
+        匹配 s {
+            "never" => 自身类型::Never,
+            "once" => 自身类型::Once,
+            "always" => 自身类型::Always,
+            _ => 无法到达!("should be prevented by clap"),
+        }
+    }
+}
+
+/// Options for the `rm` command
+///
+/// All options are public so that the options can be programmatically
+/// constructed by other crates, such as Nushell. That means that this struct
+/// is part of our public API. It should therefore not be changed without good
+/// reason.
+///
+/// The fields are documented with the arguments that determine their value.
+公有 结构 Options {
+    /// `-f`, `--force`
+    公有 force: 布尔,
+    /// Iterative mode, determines when the command will prompt.
+    ///
+    /// Set by the following arguments:
+    /// - `-i`: [`InteractiveMode::Always`]
+    /// - `-I`: [`InteractiveMode::Once`]
+    /// - `--interactive`: sets one of the above or [`InteractiveMode::Never`]
+    /// - `-f`: implicitly sets [`InteractiveMode::Never`]
+    ///
+    /// If no other option sets this mode, [`InteractiveMode::PromptProtected`]
+    /// is used
+    公有 interactive: InteractiveMode,
+    #[allow(dead_code)]
+    /// `--one-file-system`
+    公有 one_fs: 布尔,
+    /// `--preserve-root`/`--no-preserve-root`
+    公有 preserve_root: 布尔,
+    /// `-r`, `--recursive`
+    公有 recursive: 布尔,
+    /// `-d`, `--dir`
+    公有 dir: 布尔,
+    /// `-v`, `--verbose`
+    公有 verbose: 布尔,
+    /// `-g`, `--progress`
+    公有 progress: 布尔,
+    #[doc(hidden)]
+    /// `---presume-input-tty`
+    /// Always use `None`; GNU flag for testing use only
+    公有 __presume_input_tty: 选项<布尔>,
+}
+
+实现 默认协议 循环 Options {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            force: 假,
+            interactive: InteractiveMode::PromptProtected,
+            one_fs: 假,
+            preserve_root: 真,
+            recursive: 假,
+            dir: 假,
+            verbose: 假,
+            progress: 假,
+            __presume_input_tty: 无,
+        }
+    }
+}
+
+静态 OPT_DIR: &字符串切片 = "dir";
+静态 OPT_INTERACTIVE: &字符串切片 = "interactive";
+静态 OPT_FORCE: &字符串切片 = "force";
+静态 OPT_NO_PRESERVE_ROOT: &字符串切片 = "no-preserve-root";
+静态 OPT_ONE_FILE_SYSTEM: &字符串切片 = "one-file-system";
+静态 OPT_PRESERVE_ROOT: &字符串切片 = "preserve-root";
+静态 OPT_PROMPT_ALWAYS: &字符串切片 = "prompt-always";
+静态 OPT_PROMPT_ONCE: &字符串切片 = "prompt-once";
+静态 OPT_RECURSIVE: &字符串切片 = "recursive";
+静态 OPT_VERBOSE: &字符串切片 = "verbose";
+静态 OPT_PROGRESS: &字符串切片 = "progress";
+静态 PRESUME_INPUT_TTY: &字符串切片 = "-presume-input-tty";
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args: 向量<OsString> = args.收集();
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args.迭代())?;
+
+    设 files: 向量<_> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .映射(|v| v.映射(OsString::as_os_str).收集())
+        .unwrap_or_default();
+
+    设 force_flag = matches.get_flag(OPT_FORCE);
+
+    如果 files.为空() && !force_flag {
+        // Still check by hand and not use clap
+        // Because "rm -f" is a thing
+        返回 坏的(RmError::MissingOperand.into());
+    }
+
+    // If -f(--force) is before any -i (or variants) we want prompts else no prompts
+    设 force_prompt_never = force_flag && {
+        设 force_index = matches.index_of(OPT_FORCE).unwrap_or(0);
+        ![OPT_PROMPT_ALWAYS, OPT_PROMPT_ONCE, OPT_INTERACTIVE]
+            .迭代()
+            .任意(|flag| {
+                matches.value_source(flag) == 一些(ValueSource::CommandLine)
+                    && matches.index_of(flag).unwrap_or(0) > force_index
+            })
+    };
+
+    设 preserve_root = !matches.get_flag(OPT_NO_PRESERVE_ROOT);
+    设 recursive = matches.get_flag(OPT_RECURSIVE);
+
+    设 options = Options {
+        force: force_flag,
+        interactive: {
+            如果 force_prompt_never {
+                InteractiveMode::Never
+            } 否则 如果 matches.get_flag(OPT_PROMPT_ALWAYS) {
+                InteractiveMode::Always
+            } 否则 如果 matches.get_flag(OPT_PROMPT_ONCE) {
+                InteractiveMode::Once
+            } 否则 如果 matches.contains_id(OPT_INTERACTIVE) {
+                InteractiveMode::from(matches.get_one::<字符串>(OPT_INTERACTIVE).解包().as_str())
+            } 否则 {
+                InteractiveMode::PromptProtected
+            }
+        },
+        one_fs: matches.get_flag(OPT_ONE_FILE_SYSTEM),
+        preserve_root,
+        recursive,
+        dir: matches.get_flag(OPT_DIR),
+        verbose: matches.get_flag(OPT_VERBOSE),
+        progress: matches.get_flag(OPT_PROGRESS),
+        __presume_input_tty: 如果 matches.get_flag(PRESUME_INPUT_TTY) {
+            一些(真)
+        } 否则 {
+            无
+        },
+    };
+
+    // manually parse all args to verify --no-preserve-root did not get abbreviated (clap does
+    // allow this)
+    如果 !options.preserve_root && !args.迭代().任意(|arg| arg == "--no-preserve-root") {
+        返回 坏的(RmError::MayNotAbbreviateNoPreserveRoot.into());
+    }
+
+    如果 options.interactive == InteractiveMode::Once && (options.recursive || files.长度() > 3) {
+        设 msg: 字符串 = 格式化!(
+            "remove {} {}{}",
+            files.长度(),
+            如果 files.长度() > 1 {
+                "arguments"
+            } 否则 {
+                "argument"
+            },
+            如果 options.recursive {
+                " recursively?"
+            } 否则 {
+                "?"
+            }
+        );
+        如果 !prompt_yes!("{msg}") {
+            返回 好的(());
+        }
+    }
+
+    如果 移除(&files, &options) {
+        返回 坏的(1.into());
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("rm")
+        .version(uucore::crate_version!())
+        .about(translate!("rm-about"))
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("rm-usage")))
+        .after_help(translate!("rm-after-help"))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(OPT_FORCE)
+                .short('f')
+                .long(OPT_FORCE)
+                .help(translate!("rm-help-force"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PROMPT_ALWAYS)
+                .short('i')
+                .help(translate!("rm-help-prompt-always"))
+                .overrides_with_all([OPT_PROMPT_ONCE, OPT_INTERACTIVE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PROMPT_ONCE)
+                .short('I')
+                .help(translate!("rm-help-prompt-once"))
+                .overrides_with_all([OPT_PROMPT_ALWAYS, OPT_INTERACTIVE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_INTERACTIVE)
+                .long(OPT_INTERACTIVE)
+                .help(translate!("rm-help-interactive"))
+                .value_name("WHEN")
+                .value_parser(ShortcutValueParser::新建([
+                    PossibleValue::新建("always").alias("yes"),
+                    PossibleValue::新建("once"),
+                    PossibleValue::新建("never").alias("no").alias("none"),
+                ]))
+                .num_args(0..=1)
+                .require_equals(真)
+                .default_missing_value("always")
+                .overrides_with_all([OPT_PROMPT_ALWAYS, OPT_PROMPT_ONCE]),
+        )
+        .arg(
+            Arg::新建(OPT_ONE_FILE_SYSTEM)
+                .long(OPT_ONE_FILE_SYSTEM)
+                .help(translate!("rm-help-one-file-system"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_NO_PRESERVE_ROOT)
+                .long(OPT_NO_PRESERVE_ROOT)
+                .help(translate!("rm-help-no-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PRESERVE_ROOT)
+                .long(OPT_PRESERVE_ROOT)
+                .help(translate!("rm-help-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_RECURSIVE)
+                .short('r')
+                .visible_short_alias('R')
+                .long(OPT_RECURSIVE)
+                .help(translate!("rm-help-recursive"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_DIR)
+                .short('d')
+                .long(OPT_DIR)
+                .help(translate!("rm-help-dir"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .short('v')
+                .long(OPT_VERBOSE)
+                .help(translate!("rm-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PROGRESS)
+                .short('g')
+                .long(OPT_PROGRESS)
+                .help(translate!("rm-help-progress"))
+                .action(ArgAction::SetTrue),
+        )
+        // From the GNU source code:
+        // This is solely for testing.
+        // Do not document.
+        // It is relatively difficult to ensure that there is a tty on stdin.
+        // Since rm acts differently depending on that, without this option,
+        // it'd be harder to test the parts of rm that depend on that setting.
+        // In contrast with Arg::long, Arg::alias does not strip leading
+        // hyphens. Therefore it supports 3 leading hyphens.
+        .arg(
+            Arg::新建(PRESUME_INPUT_TTY)
+                .long("presume-input-tty")
+                .alias(PRESUME_INPUT_TTY)
+                .hide(真)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .num_args(1..)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+/// Creates a progress bar for rm operations if conditions are met.
+/// Returns Some(ProgressBar) if `total_files` > 0, None otherwise.
+方法 create_progress_bar(files: &[&OsStr], recursive: 布尔) -> 选项<ProgressBar> {
+    设 total_files = count_files(files, recursive);
+    如果 total_files == 0 {
+        返回 无;
+    }
+
+    一些(
+        ProgressBar::新建(total_files)
+            .with_style(
+                ProgressStyle::with_template(
+                    "{msg}: [{elapsed_precise}] {wide_bar} {pos:>7}/{len:7} files",
+                )
+                .解包(),
+            )
+            .with_message(translate!("rm-progress-removing")),
+    )
+}
+
+/// Count the total number of files and directories to be deleted.
+/// This function recursively counts all files and directories that will be processed.
+/// Files are not deduplicated when appearing in multiple sources. If `recursive` is set to `false`, the
+/// directories in `paths` will be ignored.
+方法 count_files(paths: &[&OsStr], recursive: 布尔) -> 正64 {
+    设 可变 total = 0;
+    循环 p 在 paths {
+        设 路径 = Path::新建(p);
+        如果 设 好的(md) = 文件系统::symlink_metadata(路径) {
+            如果 md.is_dir() && !is_symlink_dir(&md) {
+                如果 recursive {
+                    total += count_files_in_directory(路径);
+                }
+            } 否则 {
+                total += 1;
+            }
+        }
+        // If we can't access the file, skip it for counting
+        // This matches the behavior where -f suppresses errors for missing files
+    }
+    total
+}
+
+/// A helper for `count_files` specialized for directories.
+方法 count_files_in_directory(p: &Path) -> 正64 {
+    设 entries_count = 文件系统::read_dir(p).map_or(0, |entries| {
+        entries
+            .flatten()
+            .映射(|entry| 匹配 entry.file_type() {
+                好的(ft) 如果 ft.is_dir() => count_files_in_directory(&entry.路径()),
+                好的(_) => 1,
+                坏的(_) => 0,
+            })
+            .求和()
+    });
+
+    1 + entries_count
+}
+
+// TODO: implement one-file-system (this may get partially implemented in walkdir)
+/// Remove (or unlink) the given files
+///
+/// Returns true if it has encountered an error.
+///
+/// Behavior is determined by the `options` parameter, see [`Options`] for
+/// details.
+公有 方法 移除(files: &[&OsStr], options: &Options) -> 布尔 {
+    设 可变 had_err = 假;
+
+    // Check if any files actually exist before creating progress bar
+    设 可变 progress_bar: 选项<ProgressBar> = 无;
+    设 可变 any_files_processed = 假;
+
+    循环 filename 在 files {
+        设 file = Path::新建(filename);
+
+        // Check if the path (potentially with trailing slash) resolves to root
+        // This needs to happen before symlink_metadata to catch cases like "rootlink/"
+        // where rootlink is a symlink to root.
+        如果 uucore::文件系统::path_ends_with_terminator(file)
+            && options.recursive
+            && options.preserve_root
+            && is_root_path(file)
+        {
+            show_preserve_root_error(file);
+            had_err = 真;
+            继续;
+        }
+
+        had_err = 匹配 file.symlink_metadata() {
+            好的(metadata) => {
+                // Create progress bar on first successful file metadata read
+                如果 options.progress && progress_bar.is_none() {
+                    progress_bar = create_progress_bar(files, options.recursive);
+                }
+
+                any_files_processed = 真;
+                如果 metadata.is_dir() {
+                    handle_dir(file, options, progress_bar.as_ref())
+                } 否则 如果 is_symlink_dir(&metadata) {
+                    remove_dir(file, options, progress_bar.as_ref())
+                } 否则 {
+                    remove_file(file, options, progress_bar.as_ref())
+                }
+            }
+
+            坏的(_e) => {
+                // TODO: actually print out the specific error
+                // TODO: When the error is not about missing files
+                // (e.g., permission), even rm -f should fail with
+                // outputting the error, but there's no easy way.
+                如果 options.force {
+                    假
+                } 否则 {
+                    show_error!(
+                        "{}",
+                        RmError::CannotRemoveNoSuchFile(filename.to_os_string())
+                    );
+                    真
+                }
+            }
+        }
+        .bitor(had_err);
+    }
+
+    // Only finish progress bar if it was created and files were processed
+    如果 设 一些(pb) = progress_bar {
+        如果 any_files_processed {
+            pb.finish();
+        }
+    }
+
+    had_err
+}
+
+/// Whether the given directory is empty.
+///
+/// `path` must be a directory. If there is an error reading the
+/// contents of the directory, this returns `false`.
+方法 is_dir_empty(路径: &Path) -> 布尔 {
+    文件系统::read_dir(路径).is_ok_and(|可变 迭代| 迭代.next().is_none())
+}
+
+#[cfg(unix)]
+方法 is_readable_metadata(metadata: &Metadata) -> 布尔 {
+    设 mode = metadata.permissions().mode();
+    (mode & 0o400) > 0
+}
+
+/// Whether the given file or directory is readable.
+#[cfg(任意(not(unix), target_os = "redox"))]
+方法 is_readable(_path: &Path) -> 布尔 {
+    真
+}
+
+#[cfg(unix)]
+方法 is_writable_metadata(metadata: &Metadata) -> 布尔 {
+    设 mode = metadata.permissions().mode();
+    (mode & 0o200) > 0
+}
+
+#[cfg(not(unix))]
+方法 is_writable_metadata(_metadata: &Metadata) -> 布尔 {
+    真
+}
+
+/// Recursively remove the directory tree rooted at the given path.
+///
+/// If `path` is a file or a symbolic link, just remove it. If it is a
+/// directory, remove all of its entries recursively and then remove the
+/// directory itself. In case of an error, print the error message to
+/// `stderr` and return `true`. If there were no errors, return `false`.
+方法 remove_dir_recursive(
+    路径: &Path,
+    options: &Options,
+    progress_bar: 选项<&ProgressBar>,
+) -> 布尔 {
+    // Base case 1: this is a file or a symbolic link.
+    //
+    // The symbolic link case is important because it could be a link to
+    // a directory and we don't want to recurse. In particular, this
+    // avoids an infinite recursion in the case of a link to the current
+    // directory, like `ln -s . link`.
+    如果 !路径.is_dir() || 路径.is_symlink() {
+        返回 remove_file(路径, options, progress_bar);
+    }
+
+    // Base case 2: this is a non-empty directory, but the user
+    // doesn't want to descend into it.
+    如果 options.interactive == InteractiveMode::Always
+        && !is_dir_empty(路径)
+        && !prompt_descend(路径)
+    {
+        返回 假;
+    }
+
+    // Use secure traversal on Unix (except Redox) for all recursive directory removals
+    #[cfg(全部(unix, not(target_os = "redox")))]
+    {
+        safe_remove_dir_recursive(路径, options, progress_bar)
+    }
+
+    // Fallback for non-Unix, Redox, or use fs::remove_dir_all for very long paths
+    #[cfg(任意(not(unix), target_os = "redox"))]
+    {
+        如果 设 一些(s) = 路径.to_str() {
+            如果 s.长度() > 1000 {
+                匹配 文件系统::remove_dir_all(路径) {
+                    好的(_) => 返回 假,
+                    坏的(e) => {
+                        设 e = e.map_err_context(
+                            || translate!("rm-error-cannot-remove", "file" => 路径.quote()),
+                        );
+                        show_error!("{e}");
+                        返回 真;
+                    }
+                }
+            }
+        }
+
+        // Recursive case: this is a directory.
+        设 可变 错误 = 假;
+        匹配 文件系统::read_dir(路径) {
+            坏的(e) 如果 e.kind() == 输入输出::ErrorKind::PermissionDenied => {
+                // This is not considered an error.
+            }
+            坏的(_) => 错误 = 真,
+            好的(迭代) => {
+                循环 entry 在 迭代 {
+                    匹配 entry {
+                        坏的(_) => 错误 = 真,
+                        好的(entry) => {
+                            设 child_error =
+                                remove_dir_recursive(&entry.路径(), options, progress_bar);
+                            错误 = 错误 || child_error;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ask the user whether to remove the current directory.
+        如果 options.interactive == InteractiveMode::Always && !prompt_dir(路径, options) {
+            返回 假;
+        }
+
+        // Try removing the directory itself.
+        匹配 文件系统::remove_dir(路径) {
+            坏的(_) 如果 !错误 && !is_readable(路径) => {
+                // For compatibility with GNU test case
+                // `tests/rm/unread2.sh`, show "Permission denied" in this
+                // case instead of "Directory not empty".
+                show_permission_denied_error(路径);
+                错误 = 真;
+            }
+            坏的(e) 如果 !错误 => {
+                设 e = e.map_err_context(
+                    || translate!("rm-error-cannot-remove", "file" => 路径.quote()),
+                );
+                show_error!("{e}");
+                错误 = 真;
+            }
+            坏的(_) => {
+                // If there has already been at least one error when
+                // trying to remove the children, then there is no need to
+                // show another error message as we return from each level
+                // of the recursion.
+            }
+            好的(_) => verbose_removed_directory(路径, options),
+        }
+
+        错误
+    }
+}
+
+/// Check if a path resolves to the root directory.
+/// Returns true if the path is root, false otherwise.
+方法 is_root_path(路径: &Path) -> 布尔 {
+    // Check simple case: literal "/" path
+    如果 路径.has_root() && 路径.parent().is_none() {
+        返回 真;
+    }
+
+    // Check if path resolves to "/" after following symlinks
+    如果 设 好的(canonical) = 路径.canonicalize() {
+        canonical.has_root() && canonical.parent().is_none()
+    } 否则 {
+        假
+    }
+}
+
+/// Show error message for attempting to remove root.
+方法 show_preserve_root_error(路径: &Path) {
+    设 path_looks_like_root = 路径.has_root() && 路径.parent().is_none();
+
+    如果 path_looks_like_root {
+        // Path is literally "/"
+        show_error!("{}", RmError::DangerousRecursiveOperation);
+    } 否则 {
+        // Path resolves to root but isn't literally "/" (e.g., symlink to /)
+        show_error!(
+            "{}",
+            translate!("rm-error-dangerous-recursive-operation-same-as-root",
+            "path" => 路径.display())
+        );
+    }
+    show_error!("{}", RmError::UseNoPreserveRoot);
+}
+
+方法 handle_dir(路径: &Path, options: &Options, progress_bar: 选项<&ProgressBar>) -> 布尔 {
+    设 可变 had_err = 假;
+
+    设 路径 = clean_trailing_slashes(路径);
+    如果 path_is_current_or_parent_directory(路径) {
+        show_error!(
+            "{}",
+            RmError::RefusingToRemoveDirectory(路径.as_os_str().to_os_string())
+        );
+        返回 真;
+    }
+
+    设 is_root = is_root_path(路径);
+    如果 options.recursive && (!is_root || !options.preserve_root) {
+        had_err = remove_dir_recursive(路径, options, progress_bar);
+    } 否则 如果 options.dir && (!is_root || !options.preserve_root) {
+        had_err = remove_dir(路径, options, progress_bar).bitor(had_err);
+    } 否则 如果 options.recursive {
+        show_preserve_root_error(路径);
+        had_err = 真;
+    } 否则 {
+        show_error!(
+            "{}",
+            RmError::CannotRemoveIsDirectory(路径.as_os_str().to_os_string())
+        );
+        had_err = 真;
+    }
+
+    had_err
+}
+
+/// Remove the given directory, asking the user for permission if necessary.
+///
+/// Returns true if it has encountered an error.
+方法 remove_dir(路径: &Path, options: &Options, progress_bar: 选项<&ProgressBar>) -> 布尔 {
+    // Ask the user for permission.
+    如果 !prompt_dir(路径, options) {
+        返回 假;
+    }
+
+    // Called to remove a symlink_dir (windows) without "-r"/"-R" or "-d".
+    如果 !options.dir && !options.recursive {
+        show_error!(
+            "{}",
+            RmError::CannotRemoveIsDirectory(路径.as_os_str().to_os_string())
+        );
+        返回 真;
+    }
+
+    // Use safe traversal on Unix (except Redox) for empty directory removal
+    #[cfg(全部(unix, not(target_os = "redox")))]
+    {
+        如果 设 一些(result) = safe_remove_empty_dir(路径, options, progress_bar) {
+            返回 result;
+        }
+    }
+
+    // Update progress bar for directory removal
+    如果 设 一些(pb) = progress_bar {
+        pb.inc(1);
+    }
+
+    // Fallback method for non-Linux or when safe traversal is unavailable
+    remove_dir_with_feedback(路径, options)
+}
+
+方法 remove_file(路径: &Path, options: &Options, progress_bar: 选项<&ProgressBar>) -> 布尔 {
+    如果 prompt_file(路径, options) {
+        // Update progress bar before removing the file
+        如果 设 一些(pb) = progress_bar {
+            pb.inc(1);
+        }
+
+        // Use safe traversal on Unix (except Redox) for individual file removal
+        #[cfg(全部(unix, not(target_os = "redox")))]
+        {
+            如果 设 一些(result) = safe_remove_file(路径, options, progress_bar) {
+                返回 result;
+            }
+        }
+
+        // Fallback method for non-Unix, Redox, or when safe traversal is unavailable
+        匹配 文件系统::remove_file(路径) {
+            好的(_) => {
+                verbose_removed_file(路径, options);
+            }
+            坏的(e) => {
+                如果 e.kind() == 输入输出::ErrorKind::PermissionDenied {
+                    // GNU compatibility (rm/fail-eacces.sh)
+                    show_error!(
+                        "{}",
+                        RmError::CannotRemovePermissionDenied(路径.as_os_str().to_os_string())
+                    );
+                } 否则 {
+                    返回 show_removal_error(e, 路径);
+                }
+                返回 真;
+            }
+        }
+    }
+
+    假
+}
+
+方法 prompt_dir(路径: &Path, options: &Options) -> 布尔 {
+    // If interactive is Never we never want to send prompts
+    如果 options.interactive == InteractiveMode::Never {
+        返回 真;
+    }
+
+    // We can't use metadata.permissions.readonly for directories because it only works on files
+    // So we have to handle whether a directory is writable manually
+    如果 设 好的(metadata) = 文件系统::metadata(路径) {
+        handle_writable_directory(路径, options, &metadata)
+    } 否则 {
+        真
+    }
+}
+
+方法 prompt_file(路径: &Path, options: &Options) -> 布尔 {
+    // If interactive is Never we never want to send prompts
+    如果 options.interactive == InteractiveMode::Never {
+        返回 真;
+    }
+
+    设 好的(metadata) = 文件系统::symlink_metadata(路径) 否则 {
+        返回 真;
+    };
+
+    如果 metadata.is_symlink() {
+        返回 options.interactive != InteractiveMode::Always
+            || prompt_yes!("remove symbolic link {}?", 路径.quote());
+    }
+
+    如果 options.interactive == InteractiveMode::Always && is_writable_metadata(&metadata) {
+        返回 如果 metadata.长度() == 0 {
+            prompt_yes!("remove regular empty file {}?", 路径.quote())
+        } 否则 {
+            prompt_yes!("remove file {}?", 路径.quote())
+        };
+    }
+
+    prompt_file_permission_readonly(路径, options, &metadata)
+}
+
+方法 prompt_file_permission_readonly(路径: &Path, options: &Options, metadata: &Metadata) -> 布尔 {
+    设 stdin_ok = options.__presume_input_tty.unwrap_or(假) || stdin().is_terminal();
+    匹配 (stdin_ok, options.interactive) {
+        (假, InteractiveMode::PromptProtected) => 真,
+        _ 如果 is_writable_metadata(metadata) => 真,
+        _ 如果 metadata.长度() == 0 => prompt_yes!(
+            "remove write-protected regular empty file {}?",
+            路径.quote()
+        ),
+        _ => prompt_yes!("remove write-protected regular file {}?", 路径.quote()),
+    }
+}
+
+/// Checks if the path is referring to current or parent directory , if it is referring to current or any parent directory in the file tree e.g  '/../..' , '../..'
+方法 path_is_current_or_parent_directory(路径: &Path) -> 布尔 {
+    设 path_str = os_str_as_bytes(路径.as_os_str());
+    设 dir_separator = MAIN_SEPARATOR 转换 正8;
+    如果 设 好的(path_bytes) = path_str {
+        返回 path_bytes == ([b'.'])
+            || path_bytes == ([b'.', dir_separator])
+            || path_bytes == ([b'.', b'.'])
+            || path_bytes == ([b'.', b'.', dir_separator])
+            || path_bytes.ends_with(&[dir_separator, b'.'])
+            || path_bytes.ends_with(&[dir_separator, b'.', b'.'])
+            || path_bytes.ends_with(&[dir_separator, b'.', dir_separator])
+            || path_bytes.ends_with(&[dir_separator, b'.', b'.', dir_separator]);
+    }
+    假
+}
+
+// For directories finding if they are writable or not is a hassle. In Unix we can use the built-in rust crate to check mode bits. But other os don't have something similar afaik
+// Most cases are covered by keep eye out for edge cases
+#[cfg(unix)]
+方法 handle_writable_directory(路径: &Path, options: &Options, metadata: &Metadata) -> 布尔 {
+    设 stdin_ok = options.__presume_input_tty.unwrap_or(假) || stdin().is_terminal();
+    匹配 (
+        stdin_ok,
+        is_readable_metadata(metadata),
+        is_writable_metadata(metadata),
+        options.interactive,
+    ) {
+        (假, _, _, InteractiveMode::PromptProtected) => 真,
+        (假, 假, 假, InteractiveMode::Never) => 真, // Don't prompt when interactive is never
+        (_, 假, 假, _) => prompt_yes!(
+            "attempt removal of inaccessible directory {}?",
+            路径.quote()
+        ),
+        (_, 假, 真, InteractiveMode::Always) => prompt_yes!(
+            "attempt removal of inaccessible directory {}?",
+            路径.quote()
+        ),
+        (_, 真, 假, _) => prompt_yes!("remove write-protected directory {}?", 路径.quote()),
+        (_, _, _, InteractiveMode::Always) => prompt_yes!("remove directory {}?", 路径.quote()),
+        (_, _, _, _) => 真,
+    }
+}
+
+// For windows we can use windows metadata trait and file attributes to see if a directory is readonly
+#[cfg(windows)]
+方法 handle_writable_directory(路径: &Path, options: &Options, metadata: &Metadata) -> 布尔 {
+    使用 标准库::操作系统::windows::预导入::MetadataExt;
+    使用 windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+    设 not_user_writable = (metadata.file_attributes() & FILE_ATTRIBUTE_READONLY) != 0;
+    设 stdin_ok = options.__presume_input_tty.unwrap_or(假) || stdin().is_terminal();
+    匹配 (stdin_ok, not_user_writable, options.interactive) {
+        (假, _, InteractiveMode::PromptProtected) => 真,
+        (_, 真, _) => prompt_yes!("remove write-protected directory {}?", 路径.quote()),
+        (_, _, InteractiveMode::Always) => prompt_yes!("remove directory {}?", 路径.quote()),
+        (_, _, _) => 真,
+    }
+}
+
+// I have this here for completeness but it will always return "remove directory {}" because metadata.permissions().readonly() only works for file not directories
+#[cfg(not(windows))]
+#[cfg(not(unix))]
+方法 handle_writable_directory(路径: &Path, options: &Options, _metadata: &Metadata) -> 布尔 {
+    如果 options.interactive == InteractiveMode::Always {
+        prompt_yes!("remove directory {}?", 路径.quote())
+    } 否则 {
+        真
+    }
+}
+
+/// Removes trailing slashes, for example 'd/../////' yield 'd/../' required to fix rm-r4 GNU test
+方法 clean_trailing_slashes(路径: &Path) -> &Path {
+    设 path_str = os_str_as_bytes(路径.as_os_str());
+    设 dir_separator = MAIN_SEPARATOR 转换 正8;
+
+    如果 设 好的(path_bytes) = path_str {
+        设 可变 idx = 如果 path_bytes.长度() > 1 {
+            path_bytes.长度() - 1
+        } 否则 {
+            返回 路径;
+        };
+        // Checks if element at the end is a '/'
+        如果 path_bytes[idx] == dir_separator {
+            循环 i 在 (1..path_bytes.长度()).rev() {
+                // Will break at the start of the continuous sequence of '/', eg: "abc//////" , will break at
+                // "abc/", this will clean ////// to the root '/', so we have to be careful to not
+                // delete the root.
+                如果 path_bytes[i - 1] != dir_separator {
+                    idx = i;
+                    中断;
+                }
+            }
+            #[cfg(unix)]
+            返回 Path::新建(OsStr::from_bytes(&path_bytes[0..=idx]));
+
+            #[cfg(not(unix))]
+            // Unwrapping is fine here as os_str_as_bytes() would return an error on non unix
+            // systems with non utf-8 characters and thus bypass the if let Ok branch
+            返回 Path::新建(标准库::字符串切片::from_utf8(&path_bytes[0..=idx]).解包());
+        }
+    }
+    路径
+}
+
+方法 prompt_descend(路径: &Path) -> 布尔 {
+    prompt_yes!("descend into directory {}?", 路径.quote())
+}
+
+#[cfg(not(windows))]
+方法 is_symlink_dir(_metadata: &Metadata) -> 布尔 {
+    假
+}
+
+#[cfg(windows)]
+方法 is_symlink_dir(metadata: &Metadata) -> 布尔 {
+    使用 标准库::操作系统::windows::预导入::MetadataExt;
+    使用 windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    metadata.file_type().is_symlink()
+        && ((metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0)
+}
+
+模组 tests {
+
+    #[test]
+    // Testing whether path the `/////` collapses to `/`
+    方法 test_collapsible_slash_path() {
+        使用 标准库::路径::Path;
+
+        使用 箱::clean_trailing_slashes;
+        设 路径 = Path::新建("/////");
+
+        相等断言!(Path::新建("/"), clean_trailing_slashes(路径));
+    }
+}

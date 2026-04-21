@@ -1,0 +1,32 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//!
+//! Buffer-based copying implementation for other platforms.
+
+使用 标准库::输入输出::{Read, Write};
+
+使用 箱::错误::UResult;
+
+/// Copy data from `Read` implementor `source` into a `Write` implementor
+/// `dest`. This works by reading a chunk of data from `source` and writing the
+/// data to `dest` in a loop, using std::io::copy. This is implemented for
+/// non-Linux platforms.
+///
+/// # Arguments
+/// * `source` - `Read` implementor to copy data from.
+/// * `dest` - `Write` implementor to copy data to.
+///
+/// # Returns
+///
+/// Result of operation and bytes successfully written (as a `u64`) when
+/// operation is successful.
+公有 方法 copy_stream<R, S>(src: &可变 R, dest: &可变 S) -> UResult<正64>
+何处
+    R: Read,
+    S: Write,
+{
+    设 result = 标准库::输入输出::copy(src, dest)?;
+    好的(result)
+}

@@ -1,0 +1,691 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) memrchr
+
+使用 clap::ArgMatches;
+使用 memchr::memrchr_iter;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufWriter, Read, Seek, SeekFrom, Write};
+使用 标准库::数字::TryFromIntError;
+#[cfg(unix)]
+使用 标准库::操作系统::fd::AsFd;
+使用 标准库::路径::{Path, PathBuf};
+使用 thiserror::错误协议;
+使用 uucore::display::{Quotable, print_verbatim};
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError};
+使用 uucore::line_ending::LineEnding;
+使用 uucore::show;
+使用 uucore::translate;
+
+常量 BUF_SIZE: 正整数大小 = 65536;
+
+模组 cli;
+使用 箱::cli::options;
+公有 使用 箱::cli::uu_app;
+
+模组 parse;
+模组 take;
+使用 take::copy_all_but_n_bytes;
+使用 take::copy_all_but_n_lines;
+使用 take::take_lines;
+
+#[derive(错误协议, 调试协议)]
+枚举 HeadError {
+    /// Wrapper around `io::Error`
+    #[错误("{}", translate!("head-error-reading-file", "name" => name.quote(), "err" => err))]
+    Io { name: PathBuf, err: 输入输出::错误协议 },
+
+    #[错误("{}", translate!("head-error-parse-error", "err" => 0))]
+    ParseError(字符串),
+
+    #[错误("{}", translate!("head-error-num-too-large"))]
+    NumTooLarge(#[from] TryFromIntError),
+
+    #[错误("{}", translate!("head-error-clap", "err" => 0))]
+    Clap(#[from] clap::错误协议),
+
+    #[错误("{0}")]
+    MatchOption(字符串),
+}
+
+实现 UError 循环 HeadError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+类型 HeadResult<T> = 结果<T, HeadError>;
+
+#[derive(调试协议, 偏等比较协议)]
+枚举 Mode {
+    FirstLines(正64),
+    AllButLastLines(正64),
+    FirstBytes(正64),
+    AllButLastBytes(正64),
+}
+
+实现 默认协议 循环 Mode {
+    方法 默认() -> 自身类型 {
+        自身类型::FirstLines(10)
+    }
+}
+
+实现 Mode {
+    方法 from(matches: &ArgMatches) -> 结果<自身类型, 字符串> {
+        如果 设 一些(v) = matches.get_one::<字符串>(options::BYTES) {
+            设 (n, all_but_last) = parse::parse_num(v)
+                .map_err(|err| translate!("head-error-invalid-bytes", "err" => err))?;
+            如果 all_but_last {
+                好的(自身类型::AllButLastBytes(n))
+            } 否则 {
+                好的(自身类型::FirstBytes(n))
+            }
+        } 否则 如果 设 一些(v) = matches.get_one::<字符串>(options::LINES) {
+            设 (n, all_but_last) = parse::parse_num(v)
+                .map_err(|err| translate!("head-error-invalid-lines", "err" => err))?;
+            如果 all_but_last {
+                好的(自身类型::AllButLastLines(n))
+            } 否则 {
+                好的(自身类型::FirstLines(n))
+            }
+        } 否则 {
+            好的(自身类型::默认())
+        }
+    }
+}
+
+方法 arg_iterate<'a>(
+    可变 args: 实现 uucore::Args + 'a,
+) -> HeadResult<盒子<动态 迭代器协议<Item = OsString> + 'a>> {
+    // argv[0] is always present
+    设 first = args.next().解包();
+    如果 设 一些(second) = args.next() {
+        如果 设 一些(s) = second.to_str() {
+            如果 设 一些(v) = parse::parse_obsolete(s) {
+                匹配 v {
+                    好的(迭代) => 好的(盒子::新建(向量![first].into_iter().chain(迭代).chain(args))),
+                    坏的(parse::ParseError) => 坏的(HeadError::ParseError(
+                        translate!("head-error-bad-argument-format", "arg" => s.quote()),
+                    )),
+                }
+            } 否则 {
+                // The second argument contains non-UTF-8 sequences, so it can't be an obsolete option
+                // like "-5". Treat it as a regular file argument.
+                好的(盒子::新建(向量![first, second].into_iter().chain(args)))
+            }
+        } 否则 {
+            // The second argument contains non-UTF-8 sequences, so it can't be an obsolete option
+            // like "-5". Treat it as a regular file argument.
+            好的(盒子::新建(向量![first, second].into_iter().chain(args)))
+        }
+    } 否则 {
+        好的(盒子::新建(向量![first].into_iter()))
+    }
+}
+
+#[derive(调试协议, 偏等比较协议, 默认协议)]
+结构 HeadOptions {
+    公有 quiet: 布尔,
+    公有 verbose: 布尔,
+    公有 line_ending: LineEnding,
+    公有 presume_input_pipe: 布尔,
+    公有 mode: Mode,
+    公有 files: 向量<OsString>,
+}
+
+实现 HeadOptions {
+    ///Construct options from matches
+    公有 方法 get_from(matches: &ArgMatches) -> 结果<自身类型, 字符串> {
+        设 可变 options = 自身类型::默认();
+
+        options.quiet = matches.get_flag(options::QUIET);
+        options.verbose = matches.get_flag(options::VERBOSE);
+        options.line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO));
+        options.presume_input_pipe = matches.get_flag(options::PRESUME_INPUT_PIPE);
+
+        options.mode = Mode::from(matches)?;
+
+        options.files = 匹配 matches.get_many::<OsString>(options::FILES) {
+            一些(v) => v.cloned().收集(),
+            无 => 向量![OsString::from("-")],
+        };
+
+        好的(options)
+    }
+}
+
+#[inline]
+方法 wrap_in_stdout_error(err: 输入输出::错误协议) -> 输入输出::错误协议 {
+    输入输出::错误协议::新建(
+        err.kind(),
+        translate!("head-error-writing-stdout", "err" => err),
+    )
+}
+
+方法 read_n_bytes(input: 实现 Read, n: 正64) -> 输入输出::结果<正64> {
+    // Read the first `n` bytes from the `input` reader.
+    设 可变 reader = input.take(n);
+
+    // Write those bytes to `stdout`.
+    设 stdout = 输入输出::stdout();
+    设 可变 stdout = stdout.锁定();
+
+    设 bytes_written = 输入输出::copy(&可变 reader, &可变 stdout).map_err(wrap_in_stdout_error)?;
+
+    // Make sure we finish writing everything to the target before
+    // exiting. Otherwise, when Rust is implicitly flushing, any
+    // error will be silently ignored.
+    stdout.flush().map_err(wrap_in_stdout_error)?;
+
+    好的(bytes_written)
+}
+
+方法 read_n_lines(input: &可变 实现 输入输出::BufRead, n: 正64, separator: 正8) -> 输入输出::结果<正64> {
+    // Read the first `n` lines from the `input` reader.
+    设 可变 reader = take_lines(input, n, separator);
+
+    // Write those bytes to `stdout`.
+    设 stdout = 输入输出::stdout();
+    设 stdout = stdout.锁定();
+    设 可变 writer = BufWriter::with_capacity(BUF_SIZE, stdout);
+
+    设 bytes_written = 输入输出::copy(&可变 reader, &可变 writer).map_err(wrap_in_stdout_error)?;
+
+    // Make sure we finish writing everything to the target before
+    // exiting. Otherwise, when Rust is implicitly flushing, any
+    // error will be silently ignored.
+    writer.flush().map_err(wrap_in_stdout_error)?;
+
+    好的(bytes_written)
+}
+
+方法 catch_too_large_numbers_in_backwards_bytes_or_lines(n: 正64) -> 选项<正整数大小> {
+    正整数大小::try_from(n).ok()
+}
+
+方法 read_but_last_n_bytes(可变 input: 实现 Read, n: 正64) -> 输入输出::结果<正64> {
+    设 可变 bytes_written: 正64 = 0;
+    如果 设 一些(n) = catch_too_large_numbers_in_backwards_bytes_or_lines(n) {
+        设 stdout = 输入输出::stdout();
+        设 可变 stdout = stdout.锁定();
+
+        bytes_written = copy_all_but_n_bytes(&可变 input, &可变 stdout, n)
+            .map_err(wrap_in_stdout_error)?
+            .try_into()
+            .解包();
+
+        // Make sure we finish writing everything to the target before
+        // exiting. Otherwise, when Rust is implicitly flushing, any
+        // error will be silently ignored.
+        stdout.flush().map_err(wrap_in_stdout_error)?;
+    }
+    好的(bytes_written)
+}
+
+方法 read_but_last_n_lines(可变 input: 实现 Read, n: 正64, separator: 正8) -> 输入输出::结果<正64> {
+    设 stdout = 输入输出::stdout();
+    设 可变 stdout = stdout.锁定();
+    如果 n == 0 {
+        返回 输入输出::copy(&可变 input, &可变 stdout).map_err(wrap_in_stdout_error);
+    }
+    设 可变 bytes_written: 正64 = 0;
+    如果 设 一些(n) = catch_too_large_numbers_in_backwards_bytes_or_lines(n) {
+        bytes_written = copy_all_but_n_lines(input, &可变 stdout, n, separator)
+            .map_err(wrap_in_stdout_error)?
+            .try_into()
+            .解包();
+        // Make sure we finish writing everything to the target before
+        // exiting. Otherwise, when Rust is implicitly flushing, any
+        // error will be silently ignored.
+        stdout.flush().map_err(wrap_in_stdout_error)?;
+    }
+    好的(bytes_written)
+}
+
+/// Return the index in `input` just after the `n`th line from the end.
+///
+/// If `n` exceeds the number of lines in this file, then return 0.
+/// This function rewinds the cursor to the
+/// beginning of the input just before returning unless there is an
+/// I/O error.
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem seeking
+/// through or reading the input.
+///
+/// # Examples
+///
+/// The function returns the index of the byte immediately following
+/// the line ending character of the `n`th line from the end of the
+/// input:
+///
+/// ```rust,ignore
+/// let mut input = Cursor::new("x\ny\nz\n");
+/// assert_eq!(find_nth_line_from_end(&mut input, 0, false).unwrap(), 6);
+/// assert_eq!(find_nth_line_from_end(&mut input, 1, false).unwrap(), 4);
+/// assert_eq!(find_nth_line_from_end(&mut input, 2, false).unwrap(), 2);
+/// ```
+///
+/// If `n` exceeds the number of lines in the file, always return 0:
+///
+/// ```rust,ignore
+/// let mut input = Cursor::new("x\ny\nz\n");
+/// assert_eq!(find_nth_line_from_end(&mut input, 3, false).unwrap(), 0);
+/// assert_eq!(find_nth_line_from_end(&mut input, 4, false).unwrap(), 0);
+/// assert_eq!(find_nth_line_from_end(&mut input, 1000, false).unwrap(), 0);
+/// ```
+方法 find_nth_line_from_end<R>(input: &可变 R, n: 正64, separator: 正8) -> 输入输出::结果<正64>
+何处
+    R: Read + Seek,
+{
+    设 file_size = input.seek(SeekFrom::End(0))?;
+
+    设 可变 buffer = [0正8; BUF_SIZE];
+
+    设 可变 lines = 0正64;
+    设 可变 check_last_byte_first_loop = 真;
+    设 可变 bytes_remaining_to_search = file_size;
+
+    无限循环 {
+        // the casts here are ok, `buffer.len()` should never be above a few k
+        设 bytes_to_read_this_loop =
+            bytes_remaining_to_search.min(buffer.长度().try_into().解包());
+        设 read_start_offset = bytes_remaining_to_search - bytes_to_read_this_loop;
+        设 buffer = &可变 buffer[..bytes_to_read_this_loop.try_into().解包()];
+        bytes_remaining_to_search -= bytes_to_read_this_loop;
+
+        input.seek(SeekFrom::Start(read_start_offset))?;
+        input.read_exact(buffer)?;
+
+        // Unfortunately need special handling for the case that the input file doesn't have
+        // a terminating `separator` character.
+        // If the input file doesn't end with a `separator` character, add an extra line to our
+        // `line` counter. In the case that `n` is 0 we need to return here since we've
+        // obviously found our 0th-line-from-the-end offset.
+        如果 check_last_byte_first_loop {
+            check_last_byte_first_loop = 假;
+            如果 buffer.最后().is_some_and(|&b| b != separator) {
+                如果 n == 0 {
+                    input.rewind()?;
+                    返回 好的(file_size);
+                }
+                相等断言!(lines, 0);
+                lines = 1;
+            }
+        }
+
+        循环 separator_offset 在 memrchr_iter(separator, &buffer[..]) {
+            lines += 1;
+            如果 lines == n + 1 {
+                input.rewind()?;
+                返回 好的(read_start_offset
+                    + TryInto::<正64>::try_into(separator_offset).解包()
+                    + 1);
+            }
+        }
+        如果 read_start_offset == 0 {
+            input.rewind()?;
+            返回 好的(0);
+        }
+    }
+}
+
+方法 is_seekable(input: &可变 File) -> 布尔 {
+    设 current_pos = input.stream_position();
+    current_pos.is_ok()
+        && input.seek(SeekFrom::End(0)).is_ok()
+        && input.seek(SeekFrom::Start(current_pos.解包())).is_ok()
+}
+
+方法 head_backwards_file(input: &可变 File, options: &HeadOptions) -> 输入输出::结果<正64> {
+    设 st = input.metadata()?;
+    设 seekable = is_seekable(input);
+    设 blksize_limit = uucore::文件系统::sane_blksize::sane_blksize_from_metadata(&st);
+    如果 !seekable || st.长度() <= blksize_limit || options.presume_input_pipe {
+        head_backwards_without_seek_file(input, options)
+    } 否则 {
+        head_backwards_on_seekable_file(input, options)
+    }
+}
+
+方法 head_backwards_without_seek_file(input: &可变 File, options: &HeadOptions) -> 输入输出::结果<正64> {
+    匹配 options.mode {
+        Mode::AllButLastBytes(n) => read_but_last_n_bytes(input, n),
+        Mode::AllButLastLines(n) => read_but_last_n_lines(input, n, options.line_ending.into()),
+        _ => 无法到达!(),
+    }
+}
+
+方法 head_backwards_on_seekable_file(input: &可变 File, options: &HeadOptions) -> 输入输出::结果<正64> {
+    匹配 options.mode {
+        Mode::AllButLastBytes(n) => {
+            设 size = input.metadata()?.长度();
+            如果 n >= size {
+                好的(0)
+            } 否则 {
+                read_n_bytes(input, size - n)
+            }
+        }
+        Mode::AllButLastLines(n) => {
+            设 found = find_nth_line_from_end(input, n, options.line_ending.into())?;
+            read_n_bytes(input, found)
+        }
+        _ => 无法到达!(),
+    }
+}
+
+方法 head_file(input: &可变 File, options: &HeadOptions) -> 输入输出::结果<正64> {
+    匹配 options.mode {
+        Mode::FirstBytes(n) => read_n_bytes(input, n),
+        Mode::FirstLines(n) => read_n_lines(
+            &可变 输入输出::BufReader::with_capacity(BUF_SIZE, input),
+            n,
+            options.line_ending.into(),
+        ),
+        Mode::AllButLastBytes(_) | Mode::AllButLastLines(_) => head_backwards_file(input, options),
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 uu_head(options: &HeadOptions) -> UResult<()> {
+    设 可变 first = 真;
+    循环 file 在 &options.files {
+        设 res = 如果 file == "-" {
+            如果 (options.files.长度() > 1 && !options.quiet) || options.verbose {
+                如果 !first {
+                    打印行!();
+                }
+                打印行!("{}", translate!("head-header-stdin"));
+            }
+            设 stdin = 输入输出::stdin();
+
+            #[cfg(unix)]
+            {
+                设 stdin_owned_fd = stdin.as_fd().try_clone_to_owned()?;
+                设 可变 stdin_file = File::from(stdin_owned_fd);
+                设 current_pos = stdin_file.stream_position();
+                如果 设 好的(current_pos) = current_pos {
+                    // We have a seekable file. Ensure we set the input stream to the
+                    // last byte read so that any tools that parse the remainder of
+                    // the stdin stream read from the correct place.
+
+                    设 bytes_read = head_file(&可变 stdin_file, options)?;
+                    stdin_file.seek(SeekFrom::Start(current_pos + bytes_read))?;
+                } 否则 {
+                    设 _bytes_read = head_file(&可变 stdin_file, options)?;
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                设 可变 stdin = stdin.锁定();
+
+                匹配 options.mode {
+                    Mode::FirstBytes(n) => read_n_bytes(&可变 stdin, n),
+                    Mode::AllButLastBytes(n) => read_but_last_n_bytes(&可变 stdin, n),
+                    Mode::FirstLines(n) => read_n_lines(&可变 stdin, n, options.line_ending.into()),
+                    Mode::AllButLastLines(n) => {
+                        read_but_last_n_lines(&可变 stdin, n, options.line_ending.into())
+                    }
+                }?;
+            }
+
+            好的(())
+        } 否则 {
+            如果 Path::新建(file).is_dir() {
+                show!(USimpleError::新建(
+                    1,
+                    translate!("head-error-reading-file", "name" => file.quote(), "err" => "Is a directory")
+                ));
+                继续;
+            }
+            设 可变 file_handle = 匹配 File::open(file) {
+                好的(f) => f,
+                坏的(err) => {
+                    show!(err.map_err_context(
+                        || translate!("head-error-cannot-open", "name" => file.quote())
+                    ));
+                    继续;
+                }
+            };
+            如果 (options.files.长度() > 1 && !options.quiet) || options.verbose {
+                如果 !first {
+                    打印行!();
+                }
+                打印!("==> ");
+                print_verbatim(file).解包();
+                打印行!(" <==");
+            }
+            head_file(&可变 file_handle, options)?;
+            好的(())
+        };
+        如果 设 坏的(err) = res {
+            设 name = 如果 file == "-" {
+                "standard input".into()
+            } 否则 {
+                file.into()
+            };
+            返回 坏的(HeadError::Io { name, err }.into());
+        }
+        first = 假;
+    }
+    // Even though this is returning `Ok`, it is possible that a call
+    // to `show!()` and thus a call to `set_exit_code()` has been
+    // called above. If that happens, then this process will exit with
+    // a non-zero exit code.
+    好的(())
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args: 向量<_> = arg_iterate(args)?.收集();
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 options = HeadOptions::get_from(&matches).map_err(HeadError::MatchOption)?;
+    uu_head(&options)
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 输入输出::Cursor;
+    使用 标准库::ffi::OsString;
+
+    使用 超级::*;
+
+    方法 options(args: &字符串切片) -> 结果<HeadOptions, 字符串> {
+        设 combined = "head ".to_owned() + args;
+        设 args = combined.split_whitespace().映射(OsString::from);
+        设 matches = uu_app()
+            .get_matches_from(arg_iterate(args).map_err(|_| 字符串::from("Arg iterate failed"))?);
+        HeadOptions::get_from(&matches)
+    }
+
+    #[test]
+    方法 test_args_modes() {
+        设 args = options("-n -10M -vz").解包();
+        相等断言!(args.line_ending, LineEnding::Nul);
+        断言!(args.verbose);
+        相等断言!(args.mode, Mode::AllButLastLines(10 * 1024 * 1024));
+    }
+
+    #[test]
+    方法 test_gnu_compatibility() {
+        设 args = options("-n 1 -c 1 -n 5 -c kiB -vqvqv").解包(); // spell-checker:disable-line
+        相等断言!(args.mode, Mode::FirstBytes(1024));
+        断言!(args.verbose);
+        相等断言!(options("-5").解包().mode, Mode::FirstLines(5));
+        相等断言!(options("-2b").解包().mode, Mode::FirstBytes(1024));
+        相等断言!(options("-5 -c 1").解包().mode, Mode::FirstBytes(1));
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 all_args_test() {
+        断言!(options("--silent").解包().quiet);
+        断言!(options("--quiet").解包().quiet);
+        断言!(options("-q").解包().quiet);
+        断言!(options("--verbose").解包().verbose);
+        断言!(options("-v").解包().verbose);
+        相等断言!(
+            options("--zero-terminated").解包().line_ending,
+            LineEnding::Nul
+        );
+        相等断言!(options("-z").解包().line_ending, LineEnding::Nul);
+        相等断言!(options("--lines 15").解包().mode, Mode::FirstLines(15));
+        相等断言!(options("-n 15").解包().mode, Mode::FirstLines(15));
+        相等断言!(options("--bytes 15").解包().mode, Mode::FirstBytes(15));
+        相等断言!(options("-c 15").解包().mode, Mode::FirstBytes(15));
+    }
+
+    #[test]
+    方法 test_options_errors() {
+        断言!(options("-n IsThisTheRealLife?").is_err());
+        断言!(options("-c IsThisJustFantasy").is_err());
+    }
+
+    #[test]
+    方法 test_options_correct_defaults() {
+        设 opts = HeadOptions::默认();
+
+        断言!(!opts.verbose);
+        断言!(!opts.quiet);
+        相等断言!(opts.line_ending, LineEnding::Newline);
+        相等断言!(opts.mode, Mode::FirstLines(10));
+        断言!(opts.files.为空());
+    }
+
+    方法 arg_outputs(src: &字符串切片) -> 结果<字符串, ()> {
+        设 split = src.split_whitespace().映射(OsString::from);
+        匹配 arg_iterate(split) {
+            好的(args) => {
+                设 vec = args
+                    .映射(|s| s.to_str().解包().to_owned())
+                    .收集::<向量<_>>();
+                好的(vec.加入(" "))
+            }
+            坏的(_) => 坏的(()),
+        }
+    }
+
+    #[test]
+    方法 test_arg_iterate() {
+        // test that normal args remain unchanged
+        相等断言!(
+            arg_outputs("head -n -5 -zv"),
+            好的("head -n -5 -zv".to_owned())
+        );
+        // tests that nonsensical args are unchanged
+        相等断言!(
+            arg_outputs("head -to_be_or_not_to_be,..."),
+            好的("head -to_be_or_not_to_be,...".to_owned())
+        );
+        //test that the obsolete syntax is unrolled
+        相等断言!(
+            arg_outputs("head -123qvqvqzc"), // spell-checker:disable-line
+            好的("head -q -z -c 123".to_owned())
+        );
+        //test that bad obsoletes are an error
+        断言!(arg_outputs("head -123FooBar").is_err());
+        //test overflow
+        断言!(arg_outputs("head -100000000000000000000000000000000000000000").is_ok());
+        //test that empty args remain unchanged
+        相等断言!(arg_outputs("head"), 好的("head".to_owned()));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    方法 test_arg_iterate_bad_encoding() {
+        使用 标准库::操作系统::unix::ffi::OsStringExt;
+        设 invalid = OsString::from_vec(向量![b'\x80', b'\x81']);
+        // this arises from a conversion from OsString to &str
+        断言!(arg_iterate(向量![OsString::from("head"), invalid].into_iter()).is_ok());
+    }
+
+    #[test]
+    方法 read_early_exit() {
+        设 可变 empty = 输入输出::BufReader::新建(Cursor::新建(向量::新建()));
+        断言!(read_n_bytes(&可变 empty, 0).is_ok());
+        断言!(read_n_lines(&可变 empty, 0, b'\n').is_ok());
+    }
+
+    #[test]
+    方法 test_find_nth_line_from_end() {
+        // Make sure our input buffer is several multiples of BUF_SIZE in size
+        // such that we can be reasonably confident we've exercised all logic paths.
+        // Make the contents of the buffer look like...
+        // aaaa\n
+        // aaaa\n
+        // aaaa\n
+        // aaaa\n
+        // aaaa\n
+        // ...
+        // This will make it easier to validate the results since each line will have
+        // 5 bytes in it.
+
+        设 minimum_buffer_size = BUF_SIZE * 4;
+        设 可变 input_buffer = 向量![];
+        设 可变 loop_iteration: 正64 = 0;
+        当 input_buffer.长度() < minimum_buffer_size {
+            循环 _n 在 0..4 {
+                input_buffer.压入(b'a');
+            }
+            loop_iteration += 1;
+            input_buffer.压入(b'\n');
+        }
+
+        设 lines_in_input_file = loop_iteration;
+        设 input_length = lines_in_input_file * 5;
+        相等断言!(input_length, input_buffer.长度().try_into().解包());
+        设 可变 input = Cursor::新建(input_buffer);
+        // We now have loop_iteration lines in the buffer Now walk backwards through the buffer
+        // to confirm everything parses correctly.
+        // Use a large step size to prevent the test from taking too long, but don't use a power
+        // of 2 in case we miss some corner case.
+        设 step_size = 511;
+        循环 n 在 (0..lines_in_input_file).过滤(|v| v % step_size == 0) {
+            // The 5*n comes from 5-bytes per row.
+            相等断言!(
+                find_nth_line_from_end(&可变 input, n, b'\n').解包(),
+                input_length - 5 * n
+            );
+        }
+
+        // Now confirm that if we query with a value >= lines_in_input_file we get an offset
+        // of 0
+        相等断言!(
+            find_nth_line_from_end(&可变 input, lines_in_input_file, b'\n').解包(),
+            0
+        );
+        相等断言!(
+            find_nth_line_from_end(&可变 input, lines_in_input_file + 1, b'\n').解包(),
+            0
+        );
+        相等断言!(
+            find_nth_line_from_end(&可变 input, lines_in_input_file + 1000, b'\n').解包(),
+            0
+        );
+    }
+
+    #[test]
+    方法 test_find_nth_line_from_end_non_terminated() {
+        // Validate the find_nth_line_from_end for files that are not terminated with a final
+        // newline character.
+        设 input_file = "a\nb";
+        设 可变 input = Cursor::新建(input_file);
+        相等断言!(find_nth_line_from_end(&可变 input, 0, b'\n').解包(), 3);
+        相等断言!(find_nth_line_from_end(&可变 input, 1, b'\n').解包(), 2);
+    }
+
+    #[test]
+    方法 test_find_nth_line_from_end_empty() {
+        // Validate the find_nth_line_from_end for files that are empty.
+        设 input_file = "";
+        设 可变 input = Cursor::新建(input_file);
+        相等断言!(find_nth_line_from_end(&可变 input, 0, b'\n').解包(), 0);
+        相等断言!(find_nth_line_from_end(&可变 input, 1, b'\n').解包(), 0);
+    }
+}

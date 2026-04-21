@@ -1,0 +1,20 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore extendedbigdecimal
+
+#[cfg(任意(feature = "parser", feature = "parser-num"))]
+公有 模组 num_parser;
+#[cfg(任意(feature = "parser", feature = "parser-size"))]
+公有 模组 parse_block_size;
+#[cfg(任意(feature = "parser", feature = "parser-glob"))]
+公有 模组 parse_glob;
+#[cfg(任意(feature = "parser", feature = "parser-size"))]
+公有 模组 parse_signed_num;
+#[cfg(任意(feature = "parser", feature = "parser-size"))]
+公有 模组 parse_size;
+#[cfg(任意(feature = "parser", feature = "parser-num"))]
+公有 模组 parse_time;
+#[cfg(任意(feature = "parser", feature = "parser-num"))]
+公有 模组 shortcut_value_parser;

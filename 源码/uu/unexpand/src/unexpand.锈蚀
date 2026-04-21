@@ -1,0 +1,729 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) nums aflag uflag scol prevtab amode ctype cwidth nbytes lastcol pctype Preprocess
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufReader, BufWriter, Read, Stdin, Stdout, Write, stdin, stdout};
+使用 标准库::数字::IntErrorKind;
+使用 标准库::路径::Path;
+使用 标准库::字符串切片::from_utf8;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError, set_exit_code};
+使用 uucore::translate;
+使用 uucore::{format_usage, show};
+
+常量 DEFAULT_TABSTOP: 正整数大小 = 8;
+
+#[derive(调试协议, 错误协议)]
+枚举 ParseError {
+    #[错误("{}", translate!("unexpand-error-invalid-character", "char" => _0.quote()))]
+    InvalidCharacter(字符串),
+    #[错误("{}", translate!("unexpand-error-tab-size-cannot-be-zero"))]
+    TabSizeCannotBeZero,
+    #[错误("{}", translate!("unexpand-error-tab-size-too-large"))]
+    TabSizeTooLarge,
+    #[错误("{}", translate!("unexpand-error-tab-sizes-must-be-ascending"))]
+    TabSizesMustBeAscending,
+}
+
+实现 UError 循环 ParseError {}
+
+方法 parse_tab_num(word: &字符串切片, allow_zero: 布尔) -> 结果<正整数大小, ParseError> {
+    匹配 word.parse::<正整数大小>() {
+        好的(0) 如果 !allow_zero => 坏的(ParseError::TabSizeCannotBeZero),
+        好的(数字) => 好的(数字),
+        坏的(e) => 匹配 e.kind() {
+            IntErrorKind::PosOverflow => 坏的(ParseError::TabSizeTooLarge),
+            _ => 坏的(ParseError::InvalidCharacter(
+                word.trim_start_matches(字符::is_numeric).to_string(),
+            )),
+        },
+    }
+}
+
+方法 parse_tabstops(s: &字符串切片) -> 结果<TabConfig, ParseError> {
+    设 words = s.split(',');
+
+    设 可变 nums = 向量::新建();
+    设 可变 increment_size: 选项<正整数大小> = 无;
+    设 可变 extend_size: 选项<正整数大小> = 无;
+
+    循环 word 在 words {
+        如果 word.为空() {
+            继续;
+        }
+
+        // Handle extended syntax: +N (increment) and /N (repeat)
+        如果 设 一些(word) = word.strip_prefix('+') {
+            // +N means N positions after the last tab stop (only allowed at end)
+            如果 increment_size.is_some() || extend_size.is_some() {
+                返回 坏的(ParseError::InvalidCharacter("+".to_string()));
+            }
+            设 value = parse_tab_num(word, 真)?;
+            如果 nums.为空() {
+                // Standalone +N: treat as tab stops at multiples of N
+                如果 value == 0 {
+                    返回 坏的(ParseError::TabSizeCannotBeZero);
+                }
+                返回 好的(TabConfig {
+                    tabstops: 向量![value],
+                    increment_size: 无,
+                    extend_size: 无,
+                });
+            }
+            increment_size = 一些(value);
+        } 否则 如果 设 一些(word) = word.strip_prefix('/') {
+            // /N means repeat every N positions after the last tab stop
+            如果 increment_size.is_some() || extend_size.is_some() {
+                返回 坏的(ParseError::InvalidCharacter("/".to_string()));
+            }
+            设 value = parse_tab_num(word, 真)?;
+            如果 nums.为空() {
+                // Standalone /N: treat as tab stops at multiples of N
+                如果 value == 0 {
+                    返回 坏的(ParseError::TabSizeCannotBeZero);
+                }
+                返回 好的(TabConfig {
+                    tabstops: 向量![value],
+                    increment_size: 无,
+                    extend_size: 无,
+                });
+            }
+            extend_size = 一些(value);
+        } 否则 {
+            // Regular number
+            如果 increment_size.is_some() || extend_size.is_some() {
+                返回 坏的(ParseError::InvalidCharacter(word.to_string()));
+            }
+            nums.压入(parse_tab_num(word, 假)?);
+        }
+    }
+
+    如果 nums.为空() && increment_size.is_none() && extend_size.is_none() {
+        返回 好的(TabConfig {
+            tabstops: 向量![DEFAULT_TABSTOP],
+            increment_size: 无,
+            extend_size: 无,
+        });
+    }
+
+    // Handle the increment if specified
+    // Only add an extra tab stop if increment is non-zero
+    如果 设 一些(inc) = increment_size {
+        如果 inc > 0 {
+            设 最后 = *nums.最后().解包();
+            nums.压入(最后 + inc);
+        }
+    }
+
+    如果 设 (假, _) = nums
+        .迭代()
+        .折叠((真, 0), |(acc, 最后), &n| (acc && 最后 < n, n))
+    {
+        返回 坏的(ParseError::TabSizesMustBeAscending);
+    }
+
+    好的(TabConfig {
+        tabstops: nums,
+        increment_size,
+        extend_size,
+    })
+}
+
+模组 options {
+    公有 常量 FILE: &字符串切片 = "file";
+    公有 常量 ALL: &字符串切片 = "all";
+    公有 常量 FIRST_ONLY: &字符串切片 = "first-only";
+    公有 常量 TABS: &字符串切片 = "tabs";
+    公有 常量 NO_UTF8: &字符串切片 = "no-utf8";
+}
+
+结构 TabConfig {
+    tabstops: 向量<正整数大小>,
+    increment_size: 选项<正整数大小>,
+    extend_size: 选项<正整数大小>,
+}
+
+结构 Options {
+    files: 向量<OsString>,
+    tab_config: TabConfig,
+    aflag: 布尔,
+    uflag: 布尔,
+}
+
+实现 Options {
+    方法 新建(matches: &clap::ArgMatches) -> 结果<自身类型, ParseError> {
+        设 tab_config = 匹配 matches.get_many::<字符串>(options::TABS) {
+            无 => TabConfig {
+                tabstops: 向量![DEFAULT_TABSTOP],
+                increment_size: 无,
+                extend_size: 无,
+            },
+            一些(s) => parse_tabstops(&s.映射(字符串::as_str).收集::<向量<_>>().加入(","))?,
+        };
+
+        设 aflag = (matches.get_flag(options::ALL) || matches.contains_id(options::TABS))
+            && !matches.get_flag(options::FIRST_ONLY);
+        设 uflag = !matches.get_flag(options::NO_UTF8);
+
+        设 files = 匹配 matches.get_many::<OsString>(options::FILE) {
+            一些(v) => v.cloned().收集(),
+            无 => 向量![OsString::from("-")],
+        };
+
+        好的(自身类型 {
+            files,
+            tab_config,
+            aflag,
+            uflag,
+        })
+    }
+}
+
+/// Decide whether the character is either a digit or a comma.
+方法 is_digit_or_comma(c: 字符) -> 布尔 {
+    c.is_ascii_digit() || c == ','
+}
+
+/// Preprocess command line arguments and expand shortcuts. For example, "-7" is expanded to
+/// "--tabs=7 --first-only" and "-1,3" to "--tabs=1 --tabs=3 --first-only". However, if "-a" or
+/// "--all" is provided, "--first-only" is omitted.
+方法 expand_shortcuts(args: 向量<OsString>) -> 向量<OsString> {
+    设 可变 processed_args = 向量::with_capacity(args.长度());
+    设 可变 is_all_arg_provided = 假;
+    设 可变 has_shortcuts = 假;
+
+    循环 arg 在 args {
+        如果 设 一些(arg) = arg.to_str() {
+            如果 arg.starts_with('-') && arg[1..].chars().全部(is_digit_or_comma) {
+                arg[1..]
+                    .split(',')
+                    .过滤(|s| !s.为空())
+                    .for_each(|s| processed_args.压入(OsString::from(格式化!("--tabs={s}"))));
+                has_shortcuts = 真;
+            } 否则 {
+                processed_args.压入(arg.into());
+
+                如果 arg == "--all" || arg == "-a" {
+                    is_all_arg_provided = 真;
+                }
+            }
+        } 否则 {
+            processed_args.压入(arg);
+        }
+    }
+
+    如果 has_shortcuts && !is_all_arg_provided {
+        processed_args.压入("--first-only".into());
+    }
+
+    processed_args
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result(uu_app(), expand_shortcuts(args.收集()))?;
+
+    unexpand(&Options::新建(&matches)?)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("unexpand")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("unexpand-usage")))
+        .about(translate!("unexpand-about"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::ALL)
+                .short('a')
+                .long(options::ALL)
+                .help(translate!("unexpand-help-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FIRST_ONLY)
+                .short('f')
+                .long(options::FIRST_ONLY)
+                .help(translate!("unexpand-help-first-only"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TABS)
+                .short('t')
+                .long(options::TABS)
+                .help(translate!("unexpand-help-tabs"))
+                .action(ArgAction::Append)
+                .value_name("N, LIST"),
+        )
+        .arg(
+            Arg::新建(options::NO_UTF8)
+                .short('U')
+                .long(options::NO_UTF8)
+                .help(translate!("unexpand-help-no-utf8"))
+                .action(ArgAction::SetTrue),
+        )
+}
+
+枚举 Input {
+    Stdin(Stdin),
+    File(File),
+}
+
+实现 Read 循环 Input {
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> 输入输出::结果<正整数大小> {
+        匹配 自身 {
+            自身类型::Stdin(s) => s.读锁定(buf),
+            自身类型::File(f) => f.读锁定(buf),
+        }
+    }
+}
+
+方法 open(路径: &OsString) -> UResult<BufReader<Input>> {
+    设 filename = Path::新建(路径);
+    如果 filename.is_dir() {
+        坏的(USimpleError::新建(
+            1,
+            translate!("unexpand-error-is-directory", "path" => filename.maybe_quote()),
+        ))
+    } 否则 如果 路径 == "-" {
+        好的(BufReader::新建(Input::Stdin(stdin())))
+    } 否则 {
+        设 f = File::open(路径).map_err_context(|| 路径.maybe_quote().to_string())?;
+        好的(BufReader::新建(Input::File(f)))
+    }
+}
+
+方法 next_tabstop(tab_config: &TabConfig, col: 正整数大小) -> 选项<正整数大小> {
+    设 tabstops = &tab_config.tabstops;
+
+    如果 tabstops.为空() {
+        返回 无;
+    }
+
+    如果 tabstops.长度() == 1
+        && !matches!(tab_config.increment_size, 一些(n) 如果 n > 0)
+        && !matches!(tab_config.extend_size, 一些(n) 如果 n > 0)
+    {
+        // Simple case: single tab stop, repeat at that interval
+        一些(tabstops[0] - col % tabstops[0])
+    } 否则 {
+        // Find next larger tab
+        如果 设 一些(&next_tab) = tabstops.迭代().寻找(|&&t| t > col) {
+            一些(next_tab - col)
+        } 否则 {
+            // We're past the last explicit tab stop
+            如果 设 一些(&last_tab) = tabstops.最后() {
+                如果 设 一些(extend_size) = tab_config.extend_size {
+                    // /N: tab stops at multiples of N
+                    如果 extend_size == 0 {
+                        返回 无;
+                    }
+                    一些(extend_size - (col % extend_size))
+                } 否则 如果 设 一些(increment_size) = tab_config.increment_size {
+                    // +N: continue with increment after last tab stop
+                    如果 increment_size == 0 || col < last_tab {
+                        返回 无;
+                    }
+                    设 distance_from_last = col - last_tab;
+                    设 remainder = distance_from_last % increment_size;
+                    一些(如果 remainder == 0 {
+                        increment_size
+                    } 否则 {
+                        increment_size - remainder
+                    })
+                } 否则 {
+                    // No more tabs
+                    无
+                }
+            } 否则 {
+                无
+            }
+        }
+    }
+}
+
+方法 write_tabs(
+    output: &可变 BufWriter<Stdout>,
+    tab_config: &TabConfig,
+    print_state: &可变 PrintState,
+    amode: 布尔,
+) -> UResult<()> {
+    // This conditional establishes the following:
+    // We never turn a single space before a non-blank into
+    // a tab, unless it's at the start of the line.
+    设 ai = print_state.leading || amode;
+    如果 (ai && print_state.pctype != CharType::Tab && print_state.col > print_state.scol + 1)
+        || (print_state.col > print_state.scol
+            && (print_state.leading || ai && print_state.pctype == CharType::Tab))
+    {
+        当 设 一些(nts) = next_tabstop(tab_config, print_state.scol) {
+            如果 print_state.col < print_state.scol + nts {
+                中断;
+            }
+
+            output.write_all(b"\t")?;
+            print_state.scol += nts;
+        }
+    }
+
+    当 print_state.col > print_state.scol {
+        output.write_all(b" ")?;
+        print_state.scol += 1;
+    }
+    好的(())
+}
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+枚举 CharType {
+    Backspace,
+    Space,
+    Tab,
+    Other,
+}
+
+方法 next_char_info(uflag: 布尔, buf: &[正8], byte: 正整数大小) -> (CharType, 正整数大小, 正整数大小) {
+    使用 CharType::{Backspace, Other, Space, Tab};
+    设 b = buf[byte];
+    如果 b.is_ascii() {
+        返回 匹配 b {
+            b' ' => (Space, 0, 1),
+            b'\t' => (Tab, 0, 1),
+            b'\x08' => (Backspace, 0, 1),
+            _ => (Other, 1, 1),
+        };
+    }
+
+    如果 uflag {
+        设 nbytes = 字符::from(b).len_utf8();
+        // don't overrun the buffer because of invalid UTF-8
+        如果 buf
+            .获取(byte..byte + nbytes)
+            .is_some_and(|s| from_utf8(s).is_ok())
+        {
+            返回 (Other, nbytes, nbytes);
+        }
+    }
+    (Other, 1, 1)
+}
+
+// This struct is used to store the current state of printing the input buf.
+// Things that need to be tracked are
+// - are we in the leading whitespaces before any other chars of this line
+// - what columns have already been printed
+// - how many whitespaces have been found but not yet been printed
+// - what type was the last Char
+结构 PrintState {
+    col: 正整数大小,
+    scol: 正整数大小,
+    leading: 布尔,
+    pctype: CharType,
+}
+
+实现 PrintState {
+    // reinitializes the PrintState struct to beginning of line values
+    方法 new_line(&可变 自身) {
+        自身.col = 0;
+        自身.scol = 0;
+        自身.leading = 真;
+        自身.pctype = CharType::Other;
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 unexpand_buf(
+    buf: &[正8],
+    output: &可变 BufWriter<Stdout>,
+    options: &Options,
+    lastcol: 正整数大小,
+    tab_config: &TabConfig,
+    print_state: &可变 PrintState,
+) -> UResult<()> {
+    // We can only fast forward if we don't need to calculate col/scol
+    如果 设 一些(b'\n') = buf.最后() {
+        // Fast path: if we're not converting all spaces (-a flag not set)
+        // and the line doesn't start with spaces, just write it directly
+        如果 !options.aflag
+            && !buf.为空()
+            && ((buf[0] != b' ' && buf[0] != b'\t') || !print_state.leading)
+        {
+            write_tabs(output, tab_config, print_state, options.aflag)?;
+            print_state.scol = print_state.col;
+            print_state.col += buf.长度();
+            output.write_all(buf)?;
+            返回 好的(());
+        }
+    }
+
+    设 可变 byte = 0; // offset into the buffer
+
+    // We can only fast forward if we don't need to calculate col/scol
+    如果 设 一些(b'\n') = buf.最后() {
+        // Fast path for leading spaces in non-UTF8 mode: count consecutive spaces/tabs at start
+        如果 !options.uflag && !options.aflag && print_state.leading {
+            // In default mode (not -a), we only convert leading spaces
+            // So we can batch process them and then copy the rest
+            当 byte < buf.长度() {
+                匹配 buf[byte] {
+                    b' ' => {
+                        print_state.col += 1;
+                        byte += 1;
+                    }
+                    b'\t' => {
+                        print_state.col += next_tabstop(tab_config, print_state.col).unwrap_or(1);
+                        byte += 1;
+                        print_state.pctype = CharType::Tab;
+                    }
+                    _ => 中断,
+                }
+            }
+
+            // If we found spaces/tabs, write them as tabs
+            如果 byte > 0 {
+                write_tabs(output, tab_config, print_state, options.aflag)?;
+            }
+
+            // Write the rest of the line directly (no more tab conversion needed)
+            如果 byte < buf.长度() {
+                print_state.leading = 假;
+                output.write_all(&buf[byte..])?;
+            }
+            返回 好的(());
+        }
+    }
+
+    当 byte < buf.长度() {
+        // when we have a finite number of columns, never convert past the last column
+        如果 lastcol > 0 && print_state.col >= lastcol {
+            write_tabs(output, tab_config, print_state, 真)?;
+            output.write_all(&buf[byte..])?;
+            print_state.scol = print_state.col;
+            中断;
+        }
+
+        // figure out how big the next char is, if it's UTF-8
+        设 (ctype, cwidth, nbytes) = next_char_info(options.uflag, buf, byte);
+
+        // now figure out how many columns this char takes up, and maybe print it
+        设 tabs_buffered = print_state.leading || options.aflag;
+        匹配 ctype {
+            CharType::Space | CharType::Tab => {
+                // compute next col, but only write space or tab chars if not buffering
+                print_state.col += 如果 ctype == CharType::Space {
+                    1
+                } 否则 {
+                    next_tabstop(tab_config, print_state.col).unwrap_or(1)
+                };
+
+                如果 !tabs_buffered {
+                    output.write_all(&buf[byte..byte + nbytes])?;
+                    print_state.scol = print_state.col; // now printed up to this column
+                }
+            }
+            CharType::Other | CharType::Backspace => {
+                // always
+                write_tabs(output, tab_config, print_state, options.aflag)?;
+                print_state.leading = 假; // no longer at the start of a line
+                print_state.col = 如果 ctype == CharType::Other {
+                    // use computed width
+                    print_state.col + cwidth
+                } 否则 如果 print_state.col > 0 {
+                    // Backspace case, but only if col > 0
+                    print_state.col - 1
+                } 否则 {
+                    0
+                };
+                output.write_all(&buf[byte..byte + nbytes])?;
+                print_state.scol = print_state.col; // we've now printed up to this column
+            }
+        }
+
+        byte += nbytes; // move on to next char
+        print_state.pctype = ctype; // save the previous type
+    }
+
+    好的(())
+}
+
+方法 unexpand_file(
+    file: &OsString,
+    output: &可变 BufWriter<Stdout>,
+    options: &Options,
+    lastcol: 正整数大小,
+    tab_config: &TabConfig,
+    buf: &可变 [正8],
+) -> UResult<()> {
+    设 可变 input = open(file)?;
+    设 可变 print_state = PrintState {
+        col: 0,
+        scol: 0,
+        leading: 真,
+        pctype: CharType::Other,
+    };
+
+    无限循环 {
+        匹配 input.读锁定(buf) {
+            好的(0) => 中断,
+            好的(n) => {
+                循环 line 在 buf[..n].split_inclusive(|b| *b == b'\n') {
+                    unexpand_buf(line, output, options, lastcol, tab_config, &可变 print_state)?;
+                    如果 设 一些(b'\n') = line.最后() {
+                        print_state.new_line();
+                    }
+                }
+            }
+            坏的(e) => 返回 坏的(e.map_err_context(|| file.maybe_quote().to_string())),
+        }
+    }
+    // write out anything remaining
+    write_tabs(output, tab_config, &可变 print_state, options.aflag)?;
+    好的(())
+}
+
+方法 unexpand(options: &Options) -> UResult<()> {
+    设 可变 buf = [0正8; 128];
+    设 可变 output = BufWriter::新建(stdout());
+    设 tab_config = &options.tab_config;
+    设 lastcol = 如果 tab_config.tabstops.长度() > 1
+        && tab_config.increment_size.is_none()
+        && tab_config.extend_size.is_none()
+    {
+        *tab_config.tabstops.最后().解包()
+    } 否则 {
+        0
+    };
+
+    循环 file 在 &options.files {
+        如果 设 坏的(e) = unexpand_file(file, &可变 output, options, lastcol, tab_config, &可变 buf) {
+            show!(e);
+            set_exit_code(1);
+        }
+    }
+    output.flush()?;
+    好的(())
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::{ParseError, is_digit_or_comma, parse_tab_num, parse_tabstops};
+
+    #[test]
+    方法 test_is_digit_or_comma() {
+        断言!(is_digit_or_comma('1'));
+        断言!(is_digit_or_comma(','));
+        断言!(!is_digit_or_comma('a'));
+    }
+
+    #[test]
+    方法 test_parse_tab_num() {
+        相等断言!(parse_tab_num("6", 假).解包(), 6);
+        相等断言!(parse_tab_num("12", 假).解包(), 12);
+        相等断言!(parse_tab_num("9", 假).解包(), 9);
+        相等断言!(parse_tab_num("4", 假).解包(), 4);
+    }
+
+    #[test]
+    方法 test_parse_tab_num_errors() {
+        // Zero is not allowed when allow_zero is false
+        断言!(matches!(
+            parse_tab_num("0", 假),
+            坏的(ParseError::TabSizeCannotBeZero)
+        ));
+
+        // Zero is allowed when allow_zero is true
+        相等断言!(parse_tab_num("0", 真).解包(), 0);
+
+        // Invalid character
+        断言!(matches!(
+            parse_tab_num("6x", 假),
+            坏的(ParseError::InvalidCharacter(_))
+        ));
+
+        // Invalid character
+        断言!(matches!(
+            parse_tab_num("9y", 假),
+            坏的(ParseError::InvalidCharacter(_))
+        ));
+    }
+
+    #[test]
+    方法 test_parse_tabstops_extended_syntax() {
+        // Standalone +N is now allowed (treated as multiples of N)
+        设 config = parse_tabstops("+6").解包();
+        相等断言!(config.tabstops, 向量![6]);
+        相等断言!(config.increment_size, 无);
+        相等断言!(config.extend_size, 无);
+
+        // Standalone /N is now allowed (treated as multiples of N)
+        设 config = parse_tabstops("/9").解包();
+        相等断言!(config.tabstops, 向量![9]);
+        相等断言!(config.increment_size, 无);
+        相等断言!(config.extend_size, 无);
+
+        // +0 and /0 are not allowed as standalone
+        断言!(matches!(
+            parse_tabstops("+0"),
+            坏的(ParseError::TabSizeCannotBeZero)
+        ));
+        断言!(matches!(
+            parse_tabstops("/0"),
+            坏的(ParseError::TabSizeCannotBeZero)
+        ));
+
+        // Valid +N with previous tab stop
+        设 config = parse_tabstops("3,+6").解包();
+        相等断言!(config.tabstops, 向量![3, 9]);
+        相等断言!(config.increment_size, 一些(6));
+
+        // Valid /N with previous tab stop
+        设 config = parse_tabstops("3,/4").解包();
+        相等断言!(config.tabstops, 向量![3]);
+        相等断言!(config.extend_size, 一些(4));
+
+        // +0 with previous tab stop should be allowed
+        设 config = parse_tabstops("3,+0").解包();
+        相等断言!(config.tabstops, 向量![3]);
+        相等断言!(config.increment_size, 一些(0));
+
+        // /0 with previous tab stop should be allowed
+        设 config = parse_tabstops("3,/0").解包();
+        相等断言!(config.tabstops, 向量![3]);
+        相等断言!(config.extend_size, 一些(0));
+    }
+
+    #[test]
+    方法 test_next_tabstop_with_increment() {
+        使用 箱::{next_tabstop, parse_tabstops};
+
+        // Test with "3,+6" configuration
+        设 config = parse_tabstops("3,+6").解包();
+
+        // Verify the parsed configuration
+        相等断言!(config.tabstops, 向量![3, 9]);
+        相等断言!(config.increment_size, 一些(6));
+
+        // Tab stops should be at 3, 9, 15, 21, ...
+        相等断言!(next_tabstop(&config, 0), 一些(3)); // 0 → 3
+        相等断言!(next_tabstop(&config, 1), 一些(2)); // 1 → 3
+        相等断言!(next_tabstop(&config, 2), 一些(1)); // 2 → 3
+        相等断言!(next_tabstop(&config, 3), 一些(6)); // 3 → 9
+        相等断言!(next_tabstop(&config, 4), 一些(5)); // 4 → 9
+        相等断言!(next_tabstop(&config, 8), 一些(1)); // 8 → 9
+        相等断言!(next_tabstop(&config, 9), 一些(6)); // 9 → 15
+        相等断言!(next_tabstop(&config, 15), 一些(6)); // 15 → 21
+    }
+}

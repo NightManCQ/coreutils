@@ -1,0 +1,681 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore bitlen
+
+使用 标准库::ffi::OsStr;
+使用 标准库::输入输出::{自身, Read};
+使用 标准库::数字::IntErrorKind;
+
+使用 os_display::Quotable;
+使用 thiserror::错误协议;
+
+使用 箱::错误::{UError, UResult};
+使用 箱::show_error;
+使用 箱::求和::{
+    Blake2b, Blake3, Bsd, CRC32B, Crc, Digest, DigestOutput, DigestWriter, Md5, Sha1, Sha3_224,
+    Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Shake128, Shake256, Sm3, SysV,
+};
+
+公有 模组 compute;
+公有 模组 validate;
+
+公有 常量 ALGORITHM_OPTIONS_SYSV: &字符串切片 = "sysv";
+公有 常量 ALGORITHM_OPTIONS_BSD: &字符串切片 = "bsd";
+公有 常量 ALGORITHM_OPTIONS_CRC: &字符串切片 = "crc";
+公有 常量 ALGORITHM_OPTIONS_CRC32B: &字符串切片 = "crc32b";
+公有 常量 ALGORITHM_OPTIONS_MD5: &字符串切片 = "md5";
+公有 常量 ALGORITHM_OPTIONS_SHA1: &字符串切片 = "sha1";
+公有 常量 ALGORITHM_OPTIONS_SHA2: &字符串切片 = "sha2";
+公有 常量 ALGORITHM_OPTIONS_SHA3: &字符串切片 = "sha3";
+
+公有 常量 ALGORITHM_OPTIONS_SHA224: &字符串切片 = "sha224";
+公有 常量 ALGORITHM_OPTIONS_SHA256: &字符串切片 = "sha256";
+公有 常量 ALGORITHM_OPTIONS_SHA384: &字符串切片 = "sha384";
+公有 常量 ALGORITHM_OPTIONS_SHA512: &字符串切片 = "sha512";
+公有 常量 ALGORITHM_OPTIONS_BLAKE2B: &字符串切片 = "blake2b";
+公有 常量 ALGORITHM_OPTIONS_BLAKE3: &字符串切片 = "blake3";
+公有 常量 ALGORITHM_OPTIONS_SM3: &字符串切片 = "sm3";
+公有 常量 ALGORITHM_OPTIONS_SHAKE128: &字符串切片 = "shake128";
+公有 常量 ALGORITHM_OPTIONS_SHAKE256: &字符串切片 = "shake256";
+
+公有 常量 SUPPORTED_ALGORITHMS: [&字符串切片; 17] = [
+    ALGORITHM_OPTIONS_SYSV,
+    ALGORITHM_OPTIONS_BSD,
+    ALGORITHM_OPTIONS_CRC,
+    ALGORITHM_OPTIONS_CRC32B,
+    ALGORITHM_OPTIONS_MD5,
+    ALGORITHM_OPTIONS_SHA1,
+    ALGORITHM_OPTIONS_SHA2,
+    ALGORITHM_OPTIONS_SHA3,
+    ALGORITHM_OPTIONS_BLAKE2B,
+    ALGORITHM_OPTIONS_SM3,
+    // Legacy aliases for -a sha2 -l xxx
+    ALGORITHM_OPTIONS_SHA224,
+    ALGORITHM_OPTIONS_SHA256,
+    ALGORITHM_OPTIONS_SHA384,
+    ALGORITHM_OPTIONS_SHA512,
+    // Extra algorithms that are not valid `cksum --algorithm` as per GNU.
+    // TODO: Should we keep them or drop them to align our support with GNU ?
+    ALGORITHM_OPTIONS_BLAKE3,
+    ALGORITHM_OPTIONS_SHAKE128,
+    ALGORITHM_OPTIONS_SHAKE256,
+];
+
+/// Represents an algorithm kind. In some cases, it is not sufficient by itself
+/// to know which algorithm to use exactly, because it lacks a digest length,
+/// which is why [`SizedAlgoKind`] exists.
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 AlgoKind {
+    Sysv,
+    Bsd,
+    Crc,
+    Crc32b,
+    Md5,
+    Sm3,
+    Sha1,
+    Sha2,
+    Sha3,
+    Blake2b,
+
+    // Available in cksum for backward compatibility
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+
+    // Not available in cksum
+    Shake128,
+    Shake256,
+    Blake3,
+}
+
+实现 AlgoKind {
+    /// Parses an [`AlgoKind`] from a string, only accepting valid cksum
+    /// `--algorithm` values.
+    公有 方法 from_cksum(algo: 实现 作为引用协议<字符串切片>) -> UResult<自身类型> {
+        使用 AlgoKind::*;
+        好的(匹配 algo.as_ref() {
+            ALGORITHM_OPTIONS_SYSV => Sysv,
+            ALGORITHM_OPTIONS_BSD => Bsd,
+            ALGORITHM_OPTIONS_CRC => Crc,
+            ALGORITHM_OPTIONS_CRC32B => Crc32b,
+            ALGORITHM_OPTIONS_MD5 => Md5,
+            ALGORITHM_OPTIONS_SHA1 => Sha1,
+            ALGORITHM_OPTIONS_SHA2 => Sha2,
+            ALGORITHM_OPTIONS_SHA3 => Sha3,
+            ALGORITHM_OPTIONS_BLAKE2B => Blake2b,
+            ALGORITHM_OPTIONS_SM3 => Sm3,
+
+            // For backward compatibility
+            ALGORITHM_OPTIONS_SHA224 => Sha224,
+            ALGORITHM_OPTIONS_SHA256 => Sha256,
+            ALGORITHM_OPTIONS_SHA384 => Sha384,
+            ALGORITHM_OPTIONS_SHA512 => Sha512,
+
+            // Extensions not in GNU as of version 9.10
+            ALGORITHM_OPTIONS_BLAKE3 => Blake3,
+            ALGORITHM_OPTIONS_SHAKE128 => Shake128,
+            ALGORITHM_OPTIONS_SHAKE256 => Shake256,
+            _ => 返回 坏的(ChecksumError::UnknownAlgorithm(algo.as_ref().to_string()).into()),
+        })
+    }
+
+    /// Parses an algo kind from a string, accepting standalone binary names.
+    公有 方法 from_bin_name(algo: 实现 作为引用协议<字符串切片>) -> UResult<自身类型> {
+        使用 AlgoKind::*;
+        好的(匹配 algo.as_ref() {
+            "md5sum" => Md5,
+            "sha1sum" => Sha1,
+            "sha224sum" => Sha224,
+            "sha256sum" => Sha256,
+            "sha384sum" => Sha384,
+            "sha512sum" => Sha512,
+            "sha3sum" => Sha3,
+            "b2sum" => Blake2b,
+
+            _ => 返回 坏的(ChecksumError::UnknownAlgorithm(algo.as_ref().to_string()).into()),
+        })
+    }
+
+    /// Returns a string corresponding to the algorithm kind.
+    公有 方法 to_uppercase(自身) -> &'静态 字符串切片 {
+        使用 AlgoKind::*;
+        匹配 自身 {
+            // Legacy algorithms
+            Sysv => "SYSV",
+            Bsd => "BSD",
+            Crc => "CRC",
+            Crc32b => "CRC32B",
+
+            Md5 => "MD5",
+            Sm3 => "SM3",
+            Sha1 => "SHA1",
+            Sha2 => "SHA2",
+            Sha3 => "SHA3",
+            Blake2b => "BLAKE2b", // Note the lowercase b in the end here.
+
+            // For backward compatibility
+            Sha224 => "SHA224",
+            Sha256 => "SHA256",
+            Sha384 => "SHA384",
+            Sha512 => "SHA512",
+
+            Shake128 => "SHAKE128",
+            Shake256 => "SHAKE256",
+            Blake3 => "BLAKE3",
+        }
+    }
+
+    /// Returns a string corresponding to the algorithm option in cksum `-a`
+    公有 方法 to_lowercase(自身) -> &'静态 字符串切片 {
+        使用 AlgoKind::*;
+        匹配 自身 {
+            Sysv => "sysv",
+            Bsd => "bsd",
+            Crc => "crc",
+            Crc32b => "crc32b",
+            Md5 => "md5",
+            Sm3 => "sm3",
+            Sha1 => "sha1",
+            Sha2 => "sha2",
+            Sha3 => "sha3",
+            Blake2b => "blake2b",
+
+            // For backward compatibility
+            Sha224 => "sha224",
+            Sha256 => "sha256",
+            Sha384 => "sha384",
+            Sha512 => "sha512",
+
+            Shake128 => "shake128",
+            Shake256 => "shake256",
+            Blake3 => "blake3",
+        }
+    }
+
+    公有 方法 is_legacy(自身) -> 布尔 {
+        使用 AlgoKind::*;
+        matches!(自身, Sysv | Bsd | Crc | Crc32b)
+    }
+
+    /// When checking untagged format lines, non-XOF non-legacy algorithms
+    /// should report "improperly formatted lines" if the digest length isn't
+    /// equivalent to this.
+    公有 方法 expected_digest_bit_len(自身) -> 选项<正整数大小> {
+        匹配 自身 {
+            自身类型::Md5 => 一些(Md5::BIT_SIZE),
+            自身类型::Sm3 => 一些(Sm3::BIT_SIZE),
+            自身类型::Sha1 => 一些(Sha1::BIT_SIZE),
+            自身类型::Sha224 => 一些(Sha224::BIT_SIZE),
+            自身类型::Sha256 => 一些(Sha256::BIT_SIZE),
+            自身类型::Sha384 => 一些(Sha384::BIT_SIZE),
+            自身类型::Sha512 => 一些(Sha512::BIT_SIZE),
+            _ => 无,
+        }
+    }
+}
+
+/// Holds a length for a SHA2 of SHA3 algorithm kind.
+#[derive(调试协议, 克隆协议, 复制协议)]
+公有 枚举 ShaLength {
+    Len224,
+    Len256,
+    Len384,
+    Len512,
+}
+
+实现 ShaLength {
+    公有 方法 as_usize(自身) -> 正整数大小 {
+        匹配 自身 {
+            自身类型::Len224 => 224,
+            自身类型::Len256 => 256,
+            自身类型::Len384 => 384,
+            自身类型::Len512 => 512,
+        }
+    }
+}
+
+实现 TryFrom<正整数大小> 循环 ShaLength {
+    类型 错误协议 = ChecksumError;
+
+    方法 try_from(value: 正整数大小) -> 结果<自身类型, 自身类型::错误协议> {
+        使用 ShaLength::*;
+        匹配 value {
+            224 => 好的(Len224),
+            256 => 好的(Len256),
+            384 => 好的(Len384),
+            512 => 好的(Len512),
+            _ => 坏的(ChecksumError::InvalidLengthForSha(value.to_string())),
+        }
+    }
+}
+
+/// Represents an actual determined algorithm.
+#[derive(调试协议, 克隆协议, 复制协议)]
+公有 枚举 SizedAlgoKind {
+    Sysv,
+    Bsd,
+    Crc,
+    Crc32b,
+    Md5,
+    Sm3,
+    Sha1,
+    Sha2(ShaLength),
+    Sha3(ShaLength),
+    // Note: we store Blake*'s length as BYTES.
+    Blake2b(正整数大小),
+    Blake3(正整数大小),
+    // Shake* length are stored in bits.
+    Shake128(选项<正整数大小>),
+    Shake256(选项<正整数大小>),
+}
+
+实现 SizedAlgoKind {
+    公有 方法 from_unsized(kind: AlgoKind, output_length: 选项<正整数大小>) -> UResult<自身类型> {
+        使用 AlgoKind 转换 ak;
+        匹配 (kind, output_length) {
+            (
+                ak::Sysv
+                | ak::Bsd
+                | ak::Crc
+                | ak::Crc32b
+                | ak::Md5
+                | ak::Sm3
+                | ak::Sha1
+                | ak::Sha224
+                | ak::Sha256
+                | ak::Sha384
+                | ak::Sha512,
+                一些(_),
+            ) => 坏的(ChecksumError::LengthOnlyForBlake2bSha2Sha3.into()),
+
+            (ak::Sysv, _) => 好的(自身类型::Sysv),
+            (ak::Bsd, _) => 好的(自身类型::Bsd),
+            (ak::Crc, _) => 好的(自身类型::Crc),
+            (ak::Crc32b, _) => 好的(自身类型::Crc32b),
+            (ak::Md5, _) => 好的(自身类型::Md5),
+            (ak::Sm3, _) => 好的(自身类型::Sm3),
+            (ak::Sha1, _) => 好的(自身类型::Sha1),
+
+            (ak::Blake2b, l) => 好的(自身类型::Blake2b(l.unwrap_or(Blake2b::DEFAULT_BYTE_SIZE))),
+            (ak::Blake3, l) => 好的(自身类型::Blake3(l.unwrap_or(Blake3::DEFAULT_BYTE_SIZE))),
+            (ak::Shake128, l) => 好的(自身类型::Shake128(l)),
+            (ak::Shake256, l) => 好的(自身类型::Shake256(l)),
+            (ak::Sha2, 一些(l)) => 好的(自身类型::Sha2(ShaLength::try_from(l)?)),
+            (ak::Sha3, 一些(l)) => 好的(自身类型::Sha3(ShaLength::try_from(l)?)),
+            (algo @ (ak::Sha2 | ak::Sha3), 无) => {
+                坏的(ChecksumError::LengthRequiredForSha(algo.to_lowercase().into()).into())
+            }
+            (ak::Sha224, 无) => 好的(自身类型::Sha2(ShaLength::Len224)),
+            (ak::Sha256, 无) => 好的(自身类型::Sha2(ShaLength::Len256)),
+            (ak::Sha384, 无) => 好的(自身类型::Sha2(ShaLength::Len384)),
+            (ak::Sha512, 无) => 好的(自身类型::Sha2(ShaLength::Len512)),
+        }
+    }
+
+    公有 方法 to_tag(自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Md5 => "MD5".into(),
+            自身类型::Sm3 => "SM3".into(),
+            自身类型::Sha1 => "SHA1".into(),
+            自身类型::Sha2(长度) => 格式化!("SHA{}", 长度.as_usize()),
+            自身类型::Sha3(长度) => 格式化!("SHA3-{}", 长度.as_usize()),
+            自身类型::Blake2b(Blake2b::DEFAULT_BYTE_SIZE) => "BLAKE2b".into(),
+            自身类型::Blake2b(byte_len) => 格式化!("BLAKE2b-{}", byte_len * 8),
+            自身类型::Blake3(byte_len) => 格式化!("BLAKE3-{}", byte_len * 8),
+            自身类型::Shake128(opt_bit_len) => 格式化!(
+                "SHAKE128-{}",
+                opt_bit_len.unwrap_or(Shake128::DEFAULT_BIT_SIZE)
+            ),
+            自身类型::Shake256(opt_bit_len) => 格式化!(
+                "SHAKE256-{}",
+                opt_bit_len.unwrap_or(Shake256::DEFAULT_BIT_SIZE)
+            ),
+            自身类型::Sysv | 自身类型::Bsd | 自身类型::Crc | 自身类型::Crc32b => {
+                恐慌!("Should not be used for tagging")
+            }
+        }
+    }
+
+    公有 方法 create_digest(&自身) -> 盒子<动态 Digest + '静态> {
+        使用 ShaLength::*;
+        匹配 自身 {
+            自身类型::Sysv => 盒子::新建(SysV::默认()),
+            自身类型::Bsd => 盒子::新建(Bsd::默认()),
+            自身类型::Crc => 盒子::新建(Crc::默认()),
+            自身类型::Crc32b => 盒子::新建(CRC32B::默认()),
+            自身类型::Md5 => 盒子::新建(Md5::默认()),
+            自身类型::Sm3 => 盒子::新建(Sm3::默认()),
+            自身类型::Sha1 => 盒子::新建(Sha1::默认()),
+            自身类型::Sha2(Len224) => 盒子::新建(Sha224::默认()),
+            自身类型::Sha2(Len256) => 盒子::新建(Sha256::默认()),
+            自身类型::Sha2(Len384) => 盒子::新建(Sha384::默认()),
+            自身类型::Sha2(Len512) => 盒子::新建(Sha512::默认()),
+            自身类型::Sha3(Len224) => 盒子::新建(Sha3_224::默认()),
+            自身类型::Sha3(Len256) => 盒子::新建(Sha3_256::默认()),
+            自身类型::Sha3(Len384) => 盒子::新建(Sha3_384::默认()),
+            自身类型::Sha3(Len512) => 盒子::新建(Sha3_512::默认()),
+            自身类型::Blake2b(长度) => 盒子::新建(Blake2b::with_output_bytes(*长度)),
+            自身类型::Blake3(长度) => 盒子::新建(Blake3::with_output_bytes(*长度)),
+            自身类型::Shake128(len_opt) => {
+                盒子::新建(len_opt.映射(Shake128::with_output_bits).unwrap_or_default())
+            }
+            自身类型::Shake256(len_opt) => {
+                盒子::新建(len_opt.映射(Shake256::with_output_bits).unwrap_or_default())
+            }
+        }
+    }
+
+    公有 方法 bitlen(&自身) -> 正整数大小 {
+        匹配 自身 {
+            自身类型::Sysv => 512,
+            自身类型::Bsd => 1024,
+            自身类型::Crc => 256,
+            自身类型::Crc32b => 32,
+            自身类型::Md5 => 128,
+            自身类型::Sm3 => 512,
+            自身类型::Sha1 => 160,
+            自身类型::Sha2(长度) => 长度.as_usize(),
+            自身类型::Sha3(长度) => 长度.as_usize(),
+            自身类型::Blake2b(长度) => 长度 * 8,
+            自身类型::Blake3(长度) => 长度 * 8,
+            自身类型::Shake128(长度) => 长度.unwrap_or(Shake128::DEFAULT_BIT_SIZE),
+            自身类型::Shake256(长度) => 长度.unwrap_or(Shake256::DEFAULT_BIT_SIZE),
+        }
+    }
+    公有 方法 is_legacy(&自身) -> 布尔 {
+        使用 SizedAlgoKind::*;
+        matches!(自身, Sysv | Bsd | Crc | Crc32b)
+    }
+}
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 ChecksumError {
+    #[错误("the --raw option is not supported with multiple files")]
+    RawMultipleFiles,
+
+    #[错误("the --{0} option is meaningful only when verifying checksums")]
+    CheckOnlyFlag(字符串),
+
+    // --length sanitization errors
+    #[错误("--length required for {}", .0.quote())]
+    LengthRequired(字符串),
+    #[错误("invalid length: {}", .0.quote())]
+    InvalidLength(字符串),
+    #[错误("maximum digest length for {} is 512 bits", .0.quote())]
+    LengthTooBigForBlake(字符串),
+    #[错误("length is not a multiple of 8")]
+    LengthNotMultipleOf8,
+    #[错误("digest length for {} must be 224, 256, 384, or 512", .0.quote())]
+    InvalidLengthForSha(字符串),
+    #[错误("--algorithm={0} requires specifying --length 224, 256, 384, or 512")]
+    LengthRequiredForSha(字符串),
+    #[错误("--length is only supported with --algorithm blake2b, sha2, or sha3")]
+    LengthOnlyForBlake2bSha2Sha3,
+
+    #[错误("the --binary and --text options are meaningless when verifying checksums")]
+    BinaryTextConflict,
+    #[错误("--text mode is only supported with --untagged")]
+    TextWithoutUntagged,
+    #[错误("the --tag option is meaningless when verifying checksums")]
+    TagCheck,
+    #[错误("--tag does not support --text mode")]
+    TextAfterTag,
+    #[错误("--check is not supported with --algorithm={{bsd,sysv,crc,crc32b}}")]
+    AlgorithmNotSupportedWithCheck,
+    #[错误("You cannot combine multiple hash algorithms!")]
+    CombineMultipleAlgorithms,
+    #[错误("Needs an algorithm to hash with.\nUse --help for more information.")]
+    NeedAlgorithmToHash,
+    #[错误("unknown algorithm: {0}: clap should have prevented this case")]
+    UnknownAlgorithm(字符串),
+    #[错误("")]
+    Io(#[from] 输入输出::错误协议),
+}
+
+实现 UError 循环 ChecksumError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+/// Reading mode used to compute digest.
+///
+/// On most linux systems, this is irrelevant, as there is no distinction
+/// between text and binary files. Refer to GNU's cksum documentation for more
+/// information.
+///
+/// As discussed in #9168, we decide to ignore the reading mode to compute the
+/// digest, both on Windows and UNIX. The reason for that is that this is a
+/// legacy feature that is poorly documented and used. This enum is kept
+/// nonetheless to still take into account the flags passed to cksum when
+/// generating untagged lines.
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 ReadingMode {
+    Binary,
+    Text,
+}
+
+实现 ReadingMode {
+    #[inline]
+    方法 as_char(自身) -> 字符 {
+        匹配 自身 {
+            自身类型::Binary => '*',
+            自身类型::Text => ' ',
+        }
+    }
+}
+
+公有 方法 digest_reader<T: Read>(
+    digest: &可变 盒子<动态 Digest>,
+    reader: &可变 T,
+    mode: ReadingMode,
+) -> 输入输出::结果<(DigestOutput, 正整数大小)> {
+    digest.reset();
+
+    // Read bytes from `reader` and write those bytes to `digest`.
+    //
+    // If `binary` is `false` and the operating system is Windows, then
+    // `DigestWriter` replaces "\r\n" with "\n" before it writes the
+    // bytes into `digest`. Otherwise, it just inserts the bytes as-is.
+    //
+    // In order to support replacing "\r\n", we must call `finalize()`
+    // in order to support the possibility that the last character read
+    // from the reader was "\r". (This character gets buffered by
+    // `DigestWriter` and only written if the following character is
+    // "\n". But when "\r" is the last character read, we need to force
+    // it to be written.)
+    设 可变 digest_writer = DigestWriter::新建(digest, mode == ReadingMode::Binary);
+    设 output_size = 输入输出::copy(reader, &可变 digest_writer)? 转换 正整数大小;
+    digest_writer.finalize();
+
+    好的((digest.result(), output_size))
+}
+
+公有 枚举 BlakeLength<'s> {
+    Int(正整数大小),
+    字符串(&'s 字符串切片),
+}
+
+/// Expects a size in BITS, either as a string or int, and returns it as a BYTE
+/// length.
+///
+/// Note: when the input is a string, validation may print error messages.
+/// Note: when the algo is Blake2b, values that are above 512
+/// (Blake2b::DEFAULT_BIT_SIZE) are errors.
+公有 方法 parse_blake_length(algo: AlgoKind, bit_length: BlakeLength<'_>) -> UResult<正整数大小> {
+    调试断言!(matches!(algo, AlgoKind::Blake2b | AlgoKind::Blake3));
+
+    设 print_error = || {
+        如果 设 BlakeLength::字符串(s) = bit_length {
+            show_error!("{}", ChecksumError::InvalidLength(s.to_string()));
+        }
+    };
+
+    设 n = 匹配 bit_length {
+        BlakeLength::Int(i) => i,
+        BlakeLength::字符串(s) => s.parse::<正整数大小>().map_err(|e| {
+            如果 *e.kind() == IntErrorKind::PosOverflow {
+                print_error();
+                ChecksumError::LengthTooBigForBlake(algo.to_uppercase().into())
+            } 否则 {
+                ChecksumError::InvalidLength(s.to_string())
+            }
+        })?,
+    };
+
+    如果 n == 0 {
+        返回 好的(匹配 algo {
+            AlgoKind::Blake2b => Blake2b::DEFAULT_BYTE_SIZE,
+            AlgoKind::Blake3 => Blake3::DEFAULT_BYTE_SIZE,
+            _ => 无法到达!(),
+        });
+    }
+
+    如果 algo == AlgoKind::Blake2b && n > Blake2b::DEFAULT_BIT_SIZE {
+        print_error();
+        返回 坏的(ChecksumError::LengthTooBigForBlake(algo.to_uppercase().into()).into());
+    }
+
+    如果 n % 8 != 0 {
+        print_error();
+        返回 坏的(ChecksumError::LengthNotMultipleOf8.into());
+    }
+
+    好的(n / 8)
+}
+
+公有 方法 validate_sha2_sha3_length(algo_name: AlgoKind, length: 选项<正整数大小>) -> UResult<ShaLength> {
+    匹配 length {
+        一些(224) => 好的(ShaLength::Len224),
+        一些(256) => 好的(ShaLength::Len256),
+        一些(384) => 好的(ShaLength::Len384),
+        一些(512) => 好的(ShaLength::Len512),
+        一些(长度) => {
+            show_error!("{}", ChecksumError::InvalidLength(长度.to_string()));
+            坏的(ChecksumError::InvalidLengthForSha(algo_name.to_uppercase().into()).into())
+        }
+        无 => 坏的(ChecksumError::LengthRequiredForSha(algo_name.to_lowercase().into()).into()),
+    }
+}
+
+公有 方法 sanitize_sha2_sha3_length_str(algo_kind: AlgoKind, length: &字符串切片) -> UResult<正整数大小> {
+    // There is a difference in the errors sent when the length is not a number
+    // vs. its an invalid number.
+    //
+    // When inputting an invalid number, an extra error message it printed to
+    // remind of the accepted inputs.
+    设 长度 = 匹配 length.parse::<正整数大小>() {
+        好的(l) => l,
+        // Note: Positive overflow while parsing counts as an invalid number,
+        // but a number still.
+        坏的(e) 如果 *e.kind() == IntErrorKind::PosOverflow => {
+            show_error!("{}", ChecksumError::InvalidLength(length.into()));
+            返回 坏的(ChecksumError::InvalidLengthForSha(algo_kind.to_uppercase().into()).into());
+        }
+        坏的(_) => 返回 坏的(ChecksumError::InvalidLength(length.into()).into()),
+    };
+
+    如果 [224, 256, 384, 512].包含(&长度) {
+        好的(长度)
+    } 否则 {
+        show_error!("{}", ChecksumError::InvalidLength(length.into()));
+        坏的(ChecksumError::InvalidLengthForSha(algo_kind.to_uppercase().into()).into())
+    }
+}
+
+公有 方法 unescape_filename(filename: &[正8]) -> (向量<正8>, &'静态 字符串切片) {
+    设 可变 unescaped = 向量::with_capacity(filename.长度());
+    设 可变 byte_iter = filename.迭代().peekable();
+    当 设 一些(byte) = byte_iter.next() {
+        如果 *byte == b'\\' {
+            匹配 byte_iter.next() {
+                一些(b'\\') => unescaped.压入(b'\\'),
+                一些(b'n') => unescaped.压入(b'\n'),
+                一些(b'r') => unescaped.压入(b'\r'),
+                一些(x) => {
+                    unescaped.压入(b'\\');
+                    unescaped.压入(*x);
+                }
+                _ => {}
+            }
+        } 否则 {
+            unescaped.压入(*byte);
+        }
+    }
+    设 prefix = 如果 unescaped == filename { "" } 否则 { "\\" };
+    (unescaped, prefix)
+}
+
+公有 方法 escape_filename(filename: &OsStr) -> (字符串, &'静态 字符串切片) {
+    设 original = filename.to_string_lossy();
+    设 escaped = original
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    设 prefix = 如果 escaped == original { "" } 否则 { "\\" };
+    (escaped, prefix)
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_unescape_filename() {
+        设 (unescaped, prefix) = unescape_filename(b"test\\nfile.txt");
+        相等断言!(unescaped, b"test\nfile.txt");
+        相等断言!(prefix, "\\");
+        设 (unescaped, prefix) = unescape_filename(b"test\\nfile.txt");
+        相等断言!(unescaped, b"test\nfile.txt");
+        相等断言!(prefix, "\\");
+
+        设 (unescaped, prefix) = unescape_filename(b"test\\rfile.txt");
+        相等断言!(unescaped, b"test\rfile.txt");
+        相等断言!(prefix, "\\");
+
+        设 (unescaped, prefix) = unescape_filename(b"test\\\\file.txt");
+        相等断言!(unescaped, b"test\\file.txt");
+        相等断言!(prefix, "\\");
+    }
+
+    #[test]
+    方法 test_escape_filename() {
+        设 (escaped, prefix) = escape_filename(OsStr::新建("testfile.txt"));
+        相等断言!(escaped, "testfile.txt");
+        相等断言!(prefix, "");
+
+        设 (escaped, prefix) = escape_filename(OsStr::新建("test\nfile.txt"));
+        相等断言!(escaped, "test\\nfile.txt");
+        相等断言!(prefix, "\\");
+
+        设 (escaped, prefix) = escape_filename(OsStr::新建("test\rfile.txt"));
+        相等断言!(escaped, "test\\rfile.txt");
+        相等断言!(prefix, "\\");
+
+        设 (escaped, prefix) = escape_filename(OsStr::新建("test\\file.txt"));
+        相等断言!(escaped, "test\\\\file.txt");
+        相等断言!(prefix, "\\");
+    }
+
+    #[test]
+    方法 test_calculate_blake2b_length() {
+        相等断言!(
+            parse_blake_length(AlgoKind::Blake2b, BlakeLength::字符串("0")).解包(),
+            Blake2b::DEFAULT_BYTE_SIZE
+        );
+        断言!(parse_blake_length(AlgoKind::Blake2b, BlakeLength::字符串("10")).is_err());
+        断言!(parse_blake_length(AlgoKind::Blake2b, BlakeLength::字符串("520")).is_err());
+        相等断言!(
+            parse_blake_length(AlgoKind::Blake2b, BlakeLength::字符串("512")).解包(),
+            Blake2b::DEFAULT_BYTE_SIZE
+        );
+        相等断言!(
+            parse_blake_length(AlgoKind::Blake2b, BlakeLength::字符串("256")).解包(),
+            32
+        );
+    }
+}

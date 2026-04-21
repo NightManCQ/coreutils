@@ -1,0 +1,52 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) formatteriteminfo
+
+使用 标准库::格式化;
+
+#[allow(clippy::enum_variant_names)]
+#[allow(unpredictable_function_pointer_comparisons)]
+#[derive(克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 FormatWriter {
+    IntWriter(方法(正64) -> 字符串),
+    FloatWriter(方法(点64) -> 字符串),
+    LongDoubleWriter(方法(点64) -> 字符串), // On most platforms, long double is f64 or emulated
+    BFloatWriter(方法(点64) -> 字符串),
+    MultibyteWriter(方法(&[正8]) -> 字符串),
+}
+
+实现 格式化::调试协议 循环 FormatWriter {
+    方法 格式化(&自身, f: &可变 格式化::Formatter) -> 格式化::结果 {
+        匹配 *自身 {
+            自身类型::IntWriter(引用 p) => {
+                f.write_str("IntWriter:")?;
+                格式化::Pointer::格式化(p, f)
+            }
+            自身类型::FloatWriter(引用 p) => {
+                f.write_str("FloatWriter:")?;
+                格式化::Pointer::格式化(p, f)
+            }
+            自身类型::LongDoubleWriter(引用 p) => {
+                f.write_str("LongDoubleWriter:")?;
+                格式化::Pointer::格式化(p, f)
+            }
+            自身类型::BFloatWriter(引用 p) => {
+                f.write_str("BFloatWriter:")?;
+                格式化::Pointer::格式化(p, f)
+            }
+            自身类型::MultibyteWriter(引用 p) => {
+                f.write_str("MultibyteWriter:")?;
+                格式化::Pointer::格式化(&(*p 转换 *常量 ()), f)
+            }
+        }
+    }
+}
+
+#[derive(复制协议, 克隆协议, 偏等比较协议, 相等比较协议, 调试协议)]
+公有 结构 FormatterItemInfo {
+    公有 byte_size: 正整数大小,
+    公有 print_width: 正整数大小, // including a space in front of the text
+    公有 formatter: FormatWriter,
+}

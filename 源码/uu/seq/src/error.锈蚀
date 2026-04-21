@@ -1,0 +1,57 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore numberparse
+//! Errors returned by seq.
+使用 箱::numberparse::ParseNumberError;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::UError;
+使用 uucore::translate;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 SeqError {
+    /// An error parsing the input arguments.
+    ///
+    /// The parameters are the [`String`] argument as read from the
+    /// command line and the underlying parsing error itself.
+    #[错误("{}", translate!("seq-error-parse", "type" => parse_error_type(.1), "arg" => .0.quote()))]
+    ParseError(字符串, ParseNumberError),
+
+    /// The increment argument was zero, which is not allowed.
+    ///
+    /// The parameter is the increment argument as a [`String`] as read
+    /// from the command line.
+    #[错误("{}", translate!("seq-error-zero-increment", "arg" => .0.quote()))]
+    ZeroIncrement(字符串),
+
+    /// No arguments were passed to this function, 1 or more is required
+    #[错误("{}", translate!("seq-error-no-arguments"))]
+    NoArguments,
+
+    /// Both a format and equal width where passed to seq
+    #[错误(
+        "{}",
+        translate!("seq-error-format-and-equal-width")
+    )]
+    FormatAndEqualWidth,
+}
+
+方法 parse_error_type(e: &ParseNumberError) -> 字符串 {
+    匹配 e {
+        ParseNumberError::Float => translate!("seq-parse-error-type-float"),
+        ParseNumberError::Nan => translate!("seq-parse-error-type-nan"),
+    }
+}
+
+实现 UError 循环 SeqError {
+    /// Always return 1.
+    方法 code(&自身) -> 整32 {
+        1
+    }
+
+    方法 usage(&自身) -> 布尔 {
+        真
+    }
+}

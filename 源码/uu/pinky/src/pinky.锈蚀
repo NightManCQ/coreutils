@@ -1,0 +1,150 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) BUFSIZE gecos fullname, mesg iobuf
+
+使用 clap::{Arg, ArgAction, Command};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+模组 platform;
+
+模组 options {
+    公有 常量 LONG_FORMAT: &字符串切片 = "long_format";
+    公有 常量 LOOKUP: &字符串切片 = "lookup";
+    公有 常量 OMIT_HOME_DIR: &字符串切片 = "omit_home_dir";
+    公有 常量 OMIT_PROJECT_FILE: &字符串切片 = "omit_project_file";
+    公有 常量 OMIT_PLAN_FILE: &字符串切片 = "omit_plan_file";
+    公有 常量 SHORT_FORMAT: &字符串切片 = "short_format";
+    公有 常量 OMIT_HEADINGS: &字符串切片 = "omit_headings";
+    公有 常量 OMIT_NAME: &字符串切片 = "omit_name";
+    公有 常量 OMIT_NAME_HOST: &字符串切片 = "omit_name_host";
+    公有 常量 OMIT_NAME_HOST_TIME: &字符串切片 = "omit_name_host_time";
+    公有 常量 USER: &字符串切片 = "user";
+    公有 常量 HELP: &字符串切片 = "help";
+}
+
+#[uucore::主函数(no_signals)]
+使用 platform::uumain;
+
+公有 方法 uu_app() -> Command {
+    #[cfg(not(target_env = "musl"))]
+    设 about = translate!("pinky-about");
+    #[cfg(target_env = "musl")]
+    设 about = translate!("pinky-about") + &translate!("pinky-about-musl-warning");
+
+    设 cmd = Command::新建("pinky")
+        .version(uucore::crate_version!())
+        .about(about)
+        .override_usage(format_usage(&translate!("pinky-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::LONG_FORMAT)
+                .short('l')
+                .requires(options::USER)
+                .help(translate!("pinky-help-long-format"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_HOME_DIR)
+                .short('b')
+                .help(translate!("pinky-help-omit-home-dir"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_PROJECT_FILE)
+                .short('h')
+                .help(translate!("pinky-help-omit-project-file"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_PLAN_FILE)
+                .short('p')
+                .help(translate!("pinky-help-omit-plan-file"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHORT_FORMAT)
+                .short('s')
+                .help(translate!("pinky-help-short-format"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_HEADINGS)
+                .short('f')
+                .help(translate!("pinky-help-omit-headings"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_NAME)
+                .short('w')
+                .help(translate!("pinky-help-omit-name"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_NAME_HOST)
+                .short('i')
+                .help(translate!("pinky-help-omit-name-host"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OMIT_NAME_HOST_TIME)
+                .short('q')
+                .help(translate!("pinky-help-omit-name-host-time"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::USER)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::Username),
+        )
+        .arg(
+            Arg::新建(options::LOOKUP)
+                .long(options::LOOKUP)
+                .help(translate!("pinky-help-lookup"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            // Redefine the help argument to not include the short flag
+            // since that conflicts with omit_project_file.
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("pinky-help-help"))
+                .action(ArgAction::Help),
+        )
+}
+
+公有 协议 Capitalize {
+    方法 capitalize(&自身) -> 字符串;
+}
+
+实现 Capitalize 循环 字符串切片 {
+    方法 capitalize(&自身) -> 字符串 {
+        自身.char_indices()
+            .折叠(字符串::with_capacity(自身.长度()), |可变 acc, x| {
+                如果 x.0 == 0 {
+                    acc.压入(x.1.to_ascii_uppercase());
+                } 否则 {
+                    acc.压入(x.1);
+                }
+                acc
+            })
+    }
+}
+
+#[cfg(test)]
+模组 test {
+    使用 超级::*;
+
+    #[test]
+    方法 test_capitalize() {
+        相等断言!("Zbnmasd", "zbnmasd".capitalize()); // spell-checker:disable-line
+        相等断言!("Abnmasd", "Abnmasd".capitalize()); // spell-checker:disable-line
+        相等断言!("1masd", "1masd".capitalize()); // spell-checker:disable-line
+        相等断言!("", "".capitalize());
+    }
+}

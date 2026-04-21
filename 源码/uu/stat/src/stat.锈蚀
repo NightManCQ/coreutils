@@ -1,0 +1,1592 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore datetime
+
+使用 uucore::错误::{UError, UResult, USimpleError};
+使用 uucore::translate;
+
+使用 clap::builder::ValueParser;
+使用 uucore::display::Quotable;
+使用 uucore::文件系统::{display_permissions, major, minor};
+使用 uucore::fsext::{
+    FsMeta, MetadataTimeField, StatFs, metadata_get_time, pretty_filetype, pretty_fstype,
+    read_fs_list, statfs,
+};
+使用 uucore::libc::mode_t;
+使用 uucore::{entries, format_usage, show_error, show_warning};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 标准库::borrow::Cow;
+使用 标准库::单元格::OnceCell;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::{FileType, Metadata};
+使用 标准库::输入输出::Write;
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt};
+使用 标准库::路径::Path;
+使用 标准库::{环境, 文件系统};
+
+使用 thiserror::错误协议;
+使用 uucore::时间::{FormatSystemTimeFallback, format_system_time, system_time_to_sec};
+
+#[derive(调试协议, 错误协议)]
+枚举 StatError {
+    #[错误("{}", translate!("stat-error-invalid-quoting-style", "style" => style.克隆()))]
+    InvalidQuotingStyle { style: 字符串 },
+    #[错误("{}", translate!("stat-error-missing-operand"))]
+    MissingOperand,
+    #[错误("{}", translate!("stat-error-invalid-directive", "directive" => directive.克隆()))]
+    InvalidDirective { directive: 字符串 },
+    #[错误("{}", translate!("stat-error-cannot-read-filesystem", "error" => 错误.克隆()))]
+    CannotReadFilesystem { 错误: 字符串 },
+    #[错误("{}", translate!("stat-error-stdin-filesystem-mode"))]
+    StdinFilesystemMode,
+    #[错误("{}", translate!("stat-error-cannot-read-filesystem-info", "file" => file.克隆(), "error" => 错误.克隆()))]
+    CannotReadFilesystemInfo { file: 字符串, 错误: 字符串 },
+    #[错误("{}", translate!("stat-error-cannot-stat", "file" => file.克隆(), "error" => 错误.克隆()))]
+    CannotStat { file: 字符串, 错误: 字符串 },
+}
+
+实现 UError 循环 StatError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+模组 options {
+    公有 常量 DEREFERENCE: &字符串切片 = "dereference";
+    公有 常量 FILE_SYSTEM: &字符串切片 = "file-system";
+    公有 常量 FORMAT: &字符串切片 = "format";
+    公有 常量 PRINTF: &字符串切片 = "printf";
+    公有 常量 TERSE: &字符串切片 = "terse";
+    公有 常量 FILES: &字符串切片 = "files";
+}
+
+#[derive(默认协议, 调试协议, 偏等比较协议, 相等比较协议, 克隆协议, 复制协议)]
+结构 Flags {
+    alter: 布尔,
+    zero: 布尔,
+    left: 布尔,
+    space: 布尔,
+    sign: 布尔,
+    group: 布尔,
+    major: 布尔,
+    minor: 布尔,
+}
+
+/// checks if the string is within the specified bound,
+/// if it gets out of bound, error out by printing sub-string from index `beg` to`end`,
+/// where `beg` & `end` is the beginning and end index of sub-string, respectively
+方法 check_bound(切片: &字符串切片, bound: 正整数大小, beg: 正整数大小, end: 正整数大小) -> UResult<()> {
+    如果 end >= bound {
+        返回 坏的(USimpleError::新建(
+            1,
+            StatError::InvalidDirective {
+                directive: 切片[beg..end].quote().to_string(),
+            }
+            .to_string(),
+        ));
+    }
+    好的(())
+}
+
+枚举 Padding {
+    Zero,
+    Space,
+}
+
+/// pads the string with zeroes or spaces and prints it
+///
+/// # Example
+/// ```ignore
+/// uu_stat::pad_and_print("1", false, 5, Padding::Zero) == "00001";
+/// ```
+/// currently only supports '0' & ' ' as the padding character
+/// because the format specification of print! does not support general
+/// fill characters.
+方法 pad_and_print(result: &字符串切片, left: 布尔, width: 正整数大小, padding: Padding) {
+    匹配 (left, padding) {
+        (假, Padding::Zero) => 打印!("{result:0>width$}"),
+        (假, Padding::Space) => 打印!("{result:>width$}"),
+        (真, Padding::Zero) => 打印!("{result:0<width$}"),
+        (真, Padding::Space) => 打印!("{result:<width$}"),
+    }
+}
+
+/// Pads and prints raw bytes (Unix-specific) or falls back to string printing
+///
+/// On Unix systems, this preserves non-UTF8 data by printing raw bytes
+/// On other platforms, falls back to lossy string conversion
+方法 pad_and_print_bytes<W: Write>(
+    可变 writer: W,
+    bytes: &[正8],
+    left: 布尔,
+    width: 正整数大小,
+    precision: Precision,
+) -> 结果<(), 标准库::输入输出::错误协议> {
+    设 display_bytes = 匹配 precision {
+        Precision::Number(p) 如果 p < bytes.长度() => &bytes[..p],
+        _ => bytes,
+    };
+
+    设 display_len = display_bytes.长度();
+    设 padding_needed = width.saturating_sub(display_len);
+
+    设 (left_pad, right_pad) = 如果 left {
+        (0, padding_needed)
+    } 否则 {
+        (padding_needed, 0)
+    };
+
+    如果 left_pad > 0 {
+        write_padding(&可变 writer, left_pad)?;
+    }
+    writer.write_all(display_bytes)?;
+    如果 right_pad > 0 {
+        write_padding(&可变 writer, right_pad)?;
+    }
+
+    好的(())
+}
+
+/// write padding based on a writer W and n size
+/// writer is genric to be any buffer like: `std::io::stdout`
+/// n is the calculated padding size
+方法 write_padding<W: Write>(writer: &可变 W, n: 正整数大小) -> 结果<(), 标准库::输入输出::错误协议> {
+    循环 _ 在 0..n {
+        writer.write_all(b" ")?;
+    }
+    好的(())
+}
+
+#[derive(调试协议)]
+公有 枚举 OutputType<'a> {
+    Str(字符串),
+    OsStr(&'a OsString),
+    Integer(整64),
+    Unsigned(正64),
+    UnsignedHex(正64),
+    UnsignedOct(正32),
+    Float(点64),
+    Unknown,
+}
+
+#[derive(默认协议)]
+枚举 QuotingStyle {
+    Locale,
+    Shell,
+    #[默认]
+    ShellEscapeAlways,
+    Quote,
+}
+
+实现 标准库::字符串切片::FromStr 循环 QuotingStyle {
+    类型 坏的 = StatError;
+
+    方法 from_str(s: &字符串切片) -> 结果<自身类型, 自身类型::坏的> {
+        匹配 s {
+            "locale" => 好的(自身类型::Locale),
+            "shell" => 好的(自身类型::Shell),
+            "shell-escape-always" => 好的(自身类型::ShellEscapeAlways),
+            // The others aren't exposed to the user
+            _ => 坏的(StatError::InvalidQuotingStyle {
+                style: s.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议, 复制协议)]
+枚举 Precision {
+    NotSpecified,
+    NoNumber,
+    Number(正整数大小),
+}
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议)]
+枚举 Token {
+    Char(字符),
+    Byte(正8),
+    Directive {
+        flag: Flags,
+        width: 正整数大小,
+        precision: Precision,
+        format: 字符,
+    },
+}
+
+协议 ScanUtil {
+    方法 scan_num<F>(&自身) -> 选项<(F, 正整数大小)>
+    何处
+        F: 标准库::字符串切片::FromStr;
+    方法 scan_char(&自身, radix: 正32) -> 选项<(字符, 正整数大小)>;
+}
+
+实现 ScanUtil 循环 字符串切片 {
+    /// Scans for a number at the beginning of the string
+    /// Returns the parsed number and the character count
+    /// Since we only deal with ASCII characters (+, -, 0-9), character count equals byte count
+    方法 scan_num<F>(&自身) -> 选项<(F, 正整数大小)>
+    何处
+        F: 标准库::字符串切片::FromStr,
+    {
+        设 可变 chars = 自身.chars();
+        设 计数 = chars
+            .next()
+            .过滤(|&c| c.is_ascii_digit() || c == '-' || c == '+')
+            .map_or(0, |_| 1 + chars.take_while(字符::is_ascii_digit).计数());
+
+        如果 计数 > 0 {
+            F::from_str(&自身[..计数]).ok().映射(|x| (x, 计数))
+        } 否则 {
+            无
+        }
+    }
+
+    方法 scan_char(&自身, radix: 正32) -> 选项<(字符, 正整数大小)> {
+        设 计数 = 匹配 radix {
+            8 => 3,
+            16 => 2,
+            _ => 返回 无,
+        };
+        设 chars = 自身.chars().enumerate();
+        设 可变 res = 0;
+        设 可变 offset = 0;
+        循环 (i, c) 在 chars {
+            如果 i >= 计数 {
+                中断;
+            }
+            匹配 c.to_digit(radix) {
+                一些(digit) => {
+                    设 tmp = res * radix + digit;
+                    如果 tmp < 256 {
+                        res = tmp;
+                    } 否则 {
+                        中断;
+                    }
+                }
+                无 => 中断,
+            }
+            offset = i + 1;
+        }
+        如果 offset > 0 {
+            一些((res 转换 正8 转换 字符, offset))
+        } 否则 {
+            无
+        }
+    }
+}
+
+方法 group_num(s: &字符串切片) -> Cow<'_, 字符串切片> {
+    设 is_negative = s.starts_with('-');
+    断言!(is_negative || s.chars().take(1).全部(|c| c.is_ascii_digit()));
+    断言!(s.chars().skip(1).全部(|c| c.is_ascii_digit()));
+    如果 s.长度() < 4 {
+        返回 s.into();
+    }
+    设 可变 res = 字符串::with_capacity((s.长度() - 1) / 3);
+    设 s = 如果 is_negative {
+        res.压入('-');
+        &s[1..]
+    } 否则 {
+        s
+    };
+    设 可变 alone = (s.长度() - 1) % 3 + 1;
+    res.push_str(&s[..alone]);
+    当 alone != s.长度() {
+        res.压入(',');
+        res.push_str(&s[alone..alone + 3]);
+        alone += 3;
+    }
+    res.into()
+}
+
+结构 Stater {
+    follow: 布尔,
+    show_fs: 布尔,
+    from_user: 布尔,
+    files: 向量<OsString>,
+    mount_list: OnceCell<选项<向量<OsString>>>,
+    mount_list_needed: 布尔,
+    default_tokens: 向量<Token>,
+    default_dev_tokens: 向量<Token>,
+}
+
+/// Prints a formatted output based on the provided output type, flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `output` - A reference to the [`OutputType`] enum containing the value to be printed.
+/// * `flags` - A Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed output.
+/// * `precision` - How many digits of precision, if any.
+///
+/// This function delegates the printing process to more specialized functions depending on the output type.
+方法 print_it(output: &OutputType, flags: Flags, width: 正整数大小, precision: Precision) {
+    // If the precision is given as just '.', the precision is taken to be zero.
+    // A negative precision is taken as if the precision were omitted.
+    // This gives the minimum number of digits to appear for d, i, o, u, x, and X conversions,
+    // the maximum number of characters to be printed from a string for s and S conversions.
+
+    // #
+    // The value should be converted to an "alternate form".
+    // For o conversions, the first character of the output string  is made  zero  (by  prefixing  a 0 if it was not zero already).
+    // For x and X conversions, a nonzero result has the string "0x" (or "0X" for X conversions) prepended to it.
+
+    // 0
+    // The value should be zero padded.
+    // For d, i, o, u, x, X, a, A, e, E, f, F, g, and G conversions, the converted value is padded on the left with zeros rather than blanks.
+    // If the 0 and - flags both appear, the 0 flag is ignored.
+    // If a precision  is  given with a numeric conversion (d, i, o, u, x, and X), the 0 flag is ignored.
+    // For other conversions, the behavior is undefined.
+
+    // -
+    // The converted value is to be left adjusted on the field boundary.  (The default is right justification.)
+    // The  converted  value  is padded on the right with blanks, rather than on the left with blanks or zeros.
+    // A - overrides a 0 if both are given.
+
+    // ' ' (a space)
+    // A blank should be left before a positive number (or empty string) produced by a signed conversion.
+
+    // +
+    // A sign (+ or -) should always be placed before a number produced by a signed conversion.
+    // By default, a sign  is  used only for negative numbers.
+    // A + overrides a space if both are used.
+    设 padding_char = determine_padding_char(flags);
+
+    匹配 output {
+        OutputType::Str(s) => print_str(s, flags, width, precision),
+        OutputType::OsStr(s) => print_os_str(s, flags, width, precision),
+        OutputType::Integer(数字) => print_integer(*数字, flags, width, precision, padding_char),
+        OutputType::Unsigned(数字) => print_unsigned(*数字, flags, width, precision, padding_char),
+        OutputType::UnsignedOct(数字) => {
+            print_unsigned_oct(*数字, flags, width, precision, padding_char);
+        }
+        OutputType::UnsignedHex(数字) => {
+            print_unsigned_hex(*数字, flags, width, precision, padding_char);
+        }
+        OutputType::Float(数字) => {
+            print_float(*数字, flags, width, precision, padding_char);
+        }
+        OutputType::Unknown => 打印!("?"),
+    }
+}
+
+/// Determines the padding character based on the provided flags and precision.
+///
+/// # Arguments
+///
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+///
+/// # Returns
+///
+/// * Padding - An instance of the Padding enum representing the padding character.
+方法 determine_padding_char(flags: Flags) -> Padding {
+    如果 flags.zero && !flags.left {
+        Padding::Zero
+    } 否则 {
+        Padding::Space
+    }
+}
+
+/// Prints a string value based on the provided flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `s` - The string to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed string.
+/// * `precision` - How many digits of precision, if any.
+方法 print_str(s: &字符串切片, flags: Flags, width: 正整数大小, precision: Precision) {
+    设 s = 匹配 precision {
+        Precision::Number(p) 如果 p < s.长度() => &s[..p],
+        _ => s,
+    };
+    pad_and_print(s, flags.left, width, Padding::Space);
+}
+
+/// Prints a `OsString` value based on the provided flags, width, and precision.
+/// for unix it converts it to bytes then tries to print it if failed print the lossy string version
+/// for windows, `OsString` uses UTF-16 internally which doesn't map directly to bytes like Unix,
+/// so we fall back to lossy string conversion to handle invalid UTF-8 sequences gracefully
+///
+/// # Arguments
+///
+/// * `s` - The `OsString` to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed string.
+/// * `precision` - How many digits of precision, if any.
+方法 print_os_str(s: &OsString, flags: Flags, width: 正整数大小, precision: Precision) {
+    #[cfg(unix)]
+    {
+        使用 标准库::操作系统::unix::ffi::OsStrExt;
+
+        设 bytes = s.as_bytes();
+
+        如果 pad_and_print_bytes(标准库::输入输出::stdout(), bytes, flags.left, width, precision).is_err() {
+            // if an error occurred while trying to print bytes fall back to normal lossy string so it can be printed
+            设 fallback_string = s.to_string_lossy();
+            print_str(&fallback_string, flags, width, precision);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        设 lossy_string = s.to_string_lossy();
+        print_str(&lossy_string, flags, width, precision);
+    }
+}
+
+方法 quote_file_name(file_name: &字符串切片, quoting_style: &QuotingStyle) -> 字符串 {
+    匹配 quoting_style {
+        QuotingStyle::Locale | QuotingStyle::Shell => {
+            设 escaped = file_name.replace('\'', r"\'");
+            格式化!("'{escaped}'")
+        }
+        QuotingStyle::ShellEscapeAlways => {
+            设 quote = 如果 file_name.包含('\'') { '"' } 否则 { '\'' };
+            格式化!("{quote}{file_name}{quote}")
+        }
+        QuotingStyle::Quote => file_name.to_string(),
+    }
+}
+
+方法 get_quoted_file_name(
+    display_name: &字符串切片,
+    file: &OsString,
+    file_type: FileType,
+    from_user: 布尔,
+) -> 结果<字符串, 整32> {
+    设 quoting_style = 环境::var("QUOTING_STYLE")
+        .ok()
+        .and_then(|style| style.parse().ok())
+        .unwrap_or_default();
+
+    如果 file_type.is_symlink() {
+        设 quoted_display_name = quote_file_name(display_name, &quoting_style);
+        匹配 文件系统::read_link(file) {
+            好的(dst) => {
+                设 quoted_dst = quote_file_name(&dst.to_string_lossy(), &quoting_style);
+                好的(格式化!("{quoted_display_name} -> {quoted_dst}"))
+            }
+            坏的(e) => {
+                show_error!("{e}");
+                坏的(1)
+            }
+        }
+    } 否则 {
+        设 style = 如果 from_user {
+            quoting_style
+        } 否则 {
+            QuotingStyle::Quote
+        };
+        好的(quote_file_name(display_name, &style))
+    }
+}
+
+方法 process_token_filesystem(t: &Token, meta: &StatFs, display_name: &字符串切片) {
+    匹配 *t {
+        Token::Byte(byte) => write_raw_byte(byte),
+        Token::Char(c) => 打印!("{c}"),
+        Token::Directive {
+            flag,
+            width,
+            precision,
+            format,
+        } => {
+            设 output = 匹配 format {
+                // free blocks available to non-superuser
+                'a' => OutputType::Unsigned(meta.avail_blocks()),
+                // total data blocks in file system
+                'b' => OutputType::Unsigned(meta.total_blocks()),
+                // total file nodes in file system
+                'c' => OutputType::Unsigned(meta.total_file_nodes()),
+                // free file nodes in file system
+                'd' => OutputType::Unsigned(meta.free_file_nodes()),
+                // free blocks in file system
+                'f' => OutputType::Unsigned(meta.free_blocks()),
+                // file system ID in hex
+                'i' => OutputType::UnsignedHex(meta.fsid()),
+                // maximum length of filenames
+                'l' => OutputType::Unsigned(meta.namelen()),
+                // file name
+                'n' => OutputType::Str(display_name.to_string()),
+                // block size (for faster transfers)
+                's' => OutputType::Unsigned(meta.io_size()),
+                // fundamental block size (for block counts)
+                'S' => OutputType::Integer(meta.block_size()),
+                // file system type in hex
+                't' => OutputType::UnsignedHex(meta.fs_type() 转换 正64),
+                // file system type in human readable form
+                'T' => OutputType::Str(pretty_fstype(meta.fs_type()).into()),
+                _ => OutputType::Unknown,
+            };
+
+            print_it(&output, flag, width, precision);
+        }
+    }
+}
+
+/// Prints an integer value based on the provided flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `num` - The integer value to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed integer.
+/// * `precision` - How many digits of precision, if any.
+/// * `padding_char` - The padding character as determined by `determine_padding_char`.
+方法 print_integer(
+    数字: 整64,
+    flags: Flags,
+    width: 正整数大小,
+    precision: Precision,
+    padding_char: Padding,
+) {
+    设 数字 = 数字.to_string();
+    设 arg = 如果 flags.group {
+        group_num(&数字)
+    } 否则 {
+        Cow::Borrowed(数字.as_str())
+    };
+    设 prefix = 如果 flags.sign {
+        "+"
+    } 否则 如果 flags.space {
+        " "
+    } 否则 {
+        ""
+    };
+    设 extended = 匹配 precision {
+        Precision::NotSpecified => 格式化!("{prefix}{arg}"),
+        Precision::NoNumber => 格式化!("{prefix}{arg}"),
+        Precision::Number(p) => 格式化!("{prefix}{arg:0>p$}"),
+    };
+    pad_and_print(&extended, flags.left, width, padding_char);
+}
+
+/// Truncate a float to the given number of digits after the decimal point.
+方法 precision_trunc(数字: 点64, precision: Precision) -> 字符串 {
+    // GNU `stat` doesn't round, it just seems to truncate to the
+    // given precision:
+    //
+    //     $ stat -c "%.5Y" /dev/pts/ptmx
+    //     1736344012.76399
+    //     $ stat -c "%.4Y" /dev/pts/ptmx
+    //     1736344012.7639
+    //     $ stat -c "%.3Y" /dev/pts/ptmx
+    //     1736344012.763
+    //
+    // Contrast this with `printf`, which seems to round the
+    // numbers:
+    //
+    //     $ printf "%.5f\n" 1736344012.76399
+    //     1736344012.76399
+    //     $ printf "%.4f\n" 1736344012.76399
+    //     1736344012.7640
+    //     $ printf "%.3f\n" 1736344012.76399
+    //     1736344012.764
+    //
+    设 num_str = 数字.to_string();
+    设 n = num_str.长度();
+    匹配 (num_str.寻找('.'), precision) {
+        (无, Precision::NotSpecified) => num_str,
+        (无, Precision::NoNumber) => num_str,
+        (无, Precision::Number(0)) => num_str,
+        (无, Precision::Number(p)) => 格式化!("{num_str}.{zeros}", zeros = "0".repeat(p)),
+        (一些(i), Precision::NotSpecified) => num_str[..i].to_string(),
+        (一些(_), Precision::NoNumber) => num_str,
+        (一些(i), Precision::Number(0)) => num_str[..i].to_string(),
+        (一些(i), Precision::Number(p)) 如果 p < n - i => num_str[..i + 1 + p].to_string(),
+        (一些(i), Precision::Number(p)) => {
+            格式化!("{num_str}{zeros}", zeros = "0".repeat(p - (n - i - 1)))
+        }
+    }
+}
+
+方法 print_float(数字: 点64, flags: Flags, width: 正整数大小, precision: Precision, padding_char: Padding) {
+    设 prefix = 如果 flags.sign {
+        "+"
+    } 否则 如果 flags.space {
+        " "
+    } 否则 {
+        ""
+    };
+    设 num_str = precision_trunc(数字, precision);
+    设 extended = 格式化!("{prefix}{num_str}");
+    pad_and_print(&extended, flags.left, width, padding_char);
+}
+
+/// Prints an unsigned integer value based on the provided flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `num` - The unsigned integer value to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed unsigned integer.
+/// * `precision` - How many digits of precision, if any.
+/// * `padding_char` - The padding character as determined by `determine_padding_char`.
+方法 print_unsigned(
+    数字: 正64,
+    flags: Flags,
+    width: 正整数大小,
+    precision: Precision,
+    padding_char: Padding,
+) {
+    设 数字 = 数字.to_string();
+    设 s = 如果 flags.group {
+        group_num(&数字)
+    } 否则 {
+        Cow::Borrowed(数字.as_str())
+    };
+    设 s = 匹配 precision {
+        Precision::NotSpecified => s,
+        Precision::NoNumber => s,
+        Precision::Number(p) => 格式化!("{s:0>p$}").into(),
+    };
+    pad_and_print(&s, flags.left, width, padding_char);
+}
+
+/// Prints an unsigned octal integer value based on the provided flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `num` - The unsigned octal integer value to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed unsigned octal integer.
+/// * `precision` - How many digits of precision, if any.
+/// * `padding_char` - The padding character as determined by `determine_padding_char`.
+方法 print_unsigned_oct(
+    数字: 正32,
+    flags: Flags,
+    width: 正整数大小,
+    precision: Precision,
+    padding_char: Padding,
+) {
+    设 prefix = 如果 flags.alter { "0" } 否则 { "" };
+    设 s = 匹配 precision {
+        Precision::NotSpecified => 格式化!("{prefix}{num:o}"),
+        Precision::NoNumber => 格式化!("{prefix}{num:o}"),
+        Precision::Number(p) => 格式化!("{prefix}{num:0>p$o}"),
+    };
+    pad_and_print(&s, flags.left, width, padding_char);
+}
+
+/// Prints an unsigned hexadecimal integer value based on the provided flags, width, and precision.
+///
+/// # Arguments
+///
+/// * `num` - The unsigned hexadecimal integer value to be printed.
+/// * `flags` - A reference to the Flags struct containing formatting flags.
+/// * `width` - The width of the field for the printed unsigned hexadecimal integer.
+/// * `precision` - How many digits of precision, if any.
+/// * `padding_char` - The padding character as determined by `determine_padding_char`.
+方法 print_unsigned_hex(
+    数字: 正64,
+    flags: Flags,
+    width: 正整数大小,
+    precision: Precision,
+    padding_char: Padding,
+) {
+    设 prefix = 如果 flags.alter { "0x" } 否则 { "" };
+    设 s = 匹配 precision {
+        Precision::NotSpecified => 格式化!("{prefix}{num:x}"),
+        Precision::NoNumber => 格式化!("{prefix}{num:x}"),
+        Precision::Number(p) => 格式化!("{prefix}{num:0>p$x}"),
+    };
+    pad_and_print(&s, flags.left, width, padding_char);
+}
+
+方法 write_raw_byte(byte: 正8) {
+    标准库::输入输出::stdout().write_all(&[byte]).解包();
+}
+
+实现 Stater {
+    方法 process_flags(chars: &[字符], i: &可变 正整数大小, bound: 正整数大小, flag: &可变 Flags) {
+        当 *i < bound {
+            匹配 chars[*i] {
+                '#' => flag.alter = 真,
+                '0' => flag.zero = 真,
+                '-' => flag.left = 真,
+                ' ' => flag.space = 真,
+                // This is not documented but the behavior seems to be
+                // the same as a space. For example `stat -c "%I5s" f`
+                // prints "    0".
+                'I' => flag.space = 真,
+                '+' => flag.sign = 真,
+                '\'' => flag.group = 真,
+                _ => 中断,
+            }
+            *i += 1;
+        }
+    }
+
+    /// Converts a character index to a byte index in a UTF-8 string
+    /// This is necessary because Rust strings are UTF-8 encoded, so character positions
+    /// don't always align with byte positions for multi-byte characters
+    方法 char_index_to_byte_index(format_str: &字符串切片, char_index: 正整数大小) -> 正整数大小 {
+        format_str
+            .char_indices()
+            .nth(char_index)
+            .map_or(format_str.长度(), |(byte_idx, _)| byte_idx)
+    }
+
+    方法 handle_percent_case(
+        chars: &[字符],
+        i: &可变 正整数大小,
+        bound: 正整数大小,
+        format_str: &字符串切片,
+    ) -> UResult<Token> {
+        设 old = *i;
+
+        *i += 1;
+        如果 *i >= bound {
+            返回 好的(Token::Char('%'));
+        }
+        如果 chars[*i] == '%' {
+            返回 好的(Token::Char('%'));
+        }
+
+        设 可变 flag = Flags::默认();
+
+        自身类型::process_flags(chars, i, bound, &可变 flag);
+
+        设 可变 width = 0;
+        设 可变 precision = Precision::NotSpecified;
+        设 可变 j = *i;
+
+        设 j_byte = 自身类型::char_index_to_byte_index(format_str, j);
+        如果 设 一些((field_width, offset)) = format_str[j_byte..].scan_num::<正整数大小>() {
+            width = field_width;
+            j += offset;
+
+            // Reject directives like `%<NUMBER>` by checking if width has been parsed.
+            如果 j >= bound || chars[j] == '%' {
+                设 invalid_directive: 字符串 = chars[old..=j.min(bound - 1)].迭代().收集();
+                返回 坏的(USimpleError::新建(
+                    1,
+                    StatError::InvalidDirective {
+                        directive: invalid_directive.quote().to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+        check_bound(format_str, bound, old, j)?;
+
+        如果 chars[j] == '.' {
+            j += 1;
+            check_bound(format_str, bound, old, j)?;
+
+            设 j_byte = 自身类型::char_index_to_byte_index(format_str, j);
+            匹配 format_str[j_byte..].scan_num::<整32>() {
+                一些((value, offset)) => {
+                    如果 value >= 0 {
+                        precision = Precision::Number(value 转换 正整数大小);
+                    }
+                    j += offset;
+                }
+                无 => precision = Precision::NoNumber,
+            }
+            check_bound(format_str, bound, old, j)?;
+        }
+
+        *i = j;
+
+        // Check for multi-character specifiers (e.g., `%Hd`, `%Lr`)
+        如果 *i + 1 < bound {
+            如果 设 一些(&next_char) = chars.获取(*i + 1) {
+                如果 (chars[*i] == 'H' || chars[*i] == 'L') && (next_char == 'd' || next_char == 'r')
+                {
+                    flag.major = chars[*i] == 'H';
+                    flag.minor = chars[*i] == 'L';
+                    *i += 1;
+                    返回 好的(Token::Directive {
+                        flag,
+                        width,
+                        precision,
+                        format: next_char,
+                    });
+                }
+            }
+        }
+
+        好的(Token::Directive {
+            flag,
+            width,
+            precision,
+            format: chars[*i],
+        })
+    }
+
+    方法 handle_escape_sequences(
+        chars: &[字符],
+        i: &可变 正整数大小,
+        bound: 正整数大小,
+        format_str: &字符串切片,
+    ) -> Token {
+        *i += 1;
+        如果 *i >= bound {
+            show_warning!("{}", translate!("stat-warning-backslash-end-format"));
+            返回 Token::Char('\\');
+        }
+        匹配 chars[*i] {
+            'a' => Token::Byte(0x07),   // BEL
+            'b' => Token::Byte(0x08),   // Backspace
+            'f' => Token::Byte(0x0C),   // Form feed
+            'n' => Token::Byte(0x0A),   // Line feed
+            'r' => Token::Byte(0x0D),   // Carriage return
+            't' => Token::Byte(0x09),   // Horizontal tab
+            '\\' => Token::Byte(b'\\'), // Backslash
+            '\'' => Token::Byte(b'\''), // Single quote
+            '"' => Token::Byte(b'"'),   // Double quote
+            '0'..='7' => {
+                // Parse octal escape sequence (up to 3 digits)
+                设 可变 value = 0正8;
+                设 可变 计数 = 0;
+                当 *i < bound && 计数 < 3 {
+                    如果 设 一些(digit) = chars[*i].to_digit(8) {
+                        value = value * 8 + digit 转换 正8;
+                        *i += 1;
+                        计数 += 1;
+                    } 否则 {
+                        中断;
+                    }
+                }
+                *i -= 1; // Adjust index to account for the outer loop increment
+                Token::Byte(value)
+            }
+            'x' => {
+                // Parse hexadecimal escape sequence (\xNN format)
+                // Uses UTF-8 safe byte indexing to handle multi-byte characters properly
+                如果 *i + 1 < bound {
+                    设 byte_index = 自身类型::char_index_to_byte_index(format_str, *i + 1);
+                    如果 设 一些((c, offset)) = format_str[byte_index..].scan_char(16) {
+                        *i += offset;
+                        Token::Byte(c 转换 正8)
+                    } 否则 {
+                        show_warning!("{}", translate!("stat-warning-unrecognized-escape-x"));
+                        Token::Byte(b'x')
+                    }
+                } 否则 {
+                    show_warning!("{}", translate!("stat-warning-incomplete-hex-escape"));
+                    Token::Byte(b'x')
+                }
+            }
+            other => {
+                show_warning!(
+                    "{}",
+                    translate!("stat-warning-unrecognized-escape", "escape" => other)
+                );
+                Token::Byte(other 转换 正8)
+            }
+        }
+    }
+
+    方法 generate_tokens(format_str: &字符串切片, use_printf: 布尔) -> UResult<向量<Token>> {
+        设 可变 tokens = 向量::新建();
+        设 chars = format_str.chars().收集::<向量<字符>>();
+        设 bound = chars.长度();
+        设 可变 i = 0;
+        当 i < bound {
+            匹配 chars.获取(i) {
+                一些('%') => tokens.压入(自身类型::handle_percent_case(
+                    &chars, &可变 i, bound, format_str,
+                )?),
+                一些('\\') => {
+                    如果 use_printf {
+                        tokens.压入(自身类型::handle_escape_sequences(
+                            &chars, &可变 i, bound, format_str,
+                        ));
+                    } 否则 {
+                        tokens.压入(Token::Char('\\'));
+                    }
+                }
+                一些(c) => tokens.压入(Token::Char(*c)),
+                无 => 中断,
+            }
+            i += 1;
+        }
+        如果 !use_printf && !format_str.ends_with('\n') {
+            tokens.压入(Token::Char('\n'));
+        }
+        好的(tokens)
+    }
+
+    方法 populate_mount_list() -> UResult<向量<OsString>> {
+        设 可变 mount_list = read_fs_list()
+            .map_err(|e| {
+                USimpleError::新建(
+                    e.code(),
+                    StatError::CannotReadFilesystem {
+                        错误: e.to_string(),
+                    }
+                    .to_string(),
+                )
+            })?
+            .迭代()
+            .映射(|mi| mi.mount_dir.克隆())
+            .收集::<向量<_>>();
+
+        // Reverse sort. The longer comes first.
+        mount_list.sort();
+        mount_list.reverse();
+
+        好的(mount_list)
+    }
+
+    方法 新建(matches: &ArgMatches) -> UResult<自身类型> {
+        设 files: 向量<OsString> = matches
+            .get_many::<OsString>(options::FILES)
+            .映射(|v| v.映射(OsString::from).收集())
+            .unwrap_or_default();
+        如果 files.为空() {
+            返回 坏的(盒子::新建(StatError::MissingOperand) 转换 盒子<动态 UError>);
+        }
+        设 format_str = 如果 matches.contains_id(options::PRINTF) {
+            matches
+                .get_one::<字符串>(options::PRINTF)
+                .期望("Invalid format string")
+        } 否则 {
+            matches
+                .get_one::<字符串>(options::FORMAT)
+                .map_or("", |s| s.as_str())
+        };
+
+        设 use_printf = matches.contains_id(options::PRINTF);
+        设 terse = matches.get_flag(options::TERSE);
+        设 show_fs = matches.get_flag(options::FILE_SYSTEM);
+
+        设 default_tokens = 如果 format_str.为空() {
+            自身类型::generate_tokens(&自身类型::default_format(show_fs, terse, 假), use_printf)?
+        } 否则 {
+            自身类型::generate_tokens(format_str, use_printf)?
+        };
+        设 default_dev_tokens =
+            自身类型::generate_tokens(&自身类型::default_format(show_fs, terse, 真), use_printf)?;
+
+        // mount points aren't displayed when showing filesystem information, or
+        // whenever the format string does not request the mount point.
+        设 mount_list_needed = !show_fs
+            && default_tokens
+                .迭代()
+                .任意(|tok| matches!(tok, Token::Directive { format: 'm', .. }));
+
+        好的(自身类型 {
+            follow: matches.get_flag(options::DEREFERENCE),
+            show_fs,
+            from_user: !format_str.为空(),
+            files,
+            mount_list: OnceCell::新建(),
+            mount_list_needed,
+            default_tokens,
+            default_dev_tokens,
+        })
+    }
+
+    方法 find_mount_point<P: 作为引用协议<Path>>(&自身, p: P) -> 选项<&OsString> {
+        如果 !自身.mount_list_needed {
+            返回 无;
+        }
+
+        设 mount_list = 自身.mount_list.get_or_init(|| {
+            匹配 自身类型::populate_mount_list() {
+                好的(list) => 一些(list),
+                坏的(e) => {
+                    // Show warning like GNU does when mount information cannot be read
+                    show_warning!(
+                        "{}",
+                        translate!("stat-error-cannot-read-filesystem", "error" => e.to_string())
+                    );
+                    无
+                }
+            }
+        });
+
+        设 路径 = p.as_ref().canonicalize().ok()?;
+        mount_list
+            .as_ref()?
+            .迭代()
+            .寻找(|root| 路径.starts_with(root))
+    }
+
+    方法 exec(&自身) -> 整32 {
+        设 可变 stdin_is_fifo = 假;
+        如果 cfg!(unix) {
+            如果 设 好的(md) = 文件系统::metadata("/dev/stdin") {
+                stdin_is_fifo = md.file_type().is_fifo();
+            }
+        }
+
+        设 可变 ret = 0;
+        循环 f 在 &自身.files {
+            ret |= 自身.do_stat(f, stdin_is_fifo);
+        }
+        ret
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    方法 process_token_files(
+        &自身,
+        t: &Token,
+        meta: &Metadata,
+        display_name: &字符串切片,
+        file: &OsString,
+        file_type: FileType,
+        from_user: 布尔,
+        #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+        follow_symbolic_links: 布尔,
+        #[cfg(not(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android"))))]
+        _: 布尔,
+    ) -> 结果<(), 整32> {
+        匹配 *t {
+            Token::Byte(byte) => write_raw_byte(byte),
+            Token::Char(c) => 打印!("{c}"),
+
+            Token::Directive {
+                flag,
+                width,
+                precision,
+                format,
+            } => {
+                设 output = 匹配 format {
+                    // access rights in octal
+                    'a' => OutputType::UnsignedOct(0o7777 & meta.mode()),
+                    // access rights in human readable form
+                    'A' => OutputType::Str(display_permissions(meta, 真)),
+                    // number of blocks allocated (see %B)
+                    'b' => OutputType::Unsigned(meta.blocks()),
+
+                    // the size in bytes of each block reported by %b
+                    // FIXME: blocksize differs on various platform
+                    // See coreutils/gnulib/lib/stat-size.h ST_NBLOCKSIZE // spell-checker:disable-line
+                    'B' => OutputType::Unsigned(512),
+                    // SELinux security context string
+                    'C' => {
+                        #[cfg(全部(
+                            feature = "selinux",
+                            任意(target_os = "linux", target_os = "android")
+                        ))]
+                        {
+                            如果 uucore::selinux::is_selinux_enabled() {
+                                匹配 uucore::selinux::get_selinux_security_context(
+                                    Path::新建(file),
+                                    follow_symbolic_links,
+                                ) {
+                                    好的(ctx) => OutputType::Str(ctx),
+                                    坏的(_) => OutputType::Str(translate!(
+                                        "stat-selinux-failed-get-context"
+                                    )),
+                                }
+                            } 否则 {
+                                OutputType::Str(translate!("stat-selinux-unsupported-system"))
+                            }
+                        }
+                        #[cfg(not(全部(
+                            feature = "selinux",
+                            任意(target_os = "linux", target_os = "android")
+                        )))]
+                        {
+                            OutputType::Str(translate!("stat-selinux-unsupported-os"))
+                        }
+                    }
+                    // device number in decimal
+                    'd' 如果 flag.major => OutputType::Unsigned(major(meta.dev() 转换 _) 转换 正64),
+                    'd' 如果 flag.minor => OutputType::Unsigned(minor(meta.dev() 转换 _) 转换 正64),
+                    'd' => OutputType::Unsigned(meta.dev()),
+                    // device number in hex
+                    'D' => OutputType::UnsignedHex(meta.dev()),
+                    // raw mode in hex
+                    'f' => OutputType::UnsignedHex(meta.mode() 转换 正64),
+                    // file type
+                    'F' => OutputType::Str(pretty_filetype(meta.mode() 转换 mode_t, meta.长度())),
+                    // group ID of owner
+                    'g' => OutputType::Unsigned(meta.gid() 转换 正64),
+                    // group name of owner
+                    'G' => {
+                        设 group_name =
+                            entries::gid2grp(meta.gid()).unwrap_or_else(|_| "UNKNOWN".to_owned());
+                        OutputType::Str(group_name)
+                    }
+                    // number of hard links
+                    'h' => OutputType::Unsigned(meta.nlink()),
+                    // inode number
+                    'i' => OutputType::Unsigned(meta.ino()),
+                    // mount point
+                    'm' => 匹配 自身.find_mount_point(file) {
+                        一些(s) => OutputType::OsStr(s),
+                        无 => OutputType::Str(字符串::新建()),
+                    },
+                    // file name
+                    'n' => OutputType::Str(display_name.to_string()),
+                    // quoted file name with dereference if symbolic link
+                    'N' => {
+                        设 file_name =
+                            get_quoted_file_name(display_name, file, file_type, from_user)?;
+                        OutputType::Str(file_name)
+                    }
+                    // optimal I/O transfer size hint
+                    'o' => OutputType::Unsigned(meta.blksize()),
+                    // total size, in bytes
+                    's' => OutputType::Integer(meta.长度() 转换 整64),
+                    // major device type in hex, for character/block device special
+                    // files
+                    't' => OutputType::UnsignedHex(major(meta.rdev() 转换 _) 转换 正64),
+                    // minor device type in hex, for character/block device special
+                    // files
+                    'T' => OutputType::UnsignedHex(minor(meta.rdev() 转换 _) 转换 正64),
+                    // user ID of owner
+                    'u' => OutputType::Unsigned(meta.uid() 转换 正64),
+                    // user name of owner
+                    'U' => {
+                        设 user_name =
+                            entries::uid2usr(meta.uid()).unwrap_or_else(|_| "UNKNOWN".to_owned());
+                        OutputType::Str(user_name)
+                    }
+
+                    // time of file birth, human-readable; - if unknown
+                    'w' => OutputType::Str(pretty_time(meta, MetadataTimeField::Birth)),
+
+                    // time of file birth, seconds since Epoch; 0 if unknown
+                    'W' => OutputType::Integer(
+                        metadata_get_time(meta, MetadataTimeField::Birth)
+                            .map_or(0, |x| system_time_to_sec(x).0),
+                    ),
+
+                    // time of last access, human-readable
+                    'x' => OutputType::Str(pretty_time(meta, MetadataTimeField::Access)),
+                    // time of last access, seconds since Epoch
+                    'X' => {
+                        设 (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Access)
+                            .map_or((0, 0), system_time_to_sec);
+                        OutputType::Float(sec 转换 点64 + nsec 转换 点64 / 1_000_000_000.0)
+                    }
+                    // time of last data modification, human-readable
+                    'y' => OutputType::Str(pretty_time(meta, MetadataTimeField::Modification)),
+                    // time of last data modification, seconds since Epoch
+                    'Y' => {
+                        设 (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Modification)
+                            .map_or((0, 0), system_time_to_sec);
+                        OutputType::Float(sec 转换 点64 + nsec 转换 点64 / 1_000_000_000.0)
+                    }
+                    // time of last status change, human-readable
+                    'z' => OutputType::Str(pretty_time(meta, MetadataTimeField::Change)),
+                    // time of last status change, seconds since Epoch
+                    'Z' => {
+                        设 (sec, nsec) = metadata_get_time(meta, MetadataTimeField::Change)
+                            .map_or((0, 0), system_time_to_sec);
+                        OutputType::Float(sec 转换 点64 + nsec 转换 点64 / 1_000_000_000.0)
+                    }
+                    'R' => OutputType::UnsignedHex(meta.rdev()),
+                    'r' 如果 flag.major => OutputType::Unsigned(major(meta.rdev() 转换 _) 转换 正64),
+                    'r' 如果 flag.minor => OutputType::Unsigned(minor(meta.rdev() 转换 _) 转换 正64),
+                    'r' => OutputType::Unsigned(meta.rdev()),
+                    _ => OutputType::Unknown,
+                };
+                print_it(&output, flag, width, precision);
+            }
+        }
+        好的(())
+    }
+
+    方法 do_stat(&自身, file: &OsStr, stdin_is_fifo: 布尔) -> 整32 {
+        设 display_name = file.to_string_lossy();
+        设 file = 如果 cfg!(unix) && display_name == "-" {
+            如果 自身.show_fs {
+                show_error!("{}", StatError::StdinFilesystemMode);
+                返回 1;
+            }
+            如果 设 好的(p) = Path::新建("/dev/stdin").canonicalize() {
+                p.into_os_string()
+            } 否则 {
+                OsString::from("/dev/stdin")
+            }
+        } 否则 {
+            OsString::from(file)
+        };
+        如果 自身.show_fs {
+            匹配 statfs(&file) {
+                好的(meta) => {
+                    设 tokens = &自身.default_tokens;
+
+                    // Usage
+                    循环 t 在 tokens {
+                        process_token_filesystem(t, &meta, &display_name);
+                    }
+                }
+                坏的(错误) => {
+                    show_error!(
+                        "{}",
+                        StatError::CannotReadFilesystemInfo {
+                            file: display_name.quote().to_string(),
+                            错误
+                        }
+                    );
+                    返回 1;
+                }
+            }
+        } 否则 {
+            设 follow_symbolic_links = 自身.follow || stdin_is_fifo && display_name == "-";
+            设 result = 如果 follow_symbolic_links {
+                文件系统::metadata(&file)
+            } 否则 {
+                文件系统::symlink_metadata(&file)
+            };
+            匹配 result {
+                好的(meta) => {
+                    设 file_type = meta.file_type();
+                    设 tokens = 如果 自身.from_user
+                        || !(file_type.is_char_device() || file_type.is_block_device())
+                    {
+                        &自身.default_tokens
+                    } 否则 {
+                        &自身.default_dev_tokens
+                    };
+
+                    循环 t 在 tokens {
+                        如果 设 坏的(code) = 自身.process_token_files(
+                            t,
+                            &meta,
+                            &display_name,
+                            &file,
+                            file_type,
+                            自身.from_user,
+                            follow_symbolic_links,
+                        ) {
+                            返回 code;
+                        }
+                    }
+                }
+                坏的(e) => {
+                    show_error!(
+                        "{}",
+                        StatError::CannotStat {
+                            file: display_name.quote().to_string(),
+                            错误: e.to_string()
+                        }
+                    );
+                    返回 1;
+                }
+            }
+        }
+        0
+    }
+
+    方法 default_format(show_fs: 布尔, terse: 布尔, show_dev_type: 布尔) -> 字符串 {
+        // SELinux related format is *ignored*
+
+        如果 show_fs {
+            如果 terse {
+                "%n %i %l %t %s %S %b %f %a %c %d\n".into()
+            } 否则 {
+                格式化!(
+                    "  {}: \"%n\"\n    {}: %-8i {}: %-7l {}: %T\n{} \
+                         {}: %-10s {} {}: %S\n{}: {}: %-10b \
+                         {}: %-10f {}: %a\n{}: {}: %-10c {}: %d\n",
+                    translate!("stat-word-file"),
+                    translate!("stat-word-id"),
+                    translate!("stat-word-namelen"),
+                    translate!("stat-word-type"),
+                    translate!("stat-word-block"),
+                    translate!("stat-word-size"),
+                    translate!("stat-word-fundamental"),
+                    translate!("stat-word-block-size"),
+                    translate!("stat-word-blocks"),
+                    translate!("stat-word-total"),
+                    translate!("stat-word-free"),
+                    translate!("stat-word-available"),
+                    translate!("stat-word-inodes"),
+                    translate!("stat-word-total"),
+                    translate!("stat-word-free")
+                )
+            }
+        } 否则 如果 terse {
+            "%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n".into()
+        } 否则 {
+            设 device_line = 如果 show_dev_type {
+                格式化!(
+                    "{}: %Hd,%Ld\t{}: %-10i  {}: %-5h {} {}: %t,%T\n",
+                    translate!("stat-word-device"),
+                    translate!("stat-word-inode"),
+                    translate!("stat-word-links"),
+                    translate!("stat-word-device"),
+                    translate!("stat-word-type")
+                )
+            } 否则 {
+                格式化!(
+                    "{}: %Hd,%Ld\t{}: %-10i  {}: %h\n",
+                    translate!("stat-word-device"),
+                    translate!("stat-word-inode"),
+                    translate!("stat-word-links")
+                )
+            };
+
+            格式化!(
+                "  {}: %N\n  {}: %-10s\t{}: %-10b {} {}: %-6o %F\n{device_line}{}: (%04a/%10.10A)  {}: (%5u/%8U)   {}: (%5g/%8G)\n{}: %x\n{}: %y\n{}: %z\n {}: %w\n",
+                translate!("stat-word-file"),
+                translate!("stat-word-size"),
+                translate!("stat-word-blocks"),
+                translate!("stat-word-io"),
+                translate!("stat-word-block"),
+                translate!("stat-word-access"),
+                translate!("stat-word-uid"),
+                translate!("stat-word-gid"),
+                translate!("stat-word-access"),
+                translate!("stat-word-modify"),
+                translate!("stat-word-change"),
+                translate!("stat-word-birth")
+            )
+        }
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 stater = Stater::新建(&matches)?;
+    设 exit_status = stater.exec();
+    如果 exit_status == 0 {
+        好的(())
+    } 否则 {
+        坏的(exit_status.into())
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("stat")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("stat"))
+        .about(translate!("stat-about"))
+        .after_help(translate!("stat-after-help"))
+        .override_usage(format_usage(&translate!("stat-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::DEREFERENCE)
+                .short('L')
+                .long(options::DEREFERENCE)
+                .help(translate!("stat-help-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILE_SYSTEM)
+                .short('f')
+                .long(options::FILE_SYSTEM)
+                .help(translate!("stat-help-file-system"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TERSE)
+                .short('t')
+                .long(options::TERSE)
+                .help(translate!("stat-help-terse"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FORMAT)
+                .short('c')
+                .long(options::FORMAT)
+                .help(translate!("stat-help-format"))
+                .value_name("FORMAT"),
+        )
+        .arg(
+            Arg::新建(options::PRINTF)
+                .long(options::PRINTF)
+                .value_name("FORMAT")
+                .help(translate!("stat-help-printf")),
+        )
+        .arg(
+            Arg::新建(options::FILES)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+常量 PRETTY_DATETIME_FORMAT: &字符串切片 = "%Y-%m-%d %H:%M:%S.%N %z";
+
+方法 pretty_time(meta: &Metadata, md_time_field: MetadataTimeField) -> 字符串 {
+    如果 设 一些(时间) = metadata_get_time(meta, md_time_field) {
+        设 可变 tmp = 向量::新建();
+        如果 format_system_time(
+            &可变 tmp,
+            时间,
+            PRETTY_DATETIME_FORMAT,
+            FormatSystemTimeFallback::Float,
+        )
+        .is_ok()
+        {
+            返回 字符串::from_utf8(tmp).解包();
+        }
+    }
+    "-".to_string()
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::{pad_and_print_bytes, quote_file_name, write_padding};
+
+    使用 超级::{Flags, Precision, ScanUtil, Stater, Token, group_num, precision_trunc};
+
+    #[test]
+    方法 test_scanners() {
+        相等断言!(一些((-5, 2)), "-5zxc".scan_num::<整32>());
+        相等断言!(一些((51, 2)), "51zxc".scan_num::<正32>());
+        相等断言!(一些((192, 4)), "+192zxc".scan_num::<整32>());
+        相等断言!(无, "z192zxc".scan_num::<整32>());
+
+        相等断言!(一些(('a', 3)), "141zxc".scan_char(8));
+        相等断言!(一些(('\n', 2)), "12qzxc".scan_char(8)); // spell-checker:disable-line
+        相等断言!(一些(('\r', 1)), "dqzxc".scan_char(16)); // spell-checker:disable-line
+        相等断言!(无, "z2qzxc".scan_char(8)); // spell-checker:disable-line
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_group_num() {
+        相等断言!("12,379,821,234", group_num("12379821234"));
+        相等断言!("21,234", group_num("21234"));
+        相等断言!("821,234", group_num("821234"));
+        相等断言!("1,821,234", group_num("1821234"));
+        相等断言!("1,234", group_num("1234"));
+        相等断言!("234", group_num("234"));
+        相等断言!("24", group_num("24"));
+        相等断言!("4", group_num("4"));
+        相等断言!("", group_num(""));
+        相等断言!("-5", group_num("-5"));
+        相等断言!("-1,234", group_num("-1234"));
+    }
+
+    #[test]
+    #[should_panic]
+    方法 test_group_num_panic_if_invalid_numeric_characters() {
+        group_num("³³³³³");
+    }
+
+    #[test]
+    方法 normal_format() {
+        设 s = "%'010.2ac%-#5.w\n";
+        设 expected = 向量![
+            Token::Directive {
+                flag: Flags {
+                    group: 真,
+                    zero: 真,
+                    ..默认协议::默认()
+                },
+                width: 10,
+                precision: Precision::Number(2),
+                format: 'a',
+            },
+            Token::Char('c'),
+            Token::Directive {
+                flag: Flags {
+                    left: 真,
+                    alter: 真,
+                    ..默认协议::默认()
+                },
+                width: 5,
+                precision: Precision::NoNumber,
+                format: 'w',
+            },
+            Token::Char('\n'),
+        ];
+        相等断言!(&expected, &Stater::generate_tokens(s, 假).解包());
+    }
+
+    #[test]
+    方法 printf_format() {
+        设 s = r#"%-# 15a\t\r\"\\\a\b\x1B\f\x0B%+020.-23w\x12\167\132\112\n"#;
+        设 expected = 向量![
+            Token::Directive {
+                flag: Flags {
+                    left: 真,
+                    alter: 真,
+                    space: 真,
+                    ..默认协议::默认()
+                },
+                width: 15,
+                precision: Precision::NotSpecified,
+                format: 'a',
+            },
+            Token::Byte(b'\t'),
+            Token::Byte(b'\r'),
+            Token::Byte(b'"'),
+            Token::Byte(b'\\'),
+            Token::Byte(b'\x07'),
+            Token::Byte(b'\x08'),
+            Token::Byte(b'\x1B'),
+            Token::Byte(b'\x0C'),
+            Token::Byte(b'\x0B'),
+            Token::Directive {
+                flag: Flags {
+                    sign: 真,
+                    zero: 真,
+                    ..默认协议::默认()
+                },
+                width: 20,
+                precision: Precision::NotSpecified,
+                format: 'w',
+            },
+            Token::Byte(b'\x12'),
+            Token::Byte(b'w'),
+            Token::Byte(b'Z'),
+            Token::Byte(b'J'),
+            Token::Byte(b'\n'),
+        ];
+        相等断言!(&expected, &Stater::generate_tokens(s, 真).解包());
+    }
+
+    #[test]
+    方法 test_precision_trunc() {
+        相等断言!(precision_trunc(123.456, Precision::NotSpecified), "123");
+        相等断言!(precision_trunc(123.456, Precision::NoNumber), "123.456");
+        相等断言!(precision_trunc(123.456, Precision::Number(0)), "123");
+        相等断言!(precision_trunc(123.456, Precision::Number(1)), "123.4");
+        相等断言!(precision_trunc(123.456, Precision::Number(2)), "123.45");
+        相等断言!(precision_trunc(123.456, Precision::Number(3)), "123.456");
+        相等断言!(precision_trunc(123.456, Precision::Number(4)), "123.4560");
+        相等断言!(precision_trunc(123.456, Precision::Number(5)), "123.45600");
+    }
+
+    #[test]
+    方法 test_pad_and_print_bytes() {
+        // testing non-utf8 with normal settings
+        设 可变 buffer = 向量::新建();
+        设 bytes = b"\x80\xFF\x80";
+        pad_and_print_bytes(&可变 buffer, bytes, 假, 3, Precision::NotSpecified).解包();
+        相等断言!(&buffer, b"\x80\xFF\x80");
+
+        // testing left padding
+        设 可变 buffer = 向量::新建();
+        设 bytes = b"\x80\xFF\x80";
+        pad_and_print_bytes(&可变 buffer, bytes, 假, 5, Precision::NotSpecified).解包();
+        相等断言!(&buffer, b"  \x80\xFF\x80");
+
+        // testing right padding
+        设 可变 buffer = 向量::新建();
+        设 bytes = b"\x80\xFF\x80";
+        pad_and_print_bytes(&可变 buffer, bytes, 真, 5, Precision::NotSpecified).解包();
+        相等断言!(&buffer, b"\x80\xFF\x80  ");
+    }
+
+    #[test]
+    方法 test_print_padding() {
+        设 可变 buffer = 向量::新建();
+        write_padding(&可变 buffer, 5).解包();
+        相等断言!(&buffer, b"     ");
+    }
+
+    #[test]
+    方法 test_quote_file_name() {
+        设 file_name = "nice' file";
+        相等断言!(
+            quote_file_name(file_name, &箱::QuotingStyle::ShellEscapeAlways),
+            "\"nice' file\""
+        );
+
+        设 file_name = "nice\" file";
+        相等断言!(
+            quote_file_name(file_name, &箱::QuotingStyle::ShellEscapeAlways),
+            "\'nice\" file\'"
+        );
+    }
+}

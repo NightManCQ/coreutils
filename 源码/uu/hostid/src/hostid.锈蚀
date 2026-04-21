@@ -1,0 +1,41 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) gethostid
+
+使用 clap::Command;
+使用 libc::{c_long, gethostid};
+使用 标准库::输入输出::{Write, stdout};
+使用 uucore::{错误::UResult, format_usage};
+
+使用 uucore::translate;
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    /*
+     * POSIX says gethostid returns a "32-bit identifier" but is silent
+     * whether it's sign-extended.  Turn off any sign-extension.  This
+     * is a no-op unless unsigned int is wider than 32 bits.
+     */
+
+    设 可变 result: c_long = 不安全 { gethostid() };
+
+    #[allow(overflowing_literals)]
+    设 mask = 0xffff_ffff;
+
+    result &= mask;
+    writeln!(stdout().锁定(), "{result:0>8x}")?;
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("hostid")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("hostid"))
+        .about(translate!("hostid-about"))
+        .override_usage(format_usage(&translate!("hostid-usage")))
+        .infer_long_args(真)
+}

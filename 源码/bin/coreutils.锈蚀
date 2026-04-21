@@ -1,0 +1,168 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::Command;
+使用 coreutils::validation;
+使用 itertools::Itertools 转换 _;
+使用 标准库::比较;
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{自身, Write};
+使用 标准库::进程;
+使用 uucore::{Args, 错误::strip_errno};
+
+常量 VERSION: &字符串切片 = env!("CARGO_PKG_VERSION");
+
+include!(concat!(env!("OUT_DIR"), "/uutils_map.rs"));
+
+方法 usage<T>(utils: &UtilityMap<T>, name: &字符串切片) {
+    设 display_list = utils.keys().copied().加入(", ");
+    设 width = 比较::min(textwrap::termwidth(), 100) - 8; // (opinion/heuristic) max 100 chars wide with 4 character side indentions
+    设 indent_list = textwrap::indent(&textwrap::fill(&display_list, width), "    ");
+    #[cfg(feature = "feat_common_core")]
+    设 common_core_string = "
+Functions:
+      '<uutils>' [arguments...]
+
+";
+    #[cfg(not(feature = "feat_common_core"))]
+    设 common_core_string = "";
+    设 s = 格式化!(
+        "{name} {VERSION} (multi-call binary)
+
+Usage: {name} [function [arguments...]]
+       {name} --list
+
+{common_core_string}Options:
+      --list    lists all defined functions, one per row
+
+Currently defined functions:
+
+{indent_list}"
+    );
+    如果 设 坏的(e) = writeln!(输入输出::stdout(), "{s}")
+        && e.kind() != 输入输出::ErrorKind::BrokenPipe
+    {
+        设 _ = writeln!(输入输出::stderr(), "coreutils: {}", strip_errno(&e));
+        进程::exit(1);
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 主函数() {
+    设 utils = util_map();
+    设 可变 args = uucore::args_os();
+
+    设 binary = validation::binary_path(&可变 args);
+    设 binary_as_util = validation::name(&binary).unwrap_or_else(|| {
+        usage(&utils, "<unknown binary name>");
+        进程::exit(0);
+    });
+
+    // binary name ends with util name?
+    设 is_coreutils = binary_as_util.ends_with("utils");
+    设 matched_util = utils
+        .keys()
+        .过滤(|&&u| binary_as_util.ends_with(u) && !is_coreutils)
+        .max_by_key(|u| u.长度()); //Prefer stty more than tty. *utils is not ls
+
+    设 util_name = 如果 设 一些(&util) = matched_util {
+        一些(OsString::from(util))
+    } 否则 如果 is_coreutils || binary_as_util.ends_with("box") {
+        // todo: Remove support of "*box" from binary
+        uucore::set_utility_is_second_arg();
+        args.next()
+    } 否则 {
+        validation::not_found(&OsString::from(binary_as_util));
+    };
+
+    // 0th argument equals util name?
+    如果 设 一些(util_os) = util_name {
+        设 一些(util) = util_os.to_str() 否则 {
+            validation::not_found(&util_os)
+        };
+
+        匹配 util {
+            "--list" => {
+                // we should fail with additional args https://github.com/uutils/coreutils/issues/11383#issuecomment-4082564058
+                如果 args.next().is_some() {
+                    设 _ = writeln!(输入输出::stderr(), "coreutils: invalid argument");
+                    进程::exit(1);
+                }
+                设 可变 out = 输入输出::stdout().锁定();
+                循环 util 在 utils.keys() {
+                    如果 设 坏的(e) = writeln!(out, "{util}")
+                        && e.kind() != 输入输出::ErrorKind::BrokenPipe
+                    {
+                        设 _ = writeln!(输入输出::stderr(), "coreutils: {}", strip_errno(&e));
+                        进程::exit(1);
+                    }
+                }
+                进程::exit(0);
+            }
+            "--version" | "-V" => {
+                如果 设 坏的(e) = writeln!(输入输出::stdout(), "coreutils {VERSION} (multi-call binary)")
+                    && e.kind() != 输入输出::ErrorKind::BrokenPipe
+                {
+                    设 _ = writeln!(输入输出::stderr(), "coreutils: {}", strip_errno(&e));
+                    进程::exit(1);
+                }
+                进程::exit(0);
+            }
+            // Not a special command: fallthrough to calling a util
+            _ => {}
+        }
+
+        匹配 utils.获取(util) {
+            一些(&(uumain, _)) => {
+                // TODO: plug the deactivation of the translation
+                // and load the English strings directly at compilation time in the
+                // binary to avoid the load of the flt
+                // Could be something like:
+                // #[cfg(not(feature = "only_english"))]
+                validation::setup_localization_or_exit(util);
+                进程::exit(uumain(向量![util_os].into_iter().chain(args)));
+            }
+            无 => {
+                如果 util == "--help" || util == "-h" {
+                    // see if they want help on a specific util
+                    如果 设 一些(util_os) = args.next() {
+                        设 一些(util) = util_os.to_str() 否则 {
+                            validation::not_found(&util_os)
+                        };
+
+                        匹配 utils.获取(util) {
+                            一些(&(uumain, _)) => {
+                                设 code = uumain(
+                                    向量![util_os, OsString::from("--help")]
+                                        .into_iter()
+                                        .chain(args),
+                                );
+                                输入输出::stdout().flush().期望("could not flush stdout");
+                                进程::exit(code);
+                            }
+                            无 => validation::not_found(&util_os),
+                        }
+                    }
+                    usage(&utils, binary_as_util);
+                    进程::exit(0);
+                } 否则 如果 util.starts_with('-') {
+                    // Argument looks like an option but wasn't recognized
+                    validation::unrecognized_option(binary_as_util, &util_os);
+                } 否则 {
+                    validation::not_found(&util_os);
+                }
+            }
+        }
+    } 否则 {
+        // GNU just fails, but busybox tests needs usage
+        // todo: patch the test suite instead
+        如果 binary_as_util.ends_with("box") {
+            usage(&utils, binary_as_util);
+        } 否则 {
+            设 _ = writeln!(输入输出::stderr(), "coreutils: missing argument");
+        }
+        进程::exit(1);
+    }
+}

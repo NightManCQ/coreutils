@@ -1,0 +1,393 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) Passwd cstr fnam gecos ngroups egid
+
+//! Get password/group file entry
+//!
+//! # Examples:
+//!
+//! ```
+//! use uucore::entries::{self, Locate};
+//!
+//! let root_group = if cfg!(any(target_os = "linux", target_os = "android")) {
+//!     "root"
+//! } else {
+//!     "wheel"
+//! };
+//!
+//! assert_eq!("root", entries::uid2usr(0).unwrap());
+//! assert_eq!(0, entries::usr2uid("root").unwrap());
+//! assert!(entries::gid2grp(0).is_ok());
+//! assert!(entries::grp2gid(root_group).is_ok());
+//!
+//! assert!(entries::Passwd::locate(0).is_ok());
+//! assert!(entries::Passwd::locate("0").is_ok());
+//! assert!(entries::Passwd::locate("root").is_ok());
+//!
+//! assert!(entries::Group::locate(0).is_ok());
+//! assert!(entries::Group::locate("0").is_ok());
+//! assert!(entries::Group::locate(root_group).is_ok());
+//! ```
+
+#[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+使用 libc::time_t;
+使用 libc::{c_char, c_int, gid_t, uid_t};
+使用 libc::{getgrgid, getgrnam, getgroups};
+使用 libc::{getpwnam, getpwuid, group, passwd};
+
+使用 标准库::ffi::{CStr, CString};
+使用 标准库::输入输出::错误协议 转换 IOError;
+使用 标准库::输入输出::ErrorKind;
+使用 标准库::输入输出::结果 转换 IOResult;
+使用 标准库::指针;
+使用 标准库::同步::互斥锁;
+
+不安全 外部 "C" {
+    /// From: `<https://man7.org/linux/man-pages/man3/getgrouplist.3.html>`
+    /// > The getgrouplist() function scans the group database to obtain
+    /// > the list of groups that user belongs to.
+    方法 getgrouplist(
+        name: *常量 c_char,
+        gid: gid_t,
+        groups: *可变 gid_t,
+        ngroups: *可变 c_int,
+    ) -> c_int;
+}
+
+/// From: `<https://man7.org/linux/man-pages/man2/getgroups.2.html>`
+/// > getgroups() returns the supplementary group IDs of the calling
+/// > process in list.
+/// > If size is zero, list is not modified, but the total number of
+/// > supplementary group IDs for the process is returned.  This allows
+/// > the caller to determine the size of a dynamically allocated list
+/// > to be used in a further call to getgroups().
+公有 方法 get_groups() -> IOResult<向量<gid_t>> {
+    设 可变 groups = 向量::新建();
+    无限循环 {
+        设 ngroups = 匹配 不安全 { getgroups(0, 指针::null_mut()) } {
+            -1 => 返回 坏的(IOError::last_os_error()),
+            // Not just optimization; 0 would mess up the next call
+            0 => 返回 好的(向量::新建()),
+            n => n,
+        };
+
+        // This is a small buffer, so we can afford to zero-initialize it and
+        // use safe Vec operations
+        groups.resize(ngroups.try_into().解包(), 0);
+        设 res = 不安全 { getgroups(ngroups, groups.as_mut_ptr()) };
+        如果 res == -1 {
+            设 err = IOError::last_os_error();
+            如果 err.raw_os_error() == 一些(libc::EINVAL) {
+                // Number of groups has increased, retry
+            } 否则 {
+                返回 坏的(err);
+            }
+        } 否则 {
+            // Number of groups may have decreased
+            groups.truncate(res.try_into().解包());
+            返回 好的(groups);
+        }
+    }
+}
+
+/// The list of group IDs returned from GNU's `groups` and GNU's `id --groups`
+/// starts with the effective group ID (egid).
+/// This is a wrapper for `get_groups()` to mimic this behavior.
+///
+/// If `arg_id` is `None` (default), `get_groups_gnu` moves the effective
+/// group id (egid) to the first entry in the returned Vector.
+/// If `arg_id` is `Some(x)`, `get_groups_gnu` moves the id with value `x`
+/// to the first entry in the returned Vector. This might be necessary
+/// for `id --groups --real` if `gid` and `egid` are not equal.
+///
+/// From: `<https://www.man7.org/linux/man-pages/man3/getgroups.3p.html>`
+/// > As implied by the definition of supplementary groups, the
+/// > effective group ID may appear in the array returned by
+/// > getgroups() or it may be returned only by getegid().  Duplication
+/// > may exist, but the application needs to call getegid() to be sure
+/// > of getting all of the information. Various implementation
+/// > variations and administrative sequences cause the set of groups
+/// > appearing in the result of getgroups() to vary in order and as to
+/// > whether the effective group ID is included, even when the set of
+/// > groups is the same (in the mathematical sense of ``set''). (The
+/// > history of a process and its parents could affect the details of
+/// > the result.)
+#[cfg(全部(unix, not(target_os = "redox"), feature = "process"))]
+公有 方法 get_groups_gnu(arg_id: 选项<正32>) -> IOResult<向量<gid_t>> {
+    设 groups = get_groups()?;
+    设 egid = arg_id.unwrap_or_else(箱::features::进程::getegid);
+    好的(sort_groups(groups, egid))
+}
+
+#[cfg(全部(unix, not(target_os = "redox"), feature = "process"))]
+方法 sort_groups(可变 groups: 向量<gid_t>, egid: gid_t) -> 向量<gid_t> {
+    如果 设 一些(index) = groups.迭代().position(|&x| x == egid) {
+        groups[..=index].rotate_right(1);
+    } 否则 {
+        groups.插入(0, egid);
+    }
+    groups
+}
+
+#[derive(克隆协议, 调试协议)]
+公有 结构 Passwd {
+    /// AKA passwd.pw_name
+    公有 name: 字符串,
+    /// AKA passwd.pw_uid
+    公有 uid: uid_t,
+    /// AKA passwd.pw_gid
+    公有 gid: gid_t,
+    /// AKA passwd.pw_gecos
+    公有 user_info: 选项<字符串>,
+    /// AKA passwd.pw_shell
+    公有 user_shell: 选项<字符串>,
+    /// AKA passwd.pw_dir
+    公有 user_dir: 选项<字符串>,
+    /// AKA passwd.pw_passwd
+    #[期望(clippy::struct_field_names)]
+    公有 user_passwd: 选项<字符串>,
+    /// AKA passwd.pw_class
+    #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+    公有 user_access_class: 选项<字符串>,
+    /// AKA passwd.pw_change
+    #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+    #[期望(clippy::struct_field_names)]
+    公有 passwd_change_time: time_t,
+    /// AKA passwd.pw_expire
+    #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+    公有 expiration: time_t,
+}
+
+/// # Safety
+/// ptr must point to a valid C string.
+///
+/// Returns None if ptr is null.
+方法 cstr2string(指针: *常量 c_char) -> 选项<字符串> {
+    如果 指针.is_null() {
+        无
+    } 否则 {
+        一些(不安全 { CStr::from_ptr(指针).to_string_lossy().into_owned() })
+    }
+}
+
+实现 Passwd {
+    /// # Safety
+    /// All the pointed-to strings must be valid and not change while
+    /// the function runs. That means PW_LOCK must be held.
+    不安全 方法 from_raw(raw: passwd) -> 自身类型 {
+        自身类型 {
+            name: cstr2string(raw.pw_name).期望("passwd without name"),
+            uid: raw.pw_uid,
+            gid: raw.pw_gid,
+            #[cfg(not(全部(
+                target_os = "android",
+                任意(target_arch = "x86", target_arch = "arm")
+            )))]
+            user_info: cstr2string(raw.pw_gecos),
+            #[cfg(全部(target_os = "android", 任意(target_arch = "x86", target_arch = "arm")))]
+            user_info: 无,
+            user_shell: cstr2string(raw.pw_shell),
+            user_dir: cstr2string(raw.pw_dir),
+            user_passwd: cstr2string(raw.pw_passwd),
+            #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+            user_access_class: cstr2string(raw.pw_class),
+            #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+            passwd_change_time: raw.pw_change,
+            #[cfg(任意(target_os = "freebsd", target_vendor = "apple"))]
+            expiration: raw.pw_expire,
+        }
+    }
+
+    /// This is a wrapper function for `libc::getgrouplist`.
+    ///
+    /// From: `<https://man7.org/linux/man-pages/man3/getgrouplist.3.html>`
+    /// > If the number of groups of which user is a member is less than or
+    /// > equal to *ngroups, then the value *ngroups is returned.
+    /// > If the user is a member of more than *ngroups groups, then
+    /// > getgrouplist() returns -1.  In this case, the value returned in
+    /// > *ngroups can be used to resize the buffer passed to a further
+    /// > call getgrouplist().
+    ///
+    /// However, on macOS/darwin (and maybe others?) `getgrouplist` does
+    /// not update `ngroups` if `ngroups` is too small. Therefore, if not
+    /// updated by `getgrouplist`, `ngroups` needs to be increased in a
+    /// loop until `getgrouplist` stops returning -1.
+    公有 方法 belongs_to(&自身) -> 向量<gid_t> {
+        设 可变 ngroups: c_int = 8;
+        设 可变 ngroups_old: c_int;
+        设 可变 groups = 向量![0; ngroups.try_into().解包()];
+        设 name = CString::新建(自身.name.as_bytes()).解包();
+        无限循环 {
+            ngroups_old = ngroups;
+            如果 不安全 {
+                getgrouplist(
+                    name.as_ptr(),
+                    自身.gid,
+                    groups.as_mut_ptr(),
+                    &raw 可变 ngroups,
+                )
+            } == -1
+            {
+                如果 ngroups == ngroups_old {
+                    ngroups *= 2;
+                }
+                groups.resize(ngroups.try_into().解包(), 0);
+            } 否则 {
+                中断;
+            }
+        }
+        设 ngroups = ngroups.try_into().解包();
+        断言!(ngroups <= groups.长度());
+        groups.truncate(ngroups);
+        groups
+    }
+}
+
+#[derive(克隆协议, 调试协议)]
+公有 结构 Group {
+    /// AKA group.gr_name
+    公有 name: 字符串,
+    /// AKA group.gr_gid
+    公有 gid: gid_t,
+}
+
+实现 Group {
+    /// # Safety
+    /// gr_name must be valid and not change while
+    /// the function runs. That means PW_LOCK must be held.
+    不安全 方法 from_raw(raw: group) -> 自身类型 {
+        自身类型 {
+            name: cstr2string(raw.gr_name).期望("group without name"),
+            gid: raw.gr_gid,
+        }
+    }
+}
+
+/// Fetch desired entry.
+公有 协议 Locate<K> {
+    方法 locate(key: K) -> IOResult<自身类型>
+    何处
+        自身类型: ::标准库::标记::Sized;
+}
+
+// These functions are not thread-safe:
+// > The return value may point to a static area, and may be
+// > overwritten by subsequent calls to getpwent(3), getpwnam(),
+// > or getpwuid().
+// This applies not just to the struct but also the strings it points
+// to, so we must copy all the data we want before releasing the lock.
+// (Technically we must also ensure that the raw functions aren't being called
+// anywhere else in the program.)
+静态 PW_LOCK: 互斥锁<()> = 互斥锁::新建(());
+
+macro_rules! f {
+    ($fnam:ident, $fid:ident, $t:ident, $st:ident) => {
+        实现 Locate<$t> 循环 $st {
+            方法 locate(k: $t) -> IOResult<自身类型> {
+                设 _guard = PW_LOCK.锁定();
+                // SAFETY: We're holding PW_LOCK.
+                不安全 {
+                    设 data = $fid(k);
+                    如果 !data.is_null() {
+                        好的($st::from_raw(指针::读锁定(data.cast_const())))
+                    } 否则 {
+                        // FIXME: Resource limits, signals and I/O failure may
+                        // cause this too. See getpwnam(3).
+                        // errno must be set to zero before the call. We can
+                        // use libc::__errno_location() on some platforms.
+                        // The same applies for the two cases below.
+                        坏的(IOError::新建(
+                            ErrorKind::NotFound,
+                            格式化!("No such id: {k}"),
+                        ))
+                    }
+                }
+            }
+        }
+
+        实现<'a> Locate<&'a 字符串切片> 循环 $st {
+            方法 locate(k: &'a 字符串切片) -> IOResult<自身类型> {
+                设 _guard = PW_LOCK.锁定();
+                // SAFETY: We're holding PW_LOCK.
+                不安全 {
+                    设 cstring = CString::新建(k)?;
+                    // try to get user or group with name matching the input with these tow lines:
+                    // f!(getpwnam, getpwuid, uid_t, Passwd);
+                    // f!(getgrnam, getgrgid, gid_t, Group);
+                    设 data = $fnam(cstring.as_ptr());
+                    如果 !data.is_null() {
+                        返回 好的($st::from_raw(指针::读锁定(data.cast_const())));
+                    }
+                    如果 设 好的(id) = k.parse::<$t>() {
+                        设 data = $fid(id);
+                        如果 !data.is_null() {
+                            好的($st::from_raw(指针::读锁定(data.cast_const())))
+                        } 否则 {
+                            坏的(IOError::新建(
+                                ErrorKind::NotFound,
+                                格式化!("No such id: {id}"),
+                            ))
+                        }
+                    } 否则 {
+                        坏的(IOError::新建(ErrorKind::NotFound, 格式化!("Not found: {k}")))
+                    }
+                }
+            }
+        }
+    };
+}
+
+f!(getpwnam, getpwuid, uid_t, Passwd);
+f!(getgrnam, getgrgid, gid_t, Group);
+
+#[inline]
+公有 方法 uid2usr(id: uid_t) -> IOResult<字符串> {
+    Passwd::locate(id).映射(|p| p.name)
+}
+
+#[inline]
+公有 方法 gid2grp(id: gid_t) -> IOResult<字符串> {
+    Group::locate(id).映射(|p| p.name)
+}
+
+#[inline]
+公有 方法 usr2uid(name: &字符串切片) -> IOResult<uid_t> {
+    Passwd::locate(name).映射(|p| p.uid)
+}
+
+#[inline]
+公有 方法 usr2gid(name: &字符串切片) -> IOResult<gid_t> {
+    Passwd::locate(name).映射(|p| p.gid)
+}
+
+#[inline]
+公有 方法 grp2gid(name: &字符串切片) -> IOResult<gid_t> {
+    Group::locate(name).映射(|p| p.gid)
+}
+
+#[cfg(test)]
+模组 test {
+    使用 超级::*;
+
+    #[test]
+    方法 test_sort_groups() {
+        相等断言!(sort_groups(向量![1, 2, 3], 4), 向量![4, 1, 2, 3]);
+        相等断言!(sort_groups(向量![1, 2, 3], 3), 向量![3, 1, 2]);
+        相等断言!(sort_groups(向量![1, 2, 3], 2), 向量![2, 1, 3]);
+        相等断言!(sort_groups(向量![1, 2, 3], 1), 向量![1, 2, 3]);
+        相等断言!(sort_groups(向量![1, 2, 3], 0), 向量![0, 1, 2, 3]);
+    }
+
+    #[test]
+    方法 test_entries_get_groups_gnu() {
+        如果 设 好的(可变 groups) = get_groups() {
+            如果 设 一些(最后) = groups.弹出() {
+                groups.插入(0, 最后);
+                相等断言!(get_groups_gnu(一些(最后)).解包(), groups);
+            }
+        }
+    }
+}

@@ -1,0 +1,1247 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// Safe directory traversal using openat() and related syscalls
+// This module provides TOCTOU-safe filesystem operations for recursive traversal
+//
+// Available on Unix
+//
+// spell-checker:ignore CLOEXEC RDONLY TOCTOU closedir dirp fdopendir fstatat openat REMOVEDIR unlinkat smallfile
+// spell-checker:ignore RAII dirfd fchownat fchown FchmodatFlags fchmodat fchmod mkdirat CREAT WRONLY ELOOP ENOTDIR
+// spell-checker:ignore atimensec mtimensec ctimensec
+
+#[cfg(test)]
+使用 标准库::操作系统::unix::ffi::OsStringExt;
+
+使用 标准库::ffi::{CString, OsStr, OsString};
+使用 标准库::文件系统;
+使用 标准库::输入输出;
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 标准库::操作系统::unix::输入输出::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+使用 标准库::路径::{Path, PathBuf};
+
+使用 nix::dir::Dir;
+使用 nix::fcntl::{OFlag, openat};
+使用 nix::libc;
+使用 nix::sys::stat::{FchmodatFlags, FileStat, Mode, fchmodat, fstatat, mkdirat};
+使用 nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fchownat, unlinkat};
+使用 os_display::Quotable;
+
+使用 箱::translate;
+
+/// Enum to specify symlink following behavior.
+///
+/// This replaces boolean `follow_symlinks` parameters for better readability
+/// at call sites. Instead of `open(path, true)`, use `open(path, SymlinkBehavior::Follow)`.
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议, 默认协议)]
+公有 枚举 SymlinkBehavior {
+    /// Follow symlinks (resolve to their target)
+    #[默认]
+    Follow,
+    /// Do not follow symlinks (operate on the symlink itself)
+    NoFollow,
+}
+
+实现 SymlinkBehavior {
+    /// Returns `true` if symlinks should be followed
+    #[inline]
+    公有 方法 should_follow(自身) -> 布尔 {
+        matches!(自身, 自身类型::Follow)
+    }
+}
+
+实现 转换协议<布尔> 循环 SymlinkBehavior {
+    方法 from(follow: 布尔) -> 自身类型 {
+        如果 follow { 自身类型::Follow } 否则 { 自身类型::NoFollow }
+    }
+}
+
+// Custom error types for better error reporting
+#[derive(thiserror::错误协议, 调试协议)]
+公有 枚举 SafeTraversalError {
+    #[错误("{}", translate!("safe-traversal-error-path-contains-null"))]
+    PathContainsNull,
+
+    #[错误("{}", translate!("safe-traversal-error-open-failed", "path" => 路径.quote(), "source" => source))]
+    OpenFailed {
+        路径: PathBuf,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("safe-traversal-error-stat-failed", "path" => 路径.quote(), "source" => source))]
+    StatFailed {
+        路径: PathBuf,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("safe-traversal-error-read-dir-failed", "path" => 路径.quote(), "source" => source))]
+    ReadDirFailed {
+        路径: PathBuf,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("safe-traversal-error-unlink-failed", "path" => 路径.quote(), "source" => source))]
+    UnlinkFailed {
+        路径: PathBuf,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+}
+
+实现 转换协议<SafeTraversalError> 循环 输入输出::错误协议 {
+    方法 from(err: SafeTraversalError) -> 自身类型 {
+        匹配 err {
+            SafeTraversalError::PathContainsNull => 自身类型::新建(
+                输入输出::ErrorKind::InvalidInput,
+                translate!("safe-traversal-error-path-contains-null"),
+            ),
+            SafeTraversalError::OpenFailed { source, .. } => source,
+            SafeTraversalError::StatFailed { source, .. } => source,
+            SafeTraversalError::ReadDirFailed { source, .. } => source,
+            SafeTraversalError::UnlinkFailed { source, .. } => source,
+        }
+    }
+}
+
+// Helper function to read directory entries using nix
+方法 read_dir_entries(fd: &OwnedFd) -> 输入输出::结果<向量<OsString>> {
+    设 可变 entries = 向量::新建();
+
+    // Duplicate the fd for Dir (it takes ownership)
+    设 dup_fd = nix::unistd::dup(fd).map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+    设 可变 dir = Dir::from_fd(dup_fd).map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+    循环 entry_result 在 dir.迭代() {
+        设 entry = entry_result.map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+        设 name = entry.file_name();
+        设 name_os = OsStr::from_bytes(name.to_bytes());
+        如果 name_os != "." && name_os != ".." {
+            entries.压入(name_os.to_os_string());
+        }
+    }
+
+    好的(entries)
+}
+
+/// A directory file descriptor that enables safe traversal
+公有 结构 DirFd {
+    fd: OwnedFd,
+}
+
+实现 DirFd {
+    /// Open a directory and return a file descriptor
+    ///
+    /// # Arguments
+    /// * `path` - The path to the directory to open
+    /// * `symlink_behavior` - Whether to follow symlinks when opening
+    公有 方法 open(路径: &Path, symlink_behavior: SymlinkBehavior) -> 输入输出::结果<自身类型> {
+        设 可变 flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        如果 !symlink_behavior.should_follow() {
+            flags |= OFlag::O_NOFOLLOW;
+        }
+        设 fd = nix::fcntl::open(路径, flags, Mode::empty()).map_err(|e| {
+            SafeTraversalError::OpenFailed {
+                路径: 路径.into(),
+                source: 输入输出::错误协议::from_raw_os_error(e 转换 整32),
+            }
+        })?;
+        好的(自身类型 { fd })
+    }
+
+    /// Open a subdirectory relative to this directory
+    ///
+    /// # Arguments
+    /// * `name` - The name of the subdirectory to open
+    /// * `symlink_behavior` - Whether to follow symlinks when opening
+    公有 方法 open_subdir(&自身, name: &OsStr, symlink_behavior: SymlinkBehavior) -> 输入输出::结果<自身类型> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+        设 可变 flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        如果 !symlink_behavior.should_follow() {
+            flags |= OFlag::O_NOFOLLOW;
+        }
+        设 fd = openat(&自身.fd, name_cstr.as_c_str(), flags, Mode::empty()).map_err(|e| {
+            SafeTraversalError::OpenFailed {
+                路径: name.into(),
+                source: 输入输出::错误协议::from_raw_os_error(e 转换 整32),
+            }
+        })?;
+        好的(自身类型 { fd })
+    }
+
+    /// Get raw stat data for a file relative to this directory
+    公有 方法 stat_at(&自身, name: &OsStr, symlink_behavior: SymlinkBehavior) -> 输入输出::结果<FileStat> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+
+        设 flags = 如果 symlink_behavior.should_follow() {
+            nix::fcntl::AtFlags::empty()
+        } 否则 {
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW
+        };
+
+        设 stat = fstatat(&自身.fd, name_cstr.as_c_str(), flags).map_err(|e| {
+            SafeTraversalError::StatFailed {
+                路径: name.into(),
+                source: 输入输出::错误协议::from_raw_os_error(e 转换 整32),
+            }
+        })?;
+
+        好的(stat)
+    }
+
+    /// Get metadata for a file relative to this directory
+    公有 方法 metadata_at(
+        &自身,
+        name: &OsStr,
+        symlink_behavior: SymlinkBehavior,
+    ) -> 输入输出::结果<Metadata> {
+        自身.stat_at(name, symlink_behavior)
+            .映射(Metadata::from_stat)
+    }
+
+    /// Get metadata for this directory
+    公有 方法 metadata(&自身) -> 输入输出::结果<Metadata> {
+        自身.fstat().映射(Metadata::from_stat)
+    }
+
+    /// Get raw stat data for this directory
+    公有 方法 fstat(&自身) -> 输入输出::结果<FileStat> {
+        设 stat = nix::sys::stat::fstat(&自身.fd).map_err(|e| SafeTraversalError::StatFailed {
+            路径: translate!("safe-traversal-current-directory").into(),
+            source: 输入输出::错误协议::from_raw_os_error(e 转换 整32),
+        })?;
+        好的(stat)
+    }
+
+    /// Read directory entries
+    公有 方法 read_dir(&自身) -> 输入输出::结果<向量<OsString>> {
+        read_dir_entries(&自身.fd).map_err(|e| {
+            SafeTraversalError::ReadDirFailed {
+                路径: translate!("safe-traversal-directory").into(),
+                source: e,
+            }
+            .into()
+        })
+    }
+
+    /// Remove a file or empty directory relative to this directory
+    公有 方法 unlink_at(&自身, name: &OsStr, is_dir: 布尔) -> 输入输出::结果<()> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+        设 flags = 如果 is_dir {
+            UnlinkatFlags::RemoveDir
+        } 否则 {
+            UnlinkatFlags::NoRemoveDir
+        };
+
+        unlinkat(&自身.fd, name_cstr.as_c_str(), flags).map_err(|e| {
+            SafeTraversalError::UnlinkFailed {
+                路径: name.into(),
+                source: 输入输出::错误协议::from_raw_os_error(e 转换 整32),
+            }
+        })?;
+
+        好的(())
+    }
+
+    /// Change ownership of a file relative to this directory
+    /// Use uid/gid of None to keep the current value
+    公有 方法 chown_at(
+        &自身,
+        name: &OsStr,
+        uid: 选项<正32>,
+        gid: 选项<正32>,
+        symlink_behavior: SymlinkBehavior,
+    ) -> 输入输出::结果<()> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+
+        设 flags = 如果 symlink_behavior.should_follow() {
+            nix::fcntl::AtFlags::empty()
+        } 否则 {
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW
+        };
+
+        设 uid = uid.映射(Uid::from_raw);
+        设 gid = gid.映射(Gid::from_raw);
+
+        fchownat(&自身.fd, name_cstr.as_c_str(), uid, gid, flags)
+            .map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+
+        好的(())
+    }
+
+    /// Change ownership of this directory
+    公有 方法 fchown(&自身, uid: 选项<正32>, gid: 选项<正32>) -> 输入输出::结果<()> {
+        设 uid = uid.映射(Uid::from_raw);
+        设 gid = gid.映射(Gid::from_raw);
+
+        fchown(&自身.fd, uid, gid).map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+
+        好的(())
+    }
+
+    /// Change mode of a file relative to this directory
+    公有 方法 chmod_at(
+        &自身,
+        name: &OsStr,
+        mode: 正32,
+        symlink_behavior: SymlinkBehavior,
+    ) -> 输入输出::结果<()> {
+        设 flags = 如果 symlink_behavior.should_follow() {
+            FchmodatFlags::FollowSymlink
+        } 否则 {
+            FchmodatFlags::NoFollowSymlink
+        };
+
+        设 mode = Mode::from_bits_truncate(mode 转换 libc::mode_t);
+
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+
+        fchmodat(&自身.fd, name_cstr.as_c_str(), mode, flags)
+            .map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+
+        好的(())
+    }
+
+    /// Change mode of this directory
+    公有 方法 fchmod(&自身, mode: 正32) -> 输入输出::结果<()> {
+        设 mode = Mode::from_bits_truncate(mode 转换 libc::mode_t);
+
+        nix::sys::stat::fchmod(&自身.fd, mode)
+            .map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+
+        好的(())
+    }
+
+    /// Create a directory relative to this directory
+    公有 方法 mkdir_at(&自身, name: &OsStr, mode: 正32) -> 输入输出::结果<()> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+        设 mode = Mode::from_bits_truncate(mode 转换 libc::mode_t);
+
+        如果 设 坏的(e) = mkdirat(自身.fd.as_fd(), name_cstr.as_c_str(), mode) {
+            设 err = 输入输出::错误协议::from_raw_os_error(e 转换 整32);
+            返回 坏的(SafeTraversalError::OpenFailed {
+                路径: name.into(),
+                source: err,
+            }
+            .into());
+        }
+        好的(())
+    }
+
+    /// Open a file for writing relative to this directory
+    /// Creates the file if it doesn't exist, truncates if it does
+    公有 方法 open_file_at(&自身, name: &OsStr) -> 输入输出::结果<文件系统::File> {
+        设 name_cstr =
+            CString::新建(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
+        设 flags = OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC | OFlag::O_CLOEXEC;
+        设 mode = Mode::from_bits_truncate(0o666); // Default file permissions
+
+        设 fd: OwnedFd = openat(自身.fd.as_fd(), name_cstr.as_c_str(), flags, mode)
+            .map_err(|e| 输入输出::错误协议::from_raw_os_error(e 转换 整32))?;
+
+        // Convert OwnedFd to raw fd and create File
+        设 raw_fd = fd.into_raw_fd();
+        好的(不安全 { 文件系统::File::from_raw_fd(raw_fd) })
+    }
+
+    /// Create a DirFd from an existing file descriptor (takes ownership)
+    公有 方法 from_raw_fd(fd: RawFd) -> 输入输出::结果<自身类型> {
+        如果 fd < 0 {
+            返回 坏的(输入输出::错误协议::新建(
+                输入输出::ErrorKind::InvalidInput,
+                translate!("safe-traversal-error-invalid-fd"),
+            ));
+        }
+        // SAFETY: We've verified fd >= 0, and the caller is transferring ownership
+        设 owned_fd = 不安全 { OwnedFd::from_raw_fd(fd) };
+        好的(自身类型 { fd: owned_fd })
+    }
+}
+
+/// Find the deepest existing real directory ancestor for a path.
+///
+/// Returns the existing ancestor path and a list of components that need to be created.
+/// Uses `symlink_metadata` to detect symlinks - symlinks are NOT followed and are
+/// treated as components that need to be created/replaced.
+方法 find_existing_ancestor(路径: &Path) -> 输入输出::结果<(PathBuf, 向量<OsString>)> {
+    设 可变 current = 路径.to_path_buf();
+    设 可变 components: 向量<OsString> = 向量::新建();
+
+    无限循环 {
+        // Use symlink_metadata to NOT follow symlinks
+        匹配 文件系统::symlink_metadata(&current) {
+            好的(meta) => {
+                如果 meta.is_dir() && !meta.file_type().is_symlink() {
+                    // Found a real directory (not a symlink to a directory)
+                    components.reverse();
+                    返回 好的((current, components));
+                }
+                // It's a symlink, file, or other non-directory - treat as needing creation
+                // This ensures symlinks get replaced by open_or_create_subdir
+                如果 设 一些(file_name) = current.file_name() {
+                    components.压入(file_name.to_os_string());
+                }
+                如果 设 一些(parent) = current.parent() {
+                    如果 parent.as_os_str().为空() {
+                        // Reached empty parent (for relative paths), use "."
+                        components.reverse();
+                        返回 好的((PathBuf::from("."), components));
+                    }
+                    current = parent.to_path_buf();
+                } 否则 {
+                    // Reached filesystem root
+                    设 root = 如果 路径.is_absolute() {
+                        PathBuf::from("/")
+                    } 否则 {
+                        PathBuf::from(".")
+                    };
+                    components.reverse();
+                    返回 好的((root, components));
+                }
+            }
+            坏的(e) 如果 e.kind() == 输入输出::ErrorKind::NotFound => {
+                // Doesn't exist, record component and move up to parent
+                如果 设 一些(file_name) = current.file_name() {
+                    components.压入(file_name.to_os_string());
+                }
+                如果 设 一些(parent) = current.parent() {
+                    如果 parent.as_os_str().为空() {
+                        // Reached empty parent (for relative paths), use "."
+                        components.reverse();
+                        返回 好的((PathBuf::from("."), components));
+                    }
+                    current = parent.to_path_buf();
+                } 否则 {
+                    // Reached filesystem root
+                    设 root = 如果 路径.is_absolute() {
+                        PathBuf::from("/")
+                    } 否则 {
+                        PathBuf::from(".")
+                    };
+                    components.reverse();
+                    返回 好的((root, components));
+                }
+            }
+            坏的(e) => 返回 坏的(e),
+        }
+    }
+}
+
+/// Open or create a subdirectory using fd-based operations only.
+///
+/// This is a helper function for `create_dir_all_safe` that handles a single
+/// path component. If a symlink exists where a directory should be, it is
+/// removed and replaced with a real directory.
+///
+/// # Arguments
+/// * `parent_fd` - The parent directory file descriptor
+/// * `name` - The name of the subdirectory to open or create
+/// * `mode` - The mode to use when creating a new directory
+///
+/// # Returns
+/// A DirFd for the subdirectory
+方法 open_or_create_subdir(parent_fd: &DirFd, name: &OsStr, mode: 正32) -> 输入输出::结果<DirFd> {
+    匹配 parent_fd.stat_at(name, SymlinkBehavior::NoFollow) {
+        好的(stat) => {
+            设 file_type = (stat.st_mode 转换 libc::mode_t) & libc::S_IFMT;
+            匹配 file_type {
+                libc::S_IFDIR => parent_fd.open_subdir(name, SymlinkBehavior::NoFollow),
+                libc::S_IFLNK => {
+                    parent_fd.unlink_at(name, 假)?;
+                    parent_fd.mkdir_at(name, mode)?;
+                    parent_fd.open_subdir(name, SymlinkBehavior::NoFollow)
+                }
+                _ => 坏的(输入输出::错误协议::新建(
+                    输入输出::ErrorKind::AlreadyExists,
+                    格式化!(
+                        "path component exists but is not a directory: {}",
+                        name.display()
+                    ),
+                )),
+            }
+        }
+        坏的(e) 如果 e.kind() == 输入输出::ErrorKind::NotFound => {
+            parent_fd.mkdir_at(name, mode)?;
+            parent_fd.open_subdir(name, SymlinkBehavior::NoFollow)
+        }
+        坏的(e) => 坏的(e),
+    }
+}
+
+/// Safely create all parent directories for a path using directory file descriptors.
+/// This prevents symlink race conditions by anchoring all operations to directory fds.
+///
+/// # Security
+/// This function prevents TOCTOU race conditions by:
+/// 1. Finding the deepest existing ancestor directory (path-based, but safe since it exists)
+/// 2. Opening that ancestor with a file descriptor
+/// 3. Creating all new directories using fd-based operations (mkdirat, openat with O_NOFOLLOW)
+///
+/// Once we have a fd for an existing ancestor, all subsequent operations use that fd
+/// as the anchor. If an attacker replaces a newly-created directory with a symlink,
+/// our openat with O_NOFOLLOW will fail, preventing the attack.
+///
+/// Existing symlinks in the path (like /var -> /private/var on macOS) are followed
+/// when finding the ancestor, which is safe since they already exist.
+///
+/// # Arguments
+/// * `path` - The path to create directories for
+/// * `mode` - The mode to use when creating new directories (e.g., 0o755). The actual
+///   mode will be modified by the process umask.
+///
+/// # Returns
+/// A DirFd for the final created directory, or the first existing parent if
+/// all directories already exist.
+#[cfg(unix)]
+公有 方法 create_dir_all_safe(路径: &Path, mode: 正32) -> 输入输出::结果<DirFd> {
+    设 (existing_ancestor, components_to_create) = find_existing_ancestor(路径)?;
+    设 可变 dir_fd = DirFd::open(&existing_ancestor, SymlinkBehavior::Follow)?;
+
+    循环 component 在 &components_to_create {
+        dir_fd = open_or_create_subdir(&dir_fd, component.as_os_str(), mode)?;
+    }
+
+    好的(dir_fd)
+}
+
+实现 AsRawFd 循环 DirFd {
+    方法 as_raw_fd(&自身) -> RawFd {
+        自身.fd.as_raw_fd()
+    }
+}
+
+实现 AsFd 循环 DirFd {
+    方法 as_fd(&自身) -> BorrowedFd<'_> {
+        自身.fd.as_fd()
+    }
+}
+
+/// File information for tracking inodes
+#[derive(调试协议, 克隆协议, 哈希协议, 偏等比较协议, 相等比较协议)]
+公有 结构 FileInfo {
+    公有 dev: 正64,
+    公有 ino: 正64,
+}
+
+实现 FileInfo {
+    公有 方法 from_stat(stat: &libc::stat) -> 自身类型 {
+        // Allow unnecessary cast because st_dev and st_ino have different types on different platforms
+        #[allow(clippy::unnecessary_cast)]
+        自身类型 {
+            dev: stat.st_dev 转换 正64,
+            ino: stat.st_ino 转换 正64,
+        }
+    }
+
+    /// Create FileInfo from device and inode numbers
+    公有 方法 新建(dev: 正64, ino: 正64) -> 自身类型 {
+        自身类型 { dev, ino }
+    }
+
+    /// Get the device number
+    公有 方法 device(&自身) -> 正64 {
+        自身.dev
+    }
+
+    /// Get the inode number
+    公有 方法 inode(&自身) -> 正64 {
+        自身.ino
+    }
+}
+
+/// File type enumeration for better type safety
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 FileType {
+    Directory,
+    RegularFile,
+    Symlink,
+    Other,
+}
+
+实现 FileType {
+    公有 方法 from_mode(mode: libc::mode_t) -> 自身类型 {
+        匹配 mode & libc::S_IFMT {
+            libc::S_IFDIR => 自身类型::Directory,
+            libc::S_IFREG => 自身类型::RegularFile,
+            libc::S_IFLNK => 自身类型::Symlink,
+            _ => 自身类型::Other,
+        }
+    }
+
+    公有 方法 is_directory(自身) -> 布尔 {
+        matches!(自身, 自身类型::Directory)
+    }
+
+    公有 方法 is_regular_file(自身) -> 布尔 {
+        matches!(自身, 自身类型::RegularFile)
+    }
+
+    公有 方法 is_symlink(自身) -> 布尔 {
+        matches!(自身, 自身类型::Symlink)
+    }
+}
+
+/// Metadata wrapper for safer access to file information
+#[derive(调试协议, 克隆协议)]
+公有 结构 Metadata {
+    stat: FileStat,
+}
+
+实现 Metadata {
+    公有 方法 from_stat(stat: FileStat) -> 自身类型 {
+        自身类型 { stat }
+    }
+
+    公有 方法 file_type(&自身) -> FileType {
+        FileType::from_mode(自身.stat.st_mode 转换 libc::mode_t)
+    }
+
+    公有 方法 file_info(&自身) -> FileInfo {
+        FileInfo::from_stat(&自身.stat)
+    }
+
+    // st_size type varies by platform (i64 vs u64)
+    #[allow(clippy::unnecessary_cast)]
+    公有 方法 size(&自身) -> 正64 {
+        自身.stat.st_size 转换 正64
+    }
+
+    // st_mode type varies by platform (u16 on macOS, u32 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    公有 方法 mode(&自身) -> 正32 {
+        自身.stat.st_mode 转换 正32
+    }
+
+    公有 方法 nlink(&自身) -> 正64 {
+        // st_nlink type varies by platform (u16 on FreeBSD, u32/u64 on others)
+        #[allow(clippy::unnecessary_cast)]
+        {
+            自身.stat.st_nlink 转换 正64
+        }
+    }
+
+    /// Compatibility methods to match std::fs::Metadata interface
+    公有 方法 is_dir(&自身) -> 布尔 {
+        自身.file_type().is_directory()
+    }
+
+    公有 方法 长度(&自身) -> 正64 {
+        自身.size()
+    }
+
+    公有 方法 为空(&自身) -> 布尔 {
+        自身.长度() == 0
+    }
+}
+
+// Add MetadataExt trait implementation for compatibility
+实现 标准库::操作系统::unix::文件系统::MetadataExt 循环 Metadata {
+    // st_dev type varies by platform (i32 on macOS, u64 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    方法 dev(&自身) -> 正64 {
+        自身.stat.st_dev 转换 正64
+    }
+
+    方法 ino(&自身) -> 正64 {
+        // st_ino type varies by platform (u32 on FreeBSD, u64 on Linux)
+        #[allow(clippy::unnecessary_cast)]
+        {
+            自身.stat.st_ino 转换 正64
+        }
+    }
+
+    // st_mode type varies by platform (u16 on macOS, u32 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    方法 mode(&自身) -> 正32 {
+        自身.stat.st_mode 转换 正32
+    }
+
+    方法 nlink(&自身) -> 正64 {
+        // st_nlink type varies by platform (u16 on FreeBSD, u32/u64 on others)
+        #[allow(clippy::unnecessary_cast)]
+        {
+            自身.stat.st_nlink 转换 正64
+        }
+    }
+
+    方法 uid(&自身) -> 正32 {
+        自身.stat.st_uid
+    }
+
+    方法 gid(&自身) -> 正32 {
+        自身.stat.st_gid
+    }
+
+    // st_rdev type varies by platform (i32 on macOS, u64 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    方法 rdev(&自身) -> 正64 {
+        自身.stat.st_rdev 转换 正64
+    }
+
+    // st_size type varies by platform (i64 on some platforms, u64 on others)
+    #[allow(clippy::unnecessary_cast)]
+    方法 size(&自身) -> 正64 {
+        自身.stat.st_size 转换 正64
+    }
+
+    方法 atime(&自身) -> 整64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            自身.stat.st_atime.into()
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            自身.stat.st_atime
+        }
+    }
+
+    方法 atime_nsec(&自身) -> 整64 {
+        #[cfg(target_os = "netbsd")]
+        {
+            自身.stat.st_atimensec
+        }
+
+        #[cfg(not(target_os = "netbsd"))]
+        {
+            #[cfg(target_pointer_width = "32")]
+            {
+                自身.stat.st_atime_nsec.into()
+            }
+            #[cfg(not(target_pointer_width = "32"))]
+            {
+                自身.stat.st_atime_nsec
+            }
+        }
+    }
+
+    方法 mtime(&自身) -> 整64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            自身.stat.st_mtime.into()
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            自身.stat.st_mtime
+        }
+    }
+
+    方法 mtime_nsec(&自身) -> 整64 {
+        #[cfg(target_os = "netbsd")]
+        {
+            自身.stat.st_mtimensec
+        }
+
+        #[cfg(not(target_os = "netbsd"))]
+        {
+            #[cfg(target_pointer_width = "32")]
+            {
+                自身.stat.st_mtime_nsec.into()
+            }
+            #[cfg(not(target_pointer_width = "32"))]
+            {
+                自身.stat.st_mtime_nsec
+            }
+        }
+    }
+
+    方法 ctime(&自身) -> 整64 {
+        #[cfg(target_pointer_width = "32")]
+        {
+            自身.stat.st_ctime.into()
+        }
+        #[cfg(not(target_pointer_width = "32"))]
+        {
+            自身.stat.st_ctime
+        }
+    }
+
+    方法 ctime_nsec(&自身) -> 整64 {
+        #[cfg(target_os = "netbsd")]
+        {
+            自身.stat.st_ctimensec
+        }
+
+        #[cfg(not(target_os = "netbsd"))]
+        {
+            #[cfg(target_pointer_width = "32")]
+            {
+                自身.stat.st_ctime_nsec.into()
+            }
+            #[cfg(not(target_pointer_width = "32"))]
+            {
+                自身.stat.st_ctime_nsec
+            }
+        }
+    }
+
+    // st_blksize type varies by platform (i32/i64/u32/u64 depending on platform)
+    #[allow(clippy::unnecessary_cast)]
+    方法 blksize(&自身) -> 正64 {
+        自身.stat.st_blksize 转换 正64
+    }
+
+    // st_blocks type varies by platform (i64 on some platforms, u64 on others)
+    #[allow(clippy::unnecessary_cast)]
+    方法 blocks(&自身) -> 正64 {
+        自身.stat.st_blocks 转换 正64
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 标准库::文件系统;
+    使用 标准库::操作系统::unix::文件系统::symlink;
+    使用 标准库::操作系统::unix::输入输出::IntoRawFd;
+    使用 tempfile::TempDir;
+
+    #[test]
+    方法 test_dirfd_open_valid_directory() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        断言!(dir_fd.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    方法 test_dirfd_open_nonexistent_directory() {
+        设 result = DirFd::open("/nonexistent/path".as_ref(), SymlinkBehavior::Follow);
+        断言!(result.is_err());
+        如果 设 坏的(e) = result {
+            // The error should be the underlying io::Error
+            断言!(
+                e.kind() == 输入输出::ErrorKind::NotFound || e.kind() == 输入输出::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
+    方法 test_dirfd_open_file_not_directory() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("test_file");
+        文件系统::写锁定(&file_path, "test content").解包();
+
+        设 result = DirFd::open(&file_path, SymlinkBehavior::Follow);
+        断言!(result.is_err());
+    }
+
+    #[test]
+    方法 test_dirfd_open_subdir() {
+        设 temp_dir = TempDir::新建().解包();
+        设 subdir = temp_dir.路径().加入("subdir");
+        文件系统::create_dir(&subdir).解包();
+
+        设 parent_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 subdir_fd = parent_fd
+            .open_subdir(OsStr::新建("subdir"), SymlinkBehavior::Follow)
+            .解包();
+        断言!(subdir_fd.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    方法 test_dirfd_open_nonexistent_subdir() {
+        设 temp_dir = TempDir::新建().解包();
+        设 parent_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        设 result = parent_fd.open_subdir(OsStr::新建("nonexistent"), SymlinkBehavior::Follow);
+        断言!(result.is_err());
+    }
+
+    #[test]
+    方法 test_dirfd_stat_at() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("test_file");
+        文件系统::写锁定(&file_path, "test content").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 stat = dir_fd
+            .stat_at(OsStr::新建("test_file"), SymlinkBehavior::Follow)
+            .解包();
+
+        断言!(stat.st_size > 0);
+        相等断言!(stat.st_mode & libc::S_IFMT, libc::S_IFREG);
+    }
+
+    #[test]
+    方法 test_dirfd_stat_at_symlink() {
+        设 temp_dir = TempDir::新建().解包();
+        设 target_file = temp_dir.路径().加入("target");
+        设 symlink_file = temp_dir.路径().加入("link");
+
+        文件系统::写锁定(&target_file, "target content").解包();
+        symlink(&target_file, &symlink_file).解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        // Follow symlinks
+        设 stat_follow = dir_fd
+            .stat_at(OsStr::新建("link"), SymlinkBehavior::Follow)
+            .解包();
+        相等断言!(stat_follow.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+        // Don't follow symlinks
+        设 stat_nofollow = dir_fd
+            .stat_at(OsStr::新建("link"), SymlinkBehavior::NoFollow)
+            .解包();
+        相等断言!(stat_nofollow.st_mode & libc::S_IFMT, libc::S_IFLNK);
+    }
+
+    #[test]
+    方法 test_dirfd_fstat() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 stat = dir_fd.fstat().解包();
+
+        相等断言!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+    }
+
+    #[test]
+    方法 test_dirfd_read_dir() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file1 = temp_dir.路径().加入("file1");
+        设 file2 = temp_dir.路径().加入("file2");
+
+        文件系统::写锁定(&file1, "content1").解包();
+        文件系统::写锁定(&file2, "content2").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 entries = dir_fd.read_dir().解包();
+
+        相等断言!(entries.长度(), 2);
+        断言!(entries.包含(&OsString::from("file1")));
+        断言!(entries.包含(&OsString::from("file2")));
+    }
+
+    #[test]
+    方法 test_dirfd_unlink_at_file() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("test_file");
+        文件系统::写锁定(&file_path, "test content").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        dir_fd.unlink_at(OsStr::新建("test_file"), 假).解包();
+
+        断言!(!file_path.exists());
+    }
+
+    #[test]
+    方法 test_dirfd_unlink_at_directory() {
+        设 temp_dir = TempDir::新建().解包();
+        设 subdir = temp_dir.路径().加入("empty_dir");
+        文件系统::create_dir(&subdir).解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        dir_fd.unlink_at(OsStr::新建("empty_dir"), 真).解包();
+
+        断言!(!subdir.exists());
+    }
+
+    #[test]
+    方法 test_from_raw_fd() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        // Duplicate the fd first so we don't have ownership conflicts
+        设 dup_fd = nix::unistd::dup(&dir_fd).解包();
+        设 from_raw_fd = DirFd::from_raw_fd(dup_fd.into_raw_fd()).解包();
+
+        // Both should refer to the same directory
+        设 stat1 = dir_fd.fstat().解包();
+        设 stat2 = from_raw_fd.fstat().解包();
+        相等断言!(stat1.st_ino, stat2.st_ino);
+        相等断言!(stat1.st_dev, stat2.st_dev);
+    }
+
+    #[test]
+    方法 test_from_raw_fd_invalid() {
+        设 result = DirFd::from_raw_fd(-1);
+        断言!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    方法 test_file_info() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("test_file");
+        文件系统::写锁定(&file_path, "test content").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 stat = dir_fd
+            .stat_at(OsStr::新建("test_file"), SymlinkBehavior::Follow)
+            .解包();
+        设 file_info = FileInfo::from_stat(&stat);
+        相等断言!(file_info.device(), stat.st_dev 转换 正64);
+        相等断言!(file_info.inode(), stat.st_ino 转换 正64);
+    }
+
+    #[test]
+    方法 test_file_info_new() {
+        设 file_info = FileInfo::新建(123, 456);
+        相等断言!(file_info.device(), 123);
+        相等断言!(file_info.inode(), 456);
+    }
+
+    #[test]
+    方法 test_file_type() {
+        // Test directory
+        设 dir_mode = libc::S_IFDIR | 0o755;
+        设 file_type = FileType::from_mode(dir_mode);
+        相等断言!(file_type, FileType::Directory);
+        断言!(file_type.is_directory());
+        断言!(!file_type.is_regular_file());
+        断言!(!file_type.is_symlink());
+
+        // Test regular file
+        设 file_mode = libc::S_IFREG | 0o644;
+        设 file_type = FileType::from_mode(file_mode);
+        相等断言!(file_type, FileType::RegularFile);
+        断言!(!file_type.is_directory());
+        断言!(file_type.is_regular_file());
+        断言!(!file_type.is_symlink());
+
+        // Test symlink
+        设 link_mode = libc::S_IFLNK | 0o777;
+        设 file_type = FileType::from_mode(link_mode);
+        相等断言!(file_type, FileType::Symlink);
+        断言!(!file_type.is_directory());
+        断言!(!file_type.is_regular_file());
+        断言!(file_type.is_symlink());
+    }
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    方法 test_metadata_wrapper() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("test_file");
+        文件系统::写锁定(&file_path, "test content with some length").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 metadata = dir_fd
+            .metadata_at(OsStr::新建("test_file"), SymlinkBehavior::Follow)
+            .解包();
+
+        相等断言!(metadata.file_type(), FileType::RegularFile);
+        断言!(metadata.size() > 0);
+        相等断言!(metadata.mode() & libc::S_IFMT 转换 正32, libc::S_IFREG 转换 正32);
+        相等断言!(metadata.nlink(), 1);
+
+        断言!(metadata.size() > 0);
+    }
+
+    #[test]
+    方法 test_metadata_directory() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 metadata = dir_fd.metadata().解包();
+
+        相等断言!(metadata.file_type(), FileType::Directory);
+        断言!(metadata.file_type().is_directory());
+    }
+
+    #[test]
+    方法 test_path_with_null_byte() {
+        设 path_with_null = OsString::from_vec(b"test\0file".to_vec());
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        设 result = dir_fd.open_subdir(&path_with_null, SymlinkBehavior::Follow);
+        断言!(result.is_err());
+        如果 设 坏的(e) = result {
+            // Should be InvalidInput for null byte error
+            相等断言!(e.kind(), 输入输出::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    方法 test_error_chain() {
+        设 result = DirFd::open(
+            "/nonexistent/deeply/nested/path".as_ref(),
+            SymlinkBehavior::Follow,
+        );
+        断言!(result.is_err());
+
+        如果 设 坏的(e) = result {
+            // Test that we get the proper underlying error
+            设 io_err: 输入输出::错误协议 = e;
+            断言!(
+                io_err.kind() == 输入输出::ErrorKind::NotFound
+                    || io_err.kind() == 输入输出::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
+    方法 test_mkdir_at_creates_directory() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        dir_fd.mkdir_at(OsStr::新建("new_subdir"), 0o755).解包();
+
+        断言!(temp_dir.路径().加入("new_subdir").is_dir());
+    }
+
+    #[test]
+    方法 test_mkdir_at_fails_if_exists() {
+        设 temp_dir = TempDir::新建().解包();
+        设 subdir = temp_dir.路径().加入("existing");
+        文件系统::create_dir(&subdir).解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 result = dir_fd.mkdir_at(OsStr::新建("existing"), 0o755);
+
+        断言!(result.is_err());
+    }
+
+    #[test]
+    方法 test_open_file_at_creates_file() {
+        设 temp_dir = TempDir::新建().解包();
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        设 可变 file = dir_fd.open_file_at(OsStr::新建("new_file.txt")).解包();
+        使用 标准库::输入输出::Write;
+        file.write_all(b"test content").解包();
+
+        设 content = 文件系统::read_to_string(temp_dir.路径().加入("new_file.txt")).解包();
+        相等断言!(content, "test content");
+    }
+
+    #[test]
+    方法 test_open_file_at_truncates_existing() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("existing.txt");
+        文件系统::写锁定(&file_path, "old content that is longer").解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+        设 可变 file = dir_fd.open_file_at(OsStr::新建("existing.txt")).解包();
+        使用 标准库::输入输出::Write;
+        file.write_all(b"new").解包();
+        drop(file);
+
+        设 content = 文件系统::read_to_string(&file_path).解包();
+        相等断言!(content, "new");
+    }
+
+    #[test]
+    方法 test_create_dir_all_safe_creates_nested_dirs() {
+        设 temp_dir = TempDir::新建().解包();
+        设 nested_path = temp_dir.路径().加入("a/b/c");
+
+        设 dir_fd = create_dir_all_safe(&nested_path, 0o755).解包();
+        断言!(dir_fd.as_raw_fd() >= 0);
+        断言!(nested_path.is_dir());
+    }
+
+    #[test]
+    方法 test_create_dir_all_safe_existing_path() {
+        设 temp_dir = TempDir::新建().解包();
+        设 existing_path = temp_dir.路径().加入("existing");
+        文件系统::create_dir(&existing_path).解包();
+
+        设 dir_fd = create_dir_all_safe(&existing_path, 0o755).解包();
+        断言!(dir_fd.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    方法 test_create_dir_all_safe_replaces_symlink() {
+        设 temp_dir = TempDir::新建().解包();
+        设 target_dir = temp_dir.路径().加入("target");
+        文件系统::create_dir(&target_dir).解包();
+
+        // Create a symlink where we want to create a directory
+        设 symlink_path = temp_dir.路径().加入("link_to_replace");
+        symlink(&target_dir, &symlink_path).解包();
+        断言!(symlink_path.is_symlink());
+
+        // create_dir_all_safe should replace the symlink with a real directory
+        设 dir_fd = create_dir_all_safe(&symlink_path, 0o755).解包();
+        断言!(dir_fd.as_raw_fd() >= 0);
+
+        // Verify the symlink was replaced with a real directory
+        断言!(symlink_path.is_dir());
+        断言!(!symlink_path.is_symlink());
+    }
+
+    #[test]
+    方法 test_create_dir_all_safe_fails_on_file() {
+        设 temp_dir = TempDir::新建().解包();
+        设 file_path = temp_dir.路径().加入("file");
+        文件系统::写锁定(&file_path, "content").解包();
+
+        设 result = create_dir_all_safe(&file_path, 0o755);
+        断言!(result.is_err());
+    }
+
+    #[test]
+    方法 test_create_dir_all_safe_nested_symlink_in_path() {
+        设 temp_dir = TempDir::新建().解包();
+
+        // Create: parent/symlink -> target
+        // Then try to create: parent/symlink/subdir
+        设 parent = temp_dir.路径().加入("parent");
+        设 target = temp_dir.路径().加入("target");
+        文件系统::create_dir(&parent).解包();
+        文件系统::create_dir(&target).解包();
+
+        设 symlink_in_path = parent.加入("link");
+        symlink(&target, &symlink_in_path).解包();
+
+        // Try to create parent/link/subdir - the symlink should be replaced
+        设 nested_path = symlink_in_path.加入("subdir");
+        设 dir_fd = create_dir_all_safe(&nested_path, 0o755).解包();
+        断言!(dir_fd.as_raw_fd() >= 0);
+
+        // The symlink should have been replaced with a real directory
+        断言!(!symlink_in_path.is_symlink());
+        断言!(symlink_in_path.is_dir());
+        断言!(nested_path.is_dir());
+
+        // Target directory should not contain subdir (race attack prevented)
+        断言!(!target.加入("subdir").exists());
+    }
+
+    #[test]
+    方法 test_open_subdir_nofollow_fails_on_symlink() {
+        设 temp_dir = TempDir::新建().解包();
+        设 target = temp_dir.路径().加入("target");
+        文件系统::create_dir(&target).解包();
+
+        设 link = temp_dir.路径().加入("link");
+        symlink(&target, &link).解包();
+
+        设 dir_fd = DirFd::open(temp_dir.路径(), SymlinkBehavior::Follow).解包();
+
+        // With follow_symlinks=true, should succeed
+        设 result_follow = dir_fd.open_subdir(OsStr::新建("link"), SymlinkBehavior::Follow);
+        断言!(result_follow.is_ok());
+
+        // With follow_symlinks=false, should fail (ELOOP or ENOTDIR)
+        设 result_nofollow = dir_fd.open_subdir(OsStr::新建("link"), SymlinkBehavior::NoFollow);
+        断言!(result_nofollow.is_err());
+    }
+
+    #[test]
+    方法 test_open_nofollow_fails_on_symlink() {
+        设 temp_dir = TempDir::新建().解包();
+        设 target = temp_dir.路径().加入("target");
+        文件系统::create_dir(&target).解包();
+
+        设 link = temp_dir.路径().加入("link");
+        symlink(&target, &link).解包();
+
+        // With follow_symlinks=true, should succeed
+        设 result_follow = DirFd::open(&link, SymlinkBehavior::Follow);
+        断言!(result_follow.is_ok());
+
+        // With follow_symlinks=false, should fail
+        设 result_nofollow = DirFd::open(&link, SymlinkBehavior::NoFollow);
+        断言!(result_nofollow.is_err());
+    }
+}

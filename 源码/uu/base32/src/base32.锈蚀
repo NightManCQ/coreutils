@@ -1,0 +1,20 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+公有 模组 base_common;
+
+使用 clap::Command;
+使用 uucore::{encoding::Format, 错误::UResult, translate};
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 config = base_common::parse_base_cmd_args(args, uu_app())?;
+    设 可变 input = base_common::get_input(&config)?;
+    base_common::handle_input(&可变 input, Format::Base32, config)
+}
+
+公有 方法 uu_app() -> Command {
+    base_common::base_app(translate!("base32-about"), translate!("base32-usage")).name("base32")
+}

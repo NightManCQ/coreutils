@@ -1,0 +1,710 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDOs) ncount routput
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+使用 标准库::路径::Path;
+使用 unicode_width::UnicodeWidthChar;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+常量 TAB_WIDTH: 正整数大小 = 8;
+常量 NL: 正8 = b'\n';
+常量 CR: 正8 = b'\r';
+常量 TAB: 正8 = b'\t';
+// Implementation threshold (8 KiB) to prevent unbounded buffer growth during streaming.
+// Chosen as a small, fixed cap: large enough to avoid excessive flushes, but
+// small enough to keep memory bounded when the input has no fold points.
+常量 STREAMING_FLUSH_THRESHOLD: 正整数大小 = 8 * 1024;
+
+模组 options {
+    公有 常量 BYTES: &字符串切片 = "bytes";
+    公有 常量 CHARACTERS: &字符串切片 = "characters";
+    公有 常量 SPACES: &字符串切片 = "spaces";
+    公有 常量 WIDTH: &字符串切片 = "width";
+    公有 常量 FILE: &字符串切片 = "file";
+}
+
+#[derive(克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+枚举 WidthMode {
+    Columns,
+    Characters,
+}
+
+结构 FoldContext<'a, W: Write> {
+    spaces: 布尔,
+    width: 正整数大小,
+    mode: WidthMode,
+    writer: &'a 可变 W,
+    output: &'a 可变 向量<正8>,
+    col_count: &'a 可变 正整数大小,
+    last_space: &'a 可变 选项<正整数大小>,
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args = args.collect_lossy();
+
+    设 (args, obs_width) = handle_obsolete(&args[..]);
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 bytes = matches.get_flag(options::BYTES);
+    设 characters = matches.get_flag(options::CHARACTERS);
+    设 spaces = matches.get_flag(options::SPACES);
+    设 poss_width = 匹配 matches.get_one::<字符串>(options::WIDTH) {
+        一些(v) => 一些(v.克隆()),
+        无 => obs_width,
+    };
+
+    设 width = 匹配 poss_width {
+        一些(inp_width) => inp_width.parse::<正整数大小>().map_err(|e| {
+            USimpleError::新建(
+                1,
+                translate!("fold-error-illegal-width", "width" => inp_width.quote(), "error" => e),
+            )
+        })?,
+        无 => 80,
+    };
+
+    设 files = 匹配 matches.get_many::<字符串>(options::FILE) {
+        一些(v) => v.cloned().收集(),
+        无 => 向量!["-".to_owned()],
+    };
+
+    折叠(&files, bytes, characters, spaces, width)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("fold")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("fold-usage")))
+        .about(translate!("fold-about"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::BYTES)
+                .long(options::BYTES)
+                .short('b')
+                .help(translate!("fold-bytes-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CHARACTERS)
+                .long(options::CHARACTERS)
+                .short('c')
+                .help(translate!("fold-characters-help"))
+                .conflicts_with(options::BYTES)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SPACES)
+                .long(options::SPACES)
+                .short('s')
+                .help(translate!("fold-spaces-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::WIDTH)
+                .long(options::WIDTH)
+                .short('w')
+                .help(translate!("fold-width-help"))
+                .value_name("WIDTH")
+                .allow_hyphen_values(真),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+方法 handle_obsolete(args: &[字符串]) -> (向量<字符串>, 选项<字符串>) {
+    循环 (i, arg) 在 args.迭代().enumerate() {
+        设 切片 = &arg;
+        如果 切片.starts_with('-') && 切片.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+            设 可变 v = args.to_vec();
+            v.移除(i);
+            返回 (v, 一些(切片[1..].to_owned()));
+        }
+    }
+    (args.to_vec(), 无)
+}
+
+方法 折叠(
+    filenames: &[字符串],
+    bytes: 布尔,
+    characters: 布尔,
+    spaces: 布尔,
+    width: 正整数大小,
+) -> UResult<()> {
+    设 可变 output = BufWriter::新建(stdout());
+
+    循环 filename 在 filenames {
+        设 filename: &字符串切片 = filename;
+        设 可变 stdin_buf;
+        设 可变 file_buf;
+        设 buffer = BufReader::新建(如果 filename == "-" {
+            stdin_buf = stdin();
+            &可变 stdin_buf 转换 &可变 动态 Read
+        } 否则 {
+            file_buf = File::open(Path::新建(filename)).map_err_context(|| filename.to_string())?;
+            &可变 file_buf 转换 &可变 动态 Read
+        });
+
+        如果 bytes {
+            fold_file_bytewise(buffer, spaces, width, &可变 output)?;
+        } 否则 {
+            设 mode = 如果 characters {
+                WidthMode::Characters
+            } 否则 {
+                WidthMode::Columns
+            };
+            fold_file(buffer, spaces, width, mode, &可变 output)?;
+        }
+    }
+
+    output
+        .flush()
+        .map_err_context(|| translate!("fold-error-failed-to-write"))?;
+    好的(())
+}
+
+/// Fold `file` to fit `width` (number of columns), counting all characters as
+/// one column.
+///
+/// This function handles folding for the `-b`/`--bytes` option, counting
+/// tab, backspace, and carriage return as occupying one column, identically
+/// to all other characters in the stream.
+///
+///  If `spaces` is `true`, attempt to break lines at whitespace boundaries.
+方法 fold_file_bytewise<T: Read, W: Write>(
+    可变 file: BufReader<T>,
+    spaces: 布尔,
+    width: 正整数大小,
+    output: &可变 W,
+) -> UResult<()> {
+    设 可变 line = 向量::新建();
+
+    无限循环 {
+        如果 file
+            .read_until(NL, &可变 line)
+            .map_err_context(|| translate!("fold-error-readline"))?
+            == 0
+        {
+            中断;
+        }
+
+        如果 line == [NL] {
+            output.write_all(&[NL])?;
+            line.clear();
+            继续;
+        }
+
+        设 长度 = line.长度();
+        设 可变 i = 0;
+
+        当 i < 长度 {
+            设 width = 如果 长度 - i >= width { width } 否则 { 长度 - i };
+            设 切片 = {
+                设 切片 = &line[i..i + width];
+                如果 spaces && i + width < 长度 {
+                    匹配 切片
+                        .迭代()
+                        .enumerate()
+                        .rev()
+                        .寻找(|(_, c)| c.is_ascii_whitespace() && **c != CR)
+                    {
+                        一些((m, _)) => &切片[..=m],
+                        无 => 切片,
+                    }
+                } 否则 {
+                    切片
+                }
+            };
+
+            // Don't duplicate trailing newlines: if the slice is "\n", the
+            // previous iteration folded just before the end of the line and
+            // has already printed this newline.
+            如果 切片 == [NL] {
+                中断;
+            }
+
+            i += 切片.长度();
+
+            设 at_eol = i >= 长度;
+
+            如果 at_eol {
+                output.write_all(切片)?;
+            } 否则 {
+                output.write_all(切片)?;
+                output.write_all(&[NL])?;
+            }
+        }
+
+        line.clear();
+    }
+
+    好的(())
+}
+
+方法 next_tab_stop(col_count: 正整数大小) -> 正整数大小 {
+    col_count + TAB_WIDTH - col_count % TAB_WIDTH
+}
+
+方法 compute_col_count(buffer: &[正8], mode: WidthMode) -> 正整数大小 {
+    如果 设 好的(s) = 标准库::字符串切片::from_utf8(buffer) {
+        设 可变 width = 0;
+        循环 ch 在 s.chars() {
+            匹配 ch {
+                '\r' => width = 0,
+                '\t' => width = next_tab_stop(width),
+                '\x08' => width = width.saturating_sub(1),
+                _ => {
+                    width += 匹配 mode {
+                        WidthMode::Characters => 1,
+                        WidthMode::Columns => UnicodeWidthChar::width(ch).unwrap_or(0),
+                    }
+                }
+            }
+        }
+        width
+    } 否则 {
+        设 可变 width = 0;
+        循环 &byte 在 buffer {
+            匹配 byte {
+                CR => width = 0,
+                TAB => width = next_tab_stop(width),
+                0x08 => width = width.saturating_sub(1),
+                _ => width += 1,
+            }
+        }
+        width
+    }
+}
+
+方法 emit_output<W: Write>(ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    // Emit one folded line:
+    // - with `-s`, cut at the last remembered whitespace when possible
+    // - otherwise, cut at the current buffer end
+    // The remainder (if any) stays in the buffer for the next line.
+    设 consume = 匹配 *ctx.last_space {
+        一些(index) => index + 1,
+        无 => ctx.output.长度(),
+    };
+
+    如果 consume > 0 {
+        ctx.writer.write_all(&ctx.output[..consume])?;
+    }
+    ctx.writer.write_all(&[NL])?;
+
+    设 last_space = *ctx.last_space;
+
+    如果 consume < ctx.output.长度() {
+        ctx.output.清空(..consume);
+    } 否则 {
+        ctx.output.clear();
+    }
+
+    *ctx.col_count = compute_col_count(ctx.output, ctx.mode);
+
+    如果 ctx.spaces {
+        // Rebase the remembered whitespace position into the remaining buffer.
+        *ctx.last_space = last_space.and_then(|idx| {
+            如果 idx < consume {
+                无
+            } 否则 {
+                一些(idx - consume)
+            }
+        });
+    } 否则 {
+        *ctx.last_space = 无;
+    }
+    好的(())
+}
+
+方法 maybe_flush_unbroken_output<W: Write>(ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    // In streaming mode without `-s`, avoid unbounded buffering by periodically
+    // flushing long unbroken segments. With `-s` we must keep the buffer so we
+    // can still break at the last whitespace boundary.
+    如果 ctx.spaces || ctx.output.长度() < STREAMING_FLUSH_THRESHOLD {
+        返回 好的(());
+    }
+
+    // Write raw bytes without inserting a newline; folding will continue
+    // based on updated column tracking in the caller.
+    ctx.writer.write_all(ctx.output)?;
+    ctx.output.clear();
+    好的(())
+}
+
+方法 push_byte<W: Write>(ctx: &可变 FoldContext<'_, W>, byte: 正8) -> UResult<()> {
+    // Append a single byte to the buffer.
+    ctx.output.压入(byte);
+    maybe_flush_unbroken_output(ctx)
+}
+
+方法 push_bytes<W: Write>(ctx: &可变 FoldContext<'_, W>, bytes: &[正8]) -> UResult<()> {
+    // Append a byte slice to the buffer and flush if it grows too large.
+    如果 bytes.为空() {
+        返回 好的(());
+    }
+    ctx.output.extend_from_slice(bytes);
+    maybe_flush_unbroken_output(ctx)
+}
+
+方法 process_ascii_line<W: Write>(line: &[正8], ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    设 可变 idx = 0;
+    设 长度 = line.长度();
+
+    当 idx < 长度 {
+        匹配 line[idx] {
+            NL => {
+                *ctx.last_space = 无;
+                emit_output(ctx)?;
+                idx += 1;
+            }
+            CR => {
+                push_byte(ctx, CR)?;
+                *ctx.col_count = 0;
+                idx += 1;
+            }
+            0x08 => {
+                push_byte(ctx, 0x08)?;
+                *ctx.col_count = ctx.col_count.saturating_sub(1);
+                idx += 1;
+            }
+            TAB => {
+                无限循环 {
+                    设 next_stop = next_tab_stop(*ctx.col_count);
+                    如果 next_stop > ctx.width && !ctx.output.为空() {
+                        emit_output(ctx)?;
+                        继续;
+                    }
+                    *ctx.col_count = next_stop;
+                    中断;
+                }
+                如果 ctx.spaces {
+                    *ctx.last_space = 一些(ctx.output.长度());
+                } 否则 {
+                    *ctx.last_space = 无;
+                }
+                push_byte(ctx, TAB)?;
+                idx += 1;
+            }
+            0x00..=0x07 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F => {
+                push_byte(ctx, line[idx])?;
+                如果 ctx.spaces && line[idx].is_ascii_whitespace() && line[idx] != CR {
+                    *ctx.last_space = 一些(ctx.output.长度() - 1);
+                } 否则 如果 !ctx.spaces {
+                    *ctx.last_space = 无;
+                }
+
+                如果 ctx.mode == WidthMode::Characters {
+                    *ctx.col_count = ctx.col_count.saturating_add(1);
+                    如果 *ctx.col_count >= ctx.width {
+                        emit_output(ctx)?;
+                    }
+                }
+                idx += 1;
+            }
+            _ => {
+                设 start = idx;
+                当 idx < 长度
+                    && !matches!(
+                        line[idx],
+                        NL | CR | TAB | 0x08 | 0x00..=0x07 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F
+                    )
+                {
+                    idx += 1;
+                }
+                push_ascii_segment(&line[start..idx], ctx)?;
+            }
+        }
+    }
+
+    好的(())
+}
+
+方法 push_ascii_segment<W: Write>(segment: &[正8], ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    如果 segment.为空() {
+        返回 好的(());
+    }
+
+    设 可变 remaining = segment;
+
+    当 !remaining.为空() {
+        如果 *ctx.col_count >= ctx.width {
+            emit_output(ctx)?;
+            继续;
+        }
+
+        设 available = ctx.width - *ctx.col_count;
+        设 take = remaining.长度().min(available);
+        设 base_len = ctx.output.长度();
+
+        push_bytes(ctx, &remaining[..take])?;
+        *ctx.col_count += take;
+
+        如果 ctx.spaces {
+            如果 设 一些(pos) = remaining[..take]
+                .迭代()
+                .rposition(|b| b.is_ascii_whitespace() && *b != CR)
+            {
+                *ctx.last_space = 一些(base_len + pos);
+            }
+        } 否则 {
+            *ctx.last_space = 无;
+        }
+
+        remaining = &remaining[take..];
+    }
+
+    好的(())
+}
+
+方法 process_utf8_line<W: Write>(line: &字符串切片, ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    如果 line.is_ascii() {
+        返回 process_ascii_line(line.as_bytes(), ctx);
+    }
+
+    process_utf8_chars(line, ctx)
+}
+
+方法 process_utf8_chars<W: Write>(line: &字符串切片, ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    设 line_bytes = line.as_bytes();
+    设 可变 迭代 = line.char_indices().peekable();
+
+    当 设 一些((byte_idx, ch)) = 迭代.next() {
+        // Include combining characters with the base character when we are
+        // measuring by display columns. In character-counting mode every
+        // scalar value must advance the counter to match `chars().count()`
+        // semantics (see `fold_characters_reference` in the tests), so we do
+        // not coalesce zero-width scalars there.
+        如果 ctx.mode == WidthMode::Columns {
+            当 设 一些(&(_, next_ch)) = 迭代.peek() {
+                如果 UnicodeWidthChar::width(next_ch).unwrap_or(1) == 0 {
+                    迭代.next();
+                } 否则 {
+                    中断;
+                }
+            }
+        }
+
+        设 next_idx = 迭代.peek().map_or(line_bytes.长度(), |(idx, _)| *idx);
+
+        如果 ch == '\n' {
+            *ctx.last_space = 无;
+            emit_output(ctx)?;
+            继续;
+        }
+
+        如果 *ctx.col_count >= ctx.width {
+            emit_output(ctx)?;
+        }
+
+        如果 ch == '\r' {
+            push_bytes(ctx, &line_bytes[byte_idx..next_idx])?;
+            *ctx.col_count = 0;
+            继续;
+        }
+
+        如果 ch == '\x08' {
+            push_bytes(ctx, &line_bytes[byte_idx..next_idx])?;
+            *ctx.col_count = ctx.col_count.saturating_sub(1);
+            继续;
+        }
+
+        如果 ch == '\t' {
+            无限循环 {
+                设 next_stop = next_tab_stop(*ctx.col_count);
+                如果 next_stop > ctx.width && !ctx.output.为空() {
+                    emit_output(ctx)?;
+                    继续;
+                }
+                *ctx.col_count = next_stop;
+                中断;
+            }
+            如果 ctx.spaces {
+                *ctx.last_space = 一些(ctx.output.长度());
+            } 否则 {
+                *ctx.last_space = 无;
+            }
+            push_bytes(ctx, &line_bytes[byte_idx..next_idx])?;
+            继续;
+        }
+
+        设 added = 匹配 ctx.mode {
+            WidthMode::Columns => UnicodeWidthChar::width(ch).unwrap_or(0),
+            WidthMode::Characters => 1,
+        };
+
+        如果 ctx.mode == WidthMode::Columns
+            && added > 0
+            && *ctx.col_count + added > ctx.width
+            && !ctx.output.为空()
+        {
+            emit_output(ctx)?;
+        }
+
+        如果 ctx.spaces && ch.is_ascii_whitespace() {
+            *ctx.last_space = 一些(ctx.output.长度());
+        }
+
+        push_bytes(ctx, &line_bytes[byte_idx..next_idx])?;
+        *ctx.col_count = ctx.col_count.saturating_add(added);
+    }
+
+    好的(())
+}
+
+方法 process_non_utf8_line<W: Write>(line: &[正8], ctx: &可变 FoldContext<'_, W>) -> UResult<()> {
+    循环 &byte 在 line {
+        如果 byte == NL {
+            *ctx.last_space = 无;
+            emit_output(ctx)?;
+            继续;
+        }
+
+        如果 *ctx.col_count >= ctx.width {
+            emit_output(ctx)?;
+        }
+
+        匹配 byte {
+            CR => *ctx.col_count = 0,
+            TAB => {
+                设 next_stop = next_tab_stop(*ctx.col_count);
+                如果 next_stop > ctx.width && !ctx.output.为空() {
+                    emit_output(ctx)?;
+                }
+                *ctx.col_count = next_stop;
+                *ctx.last_space = 如果 ctx.spaces {
+                    一些(ctx.output.长度())
+                } 否则 {
+                    无
+                };
+                push_byte(ctx, byte)?;
+                继续;
+            }
+            0x08 => *ctx.col_count = ctx.col_count.saturating_sub(1),
+            _ 如果 ctx.spaces && byte.is_ascii_whitespace() => {
+                *ctx.last_space = 一些(ctx.output.长度());
+                *ctx.col_count = ctx.col_count.saturating_add(1);
+            }
+            _ => *ctx.col_count = ctx.col_count.saturating_add(1),
+        }
+
+        push_byte(ctx, byte)?;
+    }
+
+    好的(())
+}
+
+/// Process buffered bytes, emitting output for valid UTF-8 prefixes and
+/// deferring incomplete sequences until more input arrives.
+///
+/// If the buffer contains invalid UTF-8, it is handled in non-UTF-8 mode and
+/// the buffer is fully consumed.
+方法 process_pending_chunk<W: Write>(
+    pending: &可变 向量<正8>,
+    ctx: &可变 FoldContext<'_, W>,
+) -> UResult<()> {
+    当 !pending.为空() {
+        匹配 标准库::字符串切片::from_utf8(pending) {
+            好的(valid) => {
+                process_utf8_line(valid, ctx)?;
+                pending.clear();
+                中断;
+            }
+            坏的(err) => {
+                如果 err.error_len().is_some() {
+                    设 res = process_non_utf8_line(pending, ctx);
+                    pending.clear();
+                    res?;
+                    中断;
+                }
+
+                设 valid_up_to = err.valid_up_to();
+                如果 valid_up_to == 0 {
+                    中断;
+                }
+
+                设 valid = 标准库::字符串切片::from_utf8(&pending[..valid_up_to]).期望("valid prefix");
+                process_utf8_line(valid, ctx)?;
+                pending.清空(..valid_up_to);
+            }
+        }
+    }
+
+    好的(())
+}
+
+/// Fold `file` to fit `width` (number of columns).
+///
+/// By default `fold` treats tab, backspace, and carriage return specially:
+/// tab characters count as 8 columns, backspace decreases the
+/// column count, and carriage return resets the column count to 0.
+///
+/// If `spaces` is `true`, attempt to break lines at whitespace boundaries.
+#[allow(unused_assignments)]
+#[allow(clippy::cognitive_complexity)]
+方法 fold_file<T: Read, W: Write>(
+    可变 file: BufReader<T>,
+    spaces: 布尔,
+    width: 正整数大小,
+    mode: WidthMode,
+    writer: &可变 W,
+) -> UResult<()> {
+    设 可变 output = 向量::新建();
+    设 可变 col_count = 0;
+    设 可变 last_space = 无;
+    设 可变 pending = 向量::with_capacity(8 * 1024);
+
+    {
+        设 可变 ctx = FoldContext {
+            spaces,
+            width,
+            mode,
+            writer,
+            output: &可变 output,
+            col_count: &可变 col_count,
+            last_space: &可变 last_space,
+        };
+
+        无限循环 {
+            设 buffer = file
+                .fill_buf()
+                .map_err_context(|| translate!("fold-error-readline"))?;
+            如果 buffer.为空() {
+                中断;
+            }
+            pending.extend_from_slice(buffer);
+            设 consumed = buffer.长度();
+            file.consume(consumed);
+
+            process_pending_chunk(&可变 pending, &可变 ctx)?;
+        }
+
+        如果 !pending.为空() {
+            匹配 标准库::字符串切片::from_utf8(&pending) {
+                好的(s) => process_utf8_line(s, &可变 ctx)?,
+                坏的(_) => process_non_utf8_line(&pending, &可变 ctx)?,
+            }
+            pending.clear();
+        }
+
+        如果 !ctx.output.为空() {
+            ctx.writer.write_all(ctx.output)?;
+            ctx.output.clear();
+        }
+    }
+
+    好的(())
+}

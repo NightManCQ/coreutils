@@ -1,0 +1,31 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 超级::{EscapedChar, Quoter};
+
+公有(超级) 结构 LiteralQuoter(向量<正8>);
+
+实现 LiteralQuoter {
+    公有 方法 新建(size_hint: 正整数大小) -> 自身类型 {
+        自身类型(向量::with_capacity(size_hint))
+    }
+}
+
+实现 Quoter 循环 LiteralQuoter {
+    方法 push_char(&可变 自身, input: 字符) {
+        设 escaped = EscapedChar::new_literal(input)
+            .hide_control()
+            .收集::<字符串>();
+        自身.0.extend(escaped.as_bytes());
+    }
+
+    方法 push_invalid(&可变 自身, input: &[正8]) {
+        自身.0.extend(标准库::迭代::repeat_n(b'?', input.长度()));
+    }
+
+    方法 finalize(自身: 盒子<自身类型>) -> 向量<正8> {
+        自身.0
+    }
+}

@@ -1,0 +1,884 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore rustdoc
+#![allow(rustdoc::private_intra_doc_links)]
+
+使用 标准库::borrow::Borrow;
+使用 标准库::比较::排序顺序;
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{自身, BufReader, ErrorKind};
+使用 标准库::{
+    文件系统::{File, remove_file},
+    输入输出::{BufRead, BufWriter, Write},
+};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 regex::Regex;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::format_usage;
+
+模组 csplit_error;
+模组 patterns;
+模组 split_name;
+
+使用 箱::csplit_error::CsplitError;
+使用 箱::split_name::SplitName;
+
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 SUFFIX_FORMAT: &字符串切片 = "suffix-format";
+    公有 常量 SUPPRESS_MATCHED: &字符串切片 = "suppress-matched";
+    公有 常量 DIGITS: &字符串切片 = "digits";
+    公有 常量 PREFIX: &字符串切片 = "prefix";
+    公有 常量 KEEP_FILES: &字符串切片 = "keep-files";
+    公有 常量 QUIET: &字符串切片 = "quiet";
+    公有 常量 ELIDE_EMPTY_FILES: &字符串切片 = "elide-empty-files";
+    公有 常量 FILE: &字符串切片 = "file";
+    公有 常量 PATTERN: &字符串切片 = "pattern";
+}
+
+/// Command line options for csplit.
+公有 结构 CsplitOptions {
+    split_name: SplitName,
+    keep_files: 布尔,
+    quiet: 布尔,
+    elide_empty_files: 布尔,
+    suppress_matched: 布尔,
+}
+
+实现 CsplitOptions {
+    方法 新建(matches: &ArgMatches) -> 结果<自身类型, CsplitError> {
+        设 keep_files = matches.get_flag(options::KEEP_FILES);
+        设 quiet = matches.get_flag(options::QUIET);
+        设 elide_empty_files = matches.get_flag(options::ELIDE_EMPTY_FILES);
+        设 suppress_matched = matches.get_flag(options::SUPPRESS_MATCHED);
+
+        好的(自身类型 {
+            split_name: SplitName::新建(
+                matches.get_one::<字符串>(options::PREFIX).cloned(),
+                matches.get_one::<字符串>(options::SUFFIX_FORMAT).cloned(),
+                matches.get_one::<字符串>(options::DIGITS).cloned(),
+            )?,
+            keep_files,
+            quiet,
+            elide_empty_files,
+            suppress_matched,
+        })
+    }
+}
+
+公有 结构 LinesWithNewlines<T: BufRead> {
+    inner: T,
+}
+
+实现<T: BufRead> LinesWithNewlines<T> {
+    方法 新建(s: T) -> 自身类型 {
+        自身类型 { inner: s }
+    }
+}
+
+实现<T: BufRead> 迭代器协议 循环 LinesWithNewlines<T> {
+    类型 Item = 输入输出::结果<字符串>;
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        方法 ret(v: 向量<正8>) -> 输入输出::结果<字符串> {
+            字符串::from_utf8(v).map_err(|_| {
+                输入输出::错误协议::新建(ErrorKind::InvalidData, translate!("csplit-stream-not-utf8"))
+            })
+        }
+
+        设 可变 v = 向量::新建();
+        匹配 自身.inner.read_until(b'\n', &可变 v) {
+            好的(0) => 无,
+            好的(_) => 一些(ret(v)),
+            坏的(e) => 一些(坏的(e)),
+        }
+    }
+}
+
+/// Splits a file into severals according to the command line patterns.
+///
+/// # Errors
+///
+/// - [`io::Error`] if there is some problem reading/writing from/to a file.
+/// - [`CsplitError::LineOutOfRange`] if the line number pattern is larger than the number of input
+///   lines.
+/// - [`CsplitError::LineOutOfRangeOnRepetition`], like previous but after applying the pattern
+///   more than once.
+/// - [`CsplitError::MatchNotFound`] if no line matched a regular expression.
+/// - [`CsplitError::MatchNotFoundOnRepetition`], like previous but after applying the pattern
+///   more than once.
+公有 方法 csplit<T>(options: &CsplitOptions, patterns: &[&字符串切片], input: T) -> 结果<(), CsplitError>
+何处
+    T: BufRead,
+{
+    设 enumerated_input_lines = LinesWithNewlines::新建(input)
+        .映射(|line| line.map_err_context(|| translate!("csplit-read-error")))
+        .enumerate();
+    设 可变 input_iter = InputSplitter::新建(enumerated_input_lines);
+    设 可变 split_writer = SplitWriter::新建(options);
+    设 patterns_vec: 向量<patterns::Pattern> = patterns::get_patterns(patterns)?;
+    设 all_up_to_line = patterns_vec
+        .迭代()
+        .全部(|p| matches!(p, patterns::Pattern::UpToLine(_, _)));
+    设 ret = do_csplit(&可变 split_writer, patterns_vec, &可变 input_iter);
+
+    // consume the rest, unless there was an error
+    设 ret = 如果 ret.is_ok() {
+        input_iter.rewind_buffer();
+        如果 设 一些((_, line)) = input_iter.next() {
+            // There is remaining input: create a final split and copy remainder
+            split_writer.new_writer()?;
+            split_writer.writeln(&line?)?;
+            循环 (_, line) 在 input_iter {
+                split_writer.writeln(&line?)?;
+            }
+            split_writer.finish_split()
+        } 否则 如果 all_up_to_line && options.suppress_matched {
+            // GNU semantics for integer patterns with --suppress-matched:
+            // even if no remaining input, create a final (possibly empty) split
+            split_writer.new_writer()?;
+            split_writer.finish_split()
+        } 否则 {
+            好的(())
+        }
+    } 否则 {
+        ret
+    };
+    // delete files on error by default
+    如果 ret.is_err() && !options.keep_files {
+        split_writer.delete_all_splits()?;
+    }
+    ret
+}
+
+方法 do_csplit<I>(
+    split_writer: &可变 SplitWriter,
+    patterns: 向量<patterns::Pattern>,
+    input_iter: &可变 InputSplitter<I>,
+) -> 结果<(), CsplitError>
+何处
+    I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+{
+    // split the file based on patterns
+    循环 pattern 在 patterns {
+        设 pattern_as_str = pattern.to_string();
+        设 is_skip = matches!(pattern, patterns::Pattern::SkipToMatch(_, _, _));
+        匹配 pattern {
+            patterns::Pattern::UpToLine(n, ex) => {
+                设 可变 up_to_line = n;
+                循环 (_, ith) 在 ex.迭代() {
+                    split_writer.new_writer()?;
+                    匹配 split_writer.do_to_line(&pattern_as_str, up_to_line, input_iter) {
+                        // the error happened when applying the pattern more than once
+                        坏的(CsplitError::LineOutOfRange(_)) 如果 ith != 1 => {
+                            返回 坏的(CsplitError::LineOutOfRangeOnRepetition(
+                                pattern_as_str,
+                                ith - 1,
+                            ));
+                        }
+                        坏的(err) => 返回 坏的(err),
+                        // continue the splitting process
+                        好的(()) => (),
+                    }
+                    up_to_line += n;
+                }
+            }
+            patterns::Pattern::UpToMatch(regex, offset, ex)
+            | patterns::Pattern::SkipToMatch(regex, offset, ex) => {
+                循环 (max, ith) 在 ex.迭代() {
+                    如果 is_skip {
+                        // when skipping a part of the input, no writer is created
+                        split_writer.as_dev_null();
+                    } 否则 {
+                        split_writer.new_writer()?;
+                    }
+                    匹配 (
+                        split_writer.do_to_match(&pattern_as_str, &regex, offset, input_iter),
+                        max,
+                    ) {
+                        // in case of ::pattern::ExecutePattern::Always, then it's fine not to find a
+                        // matching line
+                        (坏的(CsplitError::MatchNotFound(_)), 无) => {
+                            返回 好的(());
+                        }
+                        // the error happened when applying the pattern more than once
+                        (坏的(CsplitError::MatchNotFound(_)), 一些(m)) 如果 m != 1 && ith != 1 => {
+                            返回 坏的(CsplitError::MatchNotFoundOnRepetition(
+                                pattern_as_str,
+                                ith - 1,
+                            ));
+                        }
+                        (坏的(err), _) => 返回 坏的(err),
+                        // continue the splitting process
+                        (好的(()), _) => (),
+                    }
+                }
+            }
+        }
+    }
+    好的(())
+}
+
+/// Write a portion of the input file into a split which filename is based on an incrementing
+/// counter.
+结构 SplitWriter<'a> {
+    /// the options set through the command line
+    options: &'a CsplitOptions,
+    /// a split counter
+    counter: 正整数大小,
+    /// the writer to the current split
+    current_writer: 选项<BufWriter<File>>,
+    /// the size in bytes of the current split
+    size: 正整数大小,
+    /// flag to indicate that no content should be written to a split
+    dev_null: 布尔,
+}
+
+实现 Drop 循环 SplitWriter<'_> {
+    方法 drop(&可变 自身) {
+        如果 自身.options.elide_empty_files && 自身.size == 0 {
+            设 file_name = 自身.options.split_name.获取(自身.counter);
+            // In the case of `echo a | csplit -z - %a%1`, the file
+            // `xx00` does not exist because the positive offset
+            // advanced past the end of the input. Since there is no
+            // file to remove in that case, `remove_file` would return
+            // an error, so we just ignore it.
+            设 _ = remove_file(file_name);
+        }
+    }
+}
+
+实现 SplitWriter<'_> {
+    方法 新建(options: &CsplitOptions) -> SplitWriter<'_> {
+        SplitWriter {
+            options,
+            counter: 0,
+            current_writer: 无,
+            size: 0,
+            dev_null: 假,
+        }
+    }
+
+    /// Creates a new split and returns its filename.
+    ///
+    /// # Errors
+    ///
+    /// The creation of the split file may fail with some [`io::Error`].
+    方法 new_writer(&可变 自身) -> 输入输出::结果<()> {
+        设 file_name = 自身.options.split_name.获取(自身.counter);
+        设 file = File::create(file_name)?;
+        自身.current_writer = 一些(BufWriter::新建(file));
+        自身.counter += 1;
+        自身.size = 0;
+        自身.dev_null = 假;
+        好的(())
+    }
+
+    /// The current split will not keep any of the read input lines.
+    方法 as_dev_null(&可变 自身) {
+        自身.dev_null = 真;
+    }
+
+    /// Writes the line to the current split.
+    /// If `self.dev_null` is true, then the line is discarded.
+    ///
+    /// # Errors
+    ///
+    /// Some [`io::Error`] may occur when attempting to write the line.
+    方法 writeln(&可变 自身, line: &字符串切片) -> 输入输出::结果<()> {
+        如果 !自身.dev_null {
+            如果 设 一些(引用 可变 current_writer) = 自身.current_writer {
+                设 bytes = line.as_bytes();
+                current_writer.write_all(bytes)?;
+                自身.size += bytes.长度();
+            } 否则 {
+                恐慌!("{}", translate!("csplit-write-split-not-created"))
+            }
+        }
+        好的(())
+    }
+
+    /// Perform some operations after completing a split, i.e., either remove it
+    /// if the [`options::ELIDE_EMPTY_FILES`] option is enabled, or print how much bytes were written
+    /// to it if [`options::QUIET`] is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the writer fails.
+    方法 finish_split(&可变 自身) -> 结果<(), CsplitError> {
+        如果 !自身.dev_null {
+            // Flush the writer to ensure all data is written and errors are detected
+            如果 设 一些(引用 可变 writer) = 自身.current_writer {
+                设 file_name = 自身.options.split_name.获取(自身.counter - 1);
+                writer
+                    .flush()
+                    .map_err_context(|| file_name.克隆())
+                    .map_err(CsplitError::from)?;
+            }
+            如果 自身.options.elide_empty_files && 自身.size == 0 {
+                自身.counter -= 1;
+            } 否则 如果 !自身.options.quiet {
+                打印行!("{}", 自身.size);
+            }
+        }
+        好的(())
+    }
+
+    /// Removes all the split files that were created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if there was a problem removing a split.
+    方法 delete_all_splits(&自身) -> 输入输出::结果<()> {
+        设 可变 ret = 好的(());
+        循环 ith 在 0..自身.counter {
+            设 file_name = 自身.options.split_name.获取(ith);
+            如果 设 坏的(err) = remove_file(file_name) {
+                ret = 坏的(err);
+            }
+        }
+        ret
+    }
+
+    /// Split the input stream up to the line number `n`.
+    ///
+    /// If the line number `n` is smaller than the current position in the input, then an empty
+    /// split is created.
+    ///
+    /// # Errors
+    ///
+    /// In addition to errors reading/writing from/to a file, if the line number
+    /// `n` is greater than the total available lines, then a
+    /// [`CsplitError::LineOutOfRange`] error is returned.
+    方法 do_to_line<I>(
+        &可变 自身,
+        pattern_as_str: &字符串切片,
+        n: 正整数大小,
+        input_iter: &可变 InputSplitter<I>,
+    ) -> 结果<(), CsplitError>
+    何处
+        I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+    {
+        input_iter.rewind_buffer();
+        input_iter.set_size_of_buffer(1);
+
+        设 可变 ret = 坏的(CsplitError::LineOutOfRange(pattern_as_str.to_string()));
+        当 设 一些((ln, line)) = input_iter.next() {
+            设 line = line?;
+            匹配 n.比较(&(&ln + 1)) {
+                排序顺序::Less => {
+                    断言!(
+                        input_iter.add_line_to_buffer(ln, line).is_none(),
+                        "the buffer is big enough to contain 1 line"
+                    );
+                    ret = 好的(());
+                    中断;
+                }
+                排序顺序::Equal => {
+                    断言!(
+                        自身.options.suppress_matched
+                            || input_iter.add_line_to_buffer(ln, line).is_none(),
+                        "the buffer is big enough to contain 1 line"
+                    );
+                    ret = 好的(());
+                    中断;
+                }
+                排序顺序::Greater => (),
+            }
+            自身.writeln(&line)?;
+        }
+        自身.finish_split()?;
+        ret
+    }
+
+    /// Read lines up to the line matching a [`Regex`]. With a non-zero offset,
+    /// the block of relevant lines can be extended (if positive), or reduced
+    /// (if negative).
+    ///
+    /// # Errors
+    ///
+    /// In addition to errors reading/writing from/to a file, the following errors may be returned:
+    /// - if no line matched, an [`CsplitError::MatchNotFound`].
+    /// - if there are not enough lines to accommodate the offset, an
+    ///   [`CsplitError::LineOutOfRange`].
+    #[allow(clippy::cognitive_complexity)]
+    方法 do_to_match<I>(
+        &可变 自身,
+        pattern_as_str: &字符串切片,
+        regex: &Regex,
+        可变 offset: 整32,
+        input_iter: &可变 InputSplitter<I>,
+    ) -> 结果<(), CsplitError>
+    何处
+        I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+    {
+        如果 offset >= 0 {
+            // The offset is zero or positive, no need for a buffer on the lines read.
+            // NOTE: drain the buffer of input_iter, no match should be done within.
+            循环 line 在 input_iter.drain_buffer() {
+                自身.writeln(&line)?;
+            }
+            // retain the matching line
+            input_iter.set_size_of_buffer(1);
+
+            当 设 一些((ln, line)) = input_iter.next() {
+                设 line = line?;
+                设 l = line
+                    .strip_suffix("\r\n")
+                    .unwrap_or_else(|| line.strip_suffix('\n').unwrap_or(&line));
+                如果 regex.is_match(l) {
+                    设 可变 next_line_suppress_matched = 假;
+                    匹配 (自身.options.suppress_matched, offset) {
+                        // no offset, add the line to the next split
+                        (假, 0) => {
+                            断言!(
+                                input_iter.add_line_to_buffer(ln, line).is_none(),
+                                "the buffer is big enough to contain 1 line"
+                            );
+                        }
+                        // a positive offset, some more lines need to be added to the current split
+                        (假, _) => 自身.writeln(&line)?,
+                        // suppress matched option true, but there is a positive offset, so the line is printed
+                        (真, 1..) => {
+                            next_line_suppress_matched = 真;
+                            自身.writeln(&line)?;
+                        }
+                        _ => (),
+                    }
+                    offset -= 1;
+
+                    // write the extra lines required by the offset
+                    当 offset > 0 {
+                        如果 设 一些((_, line)) = input_iter.next() {
+                            自身.writeln(&line?)?;
+                        } 否则 {
+                            自身.finish_split()?;
+                            返回 坏的(CsplitError::LineOutOfRange(pattern_as_str.to_string()));
+                        }
+                        offset -= 1;
+                    }
+                    自身.finish_split()?;
+
+                    // if we have to suppress one line after we take the next and do nothing
+                    如果 next_line_suppress_matched {
+                        input_iter.next();
+                    }
+                    返回 好的(());
+                }
+                自身.writeln(&line)?;
+            }
+        } 否则 {
+            // With a negative offset we use a buffer to keep the lines within the offset.
+            // NOTE: do not drain the buffer of input_iter, in case of an LineOutOfRange error
+            // but do not rewind it either since no match should be done within.
+            // The consequence is that the buffer may already be full with lines from a previous
+            // split, which is taken care of when calling `shrink_buffer_to_size`.
+            设 offset_usize = -offset 转换 正整数大小;
+            input_iter.set_size_of_buffer(offset_usize);
+            当 设 一些((ln, line)) = input_iter.next() {
+                设 line = line?;
+                设 l = line
+                    .strip_suffix("\r\n")
+                    .unwrap_or_else(|| line.strip_suffix('\n').unwrap_or(&line));
+                如果 regex.is_match(l) {
+                    循环 line 在 input_iter.shrink_buffer_to_size() {
+                        自身.writeln(&line)?;
+                    }
+                    如果 自身.options.suppress_matched {
+                        // since offset_usize is for sure greater than 0
+                        // the first element of the buffer should be removed and this
+                        // line inserted to be coherent with GNU implementation
+                        input_iter.add_line_to_buffer(ln, line);
+                    } 否则 {
+                        // add 1 to the buffer size to make place for the matched line
+                        input_iter.set_size_of_buffer(offset_usize + 1);
+                        断言!(
+                            input_iter.add_line_to_buffer(ln, line).is_none(),
+                            "should be big enough to hold every lines"
+                        );
+                    }
+
+                    自身.finish_split()?;
+                    如果 input_iter.buffer_len() < offset_usize {
+                        返回 坏的(CsplitError::LineOutOfRange(pattern_as_str.to_string()));
+                    }
+                    返回 好的(());
+                }
+                如果 设 一些(line) = input_iter.add_line_to_buffer(ln, line) {
+                    自身.writeln(&line)?;
+                }
+            }
+            // no match, drain the buffer into the current split
+            循环 line 在 input_iter.drain_buffer() {
+                自身.writeln(&line)?;
+            }
+        }
+
+        自身.finish_split()?;
+        坏的(CsplitError::MatchNotFound(pattern_as_str.to_string()))
+    }
+}
+
+/// An iterator which can output items from a buffer filled externally.
+/// This is used to pass matching lines to the next split and to support patterns with a negative offset.
+结构 InputSplitter<I>
+何处
+    I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+{
+    迭代: I,
+    buffer: 向量<<I 转换 迭代器协议>::Item>,
+    /// the number of elements the buffer may hold
+    size: 正整数大小,
+    /// flag to indicate content off the buffer should be returned instead of off the wrapped
+    /// iterator
+    rewind: 布尔,
+}
+
+实现<I> InputSplitter<I>
+何处
+    I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+{
+    方法 新建(迭代: I) -> 自身类型 {
+        自身类型 {
+            迭代,
+            buffer: 向量::新建(),
+            rewind: 假,
+            size: 1,
+        }
+    }
+
+    /// Rewind the iteration by outputting the buffer's content.
+    方法 rewind_buffer(&可变 自身) {
+        自身.rewind = 真;
+    }
+
+    /// Shrink the buffer so that its length is equal to the set size, returning an iterator for
+    /// the elements that were too much.
+    方法 shrink_buffer_to_size(&可变 自身) -> 实现 迭代器协议<Item = 字符串> + '_ {
+        设 shrink_offset = 如果 自身.buffer.长度() > 自身.size {
+            自身.buffer.长度() - 自身.size
+        } 否则 {
+            0
+        };
+        自身.buffer
+            .清空(..shrink_offset)
+            .映射(|(_, line)| line.解包())
+    }
+
+    /// Drain the content of the buffer.
+    方法 drain_buffer(&可变 自身) -> 实现 迭代器协议<Item = 字符串> + '_ {
+        自身.buffer.清空(..).映射(|(_, line)| line.解包())
+    }
+
+    /// Set the maximum number of lines to keep.
+    方法 set_size_of_buffer(&可变 自身, size: 正整数大小) {
+        自身.size = size;
+    }
+
+    /// Add a line to the buffer. If the buffer has `self.size` elements, then its head is removed and
+    /// the new line is pushed to the buffer. The removed head is then available in the returned
+    /// option.
+    方法 add_line_to_buffer(&可变 自身, ln: 正整数大小, line: 字符串) -> 选项<字符串> {
+        如果 自身.rewind {
+            自身.buffer.插入(0, (ln, 好的(line)));
+            无
+        } 否则 如果 自身.buffer.长度() >= 自身.size {
+            设 (_, head_line) = 自身.buffer.移除(0);
+            自身.buffer.压入((ln, 好的(line)));
+            一些(head_line.解包())
+        } 否则 {
+            自身.buffer.压入((ln, 好的(line)));
+            无
+        }
+    }
+
+    /// Returns the number of lines stored in the buffer
+    方法 buffer_len(&自身) -> 正整数大小 {
+        自身.buffer.长度()
+    }
+}
+
+实现<I> 迭代器协议 循环 InputSplitter<I>
+何处
+    I: 迭代器协议<Item = (正整数大小, UResult<字符串>)>,
+{
+    类型 Item = <I 转换 迭代器协议>::Item;
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        如果 自身.rewind {
+            如果 !自身.buffer.为空() {
+                返回 一些(自身.buffer.移除(0));
+            }
+            自身.rewind = 假;
+        }
+        自身.迭代.next()
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    // get the file to split
+    设 file_name = matches.get_one::<OsString>(options::FILE).解包();
+
+    // get the patterns to split on
+    设 patterns: 向量<_> = matches
+        .get_many::<字符串>(options::PATTERN)
+        .解包()
+        .映射(Borrow::borrow)
+        .收集();
+    设 options = CsplitOptions::新建(&matches)?;
+    如果 file_name == "-" {
+        设 stdin = 输入输出::stdin();
+        好的(csplit(&options, &patterns, stdin.锁定())?)
+    } 否则 {
+        设 file = File::open(file_name)
+            .map_err_context(|| 格式化!("cannot open {} for reading", file_name.quote()))?;
+        好的(csplit(&options, &patterns, BufReader::新建(file))?)
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("csplit")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("csplit-about"))
+        .override_usage(format_usage(&translate!("csplit-usage")))
+        .args_override_self(真)
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::SUFFIX_FORMAT)
+                .short('b')
+                .long(options::SUFFIX_FORMAT)
+                .value_name("FORMAT")
+                .help(translate!("csplit-help-suffix-format")),
+        )
+        .arg(
+            Arg::新建(options::PREFIX)
+                .short('f')
+                .long(options::PREFIX)
+                .value_name("PREFIX")
+                .help(translate!("csplit-help-prefix")),
+        )
+        .arg(
+            Arg::新建(options::KEEP_FILES)
+                .short('k')
+                .long(options::KEEP_FILES)
+                .help(translate!("csplit-help-keep-files"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SUPPRESS_MATCHED)
+                .long(options::SUPPRESS_MATCHED)
+                .help(translate!("csplit-help-suppress-matched"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DIGITS)
+                .short('n')
+                .long(options::DIGITS)
+                .value_name("DIGITS")
+                .help(translate!("csplit-help-digits")),
+        )
+        .arg(
+            Arg::新建(options::QUIET)
+                .short('q')
+                .long(options::QUIET)
+                .visible_short_alias('s')
+                .visible_alias("silent")
+                .help(translate!("csplit-help-quiet"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ELIDE_EMPTY_FILES)
+                .short('z')
+                .long(options::ELIDE_EMPTY_FILES)
+                .help(translate!("csplit-help-elide-empty-files"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .required(真)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::PATTERN)
+                .hide(真)
+                .action(ArgAction::Append)
+                .required(真),
+        )
+        .after_help(translate!("csplit-after-help"))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 input_splitter() {
+        设 input = 向量![
+            好的(字符串::from("aaa")),
+            好的(字符串::from("bbb")),
+            好的(字符串::from("ccc")),
+            好的(字符串::from("ddd")),
+        ];
+        设 可变 input_splitter = InputSplitter::新建(input.into_iter().enumerate());
+
+        input_splitter.set_size_of_buffer(2);
+        相等断言!(input_splitter.buffer_len(), 0);
+
+        匹配 input_splitter.next() {
+            一些((0, 好的(line))) => {
+                相等断言!(line, 字符串::from("aaa"));
+                相等断言!(input_splitter.add_line_to_buffer(0, line), 无);
+                相等断言!(input_splitter.buffer_len(), 1);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((1, 好的(line))) => {
+                相等断言!(line, 字符串::from("bbb"));
+                相等断言!(input_splitter.add_line_to_buffer(1, line), 无);
+                相等断言!(input_splitter.buffer_len(), 2);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((2, 好的(line))) => {
+                相等断言!(line, 字符串::from("ccc"));
+                相等断言!(
+                    input_splitter.add_line_to_buffer(2, line),
+                    一些(字符串::from("aaa"))
+                );
+                相等断言!(input_splitter.buffer_len(), 2);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        input_splitter.rewind_buffer();
+
+        匹配 input_splitter.next() {
+            一些((1, 好的(line))) => {
+                相等断言!(line, 字符串::from("bbb"));
+                相等断言!(input_splitter.buffer_len(), 1);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((2, 好的(line))) => {
+                相等断言!(line, 字符串::from("ccc"));
+                相等断言!(input_splitter.buffer_len(), 0);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((3, 好的(line))) => {
+                相等断言!(line, 字符串::from("ddd"));
+                相等断言!(input_splitter.buffer_len(), 0);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        断言!(input_splitter.next().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 input_splitter_interrupt_rewind() {
+        设 input = 向量![
+            好的(字符串::from("aaa")),
+            好的(字符串::from("bbb")),
+            好的(字符串::from("ccc")),
+            好的(字符串::from("ddd")),
+        ];
+        设 可变 input_splitter = InputSplitter::新建(input.into_iter().enumerate());
+
+        input_splitter.set_size_of_buffer(3);
+        相等断言!(input_splitter.buffer_len(), 0);
+
+        匹配 input_splitter.next() {
+            一些((0, 好的(line))) => {
+                相等断言!(line, 字符串::from("aaa"));
+                相等断言!(input_splitter.add_line_to_buffer(0, line), 无);
+                相等断言!(input_splitter.buffer_len(), 1);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((1, 好的(line))) => {
+                相等断言!(line, 字符串::from("bbb"));
+                相等断言!(input_splitter.add_line_to_buffer(1, line), 无);
+                相等断言!(input_splitter.buffer_len(), 2);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((2, 好的(line))) => {
+                相等断言!(line, 字符串::from("ccc"));
+                相等断言!(input_splitter.add_line_to_buffer(2, line), 无);
+                相等断言!(input_splitter.buffer_len(), 3);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        input_splitter.rewind_buffer();
+
+        匹配 input_splitter.next() {
+            一些((0, 好的(line))) => {
+                相等断言!(line, 字符串::from("aaa"));
+                相等断言!(input_splitter.add_line_to_buffer(0, line), 无);
+                相等断言!(input_splitter.buffer_len(), 3);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((0, 好的(line))) => {
+                相等断言!(line, 字符串::from("aaa"));
+                相等断言!(input_splitter.buffer_len(), 2);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((1, 好的(line))) => {
+                相等断言!(line, 字符串::from("bbb"));
+                相等断言!(input_splitter.buffer_len(), 1);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((2, 好的(line))) => {
+                相等断言!(line, 字符串::from("ccc"));
+                相等断言!(input_splitter.buffer_len(), 0);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        匹配 input_splitter.next() {
+            一些((3, 好的(line))) => {
+                相等断言!(line, 字符串::from("ddd"));
+                相等断言!(input_splitter.buffer_len(), 0);
+            }
+            item => 恐慌!("wrong item: {item:?}"),
+        }
+
+        断言!(input_splitter.next().is_none());
+    }
+}

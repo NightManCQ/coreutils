@@ -1,0 +1,859 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore mangen tldr mandoc uppercasing uppercased manpages DESTDIR
+
+使用 标准库::{
+    集合::哈希映射,
+    ffi::OsString,
+    文件系统::File,
+    输入输出::{自身, Read, Seek, Write},
+    进程,
+};
+
+使用 clap::{Arg, Command};
+使用 clap_complete::Shell;
+使用 clap_mangen::Man;
+使用 fluent_syntax::ast::{Entry, Message, Pattern};
+使用 fluent_syntax::parser;
+使用 jiff::Zoned;
+使用 regex::Regex;
+使用 textwrap::{fill, indent, termwidth};
+使用 zip::ZipArchive;
+
+使用 coreutils::validation;
+使用 uucore::Args;
+使用 uucore::locale::get_message;
+
+include!(concat!(env!("OUT_DIR"), "/uutils_map.rs"));
+
+/// Post-process a generated manpage to fix mandoc lint issues
+///
+/// This function:
+/// - Fixes the TH header by uppercasing command names and adding a proper date
+/// - Removes trailing whitespace from all lines
+/// - Fixes redundant .br paragraph macros that cause mandoc warnings
+/// - Removes .br before empty lines to avoid "br before sp" warnings
+/// - Removes .br after empty lines to avoid "br after sp" warnings
+/// - Fixes escape sequences (e.g., \\\\0 to \\0) to avoid "undefined escape" warnings
+方法 post_process_manpage(manpage: 字符串, date: &字符串切片) -> 字符串 {
+    // Only match TH headers that have at least a command name on the same line
+    // Use [ \t] instead of \s to avoid matching newlines
+    // Use a date format that satisfies mandoc (YYYY-MM-DD)
+
+    设 th_regex = Regex::新建(r"(?m)^\.TH[ \t]+([^ \t\n]+)(?:[ \t]+[^\n]*)?$").解包();
+    设 可变 result = th_regex
+        .replace_all(&manpage, |caps: &regex::Captures| {
+            // Add date to satisfy mandoc - date must be quoted
+            格式化!(".TH {} 1 \"{date}\"", caps[1].to_uppercase())
+        })
+        .to_string();
+
+    // Process lines: remove trailing whitespace and fix .br issues in a single pass
+    设 lines: 向量<&字符串切片> = result.lines().映射(字符串切片::trim_end).收集();
+    设 可变 fixed_lines: 向量<&字符串切片> = 向量::with_capacity(lines.长度());
+
+    循环 i 在 0..lines.长度() {
+        设 line = lines[i];
+
+        如果 line == ".br" {
+            设 preceded_by_empty_line = i > 0 && lines[i - 1].为空();
+            设 followed_by_empty_line = i + 1 < lines.长度() && lines[i + 1].为空();
+            设 followed_by_br = i + 1 < lines.长度() && lines[i + 1] == ".br";
+
+            如果 preceded_by_empty_line || followed_by_empty_line || followed_by_br {
+                // skip this ".br"
+                继续;
+            }
+        }
+
+        fixed_lines.压入(line);
+    }
+
+    result = fixed_lines.加入("\n");
+
+    // Fix escape sequence issues
+    // \\\\0 appears when trying to represent literal \0 string
+    // In man pages, use \e for literal backslash
+    result = result.replace("\\\\\\\\0", "\\e0");
+    result = result.replace("\\\\0", "\\e0");
+
+    如果 !result.ends_with('\n') {
+        result.压入('\n');
+    }
+
+    result
+}
+
+/// Print usage information for uudoc
+方法 usage<T: Args>(utils: &UtilityMap<T>) {
+    打印行!("uudoc - Documentation generator for uutils coreutils");
+    打印行!();
+    打印行!("Usage: uudoc [command] [args]");
+    打印行!();
+    打印行!("Commands:");
+    打印行!("  (no command)                   Generate mdbook documentation (default)");
+    打印行!("  manpage <utility>              Generate manpage for a utility");
+    打印行!("  completion <utility> <shell>   Generate shell completions for a utility");
+    打印行!();
+    打印行!("Available utilities:");
+    设 all_utilities = validation::get_all_utilities(utils);
+    设 display_list = all_utilities.加入(", ");
+    设 width = 标准库::比较::min(termwidth(), 100) - 4 * 2;
+    打印行!("{}", indent(&fill(&display_list, width), "    "));
+}
+
+/// Generates the coreutils app for the utility map
+方法 gen_coreutils_app<T: Args>(util_map: &UtilityMap<T>) -> Command {
+    设 可变 command = Command::新建("coreutils");
+    循环 (name, (_, sub_app)) 在 util_map {
+        // Recreate a small subcommand with only the relevant info
+        // (name & short description)
+        设 about = sub_app()
+            .get_about()
+            .期望("Could not get the 'about'")
+            .to_string();
+        设 sub_app = Command::新建(name).about(about);
+        command = command.subcommand(sub_app);
+    }
+    command
+}
+
+/// Generate the manpage for the utility in the first parameter
+方法 gen_manpage<T: Args>(
+    tldr: &可变 选项<ZipArchive<File>>,
+    args: 实现 迭代器协议<Item = OsString>,
+    util_map: &UtilityMap<T>,
+) -> ! {
+    uucore::set_utility_is_second_arg();
+    设 all_utilities = validation::get_all_utilities(util_map);
+
+    设 matches = Command::新建("manpage")
+        .about("Prints manpage to stdout")
+        .arg(
+            Arg::新建("utility")
+                .value_parser(clap::builder::PossibleValuesParser::新建(&all_utilities))
+                .required(真),
+        )
+        .get_matches_from(标准库::迭代::once(OsString::from("manpage")).chain(args));
+
+    设 utility = matches.get_one::<字符串>("utility").解包();
+    设 command = 如果 utility == "coreutils" {
+        gen_coreutils_app(util_map)
+    } 否则 {
+        validation::setup_localization_or_exit(utility);
+        设 可变 cmd = util_map.获取(utility).解包().1();
+        cmd.set_bin_name(utility.克隆());
+        设 可变 cmd = cmd.display_name(utility);
+        如果 设 一些(zip) = tldr {
+            如果 设 好的(examples) = write_zip_examples(zip, utility, 假) {
+                cmd = cmd.after_help(examples);
+            }
+        }
+        cmd
+    };
+
+    // Generate the manpage to a buffer first so we can post-process it
+    设 可变 buffer = 向量::新建();
+    设 man = Man::新建(command);
+    man.render(&可变 buffer).期望("Man page generation failed");
+
+    // Convert to string for processing
+    设 manpage = 字符串::from_utf8(buffer).期望("Invalid UTF-8 in manpage");
+
+    // Post-process the manpage to fix mandoc lint issues
+    设 date = Zoned::now().strftime("%Y-%m-%d").to_string();
+    设 processed_manpage = post_process_manpage(manpage, &date);
+
+    // Write the processed manpage to stdout
+    输入输出::stdout()
+        .write_all(processed_manpage.as_bytes())
+        .解包();
+    输入输出::stdout().flush().解包();
+    进程::exit(0);
+}
+
+/// Generate shell completions for the utility in the first parameter
+方法 gen_completions<T: Args>(args: 实现 迭代器协议<Item = OsString>, util_map: &UtilityMap<T>) -> ! {
+    设 all_utilities = validation::get_all_utilities(util_map);
+
+    设 matches = Command::新建("completion")
+        .about("Prints completions to stdout")
+        .arg(
+            Arg::新建("utility")
+                .value_parser(clap::builder::PossibleValuesParser::新建(&all_utilities))
+                .required(真),
+        )
+        .arg(
+            Arg::新建("shell")
+                .value_parser(clap::builder::EnumValueParser::<Shell>::新建())
+                .required(真),
+        )
+        .get_matches_from(标准库::迭代::once(OsString::from("completion")).chain(args));
+
+    设 utility = matches.get_one::<字符串>("utility").解包();
+    设 shell = *matches.get_one::<Shell>("shell").解包();
+
+    设 可变 command = 如果 utility == "coreutils" {
+        gen_coreutils_app(util_map)
+    } 否则 {
+        validation::setup_localization_or_exit(utility);
+        util_map.获取(utility).解包().1()
+    };
+    设 bin_name = 标准库::环境::var("PROG_PREFIX").unwrap_or_default() + utility;
+
+    clap_complete::generate(shell, &可变 command, bin_name, &可变 输入输出::stdout());
+    输入输出::stdout().flush().解包();
+    进程::exit(0);
+}
+
+/// # Errors
+/// Returns an error if the writer fails.
+#[allow(clippy::too_many_lines)]
+方法 主函数() -> 输入输出::结果<()> {
+    设 args: 向量<OsString> = uucore::args_os_filtered().收集();
+
+    设 可变 tldr_zip = File::open("docs/tldr.zip")
+        .ok()
+        .and_then(|f| ZipArchive::新建(f).ok());
+
+    // Check for manpage/completion commands first
+    如果 args.长度() > 1 {
+        设 command = args.获取(1).and_then(|s| s.to_str()).unwrap_or_default();
+        匹配 command {
+            "manpage" => {
+                设 args_iter = args.into_iter().skip(2);
+                gen_manpage(
+                    &可变 tldr_zip,
+                    args_iter,
+                    &util_map::<盒子<动态 迭代器协议<Item = OsString>>>(),
+                );
+            }
+            "completion" => {
+                设 args_iter = args.into_iter().skip(2);
+                gen_completions(args_iter, &util_map::<盒子<动态 迭代器协议<Item = OsString>>>());
+            }
+            "--help" | "-h" => {
+                usage(&util_map::<盒子<动态 迭代器协议<Item = OsString>>>());
+                进程::exit(0);
+            }
+            _ => {
+                错误打印行!("Unknown command: {command}");
+                错误打印行!("Use 'uudoc --help' for usage information.");
+                进程::exit(1);
+            }
+        }
+    }
+    设 utils = util_map::<盒子<动态 迭代器协议<Item = OsString>>>();
+    // Initialize localization for uucore common strings (used by tldr example attribution)
+    设 _ = uucore::locale::setup_localization("uudoc");
+    匹配 标准库::文件系统::create_dir("docs/src/utils/") {
+        坏的(e) 如果 e.kind() == 输入输出::ErrorKind::AlreadyExists => 好的(()),
+        x => x,
+    }?;
+
+    打印行!("Writing initial info to SUMMARY.md");
+    设 可变 summary = File::create("docs/src/SUMMARY.md")?;
+
+    设 _ = write!(
+        summary,
+        "# Summary\n\
+        \n\
+        [Introduction](index.md)\n\
+        * [Installation](installation.md)\n\
+        * [Build from source](build.md)\n\
+        * [Platform support](platforms.md)\n\
+        * [Contributing](CONTRIBUTING.md)\n\
+        \t* [Development](DEVELOPMENT.md)\n\
+        \t* [Code of Conduct](CODE_OF_CONDUCT.md)\n\
+        * [GNU test coverage](test_coverage.md)\n\
+        * [Extensions](extensions.md)\n\
+        \n\
+        # Reference\n\
+        * [Multi-call binary](multicall.md)\n",
+    );
+
+    打印行!("Gathering utils per platform");
+    设 utils_per_platform = {
+        设 可变 映射 = 哈希映射::新建();
+        循环 platform 在 ["unix", "macos", "windows", "unix_android"] {
+            设 platform_utils: 向量<字符串> = 字符串::from_utf8(
+                进程::Command::新建("./util/show-utils.sh")
+                    .arg(格式化!("--features=feat_os_{platform}"))
+                    .output()?
+                    .stdout,
+            )
+            .解包()
+            .trim()
+            .split(' ')
+            .映射(ToString::to_string)
+            .收集();
+            映射.插入(platform, platform_utils);
+        }
+
+        // Linux is a special case because it can support selinux
+        设 platform_utils: 向量<字符串> = 字符串::from_utf8(
+            进程::Command::新建("./util/show-utils.sh")
+                .arg("--features=feat_os_unix feat_selinux")
+                .output()?
+                .stdout,
+        )
+        .解包()
+        .trim()
+        .split(' ')
+        .映射(ToString::to_string)
+        .收集();
+        映射.插入("linux", platform_utils);
+
+        映射
+    };
+
+    设 可变 utils = utils.entries().收集::<向量<_>>();
+    utils.sort();
+
+    打印行!("Writing util per platform table");
+    {
+        设 可变 platform_table_file = File::create("docs/src/platform_table.md").解包();
+
+        // sum, cksum, b2sum, etc. are all available on all platforms, but not in the data structure
+        // otherwise, we check the map for the util name.
+        设 check_supported = |name: &字符串切片, platform: &字符串切片| {
+            如果 name.ends_with("sum") || utils_per_platform[platform].迭代().任意(|u| u == name) {
+                "✓"
+            } 否则 {
+                " "
+            }
+        };
+        writeln!(
+            platform_table_file,
+            "| util             | Linux | macOS | Windows | FreeBSD | Android |\n\
+             | ---------------- | ----- | ----- | ------- | ------- | ------- |"
+        )?;
+        循环 &(&name, _) 在 &utils {
+            如果 name == "[" {
+                继续;
+            }
+            // The alignment is not necessary, but makes the output a bit more
+            // pretty when viewed as plain markdown.
+            writeln!(
+                platform_table_file,
+                "| {:<16} | {:<5} | {:<5} | {:<7} | {:<7} | {:<7} |",
+                格式化!("**{name}**"),
+                check_supported(name, "linux"),
+                check_supported(name, "macos"),
+                check_supported(name, "windows"),
+                check_supported(name, "unix"),
+                check_supported(name, "unix_android"),
+            )?;
+        }
+    }
+
+    打印行!("Writing to utils");
+    循环 (&name, (_, command)) 在 utils {
+        设 (utils_name, usage_name, command) = 匹配 name {
+            "[" => {
+                继续;
+            }
+            n => (n, n, command),
+        };
+        设 p = 格式化!("docs/src/utils/{usage_name}.md");
+
+        设 fluent = File::open(格式化!("src/uu/{utils_name}/locales/en-US.ftl"))
+            .and_then(|可变 f: File| {
+                设 可变 s = 字符串::新建();
+                f.read_to_string(&可变 s)?;
+                好的(s)
+            })
+            .ok();
+
+        如果 设 好的(f) = File::create(&p) {
+            MDWriter {
+                w: 盒子::新建(f),
+                command: command(),
+                name: usage_name,
+                tldr_zip: &可变 tldr_zip,
+                utils_per_platform: &utils_per_platform,
+                fluent,
+                fluent_key: utils_name.to_string(),
+            }
+            .markdown()?;
+            打印行!("Wrote to '{p}'");
+        } 否则 {
+            打印行!("Error writing to {p}");
+        }
+        writeln!(summary, "* [{usage_name}](utils/{usage_name}.md)")?;
+    }
+    好的(())
+}
+
+方法 fix_usage(name: &字符串切片, usage: 字符串) -> 字符串 {
+    匹配 name {
+        "test" => {
+            // replace to [ but not the first two line
+            usage
+                .lines()
+                .enumerate()
+                .映射(|(i, l)| {
+                    如果 i > 1 {
+                        l.replace("test", "[")
+                    } 否则 {
+                        l.to_string()
+                    }
+                })
+                .收集::<向量<_>>()
+                .加入("\n")
+        }
+        _ => usage,
+    }
+}
+
+结构 MDWriter<'a, 'b> {
+    w: 盒子<动态 Write>,
+    command: Command,
+    name: &'a 字符串切片,
+    tldr_zip: &'b 可变 选项<ZipArchive<File>>,
+    utils_per_platform: &'b 哈希映射<&'b 字符串切片, 向量<字符串>>,
+    fluent: 选项<字符串>,
+    fluent_key: 字符串,
+}
+
+实现 MDWriter<'_, '_> {
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 markdown(&可变 自身) -> 输入输出::结果<()> {
+        write!(自身.w, "# {}\n\n", 自身.name)?;
+        自身.additional()?;
+        自身.usage()?;
+        自身.about()?;
+        自身.options()?;
+        自身.after_help()?;
+        自身.examples()
+    }
+
+    /// Extract value for a Fluent key from the .ftl content
+    方法 extract_fluent_value(&自身, key: &字符串切片) -> 选项<字符串> {
+        设 content = 自身.fluent.as_ref()?;
+        设 resource = parser::parse(content.克隆()).ok()?;
+
+        循环 entry 在 resource.body {
+            如果 设 Entry::Message(Message {
+                id,
+                value: 一些(Pattern { elements }),
+                ..
+            }) = entry
+            {
+                如果 id.name == key {
+                    // Simple text extraction - just concatenate text elements
+                    设 可变 result = 字符串::新建();
+                    使用 fluent_syntax::ast::{
+                        Expression, InlineExpression,
+                        PatternElement::{Placeable, TextElement},
+                    };
+                    循环 element 在 elements {
+                        如果 设 TextElement { 引用 value } = element {
+                            result.push_str(value);
+                        }
+                        如果 设 Placeable {
+                            expression:
+                                Expression::Inline(InlineExpression::StringLiteral { 引用 value }),
+                        } = element
+                        {
+                            result.push_str(value);
+                        }
+                    }
+                    返回 一些(result);
+                }
+            }
+        }
+        无
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 additional(&可变 自身) -> 输入输出::结果<()> {
+        writeln!(自身.w, "<div class=\"additional\">")?;
+        自身.platforms()?;
+        自身.version()?;
+        writeln!(自身.w, "</div>")
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 platforms(&可变 自身) -> 输入输出::结果<()> {
+        writeln!(自身.w, "<div class=\"platforms\">")?;
+        循环 (feature, icon) 在 [
+            ("linux", "linux"),
+            // freebsd is disabled for now because mdbook does not use font-awesome 5 yet.
+            // ("unix", "freebsd"),
+            ("macos", "apple"),
+            ("windows", "windows"),
+        ] {
+            如果 自身.name.包含("sum")
+                || 自身.utils_per_platform[feature]
+                    .迭代()
+                    .任意(|u| u == 自身.name)
+            {
+                writeln!(自身.w, "<i class=\"fa-brands fa-{icon}\"></i>")?;
+            }
+        }
+        writeln!(自身.w, "</div>")?;
+
+        好的(())
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    /// # Panics
+    /// Panics if the version is not found.
+    方法 version(&可变 自身) -> 输入输出::结果<()> {
+        writeln!(
+            自身.w,
+            "<div class=\"version\">v{}</div>",
+            自身.command.render_version().split_once(' ').解包().1
+        )
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 usage(&可变 自身) -> 输入输出::结果<()> {
+        如果 设 一些(usage) = 自身.extract_fluent_value(&格式化!("{}-usage", 自身.fluent_key)) {
+            设 usage = fix_usage(自身.name, usage);
+            writeln!(自身.w, "\n```")?;
+            writeln!(自身.w, "{usage}")?;
+            writeln!(自身.w, "```")
+        } 否则 {
+            好的(())
+        }
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 about(&可变 自身) -> 输入输出::结果<()> {
+        如果 设 一些(about) = 自身.extract_fluent_value(&格式化!("{}-about", 自身.fluent_key)) {
+            writeln!(自身.w, "{about}")
+        } 否则 {
+            好的(())
+        }
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 after_help(&可变 自身) -> 输入输出::结果<()> {
+        如果 设 一些(after_help) =
+            自身.extract_fluent_value(&格式化!("{}-after-help", 自身.fluent_key))
+        {
+            writeln!(自身.w, "\n\n{after_help}")
+        } 否则 {
+            好的(())
+        }
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 examples(&可变 自身) -> 输入输出::结果<()> {
+        如果 设 一些(zip) = 自身.tldr_zip {
+            如果 设 好的(examples) = write_zip_examples(zip, 自身.name, 真) {
+                writeln!(自身.w, "{examples}")?;
+            }
+        }
+        好的(())
+    }
+
+    /// # Errors
+    /// Returns an error if the writer fails.
+    方法 options(&可变 自身) -> 输入输出::结果<()> {
+        writeln!(自身.w)?;
+        writeln!(自身.w, "## Options")?;
+        writeln!(自身.w)?;
+        write!(自身.w, "<dl>")?;
+        循环 arg 在 自身.command.get_arguments() {
+            write!(自身.w, "<dt>")?;
+            设 可变 first = 真;
+            循环 l 在 arg.get_long_and_visible_aliases().unwrap_or_default() {
+                如果 first {
+                    first = 假;
+                } 否则 {
+                    write!(自身.w, ", ")?;
+                }
+                write!(自身.w, "<code>")?;
+                write!(自身.w, "--{l}")?;
+                如果 设 一些(names) = arg.get_value_names() {
+                    write!(
+                        自身.w,
+                        "={}",
+                        names
+                            .迭代()
+                            .映射(|x| 格式化!("&lt;{x}&gt;"))
+                            .收集::<向量<_>>()
+                            .加入(" ")
+                    )?;
+                }
+                write!(自身.w, "</code>")?;
+            }
+            循环 s 在 arg.get_short_and_visible_aliases().unwrap_or_default() {
+                如果 first {
+                    first = 假;
+                } 否则 {
+                    write!(自身.w, ", ")?;
+                }
+                write!(自身.w, "<code>")?;
+                write!(自身.w, "-{s}")?;
+                如果 设 一些(names) = arg.get_value_names() {
+                    write!(
+                        自身.w,
+                        " {}",
+                        names
+                            .迭代()
+                            .映射(|x| 格式化!("&lt;{x}&gt;"))
+                            .收集::<向量<_>>()
+                            .加入(" ")
+                    )?;
+                }
+                write!(自身.w, "</code>")?;
+            }
+            writeln!(自身.w, "</dt>")?;
+            设 help_text = arg.get_help().unwrap_or_default().to_string();
+            // Try to resolve Fluent key if it looks like one, otherwise use as-is
+            设 resolved_help = 如果 help_text.starts_with(&格式化!("{}-help-", 自身.fluent_key)) {
+                自身.extract_fluent_value(&help_text).unwrap_or(help_text)
+            } 否则 {
+                help_text
+            };
+            writeln!(
+                自身.w,
+                "<dd>\n\n{}\n\n</dd>",
+                resolved_help.replace('\n', "<br />")
+            )?;
+        }
+        writeln!(自身.w, "</dl>\n")
+    }
+}
+
+/// # Panics
+/// Panics if the archive is not ok
+方法 get_zip_content(archive: &可变 ZipArchive<实现 Read + Seek>, name: &字符串切片) -> 选项<字符串> {
+    设 可变 s = 字符串::新建();
+    archive.by_name(name).ok()?.read_to_string(&可变 s).解包();
+    一些(s)
+}
+
+/// Extract examples for tldr.zip. The file docs/tldr.zip must exists
+///
+/// ```sh
+/// curl https://tldr.sh/assets/tldr.zip -o docs/tldr.zip
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the tldr.zip file cannot be opened or read
+方法 write_zip_examples(
+    archive: &可变 ZipArchive<实现 Read + Seek>,
+    name: &字符串切片,
+    output_markdown: 布尔,
+) -> 输入输出::结果<字符串> {
+    设 content = 如果 设 一些(f) = get_zip_content(archive, &格式化!("pages/common/{name}.md")) {
+        f
+    } 否则 如果 设 一些(f) = get_zip_content(archive, &格式化!("pages/linux/{name}.md")) {
+        f
+    } 否则 {
+        返回 坏的(输入输出::错误协议::新建(
+            输入输出::ErrorKind::NotFound,
+            格式化!("Could not find tldr examples for {name}"),
+        ));
+    };
+
+    匹配 format_examples(content, output_markdown) {
+        坏的(e) => 坏的(输入输出::错误协议::other(格式化!(
+            "Failed to format the tldr examples of {name}: {e}"
+        ))),
+        好的(s) => 好的(s),
+    }
+}
+
+/// Format examples using std::fmt::Write
+方法 format_examples(content: 字符串, output_markdown: 布尔) -> 结果<字符串, 标准库::格式化::错误协议> {
+    使用 标准库::格式化::Write;
+    设 可变 s = 字符串::新建();
+    writeln!(s)?;
+    writeln!(s, "## Examples")?;
+    writeln!(s)?;
+    循环 line 在 content.lines().skip_while(|l| !l.starts_with('-')) {
+        如果 设 一些(l) = line.strip_prefix("- ") {
+            writeln!(s, "{l}")?;
+        } 否则 如果 line.starts_with('`') {
+            如果 output_markdown {
+                writeln!(s, "```shell\n{}\n```", line.trim_matches('`'))?;
+            } 否则 {
+                writeln!(s, "{}", line.trim_matches('`'))?;
+            }
+        } 否则 如果 line.为空() {
+            writeln!(s)?;
+        } 否则 {
+            // println!("Not sure what to do with this line:");
+            // println!("{line}");
+        }
+    }
+    writeln!(s)?;
+    writeln!(s, "> {}", get_message("uudoc-tldr-attribution"))?;
+    writeln!(s, ">")?;
+    writeln!(s, "> {}", get_message("uudoc-tldr-disclaimer"))?;
+    好的(s)
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_post_process_manpage_fixes_th_header() {
+        // Test that command names are uppercased and date is removed
+        设 input =
+            ".TH cat 1 \"cat (uutils coreutils) 0.7.0\"\n.SH NAME\ncat - concatenate files\n";
+        设 expected = ".TH CAT 1 \"2024-01-01\"\n.SH NAME\ncat - concatenate files\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_removes_trailing_whitespace() {
+        // Test that trailing whitespace is removed from lines
+        设 input = ".TH TEST 1  \nSome text with trailing spaces   \n.SH SECTION  \n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nSome text with trailing spaces\n.SH SECTION\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_fixes_double_br() {
+        // Test that redundant .br macros are removed
+        设 input = ".TH TEST 1\n.br\n.br\nSome text\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\n.br\nSome text\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_fixes_br_with_empty_line() {
+        // Test that .br with empty line patterns are fixed
+        // Both .br macros should be removed (first because followed by empty, second because preceded by empty)
+        设 input = ".TH TEST 1\n.br\n\n.br\nSome text\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\n\nSome text\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_preserves_single_br() {
+        // Test that single .br macros are preserved
+        设 input = ".TH TEST 1\nLine 1\n.br\nLine 2\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nLine 1\n.br\nLine 2\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_handles_mixed_case_command() {
+        // Test that mixed case command names are uppercased
+        设 input = ".TH CaT 1 \"some version info\"\nContent\n";
+        设 expected = ".TH CAT 1 \"2024-01-01\"\nContent\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_handles_no_th_header() {
+        // Test that manpages without TH headers are handled gracefully
+        设 input = ".SH NAME\ntest - a test utility\n";
+        设 expected = ".SH NAME\ntest - a test utility\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_complex_br_pattern() {
+        // Test complex .br patterns with multiple occurrences
+        设 input =
+            ".TH TEST 1\nSection 1\n.br\n\n.br\nMiddle\n.br\n.br\nSection 2\n.br\n\n.br\nEnd\n";
+        // .br followed/preceded by empty lines should be removed, consecutive .br should have one removed
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nSection 1\n\nMiddle\n.br\nSection 2\n\nEnd\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_malformed_th_header() {
+        // Test that malformed TH headers don't cause panics and are handled gracefully
+        设 input1 = ".TH\nContent\n"; // Missing command name
+        设 expected1 = ".TH\nContent\n";
+        设 result1 = post_process_manpage(input1.to_string(), "2024-01-01");
+        相等断言!(result1, expected1);
+
+        // TH header with special characters
+        设 input2 = ".TH test-cmd 1 \"version 1.0\"\nContent\n";
+        设 expected2 = ".TH TEST-CMD 1 \"2024-01-01\"\nContent\n";
+        设 result2 = post_process_manpage(input2.to_string(), "2024-01-01");
+        相等断言!(result2, expected2);
+
+        // TH header at end of file without newline
+        设 input3 = "Content\n.TH test 1";
+        设 expected3 = "Content\n.TH TEST 1 \"2024-01-01\"\n";
+        设 result3 = post_process_manpage(input3.to_string(), "2024-01-01");
+        相等断言!(result3, expected3);
+
+        // Multiple TH headers (only first should be processed due to ^anchor)
+        设 input4 = ".TH first 1\nMiddle\n.TH second 1\n";
+        设 expected4 = ".TH FIRST 1 \"2024-01-01\"\nMiddle\n.TH SECOND 1 \"2024-01-01\"\n";
+        设 result4 = post_process_manpage(input4.to_string(), "2024-01-01");
+        相等断言!(result4, expected4);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_removes_br_before_empty_line() {
+        // Test that .br is removed when followed by empty line (which becomes .sp)
+        设 input = ".TH TEST 1\nSome text\n.br\n\nMore text\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nSome text\n\nMore text\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_complex_br_before_empty() {
+        // Test multiple .br before empty line patterns
+        设 input = ".TH TEST 1\nSection 1\n.br\n\nSection 2\n.br\n\nSection 3\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nSection 1\n\nSection 2\n\nSection 3\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_removes_br_after_empty_line() {
+        // Test that .br is removed when preceded by empty line (which becomes .sp)
+        设 input = ".TH TEST 1\nSome text\n\n.br\nMore text\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nSome text\n\nMore text\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_post_process_manpage_fixes_escape_sequences() {
+        // Test that \\\\0 and \\0 are fixed to \e0 (literal backslash-zero)
+        设 input = ".TH TEST 1\nText with \\\\\\\\0 and \\\\0 escape\n";
+        设 expected = ".TH TEST 1 \"2024-01-01\"\nText with \\e0 and \\e0 escape\n";
+
+        设 result = post_process_manpage(input.to_string(), "2024-01-01");
+        相等断言!(result, expected);
+    }
+}

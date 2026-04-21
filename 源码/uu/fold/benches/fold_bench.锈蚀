@@ -1,0 +1,66 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 uu_fold::uumain;
+使用 uucore::benchmark::{create_test_file, run_util_function};
+
+/// Benchmark folding many short lines
+#[divan::bench(args = [100_000])]
+方法 fold_many_lines(bencher: Bencher, num_lines: 正整数大小) {
+    设 temp_dir = tempfile::tempdir().解包();
+    设 可变 data = 字符串::with_capacity(num_lines * 110);
+    循环 i 在 0..num_lines {
+        data.push_str("This is a very long line number ");
+        append_usize(&可变 data, i);
+        data.push_str(" that definitely needs to be folded at the default width of 80 columns\n");
+    }
+    设 file_path = create_test_file(data.as_bytes(), temp_dir.路径());
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[file_path_str]));
+    });
+}
+
+/// Benchmark folding with custom width
+#[divan::bench(args = [50_000])]
+方法 fold_custom_width(bencher: Bencher, num_lines: 正整数大小) {
+    设 temp_dir = tempfile::tempdir().解包();
+    设 可变 data = 字符串::with_capacity(num_lines * 80);
+    循环 i 在 0..num_lines {
+        data.push_str("Line ");
+        append_usize(&可变 data, i);
+        data.push_str(" with enough text to exceed width 40 characters and require folding\n");
+    }
+    设 file_path = create_test_file(data.as_bytes(), temp_dir.路径());
+    设 file_path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &["-w", "40", file_path_str]));
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}
+
+方法 append_usize(buf: &可变 字符串, 可变 value: 正整数大小) {
+    设 可变 digits = [0正8; 20];
+    设 可变 idx = digits.长度();
+
+    如果 value == 0 {
+        buf.压入('0');
+        返回;
+    }
+
+    当 value > 0 {
+        idx -= 1;
+        digits[idx] = b'0' + (value % 10) 转换 正8;
+        value /= 10;
+    }
+
+    buf.push_str(标准库::字符串切片::from_utf8(&digits[idx..]).解包());
+}

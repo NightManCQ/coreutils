@@ -1,0 +1,619 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) seek'd tail'ing ringbuffer ringbuf unwatch
+// spell-checker:ignore (ToDO) Uncategorized filehandle Signum memrchr
+// spell-checker:ignore (libs) kqueue
+// spell-checker:ignore (acronyms)
+// spell-checker:ignore (env/flags)
+// spell-checker:ignore (jargon) tailable untailable stdlib
+// spell-checker:ignore (names)
+// spell-checker:ignore (shell/tools)
+// spell-checker:ignore (misc)
+
+公有 模组 args;
+公有 模组 chunks;
+模组 follow;
+模组 parse;
+模组 paths;
+模组 platform;
+公有 模组 text;
+
+公有 使用 args::uu_app;
+使用 args::{FilterMode, Settings, Signum, parse_args};
+使用 chunks::ReverseChunks;
+使用 follow::Observer;
+使用 memchr::{memchr_iter, memrchr_iter};
+使用 paths::{FileExtTail, HeaderPrinter, Input, InputKind};
+使用 标准库::比较::排序顺序;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write, stdin, stdout};
+使用 标准库::路径::{Path, PathBuf};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError, set_exit_code};
+使用 uucore::translate;
+
+使用 uucore::{show, show_error};
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 settings = parse_args(args)?;
+
+    settings.check_warnings();
+
+    匹配 settings.verify() {
+        args::VerificationResult::CannotFollowStdinByName => {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("tail-error-cannot-follow-stdin-by-name", "stdin" => text::DASH.quote()),
+            ));
+        }
+        // Exit early if we do not output anything. Note, that this may break a pipe
+        // when tail is on the receiving side.
+        args::VerificationResult::NoOutput => 返回 好的(()),
+        args::VerificationResult::好的 => {}
+    }
+
+    uu_tail(&settings)
+}
+
+方法 uu_tail(settings: &Settings) -> UResult<()> {
+    设 可变 printer = HeaderPrinter::新建(settings.verbose, 真);
+    设 可变 observer = Observer::from(settings);
+
+    observer.start(settings)?;
+
+    // Print debug info about the follow implementation being used
+    如果 settings.debug && settings.follow.is_some() {
+        如果 observer.use_polling {
+            show_error!("{}", translate!("tail-debug-using-polling-mode"));
+        } 否则 {
+            show_error!("{}", translate!("tail-debug-using-notification-mode"));
+        }
+    }
+
+    // Do an initial tail print of each path's content.
+    // Add `path` and `reader` to `files` map if `--follow` is selected.
+    循环 input 在 &settings.inputs.克隆() {
+        匹配 input.kind() {
+            InputKind::Stdin => {
+                tail_stdin(settings, &可变 printer, input, &可变 observer)?;
+            }
+            InputKind::File(路径) 如果 cfg!(unix) && 路径 == &PathBuf::from(text::DEV_STDIN) => {
+                tail_stdin(settings, &可变 printer, input, &可变 observer)?;
+            }
+            InputKind::File(路径) => {
+                tail_file(settings, &可变 printer, input, 路径, &可变 observer, 0)?;
+            }
+        }
+    }
+
+    如果 settings.follow.is_some() {
+        /*
+        POSIX specification regarding tail -f
+        If the input file is a regular file or if the file operand specifies a FIFO, do not
+        terminate after the last line of the input file has been copied, but read and copy
+        further bytes from the input file when they become available. If no file operand is
+        specified and standard input is a pipe or FIFO, the -f option shall be ignored. If
+        the input file is not a FIFO, pipe, or regular file, it is unspecified whether or
+        not the -f option shall be ignored.
+        */
+        如果 !settings.has_only_stdin() || settings.pid != 0 {
+            follow::follow(observer, settings)?;
+        }
+    }
+
+    好的(())
+}
+
+方法 tail_file(
+    settings: &Settings,
+    header_printer: &可变 HeaderPrinter,
+    input: &Input,
+    路径: &Path,
+    observer: &可变 Observer,
+    offset: 正64,
+) -> UResult<()> {
+    如果 路径
+        .metadata()
+        .is_err_and(|e| e.kind() == ErrorKind::NotFound)
+    {
+        set_exit_code(1);
+        show_error!(
+            "{}",
+            translate!(
+                "tail-error-cannot-open-no-such-file",
+                "file" => input.display_name.克隆(),
+                "error" => translate!("tail-no-such-file-or-directory")
+            )
+        );
+        observer.add_bad_path(路径, input.display_name.as_str(), 假)?;
+        返回 好的(());
+    }
+
+    如果 路径.is_dir() {
+        set_exit_code(1);
+
+        header_printer.print_input(input);
+        设 err_msg = translate!("tail-is-a-directory");
+
+        show_error!(
+            "{}",
+            translate!("tail-error-reading-file", "file" => input.display_name.克隆(), "error" => err_msg)
+        );
+        如果 settings.follow.is_some() {
+            设 msg = 如果 settings.retry {
+                ""
+            } 否则 {
+                &translate!("tail-giving-up-on-this-name")
+            };
+            show_error!(
+                "{}",
+                translate!("tail-error-cannot-follow-file-type", "file" => input.display_name.克隆(), "msg" => msg)
+            );
+        }
+        如果 !observer.follow_name_retry() {
+            返回 好的(());
+        }
+        observer.add_bad_path(路径, input.display_name.as_str(), 假)?;
+    } 否则 {
+        #[cfg(unix)]
+        设 open_result = open_file(路径, settings.pid != 0);
+        #[cfg(not(unix))]
+        设 open_result = File::open(路径);
+
+        匹配 open_result {
+            好的(可变 file) => {
+                设 st = file.metadata()?;
+                设 blksize_limit = uucore::文件系统::sane_blksize::sane_blksize_from_metadata(&st);
+                header_printer.print_input(input);
+                设 可变 reader;
+                如果 !settings.presume_input_pipe
+                    && file.is_seekable(如果 input.is_stdin() { offset } 否则 { 0 })
+                    && (!st.is_file() || st.长度() > blksize_limit)
+                {
+                    bounded_tail(&可变 file, settings);
+                    reader = BufReader::新建(file);
+                } 否则 {
+                    reader = BufReader::新建(file);
+                    unbounded_tail(&可变 reader, settings)?;
+                }
+                如果 input.is_tailable() {
+                    observer.add_path(
+                        路径,
+                        input.display_name.as_str(),
+                        一些(盒子::新建(reader)),
+                        真,
+                    )?;
+                } 否则 {
+                    observer.add_bad_path(路径, input.display_name.as_str(), 假)?;
+                }
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::PermissionDenied => {
+                observer.add_bad_path(路径, input.display_name.as_str(), 假)?;
+                show!(e.map_err_context(|| {
+                    translate!("tail-error-cannot-open-for-reading", "file" => input.display_name.克隆())
+                }));
+            }
+            坏的(e) => {
+                observer.add_bad_path(路径, input.display_name.as_str(), 假)?;
+                返回 坏的(e.map_err_context(|| {
+                    translate!("tail-error-cannot-open-for-reading", "file" => input.display_name.克隆())
+                }));
+            }
+        }
+    }
+
+    好的(())
+}
+
+/// Opens a file, using non-blocking mode for FIFOs when `use_nonblock_for_fifo` is true.
+///
+/// When opening a FIFO with `--pid`, we need to use O_NONBLOCK so that:
+/// 1. The open() call doesn't block waiting for a writer
+/// 2. We can periodically check if the monitored process is still alive
+///
+/// After opening, we clear O_NONBLOCK so subsequent reads block normally.
+/// Without `--pid`, FIFOs block on open() until a writer connects (GNU behavior).
+#[cfg(unix)]
+方法 open_file(路径: &Path, use_nonblock_for_fifo: 布尔) -> 输入输出::结果<File> {
+    使用 rustix::文件系统::{OFlags, fcntl_getfl, fcntl_setfl};
+    使用 标准库::文件系统::OpenOptions;
+    使用 标准库::操作系统::fd::AsFd;
+    使用 标准库::操作系统::unix::文件系统::{FileTypeExt, OpenOptionsExt};
+
+    设 is_fifo = 路径
+        .metadata()
+        .ok()
+        .is_some_and(|m| m.file_type().is_fifo());
+
+    如果 is_fifo && use_nonblock_for_fifo {
+        设 file = OpenOptions::新建()
+            .读锁定(真)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(路径)?;
+
+        // Clear O_NONBLOCK so reads block normally
+        设 flags = fcntl_getfl(file.as_fd())?;
+        设 new_flags = flags & !OFlags::NONBLOCK;
+        fcntl_setfl(file.as_fd(), new_flags)?;
+
+        好的(file)
+    } 否则 {
+        File::open(路径)
+    }
+}
+
+方法 tail_stdin(
+    settings: &Settings,
+    header_printer: &可变 HeaderPrinter,
+    input: &Input,
+    observer: &可变 Observer,
+) -> UResult<()> {
+    // on macOS, resolve() will always return None for stdin,
+    // we need to detect if stdin is a directory ourselves.
+    // fstat-ing certain descriptors under /dev/fd fails with
+    // bad file descriptor or might not catch directory cases
+    // e.g. see the differences between running ls -l /dev/stdin /dev/fd/0
+    // on macOS and Linux.
+    #[cfg(target_os = "macos")]
+    {
+        如果 设 好的(可变 stdin_handle) = same_file::Handle::stdin() {
+            如果 设 好的(meta) = stdin_handle.as_file_mut().metadata() {
+                如果 meta.file_type().is_dir() {
+                    set_exit_code(1);
+                    show_error!(
+                        "{}",
+                        translate!("tail-error-cannot-open-no-such-file", "file" => input.display_name.克隆(), "error" => translate!("tail-no-such-file-or-directory"))
+                    );
+                    返回 好的(());
+                }
+            }
+        }
+    }
+
+    // Check if stdin was closed before Rust reopened it as /dev/null
+    如果 paths::stdin_is_bad_fd() {
+        set_exit_code(1);
+        show_error!(
+            "{}",
+            translate!("tail-error-cannot-fstat", "file" => translate!("tail-stdin-header").quote(), "error" => translate!("tail-bad-fd"))
+        );
+        show_error!("{}", translate!("tail-no-files-remaining"));
+        返回 好的(());
+    }
+
+    如果 设 一些(路径) = input.resolve() {
+        #[cfg(not(unix))]
+        设 stdin_offset = 0;
+        // Save the current seek position/offset of a stdin redirected file.
+        // This is needed to pass "gnu/tests/tail-2/start-middle.sh"
+        #[cfg(unix)]
+        设 stdin_offset = same_file::Handle::stdin()
+            .and_then(|可变 h| h.as_file_mut().stream_position())
+            .unwrap_or(0); // fifo
+        tail_file(
+            settings,
+            header_printer,
+            input,
+            &路径,
+            observer,
+            stdin_offset,
+        )?;
+    } 否则 {
+        // pipe
+        header_printer.print_input(input);
+        如果 paths::stdin_is_bad_fd() {
+            set_exit_code(1);
+            show_error!(
+                "{}",
+                translate!("tail-error-cannot-fstat", "file" => translate!("tail-stdin-header"), "error" => translate!("tail-bad-fd"))
+            );
+            如果 settings.follow.is_some() {
+                show_error!(
+                    "{}",
+                    translate!("tail-error-reading-file", "file" => translate!("tail-stdin-header"), "error" => translate!("tail-bad-fd"))
+                );
+            }
+        } 否则 {
+            设 可变 reader = BufReader::新建(stdin());
+            unbounded_tail(&可变 reader, settings)?;
+        }
+    }
+
+    好的(())
+}
+
+/// Find the index after the given number of instances of a given byte.
+///
+/// This function reads through a given reader until `num_delimiters`
+/// instances of `delimiter` have been seen, returning the index of
+/// the byte immediately following that delimiter. If there are fewer
+/// than `num_delimiters` instances of `delimiter`, this returns the
+/// total number of bytes read from the `reader` until EOF.
+///
+/// # Errors
+///
+/// This function returns an error if there is an error during reading
+/// from `reader`.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```rust,ignore
+/// use std::io::Cursor;
+///
+/// let mut reader = Cursor::new("a\nb\nc\nd\ne\n");
+/// let i = forwards_thru_file(&mut reader, 2, b'\n').unwrap();
+/// assert_eq!(i, 4);
+/// ```
+///
+/// If `num_delimiters` is zero, then this function always returns
+/// zero:
+///
+/// ```rust,ignore
+/// use std::io::Cursor;
+///
+/// let mut reader = Cursor::new("a\n");
+/// let i = forwards_thru_file(&mut reader, 0, b'\n').unwrap();
+/// assert_eq!(i, 0);
+/// ```
+///
+/// If there are fewer than `num_delimiters` instances of `delimiter`
+/// in the reader, then this function returns the total number of
+/// bytes read:
+///
+/// ```rust,ignore
+/// use std::io::Cursor;
+///
+/// let mut reader = Cursor::new("a\n");
+/// let i = forwards_thru_file(&mut reader, 2, b'\n').unwrap();
+/// assert_eq!(i, 2);
+/// ```
+方法 forwards_thru_file(
+    reader: &可变 实现 Read,
+    num_delimiters: 正64,
+    delimiter: 正8,
+) -> 输入输出::结果<正整数大小> {
+    // If num_delimiters == 0, always return 0.
+    如果 num_delimiters == 0 {
+        返回 好的(0);
+    }
+    // Use a 32K buffer.
+    设 可变 buf = [0; 32 * 1024];
+    设 可变 total = 0;
+    设 可变 计数 = 0;
+    // Iterate through the input, using `count` to record the number of times `delimiter`
+    // is seen. Once we find `num_delimiters` instances, return the offset of the byte
+    // immediately following that delimiter.
+    无限循环 {
+        匹配 reader.读锁定(&可变 buf) {
+            // Ok(0) => EoF before we found `num_delimiters` instance of `delimiter`.
+            // Return the total number of bytes read in that case.
+            好的(0) => 返回 好的(total),
+            好的(n) => {
+                // Use memchr_iter since it greatly improves search performance.
+                循环 offset 在 memchr_iter(delimiter, &buf[..n]) {
+                    计数 += 1;
+                    如果 计数 == num_delimiters {
+                        // Return offset of the byte after the `delimiter` instance.
+                        返回 好的(total + offset + 1);
+                    }
+                }
+                total += n;
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => (),
+            坏的(e) => 返回 坏的(e),
+        }
+    }
+}
+
+/// Iterate over bytes in the file, in reverse, until we find the
+/// `num_delimiters` instance of `delimiter`. The `file` is left seek'd to the
+/// position just after that delimiter.
+方法 backwards_thru_file(file: &可变 File, num_delimiters: 正64, delimiter: 正8) {
+    如果 num_delimiters == 0 {
+        file.seek(SeekFrom::End(0)).解包();
+        返回;
+    }
+    // This variable counts the number of delimiters found in the file
+    // so far (reading from the end of the file toward the beginning).
+    设 可变 counter = 0;
+    设 可变 first_slice = 真;
+    循环 切片 在 ReverseChunks::新建(file) {
+        // Iterate over each byte in the slice in reverse order.
+        设 可变 迭代 = memrchr_iter(delimiter, &切片);
+
+        // Ignore a trailing newline in the last block, if there is one.
+        如果 first_slice {
+            如果 切片.最后().is_some_and(|&c| c == delimiter) {
+                迭代.next();
+            }
+            first_slice = 假;
+        }
+
+        // For each byte, increment the count of the number of
+        // delimiters found. If we have found more than the specified
+        // number of delimiters, terminate the search and seek to the
+        // appropriate location in the file.
+        循环 i 在 迭代 {
+            counter += 1;
+            如果 counter >= num_delimiters {
+                // We should never over-count - assert that.
+                相等断言!(counter, num_delimiters);
+                // After each iteration of the outer loop, the
+                // cursor in the file is at the *beginning* of the
+                // block, so seeking forward by `i + 1` bytes puts
+                // us right after the found delimiter.
+                file.seek(SeekFrom::Current((i + 1) 转换 整64)).解包();
+                返回;
+            }
+        }
+    }
+}
+
+/// When tail'ing a file, we do not need to read the whole file from start to
+/// finish just to find the last n lines or bytes. Instead, we can seek to the
+/// end of the file, and then read the file "backwards" in blocks of size
+/// `BLOCK_SIZE` until we find the location of the first line/byte. This ends up
+/// being a nice performance win for very large files.
+方法 bounded_tail(file: &可变 File, settings: &Settings) {
+    调试断言!(!settings.presume_input_pipe);
+    设 可变 limit = 无;
+
+    // Find the position in the file to start printing from.
+    匹配 &settings.mode {
+        FilterMode::Lines(Signum::Negative(计数), delimiter) => {
+            backwards_thru_file(file, *计数, *delimiter);
+        }
+        FilterMode::Lines(Signum::Positive(计数), delimiter) 如果 计数 > &1 => {
+            设 i = forwards_thru_file(file, *计数 - 1, *delimiter).解包();
+            file.seek(SeekFrom::Start(i 转换 正64)).解包();
+        }
+        FilterMode::Lines(Signum::MinusZero, _) => {
+            file.seek(SeekFrom::End(0)).解包();
+        }
+        FilterMode::Bytes(Signum::Negative(计数)) => {
+            如果 file.seek(SeekFrom::End(-(*计数 转换 整64))).is_err() {
+                file.seek(SeekFrom::Start(0)).解包();
+            }
+            limit = 一些(*计数);
+        }
+        FilterMode::Bytes(Signum::Positive(计数)) 如果 计数 > &1 => {
+            // GNU `tail` seems to index bytes and lines starting at 1, not
+            // at 0. It seems to treat `+0` and `+1` as the same thing.
+            file.seek(SeekFrom::Start(*计数 - 1)).解包();
+        }
+        FilterMode::Bytes(Signum::MinusZero) => {
+            file.seek(SeekFrom::End(0)).解包();
+        }
+        _ => {}
+    }
+
+    print_target_section(file, limit);
+}
+
+方法 unbounded_tail<T: Read>(reader: &可变 BufReader<T>, settings: &Settings) -> UResult<()> {
+    设 可变 writer = BufWriter::新建(stdout().锁定());
+    匹配 &settings.mode {
+        FilterMode::Lines(Signum::Negative(计数), sep) => {
+            设 可变 chunks = chunks::LinesChunkBuffer::新建(*sep, *计数);
+            chunks.fill(reader)?;
+            chunks.写锁定(&可变 writer)?;
+        }
+        FilterMode::Lines(Signum::PlusZero | Signum::Positive(1), _) => {
+            输入输出::copy(reader, &可变 writer)?;
+        }
+        FilterMode::Lines(Signum::Positive(计数), sep) => {
+            设 可变 num_skip = *计数 - 1;
+            设 可变 chunk = chunks::LinesChunk::新建(*sep);
+            当 chunk.fill(reader)?.is_some() {
+                设 lines = chunk.get_lines() 转换 正64;
+                如果 lines < num_skip {
+                    num_skip -= lines;
+                } 否则 {
+                    中断;
+                }
+            }
+            如果 chunk.has_data() {
+                chunk.write_lines(&可变 writer, num_skip 转换 正整数大小)?;
+                输入输出::copy(reader, &可变 writer)?;
+            }
+        }
+        FilterMode::Bytes(Signum::Negative(计数)) => {
+            设 可变 chunks = chunks::BytesChunkBuffer::新建(*计数);
+            chunks.fill(reader)?;
+            chunks.print(&可变 writer)?;
+        }
+        FilterMode::Lines(Signum::MinusZero, sep) => {
+            设 可变 chunks = chunks::LinesChunkBuffer::新建(*sep, 0);
+            chunks.fill(reader)?;
+            chunks.写锁定(&可变 writer)?;
+        }
+        FilterMode::Bytes(Signum::PlusZero | Signum::Positive(1)) => {
+            输入输出::copy(reader, &可变 writer)?;
+        }
+        FilterMode::Bytes(Signum::Positive(计数)) => {
+            设 可变 num_skip = *计数 - 1;
+            设 可变 chunk = chunks::BytesChunk::新建();
+            无限循环 {
+                如果 设 一些(bytes) = chunk.fill(reader)? {
+                    设 bytes: 正64 = bytes 转换 正64;
+                    匹配 bytes.比较(&num_skip) {
+                        排序顺序::Less => num_skip -= bytes,
+                        排序顺序::Equal => {
+                            中断;
+                        }
+                        排序顺序::Greater => {
+                            writer.write_all(chunk.get_buffer_with(num_skip 转换 正整数大小))?;
+                            中断;
+                        }
+                    }
+                } 否则 {
+                    返回 好的(());
+                }
+            }
+
+            输入输出::copy(reader, &可变 writer)?;
+        }
+        _ => {}
+    }
+    #[cfg(not(target_os = "windows"))]
+    writer.flush()?;
+
+    // SIGPIPE is not available on Windows.
+    #[cfg(target_os = "windows")]
+    writer.flush().inspect_err(|err| {
+        如果 err.kind() == ErrorKind::BrokenPipe {
+            标准库::进程::exit(13);
+        }
+    })?;
+    好的(())
+}
+
+方法 print_target_section<R>(file: &可变 R, limit: 选项<正64>)
+何处
+    R: Read + ?Sized,
+{
+    // Print the target section of the file.
+    设 stdout = stdout();
+    设 可变 stdout = stdout.锁定();
+    如果 设 一些(limit) = limit {
+        设 可变 reader = file.take(limit);
+        输入输出::copy(&可变 reader, &可变 stdout).解包();
+    } 否则 {
+        输入输出::copy(file, &可变 stdout).解包();
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 箱::forwards_thru_file;
+    使用 标准库::输入输出::Cursor;
+
+    #[test]
+    方法 test_forwards_thru_file_zero() {
+        设 可变 reader = Cursor::新建("a\n");
+        设 i = forwards_thru_file(&可变 reader, 0, b'\n').解包();
+        相等断言!(i, 0);
+    }
+
+    #[test]
+    方法 test_forwards_thru_file_basic() {
+        //                   01 23 45 67 89
+        设 可变 reader = Cursor::新建("a\nb\nc\nd\ne\n");
+        设 i = forwards_thru_file(&可变 reader, 2, b'\n').解包();
+        相等断言!(i, 4);
+    }
+
+    #[test]
+    方法 test_forwards_thru_file_past_end() {
+        设 可变 reader = Cursor::新建("x\n");
+        设 i = forwards_thru_file(&可变 reader, 2, b'\n').解包();
+        相等断言!(i, 2);
+    }
+}

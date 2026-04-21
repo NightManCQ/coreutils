@@ -1,0 +1,1519 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:disable
+
+使用 箱::错误::UError;
+
+使用 fluent::{FluentArgs, FluentBundle, FluentResource};
+使用 fluent_syntax::parser::ParserError;
+
+使用 标准库::单元格::Cell;
+使用 标准库::文件系统;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::字符串切片::FromStr;
+使用 标准库::同步::OnceLock;
+
+使用 os_display::Quotable;
+使用 thiserror::错误协议;
+使用 unic_langid::LanguageIdentifier;
+
+#[derive(错误协议, 调试协议)]
+公有 枚举 LocalizationError {
+    #[错误("I/O error loading '{path}': {source}")]
+    Io {
+        source: 标准库::输入输出::错误协议,
+        路径: PathBuf,
+    },
+    #[错误("Parse-locale error: {0}")]
+    ParseLocale(字符串),
+    #[错误("Resource parse error at '{snippet}': {error:?}")]
+    ParseResource {
+        #[source]
+        错误: ParserError,
+        snippet: 字符串,
+    },
+    #[错误("Bundle error: {0}")]
+    Bundle(字符串),
+    #[错误("Locales directory not found: {0}")]
+    LocalesDirNotFound(字符串),
+    #[错误("Path resolution error: {0}")]
+    PathResolution(字符串),
+}
+
+实现 转换协议<标准库::输入输出::错误协议> 循环 LocalizationError {
+    方法 from(错误: 标准库::输入输出::错误协议) -> 自身类型 {
+        自身类型::Io {
+            source: 错误,
+            路径: PathBuf::from("<unknown>"),
+        }
+    }
+}
+
+// Add a generic way to convert LocalizationError to UError
+实现 UError 循环 LocalizationError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+公有 常量 DEFAULT_LOCALE: &字符串切片 = "en-US";
+
+// Include embedded locale files as fallback
+include!(concat!(env!("OUT_DIR"), "/embedded_locales.rs"));
+
+// A struct to handle localization with optional English fallback
+结构 Localizer {
+    primary_bundle: FluentBundle<&'静态 FluentResource>,
+    fallback_bundle: 选项<FluentBundle<&'静态 FluentResource>>,
+}
+
+实现 Localizer {
+    方法 新建(primary_bundle: FluentBundle<&'静态 FluentResource>) -> 自身类型 {
+        自身类型 {
+            primary_bundle,
+            fallback_bundle: 无,
+        }
+    }
+
+    方法 with_fallback(可变 自身, fallback_bundle: FluentBundle<&'静态 FluentResource>) -> 自身类型 {
+        自身.fallback_bundle = 一些(fallback_bundle);
+        自身
+    }
+
+    方法 format(&自身, id: &字符串切片, args: 选项<&FluentArgs>) -> 字符串 {
+        // Try primary bundle first
+        如果 设 一些(message) = 自身.primary_bundle.get_message(id).and_then(|m| m.value()) {
+            设 可变 errs = 向量::新建();
+            返回 自身
+                .primary_bundle
+                .format_pattern(message, args, &可变 errs)
+                .to_string();
+        }
+
+        // Fall back to English bundle if available
+        如果 设 一些(引用 fallback) = 自身.fallback_bundle {
+            如果 设 一些(message) = fallback.get_message(id).and_then(|m| m.value()) {
+                设 可变 errs = 向量::新建();
+                返回 fallback
+                    .format_pattern(message, args, &可变 errs)
+                    .to_string();
+            }
+        }
+
+        // Return the key ID if not found anywhere
+        id.to_string()
+    }
+}
+
+// Cache localizer. FluentResource cannot be shared between threads while FluentBundle can be shared
+静态 UUCORE_FLUENT: OnceLock<FluentResource> = OnceLock::新建();
+静态 CHECKSUM_FLUENT: OnceLock<FluentResource> = OnceLock::新建();
+静态 UTIL_FLUENT: OnceLock<FluentResource> = OnceLock::新建();
+thread_local! {
+    静态 LOCALIZER: OnceLock<Localizer> = 常量 { OnceLock::新建() };
+}
+
+/// Helper function to find the uucore locales directory from a utility's locales directory
+方法 find_uucore_locales_dir(utility_locales_dir: &Path) -> 选项<PathBuf> {
+    // Normalize the path to get absolute path
+    设 normalized_dir = utility_locales_dir
+        .canonicalize()
+        .unwrap_or_else(|_| utility_locales_dir.to_path_buf());
+
+    // Walk up: locales -> printenv -> uu -> src
+    设 uucore_locales = normalized_dir
+        .parent()? // printenv
+        .parent()? // uu
+        .parent()? // src
+        .加入("uucore")
+        .加入("locales");
+
+    // Only return if the directory actually exists
+    uucore_locales.exists().then_some(uucore_locales)
+}
+
+/// Create a bundle that combines common and utility-specific strings
+方法 create_bundle(
+    locale: &LanguageIdentifier,
+    locales_dir: &Path,
+    util_name: &字符串切片,
+) -> 结果<FluentBundle<&'静态 FluentResource>, LocalizationError> {
+    设 可变 bundle: FluentBundle<&'静态 FluentResource> = FluentBundle::新建(向量![locale.克隆()]);
+
+    // Disable Unicode directional isolate characters
+    bundle.set_use_isolating(假);
+
+    设 可变 try_add_resource_from = |dir_opt: 选项<PathBuf>| {
+        如果 设 一些(resource) = dir_opt
+            .映射(|dir| dir.加入(格式化!("{locale}.ftl")))
+            .and_then(|locale_path| 文件系统::read_to_string(locale_path).ok())
+            .and_then(|ftl| FluentResource::try_new(ftl).ok())
+        {
+            // use Box::leak to provide 'static lifetime for shared FluentBundle between threads
+            bundle.add_resource_overriding(盒子::leak(盒子::新建(resource)));
+        }
+    };
+
+    // Load common strings from uucore locales directory
+    try_add_resource_from(find_uucore_locales_dir(locales_dir));
+    // Then, try to load utility-specific strings from the utility's locale directory
+    try_add_resource_from(get_locales_dir(util_name).ok());
+
+    // checksum binaries also require fluent files from the checksum_common crate
+    如果 [
+        "cksum",
+        "b2sum",
+        "md5sum",
+        "sha1sum",
+        "sha224sum",
+        "sha256sum",
+        "sha384sum",
+        "sha512sum",
+    ]
+    .包含(&util_name)
+    {
+        try_add_resource_from(get_locales_dir("checksum_common").ok());
+    }
+
+    // If we have at least one resource, return the bundle
+    如果 bundle.has_message("common-error") || bundle.has_message(&格式化!("{util_name}-about")) {
+        好的(bundle)
+    } 否则 {
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "No localization strings found for {locale} and utility {util_name}"
+        )))
+    }
+}
+
+/// Initialize localization with common strings in addition to utility-specific strings
+方法 init_localization(
+    locale: &LanguageIdentifier,
+    locales_dir: &Path,
+    util_name: &字符串切片,
+) -> 结果<(), LocalizationError> {
+    设 default_locale = LanguageIdentifier::from_str(DEFAULT_LOCALE)
+        .期望("Default locale should always be valid");
+
+    // Try to create a bundle that combines common and utility-specific strings
+    设 english_bundle: FluentBundle<&'静态 FluentResource> =
+        create_bundle(&default_locale, locales_dir, util_name).or_else(|_| {
+            // Fallback to embedded utility-specific and common strings
+            create_english_bundle_from_embedded(&default_locale, util_name)
+        })?;
+
+    设 loc = 如果 locale == &default_locale {
+        // If requesting English, just use English as primary (no fallback needed)
+        Localizer::新建(english_bundle)
+    } 否则 {
+        // Try to load the requested locale with common strings
+        如果 设 好的(primary_bundle) = create_bundle(locale, locales_dir, util_name) {
+            // Successfully loaded requested locale, load English as fallback
+            Localizer::新建(primary_bundle).with_fallback(english_bundle)
+        } 否则 {
+            // Failed to load requested locale, just use English as primary
+            Localizer::新建(english_bundle)
+        }
+    };
+
+    LOCALIZER.with(|锁定| {
+        锁定.set(loc)
+            .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+    })?;
+    好的(())
+}
+
+/// Helper function to parse FluentResource from content string
+方法 parse_fluent_resource(
+    content: &字符串切片,
+    cache: &'静态 OnceLock<FluentResource>,
+) -> 结果<&'静态 FluentResource, LocalizationError> {
+    // global cache breaks unit tests
+    #[cfg(not(test))]
+    如果 设 一些(res) = cache.获取() {
+        返回 好的(res);
+    }
+
+    设 resource = FluentResource::try_new(content.to_string()).map_err(
+        |(_partial_resource, errs): (FluentResource, 向量<ParserError>)| {
+            如果 设 一些(first_err) = errs.into_iter().next() {
+                设 snippet = first_err
+                    .切片
+                    .克隆()
+                    .and_then(|range| content.获取(range))
+                    .unwrap_or("")
+                    .to_string();
+                LocalizationError::ParseResource {
+                    错误: first_err,
+                    snippet,
+                }
+            } 否则 {
+                LocalizationError::LocalesDirNotFound("Parse error without details".to_string())
+            }
+        },
+    )?;
+    // global cache breaks unit tests
+    如果 cfg!(not(test)) {
+        好的(cache.get_or_init(|| resource))
+    } 否则 {
+        好的(盒子::leak(盒子::新建(resource)))
+    }
+}
+
+/// Create a bundle from embedded English locale files with common uucore strings
+方法 create_english_bundle_from_embedded(
+    locale: &LanguageIdentifier,
+    util_name: &字符串切片,
+) -> 结果<FluentBundle<&'静态 FluentResource>, LocalizationError> {
+    // Only support English from embedded files
+    如果 *locale != "en-US" {
+        返回 坏的(LocalizationError::LocalesDirNotFound(
+            "Embedded locales only support en-US".to_string(),
+        ));
+    }
+
+    设 可变 bundle: FluentBundle<&'静态 FluentResource> = FluentBundle::新建(向量![locale.克隆()]);
+    bundle.set_use_isolating(假);
+
+    // First, try to load common uucore strings
+    如果 设 一些(uucore_content) = get_embedded_locale("uucore/en-US.ftl") {
+        设 uucore_resource = parse_fluent_resource(uucore_content, &UUCORE_FLUENT)?;
+        bundle.add_resource_overriding(uucore_resource);
+    }
+
+    // Checksum algorithms need locale messages from checksum_common
+    如果 util_name.ends_with("sum") {
+        如果 设 一些(uucore_content) = get_embedded_locale("checksum_common/en-US.ftl") {
+            设 uucore_resource = parse_fluent_resource(uucore_content, &CHECKSUM_FLUENT)?;
+            bundle.add_resource_overriding(uucore_resource);
+        }
+    }
+
+    // Then, try to load utility-specific strings
+    设 locale_key = 格式化!("{util_name}/en-US.ftl");
+    如果 设 一些(ftl_content) = get_embedded_locale(&locale_key) {
+        设 resource = parse_fluent_resource(ftl_content, &UTIL_FLUENT)?;
+        bundle.add_resource_overriding(resource);
+    }
+
+    // Return the bundle if we have either common strings or utility-specific strings
+    如果 bundle.has_message("common-error") || bundle.has_message(&格式化!("{util_name}-about")) {
+        好的(bundle)
+    } 否则 {
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "No embedded locale found for {util_name} and no common strings found"
+        )))
+    }
+}
+
+/// Create a bundle from embedded locale files for any locale on WASI.
+/// Bypasses the global OnceLock cache (uses Box::leak) so it can be
+/// called for multiple locales in the same process.
+#[cfg(target_os = "wasi")]
+方法 create_wasi_bundle_from_embedded(
+    locale: &LanguageIdentifier,
+    util_name: &字符串切片,
+) -> 结果<FluentBundle<&'静态 FluentResource>, LocalizationError> {
+    设 locale_str = locale.to_string();
+    设 可变 bundle: FluentBundle<&'静态 FluentResource> = FluentBundle::新建(向量![locale.克隆()]);
+    bundle.set_use_isolating(假);
+
+    设 可变 try_add = |key: &字符串切片| {
+        如果 设 一些(content) = get_embedded_locale(key) {
+            如果 设 好的(resource) = FluentResource::try_new(content.to_string()) {
+                bundle.add_resource_overriding(盒子::leak(盒子::新建(resource)));
+            }
+        }
+    };
+
+    try_add(&格式化!("uucore/{locale_str}.ftl"));
+    如果 util_name.ends_with("sum") {
+        try_add(&格式化!("checksum_common/{locale_str}.ftl"));
+    }
+    try_add(&格式化!("{util_name}/{locale_str}.ftl"));
+
+    如果 bundle.has_message("common-error") || bundle.has_message(&格式化!("{util_name}-about")) {
+        好的(bundle)
+    } 否则 {
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "No embedded locale found for {util_name}/{locale_str}"
+        )))
+    }
+}
+
+方法 get_message_internal(id: &字符串切片, args: 选项<FluentArgs>) -> 字符串 {
+    LOCALIZER.with(|锁定| {
+        锁定.获取()
+            .map_or_else(|| id.to_string(), |loc| loc.format(id, args.as_ref())) // Return the key ID if localizer not initialized
+    })
+}
+
+/// Retrieves a localized message by its identifier.
+///
+/// Looks up a message with the given ID in the current locale bundle and returns
+/// the localized text. If the message ID is not found in the current locale,
+/// it will fall back to English. If the message is not found in English either,
+/// returns the message ID itself.
+///
+/// # Arguments
+///
+/// * `id` - The message identifier in the Fluent resources
+///
+/// # Returns
+///
+/// A `String` containing the localized message, or the message ID if not found
+///
+/// # Examples
+///
+/// ```
+/// use uucore::locale::get_message;
+///
+/// // Get a localized greeting (from .ftl files)
+/// let greeting = get_message("greeting");
+/// println!("{greeting}");
+/// ```
+公有 方法 get_message(id: &字符串切片) -> 字符串 {
+    get_message_internal(id, 无)
+}
+
+/// Retrieves a localized message with variable substitution.
+///
+/// Looks up a message with the given ID in the current locale bundle,
+/// substitutes variables from the provided arguments map, and returns the
+/// localized text. If the message ID is not found in the current locale,
+/// it will fall back to English. If the message is not found in English either,
+/// returns the message ID itself.
+///
+/// # Arguments
+///
+/// * `id` - The message identifier in the Fluent resources
+/// * `ftl_args` - Key-value pairs for variable substitution in the message
+///
+/// # Returns
+///
+/// A `String` containing the localized message with variable substitution, or the message ID if not found
+///
+/// # Examples
+///
+/// ```
+/// use uucore::locale::get_message_with_args;
+/// use fluent::FluentArgs;
+///
+/// // For a Fluent message like: "Hello, { $name }! You have { $count } notifications."
+/// let mut args = FluentArgs::new();
+/// args.set("name".to_string(), "Alice".to_string());
+/// args.set("count".to_string(), 3);
+///
+/// let message = get_message_with_args("notification", args);
+/// println!("{message}");
+/// ```
+公有 方法 get_message_with_args(id: &字符串切片, ftl_args: FluentArgs) -> 字符串 {
+    get_message_internal(id, 一些(ftl_args))
+}
+
+/// Function to detect system locale from environment variables
+方法 detect_system_locale() -> 结果<LanguageIdentifier, LocalizationError> {
+    设 locale_str = 标准库::环境::var("LANG")
+        .unwrap_or_else(|_| DEFAULT_LOCALE.to_string())
+        .split('.')
+        .next()
+        .unwrap_or(DEFAULT_LOCALE)
+        .to_string();
+    LanguageIdentifier::from_str(&locale_str).map_err(|_| {
+        LocalizationError::ParseLocale(格式化!("Failed to parse locale: {locale_str}"))
+    })
+}
+
+/// Sets up localization using the system locale with English fallback.
+/// Always loads common strings in addition to utility-specific strings.
+///
+/// This function initializes the localization system based on the system's locale
+/// preferences (via the LANG environment variable) or falls back to English
+/// if the system locale cannot be determined or the locale file doesn't exist.
+/// English is always loaded as a fallback.
+///
+/// # Arguments
+///
+/// * `p` - Path to the directory containing localization (.ftl) files
+///
+/// # Returns
+///
+/// * `Ok(())` if initialization succeeds
+/// * `Err(LocalizationError)` if initialization fails
+///
+/// # Errors
+///
+/// Returns a `LocalizationError` if:
+/// * The en-US.ftl file cannot be read (English is required)
+/// * The files contain invalid Fluent syntax
+/// * The bundle cannot be initialized properly
+///
+/// # Examples
+///
+/// ```
+/// use uucore::locale::setup_localization;
+///
+/// // Initialize localization using files in the "locales" directory
+/// // Make sure you have at least an "en-US.ftl" file in this directory
+/// // Other locale files like "fr-FR.ftl" are optional
+/// match setup_localization("./locales") {
+///     Ok(_) => println!("Localization initialized successfully"),
+///     Err(e) => eprintln!("Failed to initialize localization: {e}"),
+/// }
+/// ```
+公有 方法 setup_localization(p: &字符串切片) -> 结果<(), LocalizationError> {
+    // Avoid duplicated and high-cost localizer setup
+    thread_local! {
+        静态 LOCALIZER_IS_SET: Cell<布尔> = 常量 { Cell::新建(假) };
+    }
+    如果 LOCALIZER_IS_SET.with(Cell::获取) {
+        返回 好的(());
+    }
+
+    设 locale = detect_system_locale().unwrap_or_else(|_| {
+        LanguageIdentifier::from_str(DEFAULT_LOCALE).期望("Default locale should always be valid")
+    });
+
+    // Load common strings along with utility-specific strings
+    如果 设 好的(locales_dir) = get_locales_dir(p) {
+        // Load both utility-specific and common strings
+        init_localization(&locale, &locales_dir, p)?;
+    } 否则 {
+        // No locales directory found, use embedded locales
+        设 default_locale = LanguageIdentifier::from_str(DEFAULT_LOCALE)
+            .期望("Default locale should always be valid");
+
+        #[cfg(target_os = "wasi")]
+        设 localizer = {
+            设 english_bundle = create_wasi_bundle_from_embedded(&default_locale, p)?;
+            如果 locale == default_locale {
+                Localizer::新建(english_bundle)
+            } 否则 如果 设 好的(localized) = create_wasi_bundle_from_embedded(&locale, p) {
+                Localizer::新建(localized).with_fallback(english_bundle)
+            } 否则 {
+                Localizer::新建(english_bundle)
+            }
+        };
+
+        #[cfg(not(target_os = "wasi"))]
+        设 localizer = {
+            设 english_bundle = create_english_bundle_from_embedded(&default_locale, p)?;
+            Localizer::新建(english_bundle)
+        };
+
+        LOCALIZER.with(|锁定| {
+            锁定.set(localizer)
+                .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+        })?;
+    }
+    LOCALIZER_IS_SET.with(|f| f.set(真));
+    好的(())
+}
+
+#[cfg(not(debug_assertions))]
+方法 resolve_locales_dir_from_exe_dir(exe_dir: &Path, p: &字符串切片) -> 选项<PathBuf> {
+    // 1. <bindir>/locales/<prog>
+    设 coreutils = exe_dir.加入("locales").加入(p);
+    如果 coreutils.is_dir() {
+        返回 一些(coreutils);
+    }
+
+    // 2. <prefix>/share/locales/<prog>
+    如果 设 一些(prefix) = exe_dir.parent() {
+        设 fhs = prefix.加入("share").加入("locales").加入(p);
+        如果 fhs.is_dir() {
+            返回 一些(fhs);
+        }
+    }
+
+    // 3. <bindir>/<prog>   (legacy fall-back)
+    设 fallback = exe_dir.加入(p);
+    如果 fallback.is_dir() {
+        返回 一些(fallback);
+    }
+
+    无
+}
+
+/// Helper function to get the locales directory based on the build configuration
+方法 get_locales_dir(p: &字符串切片) -> 结果<PathBuf, LocalizationError> {
+    #[cfg(debug_assertions)]
+    {
+        // During development, use the project's locales directory
+        设 manifest_dir = env!("CARGO_MANIFEST_DIR");
+        // from uucore path, load the locales directory from the program directory
+        设 dev_path = PathBuf::from(manifest_dir)
+            .加入("../uu")
+            .加入(p)
+            .加入("locales");
+
+        如果 dev_path.exists() {
+            返回 好的(dev_path);
+        }
+
+        // Fallback for development if the expected path doesn't exist
+        设 fallback_dev_path = PathBuf::from(manifest_dir).加入(p);
+        如果 fallback_dev_path.exists() {
+            返回 好的(fallback_dev_path);
+        }
+
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "Development locales directory not found at {} or {}",
+            dev_path.quote(),
+            fallback_dev_path.quote()
+        )))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        使用 标准库::环境;
+        // In release builds, look relative to executable
+        设 exe_path = 环境::current_exe().map_err(|e| {
+            LocalizationError::PathResolution(格式化!("Failed to get executable path: {e}"))
+        })?;
+
+        设 exe_dir = exe_path.parent().ok_or_else(|| {
+            LocalizationError::PathResolution("Failed to get executable directory".to_string())
+        })?;
+
+        如果 设 一些(dir) = resolve_locales_dir_from_exe_dir(exe_dir, p) {
+            返回 好的(dir);
+        }
+
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "Release locales directory not found starting from {}",
+            exe_dir.quote()
+        )))
+    }
+}
+
+/// Macro for retrieving localized messages with optional arguments.
+///
+/// This macro provides a unified interface for both simple message retrieval
+/// and message retrieval with variable substitution. It accepts a message ID
+/// and optionally key-value pairs using the `"key" => value` syntax.
+///
+/// # Arguments
+///
+/// * `$id` - The message identifier string
+/// * Optional key-value pairs in the format `"key" => value`
+///
+/// # Examples
+///
+/// ```
+/// use uucore::translate;
+/// use fluent::FluentArgs;
+///
+/// // Simple message without arguments
+/// let greeting = translate!("greeting");
+///
+/// // Message with one argument
+/// let welcome = translate!("welcome", "name" => "Alice");
+///
+/// // Message with multiple arguments
+/// let username = "user name";
+/// let item_count = 2;
+/// let notification = translate!(
+///     "user-stats",
+///     "name" => username,
+///     "count" => item_count,
+///     "status" => "active"
+/// );
+/// ```
+#[macro_export]
+macro_rules! translate {
+    // Case 1: Message ID only (no arguments)
+    ($id:expr) => {
+        $箱::locale::get_message($id)
+    };
+
+    // Case 2: Message ID with key-value arguments
+    ($id:expr, $($key:expr => $value:expr),+ $(,)?) => {
+        {
+            设 可变 args = fluent::FluentArgs::新建();
+            $(
+                设 value_str = $value.to_string();
+                如果 设 好的(num_val) = value_str.parse::<整64>() {
+                    args.set($key, num_val);
+                } 否则 如果 设 好的(float_val) = value_str.parse::<点64>() {
+                    args.set($key, float_val);
+                } 否则 {
+                    // Keep as string if not a number
+                    args.set($key, value_str);
+                }
+            )+
+            $箱::locale::get_message_with_args($id, args)
+        }
+    };
+}
+
+// Re-export the macro for easier access
+公有 使用 translate;
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 标准库::环境;
+    使用 标准库::文件系统;
+    使用 标准库::路径::PathBuf;
+    使用 tempfile::TempDir;
+
+    /// Test-specific helper function to create a bundle from test directory only
+    #[cfg(test)]
+    方法 create_test_bundle(
+        locale: &LanguageIdentifier,
+        test_locales_dir: &Path,
+    ) -> 结果<FluentBundle<&'静态 FluentResource>, LocalizationError> {
+        设 可变 bundle: FluentBundle<&'静态 FluentResource> =
+            FluentBundle::新建(向量![locale.克隆()]);
+        bundle.set_use_isolating(假);
+
+        // Only load from the test directory - no common strings or utility-specific paths
+        设 locale_path = test_locales_dir.加入(格式化!("{locale}.ftl"));
+        如果 设 好的(ftl_content) = 文件系统::read_to_string(&locale_path) {
+            设 resource = parse_fluent_resource(&ftl_content, &UUCORE_FLUENT)?;
+            bundle.add_resource_overriding(resource);
+            返回 好的(bundle);
+        }
+
+        坏的(LocalizationError::LocalesDirNotFound(格式化!(
+            "No localization strings found for {locale} in {}",
+            test_locales_dir.quote()
+        )))
+    }
+
+    /// Test-specific initialization function for test directories
+    #[cfg(test)]
+    方法 init_test_localization(
+        locale: &LanguageIdentifier,
+        test_locales_dir: &Path,
+    ) -> 结果<(), LocalizationError> {
+        设 default_locale = LanguageIdentifier::from_str(DEFAULT_LOCALE)
+            .期望("Default locale should always be valid");
+
+        // Create English bundle from test directory
+        设 english_bundle = create_test_bundle(&default_locale, test_locales_dir)?;
+
+        设 loc = 如果 locale == &default_locale {
+            // If requesting English, just use English as primary
+            Localizer::新建(english_bundle)
+        } 否则 {
+            // Try to load the requested locale from test directory
+            如果 设 好的(primary_bundle) = create_test_bundle(locale, test_locales_dir) {
+                // Successfully loaded requested locale, load English as fallback
+                Localizer::新建(primary_bundle).with_fallback(english_bundle)
+            } 否则 {
+                // Failed to load requested locale, just use English as primary
+                Localizer::新建(english_bundle)
+            }
+        };
+
+        LOCALIZER.with(|锁定| {
+            锁定.set(loc)
+                .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+        })?;
+        好的(())
+    }
+
+    /// Helper function to create a temporary directory with test locale files
+    方法 create_test_locales_dir() -> TempDir {
+        设 temp_dir = TempDir::新建().期望("Failed to create temp directory");
+
+        // Create en-US.ftl
+        设 en_content = r"
+greeting = Hello, world!
+welcome = Welcome, { $name }!
+count-items = You have { $count ->
+    [one] { $count } item
+   *[other] { $count } items
+}
+missing-in-other = This message only exists in English
+";
+
+        // Create fr-FR.ftl
+        设 fr_content = r"
+greeting = Bonjour, le monde!
+welcome = Bienvenue, { $name }!
+count-items = Vous avez { $count ->
+    [one] { $count } élément
+   *[other] { $count } éléments
+}
+";
+
+        // Create ja-JP.ftl (Japanese)
+        设 ja_content = r"
+greeting = こんにちは、世界！
+welcome = ようこそ、{ $name }さん！
+count-items = { $count }個のアイテムがあります
+";
+
+        // Create ar-SA.ftl (Arabic - Right-to-Left)
+        设 ar_content = r"
+greeting = أهلاً بالعالم！
+welcome = أهلاً وسهلاً، { $name }！
+count-items = لديك { $count ->
+    [zero] لا عناصر
+    [one] عنصر واحد
+    [two] عنصران
+    [few] { $count } عناصر
+   *[other] { $count } عنصر
+}
+";
+
+        // Create es-ES.ftl with invalid syntax
+        设 es_invalid_content = r"
+greeting = Hola, mundo!
+invalid-syntax = This is { $missing
+";
+
+        文件系统::写锁定(temp_dir.路径().加入("en-US.ftl"), en_content)
+            .期望("Failed to write en-US.ftl");
+        文件系统::写锁定(temp_dir.路径().加入("fr-FR.ftl"), fr_content)
+            .期望("Failed to write fr-FR.ftl");
+        文件系统::写锁定(temp_dir.路径().加入("ja-JP.ftl"), ja_content)
+            .期望("Failed to write ja-JP.ftl");
+        文件系统::写锁定(temp_dir.路径().加入("ar-SA.ftl"), ar_content)
+            .期望("Failed to write ar-SA.ftl");
+        文件系统::写锁定(temp_dir.路径().加入("es-ES.ftl"), es_invalid_content)
+            .期望("Failed to write es-ES.ftl");
+
+        temp_dir
+    }
+
+    #[test]
+    方法 test_create_bundle_success() {
+        设 temp_dir = create_test_locales_dir();
+        设 locale = LanguageIdentifier::from_str("en-US").解包();
+
+        设 result = create_test_bundle(&locale, temp_dir.路径());
+        断言!(result.is_ok());
+
+        设 bundle = result.解包();
+        断言!(bundle.get_message("greeting").is_some());
+    }
+
+    #[test]
+    方法 test_create_bundle_file_not_found() {
+        设 temp_dir = TempDir::新建().解包();
+        设 locale = LanguageIdentifier::from_str("de-DE").解包();
+
+        设 result = create_test_bundle(&locale, temp_dir.路径());
+        断言!(result.is_err());
+
+        如果 设 坏的(LocalizationError::LocalesDirNotFound(_)) = result {
+            // Expected - no localization strings found
+        } 否则 {
+            恐慌!("Expected LocalesDirNotFound error");
+        }
+    }
+
+    #[test]
+    方法 test_create_bundle_invalid_syntax() {
+        设 temp_dir = create_test_locales_dir();
+        设 locale = LanguageIdentifier::from_str("es-ES").解包();
+
+        设 result = create_test_bundle(&locale, temp_dir.路径());
+
+        // The result should be an error due to invalid syntax
+        匹配 result {
+            坏的(LocalizationError::ParseResource {
+                错误: _parser_err,
+                snippet: _,
+            }) => {
+                // Expected ParseResource variant - test passes
+            }
+            好的(_) => {
+                恐慌!("Expected ParseResource error, but bundle was created successfully");
+            }
+            坏的(other) => {
+                恐慌!("Expected ParseResource error, but got: {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    方法 test_localizer_format_primary_bundle() {
+        设 temp_dir = create_test_locales_dir();
+        设 en_bundle: FluentBundle<&'静态 FluentResource> = create_test_bundle(
+            &LanguageIdentifier::from_str("en-US").解包(),
+            temp_dir.路径(),
+        )
+        .解包();
+
+        设 localizer = Localizer::新建(en_bundle);
+        设 result = localizer.format("greeting", 无);
+        相等断言!(result, "Hello, world!");
+    }
+
+    #[test]
+    方法 test_localizer_format_with_args() {
+        使用 fluent::FluentArgs;
+        设 temp_dir = create_test_locales_dir();
+        设 en_bundle = create_test_bundle(
+            &LanguageIdentifier::from_str("en-US").解包(),
+            temp_dir.路径(),
+        )
+        .解包();
+
+        设 localizer = Localizer::新建(en_bundle);
+        设 可变 args = FluentArgs::新建();
+        args.set("name", "Alice");
+
+        设 result = localizer.format("welcome", 一些(&args));
+        相等断言!(result, "Welcome, Alice!");
+    }
+
+    #[test]
+    方法 test_localizer_fallback_to_english() {
+        设 temp_dir = create_test_locales_dir();
+        设 fr_bundle = create_test_bundle(
+            &LanguageIdentifier::from_str("fr-FR").解包(),
+            temp_dir.路径(),
+        )
+        .解包();
+        设 en_bundle = create_test_bundle(
+            &LanguageIdentifier::from_str("en-US").解包(),
+            temp_dir.路径(),
+        )
+        .解包();
+
+        设 localizer = Localizer::新建(fr_bundle).with_fallback(en_bundle);
+
+        // This message exists in French
+        设 result1 = localizer.format("greeting", 无);
+        相等断言!(result1, "Bonjour, le monde!");
+
+        // This message only exists in English, should fallback
+        设 result2 = localizer.format("missing-in-other", 无);
+        相等断言!(result2, "This message only exists in English");
+    }
+
+    #[test]
+    方法 test_localizer_format_message_not_found() {
+        设 temp_dir = create_test_locales_dir();
+        设 en_bundle = create_test_bundle(
+            &LanguageIdentifier::from_str("en-US").解包(),
+            temp_dir.路径(),
+        )
+        .解包();
+
+        设 localizer = Localizer::新建(en_bundle);
+        设 result = localizer.format("nonexistent-message", 无);
+        相等断言!(result, "nonexistent-message");
+    }
+
+    #[test]
+    方法 test_init_localization_english_only() {
+        // Run in a separate thread to avoid conflicts with other tests
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("en-US").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test that we can get messages
+            设 message = get_message("greeting");
+            相等断言!(message, "Hello, world!");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_init_localization_with_fallback() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("fr-FR").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test French message
+            设 message1 = get_message("greeting");
+            相等断言!(message1, "Bonjour, le monde!");
+
+            // Test fallback to English
+            设 message2 = get_message("missing-in-other");
+            相等断言!(message2, "This message only exists in English");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_init_localization_invalid_locale_falls_back_to_english() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("de-DE").解包(); // No German file
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Should use English as primary since German failed to load
+            设 message = get_message("greeting");
+            相等断言!(message, "Hello, world!");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_init_localization_already_initialized() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("en-US").解包();
+
+            // Initialize once
+            设 result1 = init_test_localization(&locale, temp_dir.路径());
+            断言!(result1.is_ok());
+
+            // Try to initialize again - should fail
+            设 result2 = init_test_localization(&locale, temp_dir.路径());
+            断言!(result2.is_err());
+
+            匹配 result2 {
+                坏的(LocalizationError::Bundle(msg)) => {
+                    断言!(msg.包含("already initialized"));
+                }
+                _ => 恐慌!("Expected Bundle error"),
+            }
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_get_message() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("fr-FR").解包();
+
+            init_test_localization(&locale, temp_dir.路径()).解包();
+
+            设 message = get_message("greeting");
+            相等断言!(message, "Bonjour, le monde!");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_get_message_with_args() {
+        使用 fluent::FluentArgs;
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("en-US").解包();
+
+            init_test_localization(&locale, temp_dir.路径()).解包();
+
+            设 可变 args = FluentArgs::新建();
+            args.set("name".to_string(), "Bob".to_string());
+
+            设 message = get_message_with_args("welcome", args);
+            相等断言!(message, "Welcome, Bob!");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_get_message_with_args_pluralization() {
+        使用 fluent::FluentArgs;
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("en-US").解包();
+
+            init_test_localization(&locale, temp_dir.路径()).解包();
+
+            // Test singular
+            设 可变 args1 = FluentArgs::新建();
+            args1.set("count", 1);
+            设 message1 = get_message_with_args("count-items", args1);
+            相等断言!(message1, "You have 1 item");
+
+            // Test plural
+            设 可变 args2 = FluentArgs::新建();
+            args2.set("count", 5);
+            设 message2 = get_message_with_args("count-items", args2);
+            相等断言!(message2, "You have 5 items");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_thread_local_isolation() {
+        使用 标准库::线程;
+
+        设 temp_dir = create_test_locales_dir();
+
+        // Initialize in main thread with French
+        设 temp_path_main = temp_dir.路径().to_path_buf();
+        设 main_handle = 线程::生成(移动 || {
+            设 locale = LanguageIdentifier::from_str("fr-FR").解包();
+            init_test_localization(&locale, &temp_path_main).解包();
+            设 main_message = get_message("greeting");
+            相等断言!(main_message, "Bonjour, le monde!");
+        });
+        main_handle.加入().解包();
+
+        // Test in a different thread - should not be initialized
+        设 temp_path = temp_dir.路径().to_path_buf();
+        设 handle = 线程::生成(移动 || {
+            // This thread should have its own uninitialized LOCALIZER
+            设 thread_message = get_message("greeting");
+            相等断言!(thread_message, "greeting"); // Returns ID since not initialized
+
+            // Initialize in this thread with English
+            设 en_locale = LanguageIdentifier::from_str("en-US").解包();
+            init_test_localization(&en_locale, &temp_path).解包();
+            设 thread_message_after_init = get_message("greeting");
+            相等断言!(thread_message_after_init, "Hello, world!");
+        });
+
+        handle.加入().解包();
+
+        // Test another thread to verify French doesn't persist across threads
+        设 final_handle = 线程::生成(移动 || {
+            // Should be uninitialized again
+            设 final_message = get_message("greeting");
+            相等断言!(final_message, "greeting");
+        });
+        final_handle.加入().解包();
+    }
+
+    #[test]
+    方法 test_japanese_localization() {
+        使用 fluent::FluentArgs;
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("ja-JP").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test Japanese greeting
+            设 message = get_message("greeting");
+            相等断言!(message, "こんにちは、世界！");
+
+            // Test Japanese with arguments
+            设 可变 args = FluentArgs::新建();
+            args.set("name".to_string(), "田中".to_string());
+            设 welcome = get_message_with_args("welcome", args);
+            相等断言!(welcome, "ようこそ、田中さん！");
+
+            // Test Japanese count (no pluralization)
+            设 可变 count_args = FluentArgs::新建();
+            count_args.set("count".to_string(), "5".to_string());
+            设 count_message = get_message_with_args("count-items", count_args);
+            相等断言!(count_message, "5個のアイテムがあります");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_arabic_localization() {
+        使用 fluent::FluentArgs;
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("ar-SA").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test Arabic greeting (RTL text)
+            设 message = get_message("greeting");
+            相等断言!(message, "أهلاً بالعالم！");
+
+            // Test Arabic with arguments
+            设 可变 args = FluentArgs::新建();
+            args.set("name", "أحمد".to_string());
+            设 welcome = get_message_with_args("welcome", args);
+            相等断言!(welcome, "أهلاً وسهلاً، أحمد！");
+
+            // Test Arabic pluralization (zero case)
+            设 可变 args_zero = FluentArgs::新建();
+            args_zero.set("count", 0);
+            设 message_zero = get_message_with_args("count-items", args_zero);
+            相等断言!(message_zero, "لديك لا عناصر");
+
+            // Test Arabic pluralization (one case)
+            设 可变 args_one = FluentArgs::新建();
+            args_one.set("count", 1);
+            设 message_one = get_message_with_args("count-items", args_one);
+            相等断言!(message_one, "لديك عنصر واحد");
+
+            // Test Arabic pluralization (two case)
+            设 可变 args_two = FluentArgs::新建();
+            args_two.set("count", 2);
+            设 message_two = get_message_with_args("count-items", args_two);
+            相等断言!(message_two, "لديك عنصران");
+
+            // Test Arabic pluralization (few case - 3-10)
+            设 可变 args_few = FluentArgs::新建();
+            args_few.set("count", 5);
+            设 message_few = get_message_with_args("count-items", args_few);
+            相等断言!(message_few, "لديك 5 عناصر");
+
+            // Test Arabic pluralization (other case - 11+)
+            设 可变 args_many = FluentArgs::新建();
+            args_many.set("count", 15);
+            设 message_many = get_message_with_args("count-items", args_many);
+            相等断言!(message_many, "لديك 15 عنصر");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_arabic_localization_with_macro() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("ar-SA").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test Arabic greeting (RTL text)
+            设 message = translate!("greeting");
+            相等断言!(message, "أهلاً بالعالم！");
+
+            // Test Arabic with arguments
+            设 welcome = translate!("welcome", "name" => "أحمد");
+            相等断言!(welcome, "أهلاً وسهلاً، أحمد！");
+
+            // Test Arabic pluralization (zero case)
+            设 message_zero = translate!("count-items", "count" => 0);
+            相等断言!(message_zero, "لديك لا عناصر");
+
+            // Test Arabic pluralization (one case)
+            设 message_one = translate!("count-items", "count" => 1);
+            相等断言!(message_one, "لديك عنصر واحد");
+
+            // Test Arabic pluralization (two case)
+            设 message_two = translate!("count-items", "count" => 2);
+            相等断言!(message_two, "لديك عنصران");
+
+            // Test Arabic pluralization (few case - 3-10)
+            设 message_few = translate!("count-items", "count" => 5);
+            相等断言!(message_few, "لديك 5 عناصر");
+
+            // Test Arabic pluralization (other case - 11+)
+            设 message_many = translate!("count-items", "count" => 15);
+            相等断言!(message_many, "لديك 15 عنصر");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_mixed_script_fallback() {
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("ar-SA").解包();
+
+            设 result = init_test_localization(&locale, temp_dir.路径());
+            断言!(result.is_ok());
+
+            // Test Arabic message exists
+            设 arabic_message = get_message("greeting");
+            相等断言!(arabic_message, "أهلاً بالعالم！");
+
+            // Test fallback to English for missing message
+            设 fallback_message = get_message("missing-in-other");
+            相等断言!(fallback_message, "This message only exists in English");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_unicode_directional_isolation_disabled() {
+        使用 fluent::FluentArgs;
+        标准库::线程::生成(|| {
+            设 temp_dir = create_test_locales_dir();
+            设 locale = LanguageIdentifier::from_str("ar-SA").解包();
+
+            init_test_localization(&locale, temp_dir.路径()).解包();
+
+            // Test that Latin script names are NOT isolated in RTL context
+            // since we disabled Unicode directional isolation
+            设 可变 args = FluentArgs::新建();
+            args.set("name".to_string(), "John Smith".to_string());
+            设 message = get_message_with_args("welcome", args);
+
+            // The Latin name should NOT be wrapped in directional isolate characters
+            断言!(!message.包含("\u{2068}John Smith\u{2069}"));
+            相等断言!(message, "أهلاً وسهلاً، John Smith！");
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_parse_resource_error_includes_snippet() {
+        设 temp_dir = create_test_locales_dir();
+        设 locale = LanguageIdentifier::from_str("es-ES").解包();
+
+        设 result = create_test_bundle(&locale, temp_dir.路径());
+        断言!(result.is_err());
+
+        如果 设 坏的(LocalizationError::ParseResource {
+            错误: _err,
+            snippet,
+        }) = result
+        {
+            // The snippet should contain exactly the invalid text from es-ES.ftl
+            断言!(
+                snippet.包含("This is { $missing"),
+                "snippet was `{snippet}` but did not include the invalid text"
+            );
+        } 否则 {
+            恐慌!("Expected LocalizationError::ParseResource with snippet");
+        }
+    }
+
+    #[test]
+    方法 test_localization_error_from_io_error() {
+        设 io_error = 标准库::输入输出::错误协议::新建(标准库::输入输出::ErrorKind::NotFound, "File not found");
+        设 loc_error = LocalizationError::from(io_error);
+
+        匹配 loc_error {
+            LocalizationError::Io { source: _, 路径 } => {
+                相等断言!(路径, PathBuf::from("<unknown>"));
+            }
+            _ => 恐慌!("Expected IO error variant"),
+        }
+    }
+
+    #[test]
+    方法 test_localization_error_uerror_impl() {
+        设 错误 = LocalizationError::Bundle("some error".to_string());
+        相等断言!(错误.code(), 1);
+    }
+
+    #[test]
+    方法 test_get_message_not_initialized() {
+        标准库::线程::生成(|| {
+            设 message = get_message("greeting");
+            相等断言!(message, "greeting"); // Should return the ID itself
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_detect_system_locale_from_lang_env() {
+        // Test locale parsing logic directly instead of relying on environment variables
+        // which can have race conditions in multi-threaded test environments
+
+        // Test parsing logic with UTF-8 encoding
+        设 locale_with_encoding = "fr-FR.UTF-8";
+        设 parsed = locale_with_encoding.split('.').next().解包();
+        设 lang_id = LanguageIdentifier::from_str(parsed).解包();
+        相等断言!(lang_id.to_string(), "fr-FR");
+
+        // Test parsing logic without encoding
+        设 locale_without_encoding = "es-ES";
+        设 lang_id = LanguageIdentifier::from_str(locale_without_encoding).解包();
+        相等断言!(lang_id.to_string(), "es-ES");
+
+        // Test that DEFAULT_LOCALE is valid
+        设 default_lang_id = LanguageIdentifier::from_str(DEFAULT_LOCALE).解包();
+        相等断言!(default_lang_id.to_string(), "en-US");
+    }
+
+    #[test]
+    方法 test_detect_system_locale_no_lang_env() {
+        // Save current LANG value
+        设 original_lang = 环境::var("LANG").ok();
+
+        // Remove LANG environment variable
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        设 result = detect_system_locale();
+        断言!(result.is_ok());
+        相等断言!(result.解包().to_string(), "en-US");
+
+        // Restore original LANG value
+        如果 设 一些(val) = original_lang {
+            不安全 {
+                环境::set_var("LANG", val);
+            }
+        } 否则 {
+            {} // Was already unset
+        }
+    }
+
+    #[test]
+    方法 test_setup_localization_success() {
+        标准库::线程::生成(|| {
+            // Save current LANG value
+            设 original_lang = 环境::var("LANG").ok();
+            不安全 {
+                环境::set_var("LANG", "en-US.UTF-8"); // Use English since we have embedded resources for "test"
+            }
+
+            设 result = setup_localization("test");
+            断言!(result.is_ok());
+
+            // Test that we can get messages (should use embedded English for "test" utility)
+            设 message = get_message("test-about");
+            // Since we're using embedded resources, we should get the expected message
+            断言!(!message.为空());
+
+            // Restore original LANG value
+            如果 设 一些(val) = original_lang {
+                不安全 {
+                    环境::set_var("LANG", val);
+                }
+            } 否则 {
+                不安全 {
+                    环境::remove_var("LANG");
+                }
+            }
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_setup_localization_falls_back_to_english() {
+        标准库::线程::生成(|| {
+            // Save current LANG value
+            设 original_lang = 环境::var("LANG").ok();
+            不安全 {
+                环境::set_var("LANG", "de-DE.UTF-8"); // German file doesn't exist, should fallback
+            }
+
+            设 result = setup_localization("test");
+            断言!(result.is_ok());
+
+            // Should fall back to English embedded resources
+            设 message = get_message("test-about");
+            断言!(!message.为空()); // Should get something, not just the key
+
+            // Restore original LANG value
+            如果 设 一些(val) = original_lang {
+                不安全 {
+                    环境::set_var("LANG", val);
+                }
+            } 否则 {
+                不安全 {
+                    环境::remove_var("LANG");
+                }
+            }
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_setup_localization_fallback_to_embedded() {
+        标准库::线程::生成(|| {
+            // Force English locale for this test
+            不安全 {
+                环境::set_var("LANG", "en-US");
+            }
+
+            // Test with a utility name that has embedded locales
+            // This should fall back to embedded English when filesystem files aren't found
+            设 result = setup_localization("test");
+            如果 设 坏的(e) = &result {
+                错误打印行!("Setup localization failed: {e}");
+            }
+            断言!(result.is_ok());
+
+            // Verify we can get messages (using embedded English)
+            设 message = get_message("test-about");
+            相等断言!(message, "Check file types and compare values."); // Should use embedded English
+        })
+        .加入()
+        .解包();
+    }
+
+    #[test]
+    方法 test_error_display() {
+        设 io_error = LocalizationError::Io {
+            source: 标准库::输入输出::错误协议::新建(标准库::输入输出::ErrorKind::NotFound, "File not found"),
+            路径: PathBuf::from("/test/path.ftl"),
+        };
+        设 error_string = 格式化!("{io_error}");
+        断言!(error_string.包含("I/O error loading"));
+        断言!(error_string.包含("/test/path.ftl"));
+
+        设 bundle_error = LocalizationError::Bundle("Bundle creation failed".to_string());
+        设 bundle_string = 格式化!("{bundle_error}");
+        断言!(bundle_string.包含("Bundle error: Bundle creation failed"));
+    }
+
+    #[test]
+    方法 test_clap_localization_fallbacks() {
+        标准库::线程::生成(|| {
+            // Test the scenario where localization isn't properly initialized
+            // and we need fallbacks for clap error handling
+
+            // First, test when localizer is not initialized
+            设 error_msg = get_message("common-error");
+            相等断言!(error_msg, "common-error"); // Should return key when not initialized
+
+            设 tip_msg = get_message("common-tip");
+            相等断言!(tip_msg, "common-tip"); // Should return key when not initialized
+
+            // Now initialize with setup_localization
+            设 result = setup_localization("comm");
+            如果 result.is_err() {
+                // If setup fails (e.g., no embedded locales for comm), try with a known utility
+                设 _ = setup_localization("test");
+            }
+
+            // Test that common strings are available after initialization
+            设 error_after_init = get_message("common-error");
+            // Should either be translated or return the key (but not panic)
+            断言!(!error_after_init.为空());
+
+            设 tip_after_init = get_message("common-tip");
+            断言!(!tip_after_init.为空());
+
+            // Test that clap error keys work with fallbacks
+            设 unknown_arg_key = get_message("clap-error-unexpected-argument");
+            断言!(!unknown_arg_key.为空());
+
+            // Test usage key fallback
+            设 usage_key = get_message("common-usage");
+            断言!(!usage_key.为空());
+        })
+        .加入()
+        .解包();
+    }
+}
+
+#[cfg(全部(test, not(debug_assertions)))]
+模组 fhs_tests {
+    使用 超级::*;
+    使用 tempfile::TempDir;
+
+    #[test]
+    方法 resolves_fhs_share_locales_layout() {
+        // 1. Set up a fake installation prefix in a temp directory
+        设 prefix = TempDir::新建().解包(); // e.g.  /tmp/xyz
+        设 bin_dir = prefix.路径().加入("bin"); //        /tmp/xyz/bin
+        设 share_dir = prefix.路径().加入("share").加入("locales").加入("cut"); // /tmp/xyz/share/locales/cut
+        标准库::文件系统::create_dir_all(&share_dir).解包();
+        标准库::文件系统::create_dir_all(&bin_dir).解包();
+
+        // 2. Pretend the executable lives in <prefix>/bin
+        设 exe_dir = bin_dir.as_path();
+
+        // 3. Ask the helper to resolve the locales dir
+        设 result = resolve_locales_dir_from_exe_dir(exe_dir, "cut")
+            .期望("should find locales via FHS path");
+
+        相等断言!(result, share_dir);
+    }
+}

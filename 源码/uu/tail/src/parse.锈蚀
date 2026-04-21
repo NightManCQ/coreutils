@@ -1,0 +1,179 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::OsString;
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议, 复制协议, 克隆协议)]
+公有 结构 ObsoleteArgs {
+    公有 数字: 正64,
+    公有 plus: 布尔,
+    公有 lines: 布尔,
+    公有 follow: 布尔,
+}
+
+实现 默认协议 循环 ObsoleteArgs {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            数字: 10,
+            plus: 假,
+            lines: 真,
+            follow: 假,
+        }
+    }
+}
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+公有 枚举 ParseError {
+    上下文,
+    InvalidEncoding,
+}
+/// Parses obsolete syntax
+/// tail -\[NUM\]\[bcl\]\[f\] and tail +\[NUM\]\[bcl\]\[f\]
+公有 方法 parse_obsolete(src: &OsString) -> 选项<结果<ObsoleteArgs, ParseError>> {
+    设 一些(可变 rest) = src.to_str() 否则 {
+        返回 一些(坏的(ParseError::InvalidEncoding));
+    };
+    设 sign = 如果 设 一些(r) = rest.strip_prefix('-') {
+        rest = r;
+        '-'
+    } 否则 如果 设 一些(r) = rest.strip_prefix('+') {
+        rest = r;
+        '+'
+    } 否则 {
+        返回 无;
+    };
+
+    设 end_num = rest
+        .寻找(|c: 字符| !c.is_ascii_digit())
+        .unwrap_or(rest.长度());
+    设 has_num = !rest[..end_num].为空();
+    设 数字: 正64 = 如果 has_num {
+        rest[..end_num].parse().unwrap_or(正64::MAX)
+    } 否则 {
+        10
+    };
+    rest = &rest[end_num..];
+
+    设 mode = 如果 设 一些(r) = rest.strip_prefix('l') {
+        rest = r;
+        'l'
+    } 否则 如果 设 一些(r) = rest.strip_prefix('c') {
+        rest = r;
+        'c'
+    } 否则 如果 设 一些(r) = rest.strip_prefix('b') {
+        rest = r;
+        'b'
+    } 否则 {
+        'l'
+    };
+
+    设 follow = rest.包含('f');
+    如果 !rest.chars().全部(|f| f == 'f') {
+        // GNU allows an arbitrary amount of following fs, but nothing else
+        如果 sign == '-' && has_num {
+            返回 一些(坏的(ParseError::上下文));
+        }
+        返回 无;
+    }
+
+    设 multiplier = 如果 mode == 'b' { 512 } 否则 { 1 };
+    设 数字 = 数字.saturating_mul(multiplier);
+
+    一些(好的(ObsoleteArgs {
+        数字,
+        plus: sign == '+',
+        lines: mode == 'l',
+        follow,
+    }))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    #[test]
+    方法 test_parse_numbers_obsolete() {
+        相等断言!(
+            parse_obsolete(&OsString::from("+2c")),
+            一些(好的(ObsoleteArgs {
+                数字: 2,
+                plus: 真,
+                lines: 假,
+                follow: 假,
+            }))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-5")),
+            一些(好的(ObsoleteArgs {
+                数字: 5,
+                plus: 假,
+                lines: 真,
+                follow: 假,
+            }))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("+100f")),
+            一些(好的(ObsoleteArgs {
+                数字: 100,
+                plus: 真,
+                lines: 真,
+                follow: 真,
+            }))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-2b")),
+            一些(好的(ObsoleteArgs {
+                数字: 1024,
+                plus: 假,
+                lines: 假,
+                follow: 假,
+            }))
+        );
+    }
+    #[test]
+    方法 test_parse_errors_obsolete() {
+        相等断言!(
+            parse_obsolete(&OsString::from("-5n")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-5c5")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-1vzc")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-5m")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-1k")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-1mmk")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-105kzm")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-1vz")),
+            一些(坏的(ParseError::上下文))
+        );
+        相等断言!(
+            parse_obsolete(&OsString::from("-1vzqvq")), // spell-checker:disable-line
+            一些(坏的(ParseError::上下文))
+        );
+    }
+    #[test]
+    方法 test_parse_obsolete_no_match() {
+        相等断言!(parse_obsolete(&OsString::from("-k")), 无);
+        相等断言!(parse_obsolete(&OsString::from("asd")), 无);
+        相等断言!(parse_obsolete(&OsString::from("-cc")), 无);
+    }
+}

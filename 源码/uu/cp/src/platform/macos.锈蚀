@@ -1,0 +1,117 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore reflink
+使用 标准库::ffi::CString;
+使用 标准库::文件系统::{自身, File, OpenOptions};
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+使用 标准库::路径::Path;
+
+使用 uucore::buf_copy;
+使用 uucore::display::Quotable;
+使用 uucore::translate;
+
+使用 uucore::mode::get_umask;
+
+使用 箱::{
+    CopyDebug, CopyResult, CpError, OffloadReflinkDebug, ReflinkMode, SparseDebug, SparseMode,
+    is_stream,
+};
+
+/// Copies `source` to `dest` using copy-on-write if possible.
+公有(箱) 方法 copy_on_write(
+    source: &Path,
+    dest: &Path,
+    reflink_mode: ReflinkMode,
+    sparse_mode: SparseMode,
+    context: &字符串切片,
+    source_is_stream: 布尔,
+) -> CopyResult<CopyDebug> {
+    如果 sparse_mode != SparseMode::Auto {
+        返回 坏的(translate!("cp-error-sparse-not-supported")
+            .to_string()
+            .into());
+    }
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::Unsupported,
+        sparse_detection: SparseDebug::Unsupported,
+    };
+
+    // Extract paths in a form suitable to be passed to a syscall.
+    // The unwrap() is safe because they come from the command-line and so contain non nul
+    // character.
+    设 src = CString::新建(source.as_os_str().as_bytes()).解包();
+    设 dst = CString::新建(dest.as_os_str().as_bytes()).解包();
+
+    // clonefile(2) was introduced in macOS 10.12 so we cannot statically link against it
+    // for backward compatibility.
+    设 clonefile = CString::新建("clonefile").解包();
+    设 raw_pfn = 不安全 { libc::dlsym(libc::RTLD_NEXT, clonefile.as_ptr()) };
+
+    设 可变 错误 = 0;
+    如果 !raw_pfn.is_null() {
+        // Call clonefile(2).
+        // Safety: Casting a C function pointer to a rust function value is one of the few
+        // blessed uses of `transmute()`.
+        不安全 {
+            设 pfn: 外部 "C" 方法(
+                src: *常量 libc::c_char,
+                dst: *常量 libc::c_char,
+                flags: 正32,
+            ) -> libc::c_int = 标准库::内存::transmute(raw_pfn);
+            错误 = pfn(src.as_ptr(), dst.as_ptr(), 0);
+            如果 标准库::输入输出::错误协议::last_os_error().kind() == 标准库::输入输出::ErrorKind::AlreadyExists
+                // Only remove the `dest` if the `source` and `dest` are not the same
+                && source != dest
+            {
+                // clonefile(2) fails if the destination exists.  Remove it and try again.  Do not
+                // bother to check if removal worked because we're going to try to clone again.
+                // first lets make sure the dest file is not read only
+                如果 文件系统::metadata(dest).is_ok_and(|md| !md.permissions().readonly()) {
+                    // remove and copy again
+                    // TODO: rewrite this to better match linux behavior
+                    // linux first opens the source file and destination file then uses the file
+                    // descriptors to do the clone.
+                    设 _ = 文件系统::remove_file(dest);
+                    错误 = pfn(src.as_ptr(), dst.as_ptr(), 0);
+                }
+            }
+        }
+    }
+
+    如果 raw_pfn.is_null() || 错误 != 0 {
+        // clonefile(2) is either not supported or it errored out (possibly because the FS does not
+        // support COW).
+        如果 reflink_mode == ReflinkMode::Always {
+            返回 坏的(translate!("cp-error-failed-to-clone", "source" => source.quote(), "dest" => dest.quote(), "error" => 错误)
+                .into());
+        }
+        copy_debug.reflink = OffloadReflinkDebug::Yes;
+        如果 source_is_stream {
+            设 可变 src_file = File::open(source)?;
+            设 mode = 0o622 & !get_umask();
+            设 可变 dst_file = OpenOptions::新建()
+                .create(真)
+                .写锁定(真)
+                .mode(mode)
+                .open(dest)?;
+
+            设 dest_is_stream = is_stream(&dst_file.metadata()?);
+            如果 !dest_is_stream {
+                // `copy_stream` doesn't clear the dest file, if dest is not a stream, we should clear it manually.
+                dst_file.set_len(0)?;
+            }
+
+            buf_copy::copy_stream(&可变 src_file, &可变 dst_file)
+                .map_err(|_| 标准库::输入输出::错误协议::from(标准库::输入输出::ErrorKind::Other))
+                .map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+        } 否则 {
+            文件系统::copy(source, dest).map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+        }
+    }
+
+    好的(copy_debug)
+}

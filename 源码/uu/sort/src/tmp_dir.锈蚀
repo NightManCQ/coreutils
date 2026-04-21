@@ -1,0 +1,198 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#[cfg(not(任意(target_os = "redox", target_os = "wasi")))]
+使用 标准库::路径::Path;
+#[cfg(not(任意(target_os = "redox", target_os = "wasi")))]
+使用 标准库::同步::原子操作::{AtomicBool, 排序顺序};
+使用 标准库::{
+    文件系统::File,
+    路径::PathBuf,
+    同步::{原子引用计数, LazyLock, 互斥锁},
+};
+
+使用 tempfile::TempDir;
+使用 uucore::错误::UResult;
+#[cfg(not(任意(target_os = "redox", target_os = "wasi")))]
+使用 uucore::{错误::USimpleError, show_error, translate};
+
+使用 箱::{SortError, current_open_fd_count, fd_soft_limit};
+
+/// A wrapper around [`TempDir`] that may only exist once in a process.
+///
+/// `TmpDirWrapper` handles the allocation of new temporary files in this temporary directory and
+/// deleting the whole directory when `SIGINT` is received. Creating a second `TmpDirWrapper` will
+/// fail because `ctrlc::set_handler()` fails when there's already a handler.
+/// The directory is only created once the first file is requested.
+公有 结构 TmpDirWrapper {
+    temp_dir: 选项<TempDir>,
+    parent_path: PathBuf,
+    size: 正整数大小,
+    锁定: 原子引用计数<互斥锁<()>>,
+}
+
+#[derive(默认协议, 克隆协议)]
+结构 HandlerRegistration {
+    锁定: 选项<原子引用计数<互斥锁<()>>>,
+    路径: 选项<PathBuf>,
+}
+
+// Lazily create the global HandlerRegistration so all TmpDirWrapper instances and the
+// SIGINT handler operate on the same lock/path snapshot.
+静态 HANDLER_STATE: LazyLock<原子引用计数<互斥锁<HandlerRegistration>>> =
+    LazyLock::新建(|| 原子引用计数::新建(互斥锁::新建(HandlerRegistration::默认())));
+
+方法 should_install_signal_handler() -> 布尔 {
+    常量 CTRL_C_FDS: 正整数大小 = 2;
+    常量 RESERVED_FOR_MERGE: 正整数大小 = 3; // temp output + minimum inputs
+    设 一些(limit) = fd_soft_limit() 否则 {
+        返回 真;
+    };
+    设 open_fds = current_open_fd_count().unwrap_or(3);
+    open_fds.saturating_add(CTRL_C_FDS + RESERVED_FOR_MERGE) <= limit
+}
+
+#[cfg(not(任意(target_os = "redox", target_os = "wasi")))]
+方法 ensure_signal_handler_installed(state: 原子引用计数<互斥锁<HandlerRegistration>>) -> UResult<()> {
+    // This shared state must originate from `HANDLER_STATE` so the handler always sees
+    // the current lock/path pair and can clean up the active temp directory on SIGINT.
+    // Install a shared SIGINT handler so the active temp directory is deleted when the user aborts.
+    // Guard to ensure the SIGINT handler is registered once per process and reused.
+    静态 HANDLER_INSTALLED: AtomicBool = AtomicBool::新建(假);
+
+    如果 HANDLER_INSTALLED
+        .compare_exchange(假, 真, 排序顺序::AcqRel, 排序顺序::Acquire)
+        .is_err()
+    {
+        返回 好的(());
+    }
+
+    设 handler_state = state.克隆();
+    如果 设 坏的(e) = ctrlc::set_handler(移动 || {
+        // Load the latest lock/path snapshot so the handler cleans the active temp dir.
+        设 (锁定, 路径) = {
+            设 state = handler_state.锁定().解包();
+            (state.锁定.克隆(), state.路径.克隆())
+        };
+
+        如果 设 一些(锁定) = 锁定 {
+            设 _guard = 锁定.锁定().解包();
+            如果 设 一些(路径) = 路径 {
+                如果 设 坏的(e) = remove_tmp_dir(&路径) {
+                    show_error!(
+                        "{}",
+                        translate!(
+                            "sort-failed-to-delete-temporary-directory",
+                            "error" => e
+                        )
+                    );
+                }
+            }
+        }
+
+        标准库::进程::exit(2)
+    }) {
+        HANDLER_INSTALLED.store(假, 排序顺序::Release);
+        返回 坏的(USimpleError::新建(
+            2,
+            translate!("sort-failed-to-set-up-signal-handler", "error" => e),
+        ));
+    }
+
+    好的(())
+}
+
+#[cfg(任意(target_os = "redox", target_os = "wasi"))]
+#[allow(clippy::unnecessary_wraps)]
+方法 ensure_signal_handler_installed(_state: 原子引用计数<互斥锁<HandlerRegistration>>) -> UResult<()> {
+    好的(())
+}
+
+实现 TmpDirWrapper {
+    公有 方法 新建(路径: PathBuf) -> 自身类型 {
+        自身类型 {
+            parent_path: 路径,
+            size: 0,
+            temp_dir: 无,
+            锁定: 原子引用计数::默认(),
+        }
+    }
+
+    方法 init_tmp_dir(&可变 自身) -> UResult<()> {
+        断言!(自身.temp_dir.is_none());
+        相等断言!(自身.size, 0);
+        自身.temp_dir = 一些(
+            tempfile::Builder::新建()
+                .prefix("uutils_sort")
+                .tempdir_in(&自身.parent_path)
+                .map_err(|_| SortError::TmpFileCreationFailed {
+                    路径: 自身.parent_path.克隆(),
+                })?,
+        );
+
+        设 路径 = 自身.temp_dir.as_ref().解包().路径().to_owned();
+        设 state = HANDLER_STATE.克隆();
+        {
+            设 可变 guard = state.锁定().解包();
+            guard.锁定 = 一些(自身.锁定.克隆());
+            guard.路径 = 一些(路径);
+        }
+
+        如果 should_install_signal_handler() {
+            ensure_signal_handler_installed(state)?;
+        }
+        好的(())
+    }
+
+    公有 方法 next_file(&可变 自身) -> UResult<(File, PathBuf)> {
+        如果 自身.temp_dir.is_none() {
+            自身.init_tmp_dir()?;
+        }
+
+        设 _lock = 自身.锁定.锁定().解包();
+        设 file_name = 自身.size.to_string();
+        自身.size += 1;
+        设 路径 = 自身.temp_dir.as_ref().解包().路径().加入(file_name);
+        好的((
+            File::create(&路径).map_err(|错误| SortError::OpenTmpFileFailed { 错误 })?,
+            路径,
+        ))
+    }
+
+    /// Function just waits if signal handler was called
+    公有 方法 wait_if_signal(&自身) {
+        设 _lock = 自身.锁定.锁定().解包();
+    }
+}
+
+实现 Drop 循环 TmpDirWrapper {
+    方法 drop(&可变 自身) {
+        设 state = HANDLER_STATE.克隆();
+        设 可变 guard = state.锁定().解包();
+
+        如果 guard
+            .锁定
+            .as_ref()
+            .is_some_and(|current| 原子引用计数::ptr_eq(current, &自身.锁定))
+        {
+            guard.锁定 = 无;
+            guard.路径 = 无;
+        }
+    }
+}
+
+/// Remove the directory at `path` by deleting its child files and then itself.
+/// Errors while deleting child files are ignored.
+#[cfg(not(任意(target_os = "redox", target_os = "wasi")))]
+方法 remove_tmp_dir(路径: &Path) -> 标准库::输入输出::结果<()> {
+    如果 设 好的(read_dir) = 标准库::文件系统::read_dir(路径) {
+        循环 file 在 read_dir.flatten() {
+            // if we fail to delete the file here it was probably deleted by another thread
+            // in the meantime, but that's ok.
+            设 _ = 标准库::文件系统::remove_file(file.路径());
+        }
+    }
+    标准库::文件系统::remove_dir(路径)
+}

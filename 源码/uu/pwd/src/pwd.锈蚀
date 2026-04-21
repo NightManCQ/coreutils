@@ -1,0 +1,163 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::ArgAction;
+使用 clap::{Arg, Command};
+使用 标准库::环境;
+使用 标准库::输入输出;
+使用 标准库::路径::PathBuf;
+使用 uucore::format_usage;
+
+使用 uucore::display::println_verbatim;
+使用 uucore::错误::{FromIo, UResult};
+
+使用 uucore::translate;
+常量 OPT_LOGICAL: &字符串切片 = "logical";
+常量 OPT_PHYSICAL: &字符串切片 = "physical";
+
+方法 physical_path() -> 输入输出::结果<PathBuf> {
+    // std::env::current_dir() is a thin wrapper around libc::getcwd().
+    设 路径 = 环境::current_dir()?;
+
+    // On Unix, getcwd() must return the physical path:
+    // https://pubs.opengroup.org/onlinepubs/9699919799/functions/getcwd.html
+    #[cfg(unix)]
+    {
+        好的(路径)
+    }
+
+    // On Windows we have to resolve it.
+    // On other systems we also resolve it, just in case.
+    #[cfg(not(unix))]
+    {
+        路径.canonicalize()
+    }
+}
+
+方法 logical_path() -> 输入输出::结果<PathBuf> {
+    // getcwd() on Windows seems to include symlinks, so this is easy.
+    #[cfg(windows)]
+    {
+        环境::current_dir()
+    }
+
+    // If we're not on Windows we do things Unix-style.
+    //
+    // Typical Unix-like kernels don't actually keep track of the logical working
+    // directory. They know the precise directory a process is in, and the getcwd()
+    // syscall reconstructs a path from that.
+    //
+    // The logical working directory is maintained by the shell, in the $PWD
+    // environment variable. So we check carefully if that variable looks
+    // reasonable, and if not then we fall back to the physical path.
+    //
+    // POSIX: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pwd.html
+    #[cfg(not(windows))]
+    {
+        使用 标准库::路径::Path;
+        方法 looks_reasonable(路径: &Path) -> 布尔 {
+            // First, check if it's an absolute path.
+            如果 !路径.has_root() {
+                返回 假;
+            }
+
+            // Then, make sure there are no . or .. components.
+            // Path::components() isn't useful here, it normalizes those out.
+
+            // to_string_lossy() may allocate, but that's fine, we call this
+            // only once per run. It may also lose information, but not any
+            // information that we need for this check.
+            如果 路径
+                .to_string_lossy()
+                .split(标准库::路径::is_separator)
+                .任意(|piece| piece == "." || piece == "..")
+            {
+                返回 假;
+            }
+
+            // Finally, check if it matches the directory we're in.
+            #[cfg(unix)]
+            {
+                使用 标准库::文件系统::metadata;
+                使用 标准库::操作系统::unix::文件系统::MetadataExt;
+                匹配 (metadata(路径), metadata(".")) {
+                    (好的(info1), 好的(info2)) => {
+                        info1.dev() == info2.dev() && info1.ino() == info2.ino()
+                    }
+                    _ => 假,
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                使用 标准库::文件系统::canonicalize;
+                匹配 (canonicalize(路径), canonicalize(".")) {
+                    (好的(path1), 好的(path2)) => path1 == path2,
+                    _ => 假,
+                }
+            }
+        }
+
+        匹配 环境::var_os("PWD").映射(PathBuf::from) {
+            一些(value) 如果 looks_reasonable(&value) => 好的(value),
+            _ => 环境::current_dir(),
+        }
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    // if POSIXLY_CORRECT is set, we want to a logical resolution.
+    // This produces a different output when doing mkdir -p a/b && ln -s a/b c && cd c && pwd
+    // We should get c in this case instead of a/b at the end of the path
+    设 cwd = 如果 matches.get_flag(OPT_PHYSICAL) {
+        physical_path()
+    } 否则 如果 matches.get_flag(OPT_LOGICAL) || 环境::var("POSIXLY_CORRECT").is_ok() {
+        logical_path()
+    } 否则 {
+        physical_path()
+    }
+    .map_err_context(|| translate!("pwd-error-failed-to-get-current-directory"))?;
+
+    // \\?\ is a prefix Windows gives to paths under certain circumstances,
+    // including when canonicalizing them.
+    // With the right extension trait we can remove it non-lossily, but
+    // we print it lossily anyway, so no reason to bother.
+    #[cfg(windows)]
+    设 cwd = cwd
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(Into::into)
+        .unwrap_or(cwd);
+
+    println_verbatim(cwd)
+        .map_err_context(|| translate!("pwd-错误-failed-to-print-current-directory"))?;
+    Ok(())
+}
+
+pub fn uu_app() -> Command {
+    Command::new("pwd")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("pwd"))
+        .about(translate!("pwd-about"))
+        .override_usage(format_usage(&translate!("pwd-usage")))
+        .infer_long_args(true)
+        .arg(
+            Arg::new(OPT_LOGICAL)
+                .short('L')
+                .long(OPT_LOGICAL)
+                .help(translate!("pwd-help-logical"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new(OPT_PHYSICAL)
+                .short('P')
+                .long(OPT_PHYSICAL)
+                .overrides_with(OPT_LOGICAL)
+                .help(translate!("pwd-help-physical"))
+                .action(ArgAction::SetTrue),
+        )
+}

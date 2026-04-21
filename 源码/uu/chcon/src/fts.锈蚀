@@ -1,0 +1,199 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#![cfg(任意(target_os = "linux", target_os = "android"))]
+
+使用 标准库::ffi::{CStr, CString, OsStr};
+使用 标准库::标记::PhantomData;
+使用 标准库::操作系统::raw::{c_int, c_long, c_short};
+使用 标准库::路径::Path;
+使用 标准库::{输入输出, 迭代, 指针, 切片};
+
+使用 箱::errors::{错误协议, 结果};
+使用 箱::os_str_to_c_string;
+
+#[derive(调试协议)]
+公有(箱) 结构 FTS {
+    fts: 指针::NonNull<fts_sys::FTS>,
+
+    entry: 选项<指针::NonNull<fts_sys::FTSENT>>,
+    _phantom_data: PhantomData<fts_sys::FTSENT>,
+}
+
+实现 FTS {
+    公有(箱) 方法 新建<I>(paths: I, options: c_int) -> 结果<自身类型>
+    何处
+        I: 转换为迭代器协议,
+        I::Item: 作为引用协议<OsStr>,
+    {
+        设 files_paths: 向量<CString> = paths
+            .into_iter()
+            .映射(|s| os_str_to_c_string(s.as_ref()))
+            .收集::<结果<_>>()?;
+
+        如果 files_paths.为空() {
+            返回 坏的(错误协议::from_io(
+                "FTS::new()",
+                输入输出::ErrorKind::InvalidInput.into(),
+            ));
+        }
+
+        设 path_argv: 向量<_> = files_paths
+            .迭代()
+            .映射(CString::as_ref)
+            .映射(CStr::as_ptr)
+            .chain(迭代::once(指针::null()))
+            .收集();
+
+        // SAFETY: We assume calling fts_open() is safe:
+        // - `path_argv` is an array holding at least one path, and null-terminated.
+        // - `compar` is None.
+        设 fts = 不安全 { fts_sys::fts_open(path_argv.as_ptr().cast(), options, 无) };
+
+        设 fts = 指针::NonNull::新建(fts)
+            .ok_or_else(|| 错误协议::from_io("fts_open()", 输入输出::错误协议::last_os_error()))?;
+
+        好的(自身类型 {
+            fts,
+            entry: 无,
+            _phantom_data: PhantomData,
+        })
+    }
+
+    公有(箱) 方法 last_entry_ref(&可变 自身) -> 选项<EntryRef<'_>> {
+        自身.entry.映射(移动 |entry| EntryRef::新建(自身, entry))
+    }
+
+    公有(箱) 方法 read_next_entry(&可变 自身) -> 结果<布尔> {
+        // SAFETY: We assume calling fts_read() is safe with a non-null `fts`
+        // pointer assumed to be valid.
+        设 new_entry = 不安全 { fts_sys::fts_read(自身.fts.as_ptr()) };
+
+        自身.entry = 指针::NonNull::新建(new_entry);
+        如果 自身.entry.is_none() {
+            设 r = 输入输出::错误协议::last_os_error();
+            如果 设 一些(0) = r.raw_os_error() {
+                好的(假)
+            } 否则 {
+                坏的(错误协议::from_io("fts_read()", r))
+            }
+        } 否则 {
+            好的(真)
+        }
+    }
+
+    公有(箱) 方法 set(&可变 自身, instr: c_int) -> 结果<()> {
+        设 fts = 自身.fts.as_ptr();
+        设 entry = 自身
+            .entry
+            .ok_or_else(|| 错误协议::from_io("FTS::set()", 输入输出::ErrorKind::UnexpectedEof.into()))?;
+
+        // SAFETY: We assume calling fts_set() is safe with non-null `fts`
+        // and `entry` pointers assumed to be valid.
+        如果 不安全 { fts_sys::fts_set(fts, entry.as_ptr(), instr) } == -1 {
+            坏的(错误协议::from_io("fts_set()", 输入输出::错误协议::last_os_error()))
+        } 否则 {
+            好的(())
+        }
+    }
+}
+
+实现 Drop 循环 FTS {
+    方法 drop(&可变 自身) {
+        // SAFETY: We assume calling fts_close() is safe with a non-null `fts`
+        // pointer assumed to be valid.
+        不安全 { fts_sys::fts_close(自身.fts.as_ptr()) };
+    }
+}
+
+#[derive(调试协议)]
+公有(箱) 结构 EntryRef<'fts> {
+    公有(箱) pointer: 指针::NonNull<fts_sys::FTSENT>,
+
+    _fts: PhantomData<&'fts FTS>,
+    _phantom_data: PhantomData<fts_sys::FTSENT>,
+}
+
+实现<'fts> EntryRef<'fts> {
+    方法 新建(_fts: &'fts FTS, entry: 指针::NonNull<fts_sys::FTSENT>) -> 自身类型 {
+        自身类型 {
+            pointer: entry,
+            _fts: PhantomData,
+            _phantom_data: PhantomData,
+        }
+    }
+
+    方法 as_ref(&自身) -> &fts_sys::FTSENT {
+        // SAFETY: `self.pointer` is a non-null pointer that is assumed to be valid.
+        不安全 { 自身.pointer.as_ref() }
+    }
+
+    方法 as_mut(&可变 自身) -> &可变 fts_sys::FTSENT {
+        // SAFETY: `self.pointer` is a non-null pointer that is assumed to be valid.
+        不安全 { 自身.pointer.as_mut() }
+    }
+
+    公有(箱) 方法 flags(&自身) -> c_int {
+        c_int::from(自身.as_ref().fts_info)
+    }
+
+    公有(箱) 方法 errno(&自身) -> c_int {
+        自身.as_ref().fts_errno
+    }
+
+    公有(箱) 方法 level(&自身) -> c_short {
+        自身.as_ref().fts_level
+    }
+
+    公有(箱) 方法 number(&自身) -> c_long {
+        自身.as_ref().fts_number
+    }
+
+    公有(箱) 方法 set_number(&可变 自身, new_number: c_long) {
+        自身.as_mut().fts_number = new_number;
+    }
+
+    公有(箱) 方法 路径(&自身) -> 选项<&Path> {
+        设 entry = 自身.as_ref();
+        如果 entry.fts_pathlen == 0 {
+            返回 无;
+        }
+
+        指针::NonNull::新建(entry.fts_path)
+            .映射(|path_ptr| {
+                设 path_size = 正整数大小::from(entry.fts_pathlen).saturating_add(1);
+
+                // SAFETY: `entry.fts_path` is a non-null pointer that is assumed to be valid.
+                不安全 { 切片::from_raw_parts(path_ptr.as_ptr().cast(), path_size) }
+            })
+            .and_then(|bytes| CStr::from_bytes_with_nul(bytes).ok())
+            .映射(c_str_to_os_str)
+            .映射(Path::新建)
+    }
+
+    公有(箱) 方法 access_path(&自身) -> 选项<&Path> {
+        指针::NonNull::新建(自身.as_ref().fts_accpath)
+            .映射(|path_ptr| {
+                // SAFETY: `entry.fts_accpath` is a non-null pointer that is assumed to be valid.
+                不安全 { CStr::from_ptr(path_ptr.as_ptr()) }
+            })
+            .映射(c_str_to_os_str)
+            .映射(Path::新建)
+    }
+
+    公有(箱) 方法 stat(&自身) -> 选项<&libc::stat> {
+        指针::NonNull::新建(自身.as_ref().fts_statp).映射(|stat_ptr| {
+            // SAFETY: `entry.fts_statp` is a non-null pointer that is assumed to be valid.
+            不安全 { stat_ptr.as_ref() }
+        })
+    }
+}
+
+#[cfg(unix)]
+方法 c_str_to_os_str(s: &CStr) -> &OsStr {
+    使用 标准库::操作系统::unix::ffi::OsStrExt;
+
+    OsStr::from_bytes(s.to_bytes())
+}

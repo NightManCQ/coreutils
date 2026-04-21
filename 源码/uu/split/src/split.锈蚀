@@ -1,0 +1,1617 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore nbbbb ncccc hexdigit getmaxstdio
+
+模组 filenames;
+模组 number;
+模组 platform;
+模组 strategy;
+
+使用 箱::filenames::{FilenameIterator, Suffix, SuffixError};
+使用 箱::strategy::{NumberType, Strategy, StrategyError};
+使用 clap::{Arg, ArgAction, ArgMatches, Command, ValueHint, parser::ValueSource};
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::{File, metadata};
+使用 标准库::输入输出;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write, stdin};
+使用 标准库::路径::Path;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UIoError, UResult, USimpleError, UUsageError};
+使用 uucore::translate;
+
+使用 uucore::parser::parse_size::parse_size_u64;
+
+使用 uucore::format_usage;
+使用 uucore::uio_error;
+
+静态 OPT_BYTES: &字符串切片 = "bytes";
+静态 OPT_LINE_BYTES: &字符串切片 = "line-bytes";
+静态 OPT_LINES: &字符串切片 = "lines";
+静态 OPT_ADDITIONAL_SUFFIX: &字符串切片 = "additional-suffix";
+静态 OPT_FILTER: &字符串切片 = "filter";
+静态 OPT_NUMBER: &字符串切片 = "number";
+静态 OPT_NUMERIC_SUFFIXES: &字符串切片 = "numeric-suffixes";
+静态 OPT_NUMERIC_SUFFIXES_SHORT: &字符串切片 = "-d";
+静态 OPT_HEX_SUFFIXES: &字符串切片 = "hex-suffixes";
+静态 OPT_HEX_SUFFIXES_SHORT: &字符串切片 = "-x";
+静态 OPT_SUFFIX_LENGTH: &字符串切片 = "suffix-length";
+静态 OPT_VERBOSE: &字符串切片 = "verbose";
+静态 OPT_SEPARATOR: &字符串切片 = "separator";
+静态 OPT_ELIDE_EMPTY_FILES: &字符串切片 = "elide-empty-files";
+静态 OPT_IO_BLKSIZE: &字符串切片 = "-io-blksize";
+
+静态 ARG_INPUT: &字符串切片 = "input";
+静态 ARG_PREFIX: &字符串切片 = "prefix";
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 (args, obs_lines) = handle_obsolete(args);
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    匹配 Settings::from(&matches, obs_lines.as_deref()) {
+        好的(settings) => {
+            // When using --filter, we write to a child process's stdin which may
+            // close early. Disable SIGPIPE so we get EPIPE errors instead of
+            // being terminated, allowing graceful handling of broken pipes.
+            #[cfg(unix)]
+            如果 settings.过滤.is_some() {
+                设 _ = uucore::signals::disable_pipe_errors();
+            }
+            split(&settings)
+        }
+        坏的(e) 如果 e.requires_usage() => 坏的(UUsageError::新建(1, 格式化!("{e}"))),
+        坏的(e) => 坏的(USimpleError::新建(1, 格式化!("{e}"))),
+    }
+}
+
+/// Extract obsolete shorthand (if any) for specifying lines in following scenarios (and similar)
+/// `split -22 file` would mean `split -l 22 file`
+/// `split -2de file` would mean `split -l 2 -d -e file`
+/// `split -x300e file` would mean `split -x -l 300 -e file`
+/// `split -x300e -22 file` would mean `split -x -e -l 22 file` (last obsolete lines option wins)
+/// following GNU `split` behavior
+方法 handle_obsolete(args: 实现 uucore::Args) -> (向量<OsString>, 选项<字符串>) {
+    设 可变 obs_lines = 无;
+    设 可变 preceding_long_opt_req_value = 假;
+    设 可变 preceding_short_opt_req_value = 假;
+
+    设 filtered_args = args
+        .filter_map(|os_slice| {
+            filter_args(
+                os_slice,
+                &可变 obs_lines,
+                &可变 preceding_long_opt_req_value,
+                &可变 preceding_short_opt_req_value,
+            )
+        })
+        .收集();
+
+    (filtered_args, obs_lines)
+}
+
+/// Helper function to [`handle_obsolete`]
+/// Filters out obsolete lines option from args
+方法 filter_args(
+    os_slice: OsString,
+    obs_lines: &可变 选项<字符串>,
+    preceding_long_opt_req_value: &可变 布尔,
+    preceding_short_opt_req_value: &可变 布尔,
+) -> 选项<OsString> {
+    设 过滤: 选项<OsString>;
+    如果 设 一些(切片) = os_slice.to_str() {
+        如果 should_extract_obs_lines(
+            切片,
+            *preceding_long_opt_req_value,
+            *preceding_short_opt_req_value,
+        ) {
+            // start of the short option string
+            // that can have obsolete lines option value in it
+            过滤 = handle_extract_obs_lines(切片, obs_lines);
+        } 否则 {
+            // either not a short option
+            // or a short option that cannot have obsolete lines value in it
+            过滤 = 一些(OsString::from(切片));
+        }
+        handle_preceding_options(
+            切片,
+            preceding_long_opt_req_value,
+            preceding_short_opt_req_value,
+        );
+    } 否则 {
+        // Cannot cleanly convert os_slice to UTF-8
+        // Do not process and return as-is
+        // This will cause failure later on, but we should not handle it here
+        // and let clap panic on invalid UTF-8 argument
+        过滤 = 一些(os_slice);
+    }
+    过滤
+}
+
+/// Helper function to [`filter_args`]
+/// Checks if the slice is a true short option (and not hyphen prefixed value of an option)
+/// and if so, a short option that can contain obsolete lines value
+方法 should_extract_obs_lines(
+    切片: &字符串切片,
+    preceding_long_opt_req_value: 布尔,
+    preceding_short_opt_req_value: 布尔,
+) -> 布尔 {
+    切片.starts_with('-')
+        && !切片.starts_with("--")
+        && !preceding_long_opt_req_value
+        && !preceding_short_opt_req_value
+        && !切片.starts_with("-a")
+        && !切片.starts_with("-b")
+        && !切片.starts_with("-C")
+        && !切片.starts_with("-l")
+        && !切片.starts_with("-n")
+        && !切片.starts_with("-t")
+}
+
+/// Helper function to [`filter_args`]
+/// Extracts obsolete lines numeric part from argument slice
+/// and filters it out
+方法 handle_extract_obs_lines(切片: &字符串切片, obs_lines: &可变 选项<字符串>) -> 选项<OsString> {
+    设 可变 obs_lines_extracted: 向量<字符> = 向量![];
+    设 可变 obs_lines_end_reached = 假;
+    设 filtered_slice: 向量<字符> = 切片
+        .chars()
+        .过滤(|c| {
+            // To correctly process scenario like '-x200a4'
+            // we need to stop extracting digits once alphabetic character is encountered
+            // after we already have something in obs_lines_extracted
+            如果 c.is_ascii_digit() && !obs_lines_end_reached {
+                obs_lines_extracted.压入(*c);
+                假
+            } 否则 {
+                如果 !obs_lines_extracted.为空() {
+                    obs_lines_end_reached = 真;
+                }
+                真
+            }
+        })
+        .收集();
+
+    如果 obs_lines_extracted.为空() {
+        // no obsolete lines value found/extracted
+        一些(OsString::from(切片))
+    } 否则 {
+        // obsolete lines value was extracted
+        设 extracted: 字符串 = obs_lines_extracted.迭代().收集();
+        *obs_lines = 一些(extracted);
+        如果 filtered_slice.获取(1).is_some() {
+            // there were some short options in front of or after obsolete lines value
+            // i.e. '-xd100' or '-100de' or similar, which after extraction of obsolete lines value
+            // would look like '-xd' or '-de' or similar
+            设 filtered_slice: 字符串 = filtered_slice.迭代().收集();
+            一些(OsString::from(filtered_slice))
+        } 否则 {
+            无
+        }
+    }
+}
+
+/// Helper function to [`handle_extract_obs_lines`]
+/// Captures if current slice is a preceding option
+/// that requires value
+方法 handle_preceding_options(
+    切片: &字符串切片,
+    preceding_long_opt_req_value: &可变 布尔,
+    preceding_short_opt_req_value: &可变 布尔,
+) {
+    // capture if current slice is a preceding long option that requires value and does not use '=' to assign that value
+    // following slice should be treaded as value for this option
+    // even if it starts with '-' (which would be treated as hyphen prefixed value)
+    如果 切片.starts_with("--") {
+        *preceding_long_opt_req_value = &切片[2..] == OPT_BYTES
+            || &切片[2..] == OPT_LINE_BYTES
+            || &切片[2..] == OPT_LINES
+            || &切片[2..] == OPT_ADDITIONAL_SUFFIX
+            || &切片[2..] == OPT_FILTER
+            || &切片[2..] == OPT_NUMBER
+            || &切片[2..] == OPT_SUFFIX_LENGTH
+            || &切片[2..] == OPT_SEPARATOR;
+    }
+    // capture if current slice is a preceding short option that requires value and does not have value in the same slice (value separated by whitespace)
+    // following slice should be treaded as value for this option
+    // even if it starts with '-' (which would be treated as hyphen prefixed value)
+    *preceding_short_opt_req_value = 切片 == "-b"
+        || 切片 == "-C"
+        || 切片 == "-l"
+        || 切片 == "-n"
+        || 切片 == "-a"
+        || 切片 == "-t";
+    // slice is a value
+    // reset preceding option flags
+    如果 !切片.starts_with('-') {
+        *preceding_short_opt_req_value = 假;
+        *preceding_long_opt_req_value = 假;
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("split")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("split-about"))
+        .after_help(translate!("split-after-help"))
+        .override_usage(format_usage(&translate!("split-usage")))
+        .infer_long_args(真)
+        // strategy (mutually exclusive)
+        .arg(
+            Arg::新建(OPT_BYTES)
+                .short('b')
+                .long(OPT_BYTES)
+                .allow_hyphen_values(真)
+                .value_name("SIZE")
+                .help(translate!("split-help-bytes")),
+        )
+        .arg(
+            Arg::新建(OPT_LINE_BYTES)
+                .short('C')
+                .long(OPT_LINE_BYTES)
+                .allow_hyphen_values(真)
+                .value_name("SIZE")
+                .help(translate!("split-help-line-bytes")),
+        )
+        .arg(
+            Arg::新建(OPT_LINES)
+                .short('l')
+                .long(OPT_LINES)
+                .allow_hyphen_values(真)
+                .value_name("NUMBER")
+                .default_value("1000")
+                .help(translate!("split-help-lines")),
+        )
+        .arg(
+            Arg::新建(OPT_NUMBER)
+                .short('n')
+                .long(OPT_NUMBER)
+                .allow_hyphen_values(真)
+                .value_name("CHUNKS")
+                .help(translate!("split-help-number")),
+        )
+        // rest of the arguments
+        .arg(
+            Arg::新建(OPT_ADDITIONAL_SUFFIX)
+                .long(OPT_ADDITIONAL_SUFFIX)
+                .allow_hyphen_values(真)
+                .value_name("SUFFIX")
+                .default_value("")
+                .value_parser(clap::value_parser!(OsString))
+                .help(translate!("split-help-additional-suffix")),
+        )
+        .arg(
+            Arg::新建(OPT_FILTER)
+                .long(OPT_FILTER)
+                .allow_hyphen_values(真)
+                .value_name("COMMAND")
+                .value_hint(ValueHint::CommandName)
+                .help(translate!("split-help-filter")),
+        )
+        .arg(
+            Arg::新建(OPT_ELIDE_EMPTY_FILES)
+                .long(OPT_ELIDE_EMPTY_FILES)
+                .short('e')
+                .help(translate!("split-help-elide-empty-files"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_NUMERIC_SUFFIXES_SHORT)
+                .short('d')
+                .action(ArgAction::SetTrue)
+                .overrides_with_all([
+                    OPT_NUMERIC_SUFFIXES,
+                    OPT_NUMERIC_SUFFIXES_SHORT,
+                    OPT_HEX_SUFFIXES,
+                    OPT_HEX_SUFFIXES_SHORT,
+                ])
+                .help(translate!("split-help-numeric-suffixes-short")),
+        )
+        .arg(
+            Arg::新建(OPT_NUMERIC_SUFFIXES)
+                .long(OPT_NUMERIC_SUFFIXES)
+                .require_equals(真)
+                .num_args(0..=1)
+                .overrides_with_all([
+                    OPT_NUMERIC_SUFFIXES,
+                    OPT_NUMERIC_SUFFIXES_SHORT,
+                    OPT_HEX_SUFFIXES,
+                    OPT_HEX_SUFFIXES_SHORT,
+                ])
+                .value_name("FROM")
+                .help(translate!("split-help-numeric-suffixes")),
+        )
+        .arg(
+            Arg::新建(OPT_HEX_SUFFIXES_SHORT)
+                .short('x')
+                .action(ArgAction::SetTrue)
+                .overrides_with_all([
+                    OPT_NUMERIC_SUFFIXES,
+                    OPT_NUMERIC_SUFFIXES_SHORT,
+                    OPT_HEX_SUFFIXES,
+                    OPT_HEX_SUFFIXES_SHORT,
+                ])
+                .help(translate!("split-help-hex-suffixes-short")),
+        )
+        .arg(
+            Arg::新建(OPT_HEX_SUFFIXES)
+                .long(OPT_HEX_SUFFIXES)
+                .require_equals(真)
+                .num_args(0..=1)
+                .overrides_with_all([
+                    OPT_NUMERIC_SUFFIXES,
+                    OPT_NUMERIC_SUFFIXES_SHORT,
+                    OPT_HEX_SUFFIXES,
+                    OPT_HEX_SUFFIXES_SHORT,
+                ])
+                .value_name("FROM")
+                .help(translate!("split-help-hex-suffixes")),
+        )
+        .arg(
+            Arg::新建(OPT_SUFFIX_LENGTH)
+                .short('a')
+                .long(OPT_SUFFIX_LENGTH)
+                .allow_hyphen_values(真)
+                .value_name("N")
+                .help(translate!("split-help-suffix-length")),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .long(OPT_VERBOSE)
+                .help(translate!("split-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SEPARATOR)
+                .short('t')
+                .long(OPT_SEPARATOR)
+                .allow_hyphen_values(真)
+                .value_name("SEP")
+                .action(ArgAction::Append)
+                .help(translate!("split-help-separator")),
+        )
+        .arg(
+            Arg::新建(OPT_IO_BLKSIZE)
+                .long("io-blksize")
+                .alias(OPT_IO_BLKSIZE)
+                .hide(真),
+        )
+        .arg(
+            Arg::新建(ARG_INPUT)
+                .default_value("-")
+                .value_hint(ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(ARG_PREFIX)
+                .default_value("x")
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}
+
+/// Parameters that control how a file gets split.
+///
+/// You can convert an [`ArgMatches`] instance into a [`Settings`]
+/// instance by calling [`Settings::from`].
+结构 Settings {
+    prefix: OsString,
+    suffix: Suffix,
+    input: OsString,
+    /// When supplied, a shell command to output to instead of xaa, xab …
+    过滤: 选项<字符串>,
+    strategy: Strategy,
+    verbose: 布尔,
+    separator: 正8,
+
+    /// Whether to *not* produce empty files when using `-n`.
+    ///
+    /// The `-n` command-line argument gives a specific number of
+    /// chunks into which the input files will be split. If the number
+    /// of chunks is greater than the number of bytes, and this is
+    /// `false`, then empty files will be created for the excess
+    /// chunks. If this is `false`, then empty files will not be
+    /// created.
+    elide_empty_files: 布尔,
+    io_blksize: 选项<正64>,
+}
+
+#[derive(调试协议, 错误协议)]
+/// An error when parsing settings from command-line arguments.
+枚举 SettingsError {
+    /// Invalid chunking strategy.
+    #[错误("{0}")]
+    Strategy(StrategyError),
+
+    /// Invalid suffix length parameter.
+    #[错误("{0}")]
+    Suffix(SuffixError),
+
+    /// Multi-character (Invalid) separator
+    #[错误("{}", translate!("split-error-multi-character-separator", "separator" => .0.quote()))]
+    MultiCharacterSeparator(字符串),
+
+    /// Multiple different separator characters
+    #[错误("{}", translate!("split-error-multiple-separator-characters"))]
+    MultipleSeparatorCharacters,
+
+    /// Using `--filter` with `--number` option sub-strategies that print Kth chunk out of N chunks to stdout
+    /// K/N
+    /// l/K/N
+    /// r/K/N
+    #[错误("{}", translate!("split-error-filter-with-kth-chunk"))]
+    FilterWithKthChunkNumber,
+
+    /// Invalid IO block size
+    #[错误("{}", translate!("split-error-invalid-io-block-size", "size" => .0.quote()))]
+    InvalidIOBlockSize(字符串),
+
+    /// The `--filter` option is not supported on Windows.
+    #[cfg(windows)]
+    #[错误("{}", translate!("split-error-not-supported"))]
+    NotSupported,
+}
+
+实现 SettingsError {
+    /// Whether the error demands a usage message.
+    方法 requires_usage(&自身) -> 布尔 {
+        matches!(
+            自身,
+            自身类型::Strategy(StrategyError::MultipleWays)
+                | 自身类型::Suffix(SuffixError::ContainsSeparator(_))
+        )
+    }
+}
+
+实现 Settings {
+    /// Parse a strategy from the command-line arguments.
+    方法 from(matches: &ArgMatches, obs_lines: 选项<&字符串切片>) -> 结果<自身类型, SettingsError> {
+        设 strategy = Strategy::from(matches, obs_lines).map_err(SettingsError::Strategy)?;
+        设 suffix = Suffix::from(matches, &strategy).map_err(SettingsError::Suffix)?;
+
+        // Make sure that separator is only one UTF8 character (if specified)
+        // defaults to '\n' - newline character
+        // If the same separator (the same value) was used multiple times - `split` should NOT fail
+        // If the separator was used multiple times but with different values (not all values are the same) - `split` should fail
+        设 separator = 匹配 matches.get_many::<字符串>(OPT_SEPARATOR) {
+            一些(可变 sep_values) => {
+                设 first = sep_values.next().解包(); // it is safe to just unwrap here since Clap should not return empty ValuesRef<'_,String> in the option from get_many() call
+                如果 !sep_values.全部(|s| s == first) {
+                    返回 坏的(SettingsError::MultipleSeparatorCharacters);
+                }
+                匹配 first.as_str() {
+                    "\\0" => b'\0',
+                    s 如果 s.长度() == 1 => s.as_bytes()[0],
+                    s => 返回 坏的(SettingsError::MultiCharacterSeparator(s.to_string())),
+                }
+            }
+            无 => b'\n',
+        };
+
+        设 io_blksize: 选项<正64> = 如果 设 一些(s) = matches.get_one::<字符串>(OPT_IO_BLKSIZE) {
+            匹配 parse_size_u64(s) {
+                好的(0) => 返回 坏的(SettingsError::InvalidIOBlockSize(s.to_owned())),
+                好的(n) 如果 n <= uucore::文件系统::sane_blksize::MAX => 一些(n),
+                _ => 返回 坏的(SettingsError::InvalidIOBlockSize(s.to_owned())),
+            }
+        } 否则 {
+            无
+        };
+
+        设 result = 自身类型 {
+            prefix: matches.get_one::<OsString>(ARG_PREFIX).解包().克隆(),
+            suffix,
+            input: matches.get_one::<OsString>(ARG_INPUT).解包().克隆(),
+            过滤: matches.get_one::<字符串>(OPT_FILTER).cloned(),
+            strategy,
+            verbose: matches.value_source(OPT_VERBOSE) == 一些(ValueSource::CommandLine),
+            separator,
+            elide_empty_files: matches.get_flag(OPT_ELIDE_EMPTY_FILES),
+            io_blksize,
+        };
+
+        #[cfg(windows)]
+        如果 result.过滤.is_some() {
+            // see https://github.com/rust-lang/rust/issues/29494
+            返回 坏的(SettingsError::NotSupported);
+        }
+
+        // Return an error if `--filter` option is used with any of the
+        // Kth chunk sub-strategies of `--number` option
+        // As those are writing to stdout of `split` and cannot write to filter command child process
+        设 kth_chunk = matches!(
+            result.strategy,
+            Strategy::Number(
+                NumberType::KthBytes(_, _)
+                    | NumberType::KthLines(_, _)
+                    | NumberType::KthRoundRobin(_, _)
+            )
+        );
+        如果 kth_chunk && result.过滤.is_some() {
+            返回 坏的(SettingsError::FilterWithKthChunkNumber);
+        }
+
+        好的(result)
+    }
+
+    方法 instantiate_current_writer(
+        &自身,
+        filename: &OsStr,
+        is_new: 布尔,
+    ) -> 输入输出::结果<BufWriter<盒子<动态 Write>>> {
+        如果 platform::paths_refer_to_same_file(&自身.input, filename) {
+            返回 坏的(输入输出::错误协议::other(
+                translate!("split-error-would-overwrite-input", "file" => filename.quote()),
+            ));
+        }
+
+        platform::instantiate_current_writer(自身.过滤.as_deref(), filename, is_new)
+    }
+}
+
+/// When using `--filter` option, writing to child command process stdin
+/// could fail with [`ErrorKind::BrokenPipe`] error
+/// It can be safely ignored
+方法 ignorable_io_error(错误: &输入输出::错误协议, settings: &Settings) -> 布尔 {
+    错误.kind() == ErrorKind::BrokenPipe && settings.过滤.is_some()
+}
+
+/// Custom wrapper for `write()` method
+/// Follows similar approach to GNU implementation
+/// If ignorable io error occurs, return number of bytes as if all bytes written
+/// Should not be used for Kth chunk number sub-strategies
+/// as those do not work with `--filter` option
+方法 custom_write<T: Write>(bytes: &[正8], writer: &可变 T, settings: &Settings) -> 输入输出::结果<正整数大小> {
+    匹配 writer.写锁定(bytes) {
+        好的(n) => 好的(n),
+        坏的(e) 如果 ignorable_io_error(&e, settings) => 好的(bytes.长度()),
+        坏的(e) => 坏的(e),
+    }
+}
+
+/// Custom wrapper for `write_all()` method
+/// Similar to [`custom_write`], but returns true or false
+/// depending on if `--filter` stdin is still open (no [`ErrorKind::BrokenPipe`] error)
+/// Should not be used for Kth chunk number sub-strategies
+/// as those do not work with `--filter` option
+方法 custom_write_all<T: Write>(
+    bytes: &[正8],
+    writer: &可变 T,
+    settings: &Settings,
+) -> 输入输出::结果<布尔> {
+    匹配 writer.write_all(bytes) {
+        好的(()) => 好的(真),
+        坏的(e) 如果 ignorable_io_error(&e, settings) => 好的(假),
+        坏的(e) => 坏的(e),
+    }
+}
+
+/// Get the size of the input file in bytes
+/// Used only for subset of `--number=CHUNKS` strategy, as there is a need
+/// to determine input file size upfront in order to estimate the chunk size
+/// to be written into each of N files/chunks:
+/// * N       split into N files based on size of input
+/// * K/N     output Kth of N to stdout
+/// * l/N     split into N files without splitting lines/records
+/// * l/K/N   output Kth of N to stdout without splitting lines/records
+///
+/// For most files the size will be determined by either reading entire file content into a buffer
+/// or by `len()` function of [`std::fs::metadata`].
+///
+/// However, for some files which report filesystem metadata size that does not match
+/// their actual content size, we will need to attempt to find the end of file
+/// with direct `seek()` on [`std::fs::File`].
+///
+/// For STDIN stream - read into a buffer up to a limit
+/// If input stream does not EOF before that - return an error
+/// (i.e. "infinite" input as in `cat /dev/zero | split ...`, `yes | split ...` etc.).
+///
+/// Note: The `buf` might end up with either partial or entire input content.
+方法 get_input_size<R>(
+    input: &OsString,
+    reader: &可变 R,
+    buf: &可变 向量<正8>,
+    io_blksize: 选项<正64>,
+) -> 输入输出::结果<正64>
+何处
+    R: BufRead,
+{
+    // Set read limit to io_blksize if specified
+    设 read_limit: 正64 = 如果 设 一些(custom_blksize) = io_blksize {
+        custom_blksize
+    } 否则 {
+        // otherwise try to get it from filesystem, or use default
+        uucore::文件系统::sane_blksize::sane_blksize_from_path(Path::新建(input))
+    };
+
+    // Try to read into buffer up to a limit
+    设 num_bytes = reader
+        .by_ref()
+        .take(read_limit)
+        .read_to_end(buf)
+        .映射(|n| n 转换 正64)?;
+
+    如果 num_bytes < read_limit {
+        // Finite file or STDIN stream that fits entirely
+        // into a buffer within the limit
+        // Note: files like /dev/null or similar,
+        // empty STDIN stream,
+        // and files with true file size 0
+        // will also fit here
+        好的(num_bytes)
+    } 否则 如果 input == "-" {
+        // STDIN stream that did not fit all content into a buffer
+        // Most likely continuous/infinite input stream
+        坏的(输入输出::错误协议::other(
+            translate!("split-error-cannot-determine-input-size", "input" => input.maybe_quote()),
+        ))
+    } 否则 {
+        // Could be that file size is larger than set read limit
+        // Get the file size from filesystem metadata
+        设 metadata = metadata(Path::新建(input))?;
+        设 metadata_size = metadata.长度();
+        如果 num_bytes <= metadata_size {
+            好的(metadata_size)
+        } 否则 {
+            // Could be a file from locations like /dev, /sys, /proc or similar
+            // which report filesystem metadata size that does not match
+            // their actual content size
+            // Attempt direct `seek()` for the end of a file
+            设 可变 tmp_fd = File::open(Path::新建(input))?;
+            设 end = tmp_fd.seek(SeekFrom::End(0))?;
+            如果 end > 0 {
+                好的(end)
+            } 否则 {
+                // Edge case of either "infinite" file (i.e. /dev/zero)
+                // or some other "special" non-standard file type
+                // Give up and return an error
+                // TODO It might be possible to do more here
+                // to address all possible file types and edge cases
+                坏的(输入输出::错误协议::other(
+                    translate!("split-error-cannot-determine-file-size", "input" => input.maybe_quote()),
+                ))
+            }
+        }
+    }
+}
+
+/// Write a certain number of bytes to one file, then move on to another one.
+///
+/// This struct maintains an underlying writer representing the
+/// current chunk of the output. If a call to [`write`] would cause
+/// the underlying writer to write more than the allowed number of
+/// bytes, a new writer is created and the excess bytes are written to
+/// that one instead. As many new underlying writers are created as
+/// needed to write all the bytes in the input buffer.
+结构 ByteChunkWriter<'a> {
+    /// Parameters for creating the underlying writer for each new chunk.
+    settings: &'a Settings,
+
+    /// The maximum number of bytes allowed for a single chunk of output.
+    chunk_size: 正64,
+
+    /// Running total of number of chunks that have been completed.
+    num_chunks_written: 正64,
+
+    /// Remaining capacity in number of bytes in the current chunk.
+    ///
+    /// This number starts at `chunk_size` and decreases as bytes are
+    /// written. Once it reaches zero, a writer for a new chunk is
+    /// initialized and this number gets reset to `chunk_size`.
+    num_bytes_remaining_in_current_chunk: 正64,
+
+    /// The underlying writer for the current chunk.
+    ///
+    /// Once the number of bytes written to this writer exceeds
+    /// `chunk_size`, a new writer is initialized and assigned to this
+    /// field.
+    inner: BufWriter<盒子<动态 Write>>,
+
+    /// Iterator that yields filenames for each chunk.
+    filename_iterator: FilenameIterator<'a>,
+}
+
+实现<'a> ByteChunkWriter<'a> {
+    方法 新建(chunk_size: 正64, settings: &'a Settings) -> UResult<自身类型> {
+        设 可变 filename_iterator = FilenameIterator::新建(&settings.prefix, &settings.suffix)?;
+        设 filename = filename_iterator.next().ok_or_else(|| {
+            USimpleError::新建(1, translate!("split-error-output-file-suffixes-exhausted"))
+        })?;
+        如果 settings.verbose {
+            打印行!("creating file {}", filename.quote());
+        }
+        设 inner = settings.instantiate_current_writer(&filename, 真)?;
+        好的(ByteChunkWriter {
+            settings,
+            chunk_size,
+            num_bytes_remaining_in_current_chunk: chunk_size,
+            num_chunks_written: 0,
+            inner,
+            filename_iterator,
+        })
+    }
+}
+
+实现 Write 循环 ByteChunkWriter<'_> {
+    /// Implements `--bytes=SIZE`
+    方法 写锁定(&可变 自身, 可变 buf: &[正8]) -> 输入输出::结果<正整数大小> {
+        // If the length of `buf` exceeds the number of bytes remaining
+        // in the current chunk, we will need to write to multiple
+        // different underlying writers. In that case, each iteration of
+        // this loop writes to the underlying writer that corresponds to
+        // the current chunk number.
+        设 可变 carryover_bytes_written: 正整数大小 = 0;
+        无限循环 {
+            如果 buf.为空() {
+                返回 好的(carryover_bytes_written);
+            }
+
+            如果 自身.num_bytes_remaining_in_current_chunk == 0 {
+                // Increment the chunk number, reset the number of bytes remaining, and instantiate the new underlying writer.
+                自身.num_chunks_written += 1;
+                自身.num_bytes_remaining_in_current_chunk = 自身.chunk_size;
+
+                // Allocate the new file, since at this point we know there are bytes to be written to it.
+                设 filename = 自身.filename_iterator.next().ok_or_else(|| {
+                    输入输出::错误协议::other(translate!("split-error-output-file-suffixes-exhausted"))
+                })?;
+                如果 自身.settings.verbose {
+                    打印行!("creating file {}", filename.quote());
+                }
+                自身.inner = 自身.settings.instantiate_current_writer(&filename, 真)?;
+            }
+
+            // If the capacity of this chunk is greater than the number of
+            // bytes in `buf`, then write all the bytes in `buf`. Otherwise,
+            // write enough bytes to fill the current chunk, then increment
+            // the chunk number and repeat.
+            设 buf_len = buf.长度();
+            如果 (buf_len 转换 正64) < 自身.num_bytes_remaining_in_current_chunk {
+                设 num_bytes_written = custom_write(buf, &可变 自身.inner, 自身.settings)?;
+                自身.num_bytes_remaining_in_current_chunk -= num_bytes_written 转换 正64;
+                返回 好的(carryover_bytes_written + num_bytes_written);
+            }
+
+            // Write enough bytes to fill the current chunk.
+            //
+            // Conversion to usize is safe because we checked that
+            // self.num_bytes_remaining_in_current_chunk is lower than
+            // n, which is already usize.
+            设 i = 自身.num_bytes_remaining_in_current_chunk 转换 正整数大小;
+            设 num_bytes_written = custom_write(&buf[..i], &可变 自身.inner, 自身.settings)?;
+            自身.num_bytes_remaining_in_current_chunk -= num_bytes_written 转换 正64;
+
+            // It's possible that the underlying writer did not
+            // write all the bytes.
+            如果 num_bytes_written < i {
+                返回 好的(carryover_bytes_written + num_bytes_written);
+            }
+
+            // Move the window to look at only the remaining bytes.
+            buf = &buf[i..];
+
+            // Remember for the next iteration that we wrote these bytes.
+            carryover_bytes_written += num_bytes_written;
+        }
+    }
+    方法 flush(&可变 自身) -> 输入输出::结果<()> {
+        自身.inner.flush()
+    }
+}
+
+/// Write a certain number of lines to one file, then move on to another one.
+///
+/// This struct maintains an underlying writer representing the
+/// current chunk of the output. If a call to [`write`] would cause
+/// the underlying writer to write more than the allowed number of
+/// lines, a new writer is created and the excess lines are written to
+/// that one instead. As many new underlying writers are created as
+/// needed to write all the lines in the input buffer.
+结构 LineChunkWriter<'a> {
+    /// Parameters for creating the underlying writer for each new chunk.
+    settings: &'a Settings,
+
+    /// The maximum number of lines allowed for a single chunk of output.
+    chunk_size: 正64,
+
+    /// Running total of number of chunks that have been completed.
+    num_chunks_written: 正64,
+
+    /// Remaining capacity in number of lines in the current chunk.
+    ///
+    /// This number starts at `chunk_size` and decreases as lines are
+    /// written. Once it reaches zero, a writer for a new chunk is
+    /// initialized and this number gets reset to `chunk_size`.
+    num_lines_remaining_in_current_chunk: 正64,
+
+    /// The underlying writer for the current chunk.
+    ///
+    /// Once the number of lines written to this writer exceeds
+    /// `chunk_size`, a new writer is initialized and assigned to this
+    /// field.
+    inner: BufWriter<盒子<动态 Write>>,
+
+    /// Iterator that yields filenames for each chunk.
+    filename_iterator: FilenameIterator<'a>,
+}
+
+实现<'a> LineChunkWriter<'a> {
+    方法 新建(chunk_size: 正64, settings: &'a Settings) -> UResult<自身类型> {
+        设 可变 filename_iterator = FilenameIterator::新建(&settings.prefix, &settings.suffix)?;
+        设 inner = 自身类型::start_new_chunk(settings, &可变 filename_iterator)?;
+        好的(LineChunkWriter {
+            settings,
+            chunk_size,
+            num_lines_remaining_in_current_chunk: chunk_size,
+            num_chunks_written: 0,
+            inner,
+            filename_iterator,
+        })
+    }
+
+    方法 start_new_chunk(
+        settings: &Settings,
+        filename_iterator: &可变 FilenameIterator,
+    ) -> 输入输出::结果<BufWriter<盒子<动态 Write>>> {
+        设 filename = filename_iterator.next().ok_or_else(|| {
+            输入输出::错误协议::other(translate!("split-error-output-file-suffixes-exhausted"))
+        })?;
+        如果 settings.verbose {
+            打印行!("creating file {}", filename.quote());
+        }
+        settings.instantiate_current_writer(&filename, 真)
+    }
+}
+
+实现 Write 循环 LineChunkWriter<'_> {
+    /// Implements `--lines=NUMBER`
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 输入输出::结果<正整数大小> {
+        // If the number of lines in `buf` exceeds the number of lines
+        // remaining in the current chunk, we will need to write to
+        // multiple different underlying writers. In that case, each
+        // iteration of this loop writes to the underlying writer that
+        // corresponds to the current chunk number.
+        设 可变 prev = 0;
+        设 可变 total_bytes_written = 0;
+        设 sep = 自身.settings.separator;
+        循环 i 在 memchr::memchr_iter(sep, buf) {
+            // If we have exceeded the number of lines to write in the
+            // current chunk, then start a new chunk and its
+            // corresponding writer.
+            如果 自身.num_lines_remaining_in_current_chunk == 0 {
+                自身.num_chunks_written += 1;
+                自身.inner = 自身类型::start_new_chunk(自身.settings, &可变 自身.filename_iterator)?;
+                自身.num_lines_remaining_in_current_chunk = 自身.chunk_size;
+            }
+
+            // Write the line, starting from *after* the previous
+            // separator character and ending *after* the current
+            // separator character.
+            设 num_bytes_written = custom_write(&buf[prev..=i], &可变 自身.inner, 自身.settings)?;
+            total_bytes_written += num_bytes_written;
+            prev = i + 1;
+            自身.num_lines_remaining_in_current_chunk -= 1;
+        }
+
+        // There might be bytes remaining in the buffer, and we write
+        // them to the current chunk. But first, we may need to rotate
+        // the current chunk in case it has already reached its line
+        // limit.
+        如果 prev < buf.长度() {
+            如果 自身.num_lines_remaining_in_current_chunk == 0 {
+                自身.inner = 自身类型::start_new_chunk(自身.settings, &可变 自身.filename_iterator)?;
+                自身.num_lines_remaining_in_current_chunk = 自身.chunk_size;
+            }
+            设 num_bytes_written =
+                custom_write(&buf[prev..buf.长度()], &可变 自身.inner, 自身.settings)?;
+            total_bytes_written += num_bytes_written;
+        }
+        好的(total_bytes_written)
+    }
+
+    方法 flush(&可变 自身) -> 输入输出::结果<()> {
+        自身.inner.flush()
+    }
+}
+
+/// Output file parameters
+结构 OutFile {
+    filename: OsString,
+    maybe_writer: 选项<BufWriter<盒子<动态 Write>>>,
+    is_new: 布尔,
+}
+
+/// A set of output files
+/// Used in [`n_chunks_by_byte`], [`n_chunks_by_line`]
+/// and [`n_chunks_by_line_round_robin`] functions.
+类型 OutFiles = 向量<OutFile>;
+协议 ManageOutFiles {
+    方法 instantiate_writer(
+        &可变 自身,
+        idx: 正整数大小,
+        settings: &Settings,
+    ) -> UResult<&可变 BufWriter<盒子<动态 Write>>>;
+    /// Initialize a new set of output files
+    /// Each [`OutFile`] is generated with filename, while the writer for it could be
+    /// optional, to be instantiated later by the calling function as needed.
+    /// Optional writers could happen in the following situations:
+    /// * in [`n_chunks_by_line`] and [`n_chunks_by_line_round_robin`] if `elide_empty_files` parameter is set to `true`
+    /// * if the number of files is greater than system limit for open files
+    方法 init(num_files: 正64, settings: &Settings, is_writer_optional: 布尔) -> UResult<自身类型>
+    何处
+        自身类型: Sized;
+    /// Get the writer for the output file by index.
+    /// If system limit of open files has been reached
+    /// it will try to close one of previously instantiated writers
+    /// to free up resources and re-try instantiating current writer,
+    /// except for `--filter` mode.
+    /// The writers that get closed to free up resources for the current writer
+    /// are flagged as `is_new=false`, so they can be re-opened for appending
+    /// instead of created anew if we need to keep writing into them later,
+    /// i.e. in case of round robin distribution as in [`n_chunks_by_line_round_robin`]
+    方法 get_writer(
+        &可变 自身,
+        idx: 正整数大小,
+        settings: &Settings,
+    ) -> UResult<&可变 BufWriter<盒子<动态 Write>>>;
+}
+
+实现 ManageOutFiles 循环 OutFiles {
+    方法 init(num_files: 正64, settings: &Settings, is_writer_optional: 布尔) -> UResult<自身类型> {
+        // This object is responsible for creating the filename for each chunk
+        设 可变 filename_iterator: FilenameIterator<'_> =
+            FilenameIterator::新建(&settings.prefix, &settings.suffix)
+                .map_err(|e| 输入输出::错误协议::other(格式化!("{e}")))?;
+        设 可变 out_files: 自身类型 = 自身类型::新建();
+        循环 _ 在 0..num_files {
+            设 filename = filename_iterator.next().ok_or_else(|| {
+                USimpleError::新建(1, translate!("split-error-output-file-suffixes-exhausted"))
+            })?;
+            设 maybe_writer = 如果 is_writer_optional {
+                无
+            } 否则 {
+                设 instantiated = settings.instantiate_current_writer(&filename, 真);
+                // If there was an error instantiating the writer for a file,
+                // it could be due to hitting the system limit of open files,
+                // so record it as None and let [`get_writer`] function handle closing/re-opening
+                // of writers as needed within system limits.
+                // However, for `--filter` child process writers - propagate the error,
+                // as working around system limits of open files for child shell processes
+                // is currently not supported (same as in GNU)
+                匹配 instantiated {
+                    好的(writer) => 一些(writer),
+                    坏的(e) 如果 settings.过滤.is_some() => {
+                        返回 坏的(e.into());
+                    }
+                    坏的(_) => 无,
+                }
+            };
+            out_files.压入(OutFile {
+                filename,
+                maybe_writer,
+                is_new: 真,
+            });
+        }
+        好的(out_files)
+    }
+
+    方法 instantiate_writer(
+        &可变 自身,
+        idx: 正整数大小,
+        settings: &Settings,
+    ) -> UResult<&可变 BufWriter<盒子<动态 Write>>> {
+        设 可变 计数 = 0;
+        // Use-case for doing multiple tries of closing fds:
+        // E.g. split running in parallel to other processes (e.g. another split) doing similar stuff,
+        // sharing the same limits. In this scenario, after closing one fd, the other process
+        // might "steel" the freed fd and open a file on its side. Then it would be beneficial
+        // if split would be able to close another fd before cancellation.
+        'loop1: 无限循环 {
+            设 filename_to_open = &自身[idx].filename;
+            设 file_to_open_is_new = 自身[idx].is_new;
+            设 maybe_writer =
+                settings.instantiate_current_writer(filename_to_open, file_to_open_is_new);
+            如果 设 好的(writer) = maybe_writer {
+                自身[idx].maybe_writer = 一些(writer);
+                返回 好的(自身[idx].maybe_writer.as_mut().解包());
+            }
+
+            如果 settings.过滤.is_some() {
+                // Propagate error if in `--filter` mode
+                返回 坏的(maybe_writer.err().解包().into());
+            }
+
+            // Could have hit system limit for open files.
+            // Try to close one previously instantiated writer first
+            循环 (i, out_file) 在 自身.iter_mut().enumerate() {
+                如果 i != idx
+                    && 设 一些(writer) = out_file.maybe_writer.as_mut()
+                {
+                    writer.flush()?;
+                    out_file.maybe_writer = 无;
+                    out_file.is_new = 假;
+                    计数 += 1;
+
+                    // And then try to instantiate the writer again
+                    继续 'loop1;
+                }
+            }
+
+            // If this fails - give up and propagate the error
+            uucore::show_error!(
+                "{}",
+                translate!("split-error-file-descriptor-limit", "count" => 计数)
+            );
+            返回 坏的(maybe_writer.err().解包().into());
+        }
+    }
+
+    方法 get_writer(
+        &可变 自身,
+        idx: 正整数大小,
+        settings: &Settings,
+    ) -> UResult<&可变 BufWriter<盒子<动态 Write>>> {
+        如果 自身[idx].maybe_writer.is_some() {
+            好的(自身[idx].maybe_writer.as_mut().解包())
+        } 否则 {
+            // Writer was not instantiated upfront or was temporarily closed due to system resources constraints.
+            // Instantiate it and record for future use.
+            自身.instantiate_writer(idx, settings)
+        }
+    }
+}
+
+/// Split a file or STDIN into a specific number of chunks by byte.
+///
+/// When file size cannot be evenly divided into the number of chunks of the same size,
+/// the first X chunks are 1 byte longer than the rest,
+/// where X is a modulus reminder of (file size % number of chunks)
+///
+/// In Kth chunk of N mode - writes to STDOUT the contents of the chunk identified by `kth_chunk`
+///
+/// In N chunks mode - this function always creates one output file for each chunk, even
+/// if there is an error reading or writing one of the chunks or if
+/// the input file is truncated. However, if the `--filter` option is
+/// being used, then files will only be created if `$FILE` variable was used
+/// in filter command,
+/// i.e. `split -n 10 --filter='head -c1 > $FILE' in`
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem reading from
+/// `reader` or writing to one of the output files or stdout.
+///
+/// # See also
+///
+/// * [`n_chunks_by_line`], which splits its input into a specific number of chunks by line.
+///
+/// Implements `--number=CHUNKS`
+/// Where CHUNKS
+/// * N
+/// * K/N
+方法 n_chunks_by_byte<R>(
+    settings: &Settings,
+    reader: &可变 R,
+    num_chunks: 正64,
+    kth_chunk: 选项<正64>,
+) -> UResult<()>
+何处
+    R: BufRead,
+{
+    // Get the size of the input in bytes
+    设 initial_buf = &可变 向量::新建();
+    设 可变 num_bytes = get_input_size(&settings.input, reader, initial_buf, settings.io_blksize)?;
+    设 可变 reader = initial_buf.chain(reader);
+
+    // If input file is empty and we would not have determined the Kth chunk
+    // in the Kth chunk of N chunk mode, then terminate immediately.
+    // This happens on `split -n 3/10 /dev/null`, for example.
+    如果 kth_chunk.is_some() && num_bytes == 0 {
+        返回 好的(());
+    }
+
+    // If the requested number of chunks exceeds the number of bytes
+    // in the input:
+    // * in Kth chunk of N mode - just write empty byte string to stdout
+    //   NOTE: the `elide_empty_files` parameter is ignored here
+    //   as we do not generate any files
+    //   and instead writing to stdout
+    // * In N chunks mode - if the `elide_empty_files` parameter is enabled,
+    //   then behave as if the number of chunks was set to the number of
+    //   bytes in the file. This ensures that we don't write empty
+    //   files. Otherwise, just write the `num_chunks - num_bytes` empty files.
+    设 num_chunks = 如果 kth_chunk.is_none() && settings.elide_empty_files && num_chunks > num_bytes
+    {
+        num_bytes
+    } 否则 {
+        num_chunks
+    };
+
+    // If we would have written zero chunks of output, then terminate
+    // immediately. This happens on `split -e -n 3 /dev/null`, for
+    // example.
+    如果 num_chunks == 0 {
+        返回 好的(());
+    }
+
+    // In Kth chunk of N mode - we will write to stdout instead of to a file.
+    设 可变 stdout_writer = 输入输出::stdout().锁定();
+    // In N chunks mode - we will write to `num_chunks` files
+    设 可变 out_files: OutFiles = OutFiles::新建();
+
+    // Calculate chunk size base and modulo reminder
+    // to be used in calculating chunk_size later on
+    设 chunk_size_base = num_bytes / num_chunks;
+    设 chunk_size_reminder = num_bytes % num_chunks;
+
+    // If in N chunks mode
+    // Create one writer for each chunk.
+    // This will create each of the underlying files
+    // or stdin pipes to child shell/command processes if in `--filter` mode
+    如果 kth_chunk.is_none() {
+        out_files = OutFiles::init(num_chunks, settings, 假)?;
+    }
+
+    设 可变 buf = 向量::with_capacity((chunk_size_base + 1) 转换 正整数大小);
+    循环 i 在 1_u64..=num_chunks {
+        设 chunk_size = chunk_size_base + (chunk_size_reminder > i - 1) 转换 正64;
+        buf.clear();
+        如果 num_bytes > 0 {
+            // Read `chunk_size` bytes from the reader into `buf`
+            // except the last.
+            //
+            // The last chunk gets all remaining bytes so that if the number
+            // of bytes in the input file was not evenly divisible by
+            // `num_chunks`, we don't leave any bytes behind.
+            设 limit = {
+                如果 i == num_chunks {
+                    num_bytes
+                } 否则 {
+                    chunk_size
+                }
+            };
+
+            设 n_bytes_read = reader.by_ref().take(limit).read_to_end(&可变 buf);
+
+            匹配 n_bytes_read {
+                好的(n_bytes) => {
+                    num_bytes -= n_bytes 转换 正64;
+                }
+                坏的(错误) => {
+                    返回 坏的(USimpleError::新建(
+                        1,
+                        translate!("split-error-cannot-read-from-input", "input" => settings.input.maybe_quote(), "error" => 错误),
+                    ));
+                }
+            }
+
+            如果 设 一些(chunk_number) = kth_chunk {
+                如果 i == chunk_number {
+                    stdout_writer.write_all(&buf)?;
+                    中断;
+                }
+            } 否则 {
+                设 idx = (i - 1) 转换 正整数大小;
+                设 writer = out_files.get_writer(idx, settings)?;
+                writer.write_all(&buf)?;
+            }
+        } 否则 {
+            中断;
+        }
+    }
+    好的(())
+}
+
+/// Split a file or STDIN into a specific number of chunks by line.
+///
+/// It is most likely that input cannot be evenly divided into the number of chunks
+/// of the same size in bytes or number of lines, since we cannot break lines.
+/// It is also likely that there could be empty files (having `elide_empty_files` is disabled)
+/// when a long line overlaps one or more chunks.
+///
+/// In Kth chunk of N mode - writes to STDOUT the contents of the chunk identified by `kth_chunk`
+/// Note: the `elide_empty_files` flag is ignored in this mode
+///
+/// In N chunks mode - this function always creates one output file for each chunk, even
+/// if there is an error reading or writing one of the chunks or if
+/// the input file is truncated. However, if the `--filter` option is
+/// being used, then files will only be created if `$FILE` variable was used
+/// in filter command,
+/// i.e. `split -n l/10 --filter='head -c1 > $FILE' in`
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem reading from
+/// `reader` or writing to one of the output files.
+///
+/// # See also
+///
+/// * [`n_chunks_by_byte`], which splits its input into a specific number of chunks by byte.
+///
+/// Implements `--number=CHUNKS`
+/// Where CHUNKS
+/// * l/N
+/// * l/K/N
+方法 n_chunks_by_line<R>(
+    settings: &Settings,
+    reader: &可变 R,
+    num_chunks: 正64,
+    kth_chunk: 选项<正64>,
+) -> UResult<()>
+何处
+    R: BufRead,
+{
+    // Get the size of the input in bytes and compute the number
+    // of bytes per chunk.
+    设 initial_buf = &可变 向量::新建();
+    设 num_bytes = get_input_size(&settings.input, reader, initial_buf, settings.io_blksize)?;
+    设 reader = initial_buf.chain(reader);
+
+    // If input file is empty and we would not have determined the Kth chunk
+    // in the Kth chunk of N chunk mode, then terminate immediately.
+    // This happens on `split -n l/3/10 /dev/null`, for example.
+    // Similarly, if input file is empty and `elide_empty_files` parameter is enabled,
+    // then we would have written zero chunks of output,
+    // so terminate immediately as well.
+    // This happens on `split -e -n l/3 /dev/null`, for example.
+    如果 num_bytes == 0 && (kth_chunk.is_some() || settings.elide_empty_files) {
+        返回 好的(());
+    }
+
+    // In Kth chunk of N mode - we will write to stdout instead of to a file.
+    设 可变 stdout_writer = 输入输出::stdout().锁定();
+    // In N chunks mode - we will write to `num_chunks` files
+    设 可变 out_files: OutFiles = OutFiles::新建();
+
+    // Calculate chunk size base and modulo reminder
+    // to be used in calculating `num_bytes_should_be_written` later on
+    设 chunk_size_base = num_bytes / num_chunks;
+    设 chunk_size_reminder = num_bytes % num_chunks;
+
+    // If in N chunks mode
+    // Generate filenames for each file and
+    // if `elide_empty_files` parameter is NOT enabled - instantiate the writer
+    // which will create each of the underlying files or stdin pipes
+    // to child shell/command processes if in `--filter` mode.
+    // Otherwise keep writer optional, to be instantiated later if there is data
+    // to write for the associated chunk.
+    如果 kth_chunk.is_none() {
+        out_files = OutFiles::init(num_chunks, settings, settings.elide_empty_files)?;
+    }
+
+    设 可变 chunk_number = 1;
+    设 sep = settings.separator;
+    设 可变 num_bytes_should_be_written = chunk_size_base + (chunk_size_reminder > 0) 转换 正64;
+    设 可变 num_bytes_written = 0;
+
+    循环 line_result 在 reader.split(sep) {
+        设 可变 line = line_result?;
+        // add separator back in at the end of the line,
+        // since `reader.split(sep)` removes it,
+        // except if the last line did not end with separator character
+        如果 (num_bytes_written + line.长度() 转换 正64) < num_bytes {
+            line.压入(sep);
+        }
+        设 bytes = line.as_slice();
+
+        如果 设 一些(kth) = kth_chunk {
+            如果 chunk_number == kth {
+                stdout_writer.write_all(bytes)?;
+            }
+        } 否则 {
+            // Should write into a file
+            设 idx = (chunk_number - 1) 转换 正整数大小;
+            设 writer = out_files.get_writer(idx, settings)?;
+            custom_write_all(bytes, writer, settings)?;
+        }
+
+        // Advance to the next chunk if the current one is filled.
+        // There could be a situation when a long line, which started in current chunk,
+        // would overlap the next chunk (or even several next chunks),
+        // and since we cannot break lines for this split strategy, we could end up with
+        // empty files in place(s) of skipped chunk(s)
+        设 num_line_bytes = bytes.长度() 转换 正64;
+        num_bytes_written += num_line_bytes;
+        设 可变 skipped = -1;
+        当 num_bytes_should_be_written <= num_bytes_written {
+            num_bytes_should_be_written +=
+                chunk_size_base + (chunk_size_reminder > chunk_number) 转换 正64;
+            chunk_number += 1;
+            skipped += 1;
+        }
+
+        // If a chunk was skipped and `elide_empty_files` flag is set,
+        // roll chunk_number back to preserve sequential continuity
+        // of file names for files written to,
+        // except for Kth chunk of N mode
+        如果 settings.elide_empty_files && skipped > 0 && kth_chunk.is_none() {
+            chunk_number -= skipped 转换 正64;
+        }
+        如果 kth_chunk.is_some_and(|k| chunk_number > k) {
+            中断;
+        }
+    }
+    好的(())
+}
+
+/// Split a file or STDIN into a specific number of chunks by line, but
+/// assign lines via round-robin.
+/// Note: There is no need to know the size of the input upfront for this method,
+/// since the lines are assigned to chunks randomly and the size of each chunk
+/// does not need to be estimated. As a result, "infinite" inputs are supported
+/// for this method, i.e. `yes | split -n r/10` or `yes | split -n r/3/11`
+///
+/// In Kth chunk of N mode - writes to stdout the contents of the chunk identified by `kth_chunk`
+///
+/// In N chunks mode - this function always creates one output file for each chunk, even
+/// if there is an error reading or writing one of the chunks or if
+/// the input file is truncated. However, if the `--filter` option is
+/// being used, then files will only be created if `$FILE` variable was used
+/// in filter command,
+/// i.e. `split -n r/10 --filter='head -c1 > $FILE' in`
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem reading from
+/// `reader` or writing to one of the output files.
+///
+/// # See also
+///
+/// * [`n_chunks_by_line`], which splits its input into a specific number of chunks by line.
+///
+/// Implements `--number=CHUNKS`
+/// Where CHUNKS
+/// * r/N
+/// * r/K/N
+方法 n_chunks_by_line_round_robin<R>(
+    settings: &Settings,
+    reader: &可变 R,
+    num_chunks: 正64,
+    kth_chunk: 选项<正64>,
+) -> UResult<()>
+何处
+    R: BufRead,
+{
+    // In Kth chunk of N mode - we will write to stdout instead of to a file.
+    设 可变 stdout_writer = 输入输出::stdout().锁定();
+    // In N chunks mode - we will write to `num_chunks` files
+    设 可变 out_files: OutFiles = OutFiles::新建();
+
+    // If in N chunks mode
+    // Create one writer for each chunk.
+    // This will create each of the underlying files
+    // or stdin pipes to child shell/command processes if in `--filter` mode
+    如果 kth_chunk.is_none() {
+        out_files = OutFiles::init(num_chunks, settings, settings.elide_empty_files)?;
+    }
+
+    设 num_chunks: 正整数大小 = num_chunks.try_into().解包();
+    设 sep = settings.separator;
+    设 可变 closed_writers = 0;
+
+    设 可变 i = 0;
+    无限循环 {
+        设 line = &可变 向量::新建();
+        设 num_bytes_read = reader.by_ref().read_until(sep, line)?;
+
+        // if there is nothing else to read - exit the loop
+        如果 num_bytes_read == 0 {
+            中断;
+        }
+
+        设 bytes = line.as_slice();
+        如果 设 一些(chunk_number) = kth_chunk {
+            如果 (i % num_chunks) == (chunk_number - 1) 转换 正整数大小 {
+                stdout_writer.write_all(bytes)?;
+            }
+        } 否则 {
+            设 writer = out_files.get_writer(i % num_chunks, settings)?;
+            设 writer_stdin_open = custom_write_all(bytes, writer, settings)?;
+            如果 !writer_stdin_open {
+                closed_writers += 1;
+            }
+        }
+        i += 1;
+        如果 closed_writers == num_chunks {
+            // all writers are closed - stop reading
+            中断;
+        }
+    }
+    好的(())
+}
+
+/// Like `io::Lines`, but includes the line ending character.
+///
+/// This struct is generally created by calling `lines_with_sep` on a
+/// reader.
+公有 结构 LinesWithSep<R> {
+    inner: R,
+    separator: 正8,
+}
+
+实现<R> 迭代器协议 循环 LinesWithSep<R>
+何处
+    R: BufRead,
+{
+    类型 Item = 输入输出::结果<向量<正8>>;
+
+    /// Read bytes from a buffer up to the requested number of lines.
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        设 可变 buf = 向量![];
+        匹配 自身.inner.read_until(自身.separator, &可变 buf) {
+            好的(0) => 无,
+            好的(_) => 一些(好的(buf)),
+            坏的(e) => 一些(坏的(e)),
+        }
+    }
+}
+
+/// Like `std::str::lines` but includes the line ending character.
+///
+/// The `separator` defines the character to interpret as the line
+/// ending. For the usual notion of "line", set this to `b'\n'`.
+公有 方法 lines_with_sep<R>(reader: R, separator: 正8) -> LinesWithSep<R>
+何处
+    R: BufRead,
+{
+    LinesWithSep {
+        inner: reader,
+        separator,
+    }
+}
+
+方法 line_bytes<R>(settings: &Settings, reader: &可变 R, chunk_size: 正整数大小) -> UResult<()>
+何处
+    R: BufRead,
+{
+    设 可变 filename_iterator = FilenameIterator::新建(&settings.prefix, &settings.suffix)?;
+
+    // Initialize the writer just to satisfy the compiler. It is going
+    // to be overwritten for sure at the beginning of the loop below
+    // because we start with `remaining == 0`, indicating that a new
+    // chunk should start.
+    设 可变 writer: BufWriter<盒子<动态 Write>> = BufWriter::新建(盒子::新建(输入输出::Cursor::新建(向量![])));
+
+    设 可变 remaining = 0;
+    循环 line 在 lines_with_sep(reader, settings.separator) {
+        设 line = line?;
+        设 可变 line = &line[..];
+        无限循环 {
+            如果 remaining == 0 {
+                设 filename = filename_iterator.next().ok_or_else(|| {
+                    USimpleError::新建(1, translate!("split-error-output-file-suffixes-exhausted"))
+                })?;
+                如果 settings.verbose {
+                    打印行!("creating file {}", filename.quote());
+                }
+                writer = settings.instantiate_current_writer(&filename, 真)?;
+                remaining = chunk_size;
+            }
+
+            // Special case: if this is the last line and it doesn't end
+            // with a newline character, then count its length as though
+            // it did end with a newline. If that puts it over the edge
+            // of this chunk, continue to the next chunk.
+            如果 line.长度() == remaining
+                && remaining < chunk_size
+                && line[line.长度() - 1] != settings.separator
+            {
+                remaining = 0;
+                继续;
+            }
+
+            // If the entire line fits in this chunk, write it and
+            // continue to the next line.
+            如果 line.长度() <= remaining {
+                custom_write_all(line, &可变 writer, settings)?;
+                remaining -= line.长度();
+                中断;
+            }
+
+            // If the line is too large to fit in *any* chunk and we are
+            // at the start of a new chunk, write as much as we can of
+            // it and pass the remainder along to the next chunk.
+            如果 line.长度() > chunk_size && remaining == chunk_size {
+                custom_write_all(&line[..chunk_size], &可变 writer, settings)?;
+                line = &line[chunk_size..];
+                remaining = 0;
+                继续;
+            }
+
+            // If the line is too large to fit in *this* chunk, but
+            // might otherwise fit in the next chunk, then just continue
+            // to the next chunk and let it be handled there.
+            remaining = 0;
+        }
+    }
+    好的(())
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 split(settings: &Settings) -> UResult<()> {
+    设 r_box = 如果 settings.input == "-" {
+        盒子::新建(stdin()) 转换 盒子<动态 Read>
+    } 否则 {
+        设 r = File::open(Path::新建(&settings.input)).map_err_context(
+            || translate!("split-error-cannot-open-for-reading", "file" => settings.input.quote()),
+        )?;
+        盒子::新建(r) 转换 盒子<动态 Read>
+    };
+    设 可变 reader = 如果 设 一些(c) = settings.io_blksize {
+        BufReader::with_capacity(c.try_into().解包(), r_box)
+    } 否则 {
+        BufReader::新建(r_box)
+    };
+
+    匹配 settings.strategy {
+        Strategy::Number(NumberType::Bytes(num_chunks)) => {
+            // split_into_n_chunks_by_byte(settings, &mut reader, num_chunks)
+            n_chunks_by_byte(settings, &可变 reader, num_chunks, 无)
+        }
+        Strategy::Number(NumberType::KthBytes(chunk_number, num_chunks)) => {
+            // kth_chunks_by_byte(settings, &mut reader, chunk_number, num_chunks)
+            n_chunks_by_byte(settings, &可变 reader, num_chunks, 一些(chunk_number))
+        }
+        Strategy::Number(NumberType::Lines(num_chunks)) => {
+            n_chunks_by_line(settings, &可变 reader, num_chunks, 无)
+        }
+        Strategy::Number(NumberType::KthLines(chunk_number, num_chunks)) => {
+            n_chunks_by_line(settings, &可变 reader, num_chunks, 一些(chunk_number))
+        }
+        Strategy::Number(NumberType::RoundRobin(num_chunks)) => {
+            n_chunks_by_line_round_robin(settings, &可变 reader, num_chunks, 无)
+        }
+        Strategy::Number(NumberType::KthRoundRobin(chunk_number, num_chunks)) => {
+            n_chunks_by_line_round_robin(settings, &可变 reader, num_chunks, 一些(chunk_number))
+        }
+        Strategy::Lines(chunk_size) => {
+            设 可变 writer = LineChunkWriter::新建(chunk_size, settings)?;
+            匹配 输入输出::copy(&可变 reader, &可变 writer) {
+                好的(_) => 好的(()),
+                坏的(e) => 匹配 e.kind() {
+                    // TODO Since the writer object controls the creation of
+                    // new files, we need to rely on the `io::Result`
+                    // returned by its `write()` method to communicate any
+                    // errors to this calling scope. If a new file cannot be
+                    // created because we have exceeded the number of
+                    // allowable filenames, we use `ErrorKind::Other` to
+                    // indicate that. A special error message needs to be
+                    // printed in that case.
+                    ErrorKind::Other => 坏的(USimpleError::新建(1, 格式化!("{e}"))),
+                    _ => 坏的(uio_error!(
+                        e,
+                        "{}",
+                        translate!("split-error-input-output-error")
+                    )),
+                },
+            }
+        }
+        Strategy::Bytes(chunk_size) => {
+            设 可变 writer = ByteChunkWriter::新建(chunk_size, settings)?;
+            匹配 输入输出::copy(&可变 reader, &可变 writer) {
+                好的(_) => 好的(()),
+                坏的(e) => 匹配 e.kind() {
+                    // TODO Since the writer object controls the creation of
+                    // new files, we need to rely on the `io::Result`
+                    // returned by its `write()` method to communicate any
+                    // errors to this calling scope. If a new file cannot be
+                    // created because we have exceeded the number of
+                    // allowable filenames, we use `ErrorKind::Other` to
+                    // indicate that. A special error message needs to be
+                    // printed in that case.
+                    ErrorKind::Other => 坏的(USimpleError::新建(1, 格式化!("{e}"))),
+                    _ => 坏的(uio_error!(
+                        e,
+                        "{}",
+                        translate!("split-error-input-output-error")
+                    )),
+                },
+            }
+        }
+        Strategy::LineBytes(chunk_size) => line_bytes(settings, &可变 reader, chunk_size 转换 正整数大小),
+    }
+}

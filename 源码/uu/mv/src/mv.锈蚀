@@ -1,0 +1,1391 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) sourcepath targetpath nushell canonicalized unwriteable
+
+模组 错误;
+#[cfg(unix)]
+模组 hardlink;
+
+使用 clap::builder::ValueParser;
+使用 clap::错误::ErrorKind;
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+#[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+使用 rustc_hash::FxHashMap;
+使用 rustc_hash::FxHashSet;
+使用 标准库::环境;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统;
+使用 标准库::输入输出::{自身, IsTerminal};
+#[cfg(unix)]
+使用 标准库::操作系统::unix;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, PermissionsExt};
+#[cfg(windows)]
+使用 标准库::操作系统::windows;
+使用 标准库::路径::{Path, PathBuf, absolute};
+
+#[cfg(unix)]
+使用 箱::hardlink::{
+    HardlinkGroupScanner, HardlinkOptions, HardlinkTracker, create_hardlink_context,
+    with_optional_hardlink_context,
+};
+使用 uucore::backup_control::{自身, source_is_target_backup};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError, UUsageError, set_exit_code};
+#[cfg(unix)]
+使用 uucore::文件系统::display_permissions_unix;
+#[cfg(unix)]
+使用 uucore::文件系统::make_fifo;
+使用 uucore::文件系统::{
+    MissingHandling, ResolveMode, are_hardlinks_or_one_way_symlink_to_same_file,
+    are_hardlinks_to_same_file, canonicalize, path_ends_with_terminator,
+};
+#[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+使用 uucore::fsxattr;
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+使用 uucore::selinux::set_selinux_security_context;
+使用 uucore::translate;
+使用 uucore::update_control;
+
+// These are exposed for projects (e.g. nushell) that want to create an `Options` value, which
+// requires these enums
+公有 使用 uucore::{backup_control::BackupMode, update_control::UpdateMode};
+使用 uucore::{format_usage, prompt_yes, show};
+
+使用 fs_extra::dir::get_size 转换 dir_get_size;
+
+使用 箱::错误::MvError;
+
+/// Options contains all the possible behaviors and flags for mv.
+///
+/// All options are public so that the options can be programmatically
+/// constructed by other crates, such as nushell. That means that this struct is
+/// part of our public API. It should therefore not be changed without good reason.
+///
+/// The fields are documented with the arguments that determine their value.
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 结构 Options {
+    /// specifies overwrite behavior
+    /// '-n' '--no-clobber'
+    /// '-i' '--interactive'
+    /// '-f' '--force'
+    公有 overwrite: OverwriteMode,
+
+    /// `--backup[=CONTROL]`, `-b`
+    公有 backup: BackupMode,
+
+    /// '-S' --suffix' backup suffix
+    公有 suffix: 字符串,
+
+    /// Available update mode "--update-mode=all|none|older"
+    公有 update: UpdateMode,
+
+    /// Specifies target directory
+    /// '-t, --target-directory=DIRECTORY'
+    公有 target_dir: 选项<OsString>,
+
+    /// Treat destination as a normal file
+    /// '-T, --no-target-directory
+    公有 no_target_dir: 布尔,
+
+    /// '-v, --verbose'
+    公有 verbose: 布尔,
+
+    /// '--strip-trailing-slashes'
+    公有 strip_slashes: 布尔,
+
+    /// '-g, --progress'
+    公有 progress_bar: 布尔,
+
+    /// `--debug`
+    公有 debug: 布尔,
+
+    /// `-Z, --context`
+    公有 context: 选项<字符串>,
+}
+
+实现 默认协议 循环 Options {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            overwrite: OverwriteMode::默认(),
+            backup: BackupMode::默认(),
+            suffix: backup_control::DEFAULT_BACKUP_SUFFIX.to_owned(),
+            update: UpdateMode::默认(),
+            target_dir: 无,
+            no_target_dir: 假,
+            verbose: 假,
+            strip_slashes: 假,
+            progress_bar: 假,
+            debug: 假,
+            context: 无,
+        }
+    }
+}
+
+/// specifies behavior of the overwrite flag
+#[derive(克隆协议, 调试协议, 相等比较协议, 偏等比较协议, 默认协议)]
+公有 枚举 OverwriteMode {
+    /// No flag specified - prompt for unwriteable files when stdin is TTY
+    #[默认]
+    默认协议,
+    /// '-n' '--no-clobber'   do not overwrite
+    NoClobber,
+    /// '-i' '--interactive'  prompt before overwrite
+    Interactive,
+    ///'-f' '--force'         overwrite without prompt
+    Force,
+}
+
+静态 OPT_FORCE: &字符串切片 = "force";
+静态 OPT_INTERACTIVE: &字符串切片 = "interactive";
+静态 OPT_NO_CLOBBER: &字符串切片 = "no-clobber";
+静态 OPT_STRIP_TRAILING_SLASHES: &字符串切片 = "strip-trailing-slashes";
+静态 OPT_TARGET_DIRECTORY: &字符串切片 = "target-directory";
+静态 OPT_NO_TARGET_DIRECTORY: &字符串切片 = "no-target-directory";
+静态 OPT_VERBOSE: &字符串切片 = "verbose";
+静态 OPT_PROGRESS: &字符串切片 = "progress";
+静态 ARG_FILES: &字符串切片 = "files";
+静态 OPT_DEBUG: &字符串切片 = "debug";
+静态 OPT_CONTEXT: &字符串切片 = "context";
+静态 OPT_SELINUX: &字符串切片 = "selinux";
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 files: 向量<OsString> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .unwrap_or_default()
+        .cloned()
+        .收集();
+
+    如果 files.长度() == 1 && !matches.contains_id(OPT_TARGET_DIRECTORY) {
+        设 err = uu_app().错误(
+            ErrorKind::TooFewValues,
+            translate!("mv-error-insufficient-arguments", "arg_files" => ARG_FILES),
+        );
+        uucore::clap_localization::handle_clap_error_with_exit_code(err, 1);
+    }
+
+    设 overwrite_mode = determine_overwrite_mode(&matches);
+    设 backup_mode = backup_control::determine_backup_mode(&matches)?;
+    设 update_mode = update_control::determine_update_mode(&matches);
+
+    如果 backup_mode != BackupMode::无
+        && (overwrite_mode == OverwriteMode::NoClobber
+            || update_mode == UpdateMode::无
+            || update_mode == UpdateMode::NoneFail)
+    {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("mv-error-backup-with-no-clobber"),
+        ));
+    }
+
+    设 backup_suffix = backup_control::determine_backup_suffix(&matches);
+
+    设 target_dir = matches
+        .get_one::<OsString>(OPT_TARGET_DIRECTORY)
+        .映射(OsString::from);
+
+    如果 设 一些(引用 maybe_dir) = target_dir {
+        如果 !Path::新建(&maybe_dir).is_dir() {
+            返回 坏的(MvError::TargetNotADirectory(maybe_dir.quote().to_string()).into());
+        }
+    }
+
+    // Handle -Z and --context options
+    // If -Z is used, use the default context (empty string)
+    // If --context=value is used, use that specific value
+    设 context = 如果 matches.get_flag(OPT_SELINUX) {
+        一些(字符串::新建())
+    } 否则 {
+        matches.get_one::<字符串>(OPT_CONTEXT).cloned()
+    };
+
+    设 opts = Options {
+        overwrite: overwrite_mode,
+        backup: backup_mode,
+        suffix: backup_suffix,
+        update: update_mode,
+        target_dir,
+        no_target_dir: matches.get_flag(OPT_NO_TARGET_DIRECTORY),
+        verbose: matches.get_flag(OPT_VERBOSE) || matches.get_flag(OPT_DEBUG),
+        strip_slashes: matches.get_flag(OPT_STRIP_TRAILING_SLASHES),
+        progress_bar: matches.get_flag(OPT_PROGRESS),
+        debug: matches.get_flag(OPT_DEBUG),
+        context,
+    };
+
+    mv(&files[..], &opts)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("mv")
+        .version(uucore::crate_version!())
+        .about(translate!("mv-about"))
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("mv-usage")))
+        .after_help(格式化!(
+            "{}\n\n{}",
+            translate!("mv-after-help"),
+            backup_control::BACKUP_CONTROL_LONG_HELP
+        ))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_FORCE)
+                .short('f')
+                .long(OPT_FORCE)
+                .help(translate!("mv-help-force"))
+                .overrides_with_all([OPT_INTERACTIVE, OPT_NO_CLOBBER])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_INTERACTIVE)
+                .short('i')
+                .long(OPT_INTERACTIVE)
+                .help(translate!("mv-help-interactive"))
+                .overrides_with_all([OPT_FORCE, OPT_NO_CLOBBER])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_NO_CLOBBER)
+                .short('n')
+                .long(OPT_NO_CLOBBER)
+                .help(translate!("mv-help-no-clobber"))
+                .overrides_with_all([OPT_FORCE, OPT_INTERACTIVE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_STRIP_TRAILING_SLASHES)
+                .long(OPT_STRIP_TRAILING_SLASHES)
+                .help(translate!("mv-help-strip-trailing-slashes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(backup_control::arguments::backup())
+        .arg(backup_control::arguments::backup_no_args())
+        .arg(backup_control::arguments::suffix())
+        .arg(update_control::arguments::update())
+        .arg(update_control::arguments::update_no_args())
+        .arg(
+            Arg::新建(OPT_TARGET_DIRECTORY)
+                .short('t')
+                .long(OPT_TARGET_DIRECTORY)
+                .help(translate!("mv-help-target-directory"))
+                .value_name("DIRECTORY")
+                .value_hint(clap::ValueHint::DirPath)
+                .conflicts_with(OPT_NO_TARGET_DIRECTORY)
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(OPT_NO_TARGET_DIRECTORY)
+                .short('T')
+                .long(OPT_NO_TARGET_DIRECTORY)
+                .help(translate!("mv-help-no-target-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .short('v')
+                .long(OPT_VERBOSE)
+                .help(translate!("mv-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PROGRESS)
+                .short('g')
+                .long(OPT_PROGRESS)
+                .help(translate!("mv-help-progress"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SELINUX)
+                .short('Z')
+                .help(translate!("mv-help-selinux"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CONTEXT)
+                .long(OPT_CONTEXT)
+                .value_name("CTX")
+                .value_parser(clap::value_parser!(字符串))
+                .help(translate!("mv-help-context"))
+                .num_args(0..=1)
+                .require_equals(真)
+                .default_missing_value(""),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .required(真)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+        .arg(
+            Arg::新建(OPT_DEBUG)
+                .long(OPT_DEBUG)
+                .help(translate!("mv-help-debug"))
+                .action(ArgAction::SetTrue),
+        )
+}
+
+方法 determine_overwrite_mode(matches: &ArgMatches) -> OverwriteMode {
+    // This does not exactly match the GNU implementation:
+    // The GNU mv defaults to Force, but if more than one of the
+    // overwrite options are supplied, only the last takes effect.
+    // To default to no-clobber in that situation seems safer:
+    //
+    如果 matches.get_flag(OPT_NO_CLOBBER) {
+        OverwriteMode::NoClobber
+    } 否则 如果 matches.get_flag(OPT_INTERACTIVE) {
+        OverwriteMode::Interactive
+    } 否则 如果 matches.get_flag(OPT_FORCE) {
+        OverwriteMode::Force
+    } 否则 {
+        OverwriteMode::默认协议
+    }
+}
+
+方法 parse_paths(files: &[OsString], opts: &Options) -> 向量<PathBuf> {
+    设 paths = files.迭代().映射(Path::新建);
+
+    如果 opts.strip_slashes {
+        paths
+            .映射(|p| p.components().as_path().to_owned())
+            .收集::<向量<PathBuf>>()
+    } 否则 {
+        paths.映射(ToOwned::to_owned).收集::<向量<PathBuf>>()
+    }
+}
+
+方法 handle_two_paths(source: &Path, target: &Path, opts: &Options) -> UResult<()> {
+    如果 opts.backup == BackupMode::Simple && source_is_target_backup(source, target, &opts.suffix) {
+        返回 坏的(输入输出::错误协议::新建(
+            输入输出::ErrorKind::NotFound,
+            translate!("mv-error-backup-might-destroy-source", "target" => target.quote(), "source" => source.quote()),
+        )
+        .into());
+    }
+    如果 source.symlink_metadata().is_err() {
+        返回 坏的(如果 path_ends_with_terminator(source) {
+            MvError::CannotStatNotADirectory(source.quote().to_string()).into()
+        } 否则 {
+            MvError::NoSuchFile(source.quote().to_string()).into()
+        });
+    }
+
+    设 source_is_dir = source.is_dir() && !source.is_symlink();
+    设 target_is_dir = 如果 target.is_symlink() {
+        文件系统::canonicalize(target).is_ok_and(|p| p.is_dir())
+    } 否则 {
+        target.is_dir()
+    };
+
+    如果 path_ends_with_terminator(target)
+        && (!target_is_dir && !source_is_dir)
+        && !opts.no_target_dir
+        && opts.update != UpdateMode::IfOlder
+    {
+        返回 坏的(MvError::FailedToAccessNotADirectory(target.quote().to_string()).into());
+    }
+
+    assert_not_same_file(source, target, target_is_dir, opts)?;
+
+    如果 target_is_dir {
+        如果 opts.no_target_dir {
+            如果 source.is_dir() {
+                #[cfg(unix)]
+                设 (可变 hardlink_tracker, hardlink_scanner) = create_hardlink_context();
+                #[cfg(unix)]
+                设 hardlink_params = (一些(&可变 hardlink_tracker), 一些(&hardlink_scanner));
+                #[cfg(not(unix))]
+                设 hardlink_params = (无, 无);
+
+                rename(
+                    source,
+                    target,
+                    opts,
+                    无,
+                    hardlink_params.0,
+                    hardlink_params.1,
+                )
+                .map_err_context(|| {
+                    translate!("mv-error-cannot-move", "source" => source.quote(), "target" => target.quote())
+                })
+            } 否则 {
+                坏的(MvError::DirectoryToNonDirectory(target.quote().to_string()).into())
+            }
+        } 否则 {
+            move_files_into_dir(&[source.to_path_buf()], target, opts)
+        }
+    } 否则 如果 target.exists() && source_is_dir {
+        匹配 opts.overwrite {
+            OverwriteMode::NoClobber => 返回 好的(()),
+            OverwriteMode::Interactive => prompt_overwrite(target, 无)?,
+            OverwriteMode::Force => {}
+            OverwriteMode::默认协议 => {
+                设 (writable, mode) = is_writable(target);
+                如果 !writable && 输入输出::stdin().is_terminal() {
+                    prompt_overwrite(target, mode)?;
+                }
+            }
+        }
+        坏的(MvError::NonDirectoryToDirectory(
+            source.quote().to_string(),
+            target.quote().to_string(),
+        )
+        .into())
+    } 否则 {
+        #[cfg(unix)]
+        设 (可变 hardlink_tracker, hardlink_scanner) = create_hardlink_context();
+        #[cfg(unix)]
+        设 hardlink_params = (一些(&可变 hardlink_tracker), 一些(&hardlink_scanner));
+        #[cfg(not(unix))]
+        设 hardlink_params = (无, 无);
+
+        rename(
+            source,
+            target,
+            opts,
+            无,
+            hardlink_params.0,
+            hardlink_params.1,
+        )
+        .map_err(|e| USimpleError::新建(1, 格式化!("{e}")))
+    }
+}
+
+方法 assert_not_same_file(
+    source: &Path,
+    target: &Path,
+    target_is_dir: 布尔,
+    opts: &Options,
+) -> UResult<()> {
+    // we'll compare canonicalized_source and canonicalized_target for same file detection
+    设 canonicalized_source = 匹配 canonicalize(
+        absolute(source)?,
+        MissingHandling::Normal,
+        ResolveMode::Logical,
+    ) {
+        好的(source) 如果 source.exists() => source,
+        _ => absolute(source)?, // file or symlink target doesn't exist but its absolute path is still used for comparison
+    };
+
+    // special case if the target exists, is a directory, and the `-T` flag wasn't used
+    设 target_is_dir = target_is_dir && !opts.no_target_dir;
+    设 canonicalized_target = 如果 target_is_dir {
+        // `mv source_file target_dir` => target_dir/source_file
+        // canonicalize the path that exists (target directory) and join the source file name
+        canonicalize(
+            absolute(target)?,
+            MissingHandling::Normal,
+            ResolveMode::Logical,
+        )?
+        .加入(source.file_name().unwrap_or_default())
+    } 否则 {
+        // `mv source target_dir/target` => target_dir/target
+        // we canonicalize target_dir and join /target
+        匹配 absolute(target)?.parent() {
+            一些(parent) 如果 parent.to_str() != 一些("") => {
+                canonicalize(parent, MissingHandling::Normal, ResolveMode::Logical)?
+                    .加入(target.file_name().unwrap_or_default())
+            }
+            // path.parent() returns Some("") or None if there's no parent
+            _ => absolute(target)?, // absolute paths should always have a parent, but we'll fall back just in case
+        }
+    };
+
+    设 same_file = (canonicalized_source.eq(&canonicalized_target)
+        || are_hardlinks_to_same_file(source, target)
+        || are_hardlinks_or_one_way_symlink_to_same_file(source, target))
+        && opts.backup == BackupMode::无;
+
+    // get the expected target path to show in errors
+    // this is based on the argument and not canonicalized
+    设 target_display = 匹配 source.file_name() {
+        一些(file_name) 如果 target_is_dir => {
+            // join target_dir/source_file in a platform-independent manner
+            设 可变 路径 = target
+                .display()
+                .to_string()
+                .trim_end_matches('/')
+                .to_owned();
+
+            路径.压入('/');
+            路径.push_str(&file_name.to_string_lossy());
+
+            路径.quote().to_string()
+        }
+        _ => target.quote().to_string(),
+    };
+
+    如果 same_file
+        && (canonicalized_source.eq(&canonicalized_target)
+            || source.eq(Path::新建("."))
+            || source.ends_with("/.")
+            || source.is_file())
+    {
+        返回 坏的(MvError::SameFile(source.quote().to_string(), target_display).into());
+    } 否则 如果 (same_file || canonicalized_target.starts_with(canonicalized_source))
+        // don't error if we're moving a symlink of a directory into itself
+        && !source.is_symlink()
+    {
+        返回 坏的(
+            MvError::SelfTargetSubdirectory(source.quote().to_string(), target_display).into(),
+        );
+    }
+    好的(())
+}
+
+方法 handle_multiple_paths(paths: &[PathBuf], opts: &Options) -> UResult<()> {
+    如果 opts.no_target_dir {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("mv-error-extra-operand", "operand" => paths.最后().解包().quote()),
+        ));
+    }
+    设 target_dir = paths.最后().解包();
+    设 sources = &paths[..paths.长度() - 1];
+
+    move_files_into_dir(sources, target_dir, opts)
+}
+
+/// Execute the mv command. This moves 'source' to 'target', where
+/// 'target' is a directory. If 'target' does not exist, and source is a single
+/// file or directory, then 'source' will be renamed to 'target'.
+公有 方法 mv(files: &[OsString], opts: &Options) -> UResult<()> {
+    设 paths = parse_paths(files, opts);
+
+    如果 设 一些(引用 name) = opts.target_dir {
+        返回 move_files_into_dir(&paths, &PathBuf::from(name), opts);
+    }
+
+    匹配 paths.长度() {
+        2 => handle_two_paths(&paths[0], &paths[1], opts),
+        _ => handle_multiple_paths(&paths, opts),
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 move_files_into_dir(files: &[PathBuf], target_dir: &Path, options: &Options) -> UResult<()> {
+    // remember the moved destinations for further usage
+    设 可变 moved_destinations: FxHashSet<PathBuf> =
+        FxHashSet::with_capacity_and_hasher(files.长度(), rustc_hash::FxBuildHasher);
+    // Create hardlink tracking context
+    #[cfg(unix)]
+    设 (可变 hardlink_tracker, hardlink_scanner) = {
+        设 (tracker, 可变 scanner) = create_hardlink_context();
+
+        // Use hardlink options
+        设 hardlink_options = HardlinkOptions {
+            verbose: options.verbose || options.debug,
+        };
+
+        // Pre-scan files if needed
+        scanner.scan_files(files, &hardlink_options);
+
+        (tracker, scanner)
+    };
+
+    如果 !target_dir.is_dir() {
+        返回 坏的(MvError::NotADirectory(target_dir.quote().to_string()).into());
+    }
+
+    设 display_manager = options.progress_bar.then(MultiProgress::新建);
+
+    设 count_progress = 如果 设 一些(引用 display_manager) = display_manager {
+        如果 files.长度() > 1 {
+            一些(
+                display_manager.add(
+                    ProgressBar::新建(files.长度().try_into().解包()).with_style(
+                        ProgressStyle::with_template(&格式化!(
+                            "{} {{msg}} {{wide_bar}} {{pos}}/{{len}}",
+                            translate!("mv-progress-moving")
+                        ))
+                        .解包(),
+                    ),
+                ),
+            )
+        } 否则 {
+            无
+        }
+    } 否则 {
+        无
+    };
+
+    循环 sourcepath 在 files {
+        如果 sourcepath.symlink_metadata().is_err() {
+            show!(MvError::NoSuchFile(sourcepath.quote().to_string()));
+            继续;
+        }
+
+        如果 设 一些(引用 pb) = count_progress {
+            设 msg = 格式化!("{} (scanning hardlinks)", sourcepath.to_string_lossy());
+            pb.set_message(msg);
+        }
+
+        设 targetpath = 如果 设 一些(name) = sourcepath.file_name() {
+            target_dir.加入(name)
+        } 否则 {
+            show!(MvError::NoSuchFile(sourcepath.quote().to_string()));
+            继续;
+        };
+
+        如果 moved_destinations.包含(&targetpath) && options.backup != BackupMode::Numbered {
+            // If the target file was already created in this mv call, do not overwrite
+            show!(USimpleError::新建(
+                1,
+                translate!("mv-error-will-not-overwrite-just-created", "target" => targetpath.quote(), "source" => sourcepath.quote()),
+            ));
+            继续;
+        }
+
+        // Check if we have mv dir1 dir2 dir2
+        // And generate an error if this is the case
+        如果 设 坏的(e) = assert_not_same_file(sourcepath, target_dir, 真, options) {
+            show!(e);
+            继续;
+        }
+
+        #[cfg(unix)]
+        设 hardlink_params = (一些(&可变 hardlink_tracker), 一些(&hardlink_scanner));
+        #[cfg(not(unix))]
+        设 hardlink_params = (无, 无);
+
+        匹配 rename(
+            sourcepath,
+            &targetpath,
+            options,
+            display_manager.as_ref(),
+            hardlink_params.0,
+            hardlink_params.1,
+        ) {
+            坏的(e) 如果 e.to_string().为空() => set_exit_code(1),
+            坏的(e) => {
+                设 e = e.map_err_context(|| {
+                    translate!("mv-error-cannot-move", "source" => sourcepath.quote(), "target" => targetpath.quote())
+                });
+                如果 设 一些(引用 pb) = display_manager {
+                    pb.suspend(|| show!(e));
+                } 否则 {
+                    show!(e);
+                }
+            }
+            好的(()) => (),
+        }
+        如果 设 一些(引用 pb) = count_progress {
+            pb.inc(1);
+        }
+        moved_destinations.插入(targetpath.克隆());
+    }
+    好的(())
+}
+
+方法 rename(
+    from: &Path,
+    to: &Path,
+    opts: &Options,
+    display_manager: 选项<&MultiProgress>,
+    #[cfg(unix)] hardlink_tracker: 选项<&可变 HardlinkTracker>,
+    #[cfg(unix)] hardlink_scanner: 选项<&HardlinkGroupScanner>,
+    #[cfg(not(unix))] _hardlink_tracker: 选项<()>,
+    #[cfg(not(unix))] _hardlink_scanner: 选项<()>,
+) -> 输入输出::结果<()> {
+    设 可变 backup_path = 无;
+
+    如果 to.exists() {
+        如果 opts.update == UpdateMode::无 {
+            如果 opts.debug {
+                打印行!("{}", translate!("mv-debug-skipped", "target" => to.quote()));
+            }
+            返回 好的(());
+        }
+
+        如果 (opts.update == UpdateMode::IfOlder)
+            && 文件系统::metadata(from)?.modified()? <= 文件系统::metadata(to)?.modified()?
+        {
+            返回 好的(());
+        }
+
+        如果 opts.update == UpdateMode::NoneFail {
+            设 err_msg = translate!("mv-error-not-replacing", "target" => to.quote());
+            返回 坏的(输入输出::错误协议::other(err_msg));
+        }
+
+        匹配 opts.overwrite {
+            OverwriteMode::NoClobber => {
+                如果 opts.debug {
+                    打印行!("{}", translate!("mv-debug-skipped", "target" => to.quote()));
+                }
+                返回 好的(());
+            }
+            OverwriteMode::Interactive => prompt_overwrite(to, 无)?,
+            OverwriteMode::Force => {}
+            OverwriteMode::默认协议 => {
+                // GNU mv prompts when stdin is a TTY and target is not writable
+                设 (writable, mode) = is_writable(to);
+                如果 !writable && 输入输出::stdin().is_terminal() {
+                    prompt_overwrite(to, mode)?;
+                }
+            }
+        }
+
+        backup_path = backup_control::get_backup_path(opts.backup, to, &opts.suffix);
+        如果 设 一些(引用 backup_path) = backup_path {
+            // For backup renames, we don't need to track hardlinks as we're just moving the existing file
+            rename_with_fallback(to, backup_path, display_manager, 假, 无, 无)?;
+        }
+    }
+
+    // "to" may no longer exist if it was backed up
+    如果 to.exists() && to.is_dir() && !to.is_symlink() {
+        // normalize behavior between *nix and windows
+        如果 from.is_dir() {
+            如果 is_empty_dir(to) {
+                文件系统::remove_dir(to)?;
+            } 否则 {
+                返回 坏的(输入输出::错误协议::other(translate!("mv-error-directory-not-empty")));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        rename_with_fallback(
+            from,
+            to,
+            display_manager,
+            opts.verbose,
+            hardlink_tracker,
+            hardlink_scanner,
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        rename_with_fallback(from, to, display_manager, opts.verbose, 无, 无)?;
+    }
+
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    如果 设 一些(引用 context) = opts.context {
+        set_selinux_security_context(to, 一些(context))
+            .map_err(|e| 输入输出::错误协议::other(e.to_string()))?;
+    }
+
+    如果 opts.verbose {
+        设 message = 如果 设 一些(路径) = backup_path {
+            translate!("mv-verbose-renamed-with-backup", "from" => from.quote(), "to" => to.quote(), "backup" => 路径.quote())
+        } 否则 {
+            translate!("mv-verbose-renamed", "from" => from.quote(), "to" => to.quote())
+        };
+
+        匹配 display_manager {
+            一些(pb) => pb.suspend(|| {
+                打印行!("{message}");
+            }),
+            无 => 打印行!("{message}"),
+        }
+    }
+    好的(())
+}
+
+#[cfg(unix)]
+方法 is_fifo(filetype: 文件系统::FileType) -> 布尔 {
+    filetype.is_fifo()
+}
+
+#[cfg(not(unix))]
+方法 is_fifo(_filetype: 文件系统::FileType) -> 布尔 {
+    假
+}
+
+/// A wrapper around `fs::rename`, so that if it fails, we try falling back on
+/// copying and removing.
+方法 rename_with_fallback(
+    from: &Path,
+    to: &Path,
+    display_manager: 选项<&MultiProgress>,
+    verbose: 布尔,
+    #[cfg(unix)] hardlink_tracker: 选项<&可变 HardlinkTracker>,
+    #[cfg(unix)] hardlink_scanner: 选项<&HardlinkGroupScanner>,
+    #[cfg(not(unix))] _hardlink_tracker: 选项<()>,
+    #[cfg(not(unix))] _hardlink_scanner: 选项<()>,
+) -> 输入输出::结果<()> {
+    文件系统::rename(from, to).or_else(|err| {
+        #[cfg(windows)]
+        常量 EXDEV: 整32 = windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE 转换 _;
+        #[cfg(unix)]
+        常量 EXDEV: 整32 = libc::EXDEV 转换 _;
+        #[cfg(target_os = "wasi")]
+        常量 EXDEV: 整32 = 18; // POSIX EXDEV value
+
+        // We will only copy if:
+        // 1. Files are on different devices (EXDEV error)
+        // 2. On Windows, if the target file exists and source file is opened by another process
+        //    (MoveFileExW fails with "Access Denied" even if the source file has FILE_SHARE_DELETE permission)
+        设 should_fallback =
+            matches!(err.raw_os_error(), 一些(EXDEV)) || (from.is_file() && can_delete_file(from));
+        如果 !should_fallback {
+            返回 坏的(err);
+        }
+        // Get metadata without following symlinks
+        设 metadata = from.symlink_metadata()?;
+        设 file_type = metadata.file_type();
+        如果 file_type.is_symlink() {
+            rename_symlink_fallback(from, to)
+        } 否则 如果 file_type.is_dir() {
+            #[cfg(unix)]
+            {
+                with_optional_hardlink_context(
+                    hardlink_tracker,
+                    hardlink_scanner,
+                    |tracker, scanner| {
+                        rename_dir_fallback(
+                            from,
+                            to,
+                            display_manager,
+                            verbose,
+                            一些(tracker),
+                            一些(scanner),
+                        )
+                    },
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                rename_dir_fallback(from, to, display_manager, verbose)
+            }
+        } 否则 如果 is_fifo(file_type) {
+            rename_fifo_fallback(from, to)
+        } 否则 {
+            #[cfg(unix)]
+            {
+                with_optional_hardlink_context(
+                    hardlink_tracker,
+                    hardlink_scanner,
+                    |tracker, scanner| rename_file_fallback(from, to, 一些(tracker), 一些(scanner)),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                rename_file_fallback(from, to)
+            }
+        }
+    })
+}
+
+/// Replace the destination with a new pipe with the same name as the source.
+#[cfg(unix)]
+方法 rename_fifo_fallback(from: &Path, to: &Path) -> 输入输出::结果<()> {
+    如果 to.try_exists()? {
+        文件系统::remove_file(to)?;
+    }
+    make_fifo(to).and_then(|_| 文件系统::remove_file(from))
+}
+
+#[cfg(not(unix))]
+#[期望(
+    clippy::unnecessary_wraps,
+    reason = "fn sig must match on all platforms"
+)]
+方法 rename_fifo_fallback(_from: &Path, _to: &Path) -> 输入输出::结果<()> {
+    好的(())
+}
+
+/// Move the given symlink to the given destination. On Windows, dangling
+/// symlinks return an error.
+#[cfg(unix)]
+方法 rename_symlink_fallback(from: &Path, to: &Path) -> 输入输出::结果<()> {
+    设 path_symlink_points_to = 文件系统::read_link(from)?;
+    unix::文件系统::symlink(path_symlink_points_to, to)?;
+    #[cfg(not(任意(target_os = "macos", target_os = "redox")))]
+    {
+        设 _ = copy_xattrs_if_supported(from, to);
+    }
+    // Preserve ownership (uid/gid) from the source symlink
+    设 _ = preserve_ownership(from, to);
+    文件系统::remove_file(from)
+}
+
+#[cfg(windows)]
+方法 rename_symlink_fallback(from: &Path, to: &Path) -> 输入输出::结果<()> {
+    设 path_symlink_points_to = 文件系统::read_link(from)?;
+    如果 path_symlink_points_to.exists() {
+        如果 path_symlink_points_to.is_dir() {
+            windows::文件系统::symlink_dir(&path_symlink_points_to, to)?;
+        } 否则 {
+            windows::文件系统::symlink_file(&path_symlink_points_to, to)?;
+        }
+        文件系统::remove_file(from)
+    } 否则 {
+        坏的(输入输出::错误协议::新建(
+            输入输出::ErrorKind::NotFound,
+            translate!("mv-error-dangling-symlink"),
+        ))
+    }
+}
+
+#[cfg(target_os = "wasi")]
+方法 rename_symlink_fallback(_from: &Path, _to: &Path) -> 输入输出::结果<()> {
+    坏的(输入输出::错误协议::other(translate!("mv-error-no-symlink-support")))
+}
+
+方法 rename_dir_fallback(
+    from: &Path,
+    to: &Path,
+    display_manager: 选项<&MultiProgress>,
+    verbose: 布尔,
+    #[cfg(unix)] hardlink_tracker: 选项<&可变 HardlinkTracker>,
+    #[cfg(unix)] hardlink_scanner: 选项<&HardlinkGroupScanner>,
+) -> 输入输出::结果<()> {
+    // We remove the destination directory if it exists to match the
+    // behavior of `fs::rename`. As far as I can tell, `fs_extra`'s
+    // `move_dir` would otherwise behave differently.
+    如果 to.exists() {
+        文件系统::remove_dir_all(to)?;
+    }
+
+    // Calculate total size of directory
+    // Silently degrades:
+    //    If finding the total size fails for whatever reason,
+    //    the progress bar wont be shown for this file / dir.
+    //    (Move will probably fail due to permission error later?)
+    设 total_size = dir_get_size(from).ok();
+
+    设 progress_bar = 匹配 (display_manager, total_size) {
+        (一些(display_manager), 一些(total_size)) => {
+            设 template = "{msg}: [{elapsed_precise}] {wide_bar} {bytes:>7}/{total_bytes:7}";
+            设 style = ProgressStyle::with_template(template).解包();
+            设 bar = ProgressBar::新建(total_size).with_style(style);
+            一些(display_manager.add(bar))
+        }
+        (_, _) => 无,
+    };
+
+    #[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+    设 xattrs = fsxattr::retrieve_xattrs(from).unwrap_or_else(|_| FxHashMap::默认());
+
+    // Use directory copying (with or without hardlink support)
+    设 result = copy_dir_contents(
+        from,
+        to,
+        #[cfg(unix)]
+        hardlink_tracker,
+        #[cfg(unix)]
+        hardlink_scanner,
+        verbose,
+        progress_bar.as_ref(),
+        display_manager,
+    );
+
+    #[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+    fsxattr::apply_xattrs(to, xattrs)?;
+
+    result?;
+
+    // Remove the source directory after successful copy
+    文件系统::remove_dir_all(from)?;
+
+    好的(())
+}
+
+/// Copy directory recursively, optionally preserving hardlinks
+方法 copy_dir_contents(
+    from: &Path,
+    to: &Path,
+    #[cfg(unix)] hardlink_tracker: 选项<&可变 HardlinkTracker>,
+    #[cfg(unix)] hardlink_scanner: 选项<&HardlinkGroupScanner>,
+    verbose: 布尔,
+    progress_bar: 选项<&ProgressBar>,
+    display_manager: 选项<&MultiProgress>,
+) -> 输入输出::结果<()> {
+    // Create the destination directory
+    文件系统::create_dir_all(to)?;
+
+    #[cfg(unix)]
+    {
+        // Preserve ownership (uid/gid) of the top-level directory
+        设 _ = preserve_ownership(from, to);
+
+        如果 设 (一些(tracker), 一些(scanner)) = (hardlink_tracker, hardlink_scanner) {
+            copy_dir_contents_recursive(
+                from,
+                to,
+                tracker,
+                scanner,
+                verbose,
+                progress_bar,
+                display_manager,
+            )?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        copy_dir_contents_recursive(from, to, verbose, progress_bar, display_manager)?;
+    }
+
+    好的(())
+}
+
+方法 copy_dir_contents_recursive(
+    from_dir: &Path,
+    to_dir: &Path,
+    #[cfg(unix)] hardlink_tracker: &可变 HardlinkTracker,
+    #[cfg(unix)] hardlink_scanner: &HardlinkGroupScanner,
+    verbose: 布尔,
+    progress_bar: 选项<&ProgressBar>,
+    display_manager: 选项<&MultiProgress>,
+) -> 输入输出::结果<()> {
+    // Helper closure to print verbose messages
+    设 print_verbose = |from: &Path, to: &Path| {
+        如果 verbose {
+            设 message =
+                translate!("mv-verbose-renamed", "from" => from.quote(), "to" => to.quote());
+            匹配 display_manager {
+                一些(pb) => pb.suspend(|| {
+                    打印行!("{message}");
+                }),
+                无 => 打印行!("{message}"),
+            }
+        }
+    };
+
+    设 entries = 文件系统::read_dir(from_dir)?;
+
+    循环 entry 在 entries {
+        设 entry = entry?;
+        设 from_path = entry.路径();
+        设 file_name = from_path.file_name().解包();
+        设 to_path = to_dir.加入(file_name);
+
+        如果 设 一些(pb) = progress_bar {
+            pb.set_message(from_path.to_string_lossy().to_string());
+        }
+
+        如果 from_path.is_symlink() {
+            // Handle symlinks first, before checking is_dir() which follows symlinks.
+            // This prevents symlinks to directories from being expanded into full copies.
+            #[cfg(unix)]
+            {
+                copy_file_with_hardlinks_helper(
+                    &from_path,
+                    &to_path,
+                    hardlink_tracker,
+                    hardlink_scanner,
+                )?;
+            }
+            #[cfg(not(unix))]
+            {
+                rename_symlink_fallback(&from_path, &to_path)?;
+            }
+
+            print_verbose(&from_path, &to_path);
+        } 否则 如果 from_path.is_dir() {
+            // Recursively copy subdirectory (only real directories, not symlinks)
+            文件系统::create_dir_all(&to_path)?;
+
+            // Preserve ownership (uid/gid) of the subdirectory
+            #[cfg(unix)]
+            {
+                设 _ = preserve_ownership(&from_path, &to_path);
+            }
+
+            print_verbose(&from_path, &to_path);
+
+            copy_dir_contents_recursive(
+                &from_path,
+                &to_path,
+                #[cfg(unix)]
+                hardlink_tracker,
+                #[cfg(unix)]
+                hardlink_scanner,
+                verbose,
+                progress_bar,
+                display_manager,
+            )?;
+        } 否则 {
+            // Copy file with or without hardlink support based on platform
+            #[cfg(unix)]
+            {
+                copy_file_with_hardlinks_helper(
+                    &from_path,
+                    &to_path,
+                    hardlink_tracker,
+                    hardlink_scanner,
+                )?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Symlinks are already handled above, so this is always a regular file
+                文件系统::copy(&from_path, &to_path)?;
+            }
+
+            print_verbose(&from_path, &to_path);
+        }
+
+        如果 设 一些(pb) = progress_bar {
+            如果 设 好的(metadata) = from_path.metadata() {
+                pb.inc(metadata.长度());
+            }
+        }
+    }
+
+    好的(())
+}
+
+#[cfg(unix)]
+方法 copy_file_with_hardlinks_helper(
+    from: &Path,
+    to: &Path,
+    hardlink_tracker: &可变 HardlinkTracker,
+    hardlink_scanner: &HardlinkGroupScanner,
+) -> 输入输出::结果<()> {
+    // Check if this file should be a hardlink to an already-copied file
+    使用 箱::hardlink::HardlinkOptions;
+    设 hardlink_options = HardlinkOptions::默认();
+    // Create a hardlink instead of copying
+    如果 设 一些(existing_target) =
+        hardlink_tracker.check_hardlink(from, to, hardlink_scanner, &hardlink_options)
+    {
+        文件系统::hard_link(&existing_target, to)?;
+        返回 好的(());
+    }
+
+    如果 from.is_symlink() {
+        // Copy a symlink file (no-follow).
+        // rename_symlink_fallback already preserves ownership and removes the source.
+        rename_symlink_fallback(from, to)?;
+    } 否则 如果 is_fifo(from.symlink_metadata()?.file_type()) {
+        make_fifo(to)?;
+        // Preserve ownership (uid/gid) from the source
+        设 _ = preserve_ownership(from, to);
+    } 否则 {
+        // Copy a regular file.
+        文件系统::copy(from, to)?;
+        // Copy xattrs, ignoring ENOTSUP errors (filesystem doesn't support xattrs)
+        #[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+        {
+            设 _ = copy_xattrs_if_supported(from, to);
+        }
+        // Preserve ownership (uid/gid) from the source
+        设 _ = preserve_ownership(from, to);
+    }
+
+    好的(())
+}
+
+方法 rename_file_fallback(
+    from: &Path,
+    to: &Path,
+    #[cfg(unix)] hardlink_tracker: 选项<&可变 HardlinkTracker>,
+    #[cfg(unix)] hardlink_scanner: 选项<&HardlinkGroupScanner>,
+) -> 输入输出::结果<()> {
+    // Remove existing target file if it exists
+    如果 to.is_symlink() {
+        文件系统::remove_file(to).map_err(|err| {
+            设 inter_device_msg = translate!("mv-error-inter-device-move-failed", "from" => from.quote(), "to" => to.quote(), "err" => err);
+            输入输出::错误协议::新建(err.kind(), inter_device_msg)
+        })?;
+    } 否则 如果 to.exists() {
+        // For non-symlinks, just remove the file without special error handling
+        文件系统::remove_file(to)?;
+    }
+
+    // Check if this file is part of a hardlink group and if so, create a hardlink instead of copying
+    #[cfg(unix)]
+    {
+        如果 设 (一些(tracker), 一些(scanner)) = (hardlink_tracker, hardlink_scanner) {
+            使用 箱::hardlink::HardlinkOptions;
+            设 hardlink_options = HardlinkOptions::默认();
+            如果 设 一些(existing_target) =
+                tracker.check_hardlink(from, to, scanner, &hardlink_options)
+            {
+                // Create a hardlink to the first moved file instead of copying
+                文件系统::hard_link(&existing_target, to)?;
+                文件系统::remove_file(from)?;
+                返回 好的(());
+            }
+        }
+    }
+
+    // Regular file copy
+    文件系统::copy(from, to)
+        .map_err(|err| 输入输出::错误协议::新建(err.kind(), translate!("mv-error-permission-denied")))?;
+
+    // Copy xattrs, ignoring ENOTSUP errors (filesystem doesn't support xattrs)
+    #[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+    {
+        设 _ = copy_xattrs_if_supported(from, to);
+    }
+
+    // Preserve ownership (uid/gid) from the source file
+    #[cfg(unix)]
+    {
+        设 _ = preserve_ownership(from, to);
+    }
+
+    文件系统::remove_file(from)
+        .map_err(|err| 输入输出::错误协议::新建(err.kind(), translate!("mv-error-permission-denied")))?;
+    好的(())
+}
+
+/// Preserve ownership (uid/gid) from source to destination.
+/// Uses lchown so it works on symlinks without following them.
+/// Errors are silently ignored for non-root users who cannot chown.
+#[cfg(unix)]
+方法 preserve_ownership(from: &Path, to: &Path) -> 输入输出::结果<()> {
+    使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+    设 source_meta = from.symlink_metadata()?;
+    设 uid = source_meta.uid();
+    设 gid = source_meta.gid();
+
+    设 dest_meta = to.symlink_metadata()?;
+    设 dest_uid = dest_meta.uid();
+    设 dest_gid = dest_meta.gid();
+
+    // Only chown if ownership actually differs
+    如果 uid != dest_uid || gid != dest_gid {
+        使用 uucore::perms::{Verbosity, VerbosityLevel, wrap_chown};
+        // Use follow=false so lchown is used (works on symlinks)
+        // Silently ignore errors: non-root users typically cannot chown to
+        // arbitrary uid, matching GNU mv behavior which also uses best-effort.
+        设 _ = wrap_chown(
+            to,
+            &dest_meta,
+            一些(uid),
+            一些(gid),
+            假,
+            Verbosity {
+                groups_only: 假,
+                level: VerbosityLevel::Silent,
+            },
+        );
+    }
+
+    好的(())
+}
+
+/// Copy xattrs from source to destination, ignoring ENOTSUP/EOPNOTSUPP errors.
+/// These errors indicate the filesystem doesn't support extended attributes,
+/// which is acceptable when moving files across filesystems.
+#[cfg(全部(unix, not(任意(target_os = "macos", target_os = "redox"))))]
+方法 copy_xattrs_if_supported(from: &Path, to: &Path) -> 输入输出::结果<()> {
+    匹配 fsxattr::copy_xattrs(from, to) {
+        好的(()) => 好的(()),
+        坏的(e) 如果 e.raw_os_error() == 一些(libc::EOPNOTSUPP) => 好的(()),
+        坏的(e) => 坏的(e),
+    }
+}
+
+方法 is_empty_dir(路径: &Path) -> 布尔 {
+    文件系统::read_dir(路径).is_ok_and(|可变 contents| contents.next().is_none())
+}
+
+/// Check if file is writable, returning the mode for potential reuse.
+#[cfg(unix)]
+方法 is_writable(路径: &Path) -> (布尔, 选项<正32>) {
+    如果 设 好的(metadata) = 路径.metadata() {
+        设 mode = metadata.permissions().mode();
+        // Check if user write bit is set
+        ((mode & 0o200) != 0, 一些(mode))
+    } 否则 {
+        (假, 无) // If we can't get metadata, prompt user to be safe
+    }
+}
+
+/// Check if file is writable.
+#[cfg(not(unix))]
+方法 is_writable(路径: &Path) -> (布尔, 选项<正32>) {
+    如果 设 好的(metadata) = 路径.metadata() {
+        (!metadata.permissions().readonly(), 无)
+    } 否则 {
+        (假, 无) // If we can't get metadata, prompt user to be safe
+    }
+}
+
+#[cfg(unix)]
+方法 get_interactive_prompt(to: &Path, cached_mode: 选项<正32>) -> 字符串 {
+    // Use cached mode if available, otherwise fetch it
+    设 mode = cached_mode.or_else(|| to.metadata().ok().映射(|m| m.permissions().mode()));
+    如果 设 一些(mode) = mode {
+        设 file_mode = mode & 0o777;
+        // Check if file is not writable by user
+        如果 (mode & 0o200) == 0 {
+            设 perms = display_permissions_unix(mode, 假);
+            设 mode_info = 格式化!("{file_mode:04o} ({perms})");
+            返回 translate!("mv-prompt-overwrite-mode", "target" => to.quote(), "mode_info" => mode_info);
+        }
+    }
+    translate!("mv-prompt-overwrite", "target" => to.quote())
+}
+
+#[cfg(not(unix))]
+方法 get_interactive_prompt(to: &Path, _cached_mode: 选项<正32>) -> 字符串 {
+    translate!("mv-prompt-overwrite", "target" => to.quote())
+}
+
+/// Prompts the user for confirmation and returns an error if declined.
+方法 prompt_overwrite(to: &Path, cached_mode: 选项<正32>) -> 输入输出::结果<()> {
+    如果 !prompt_yes!("{}", get_interactive_prompt(to, cached_mode)) {
+        返回 坏的(输入输出::错误协议::other(""));
+    }
+    好的(())
+}
+
+/// Checks if a file can be deleted by attempting to open it with delete permissions.
+#[cfg(windows)]
+方法 can_delete_file(路径: &Path) -> 布尔 {
+    使用 标准库::{
+        操作系统::windows::ffi::OsStrExt 转换 _,
+        指针::{null, null_mut},
+    };
+
+    使用 windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+
+    设 wide_path = 路径
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .收集::<向量<正16>>();
+
+    设 handle = 不安全 {
+        CreateFileW(
+            wide_path.as_ptr(),
+            DELETE,
+            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+
+    如果 handle == INVALID_HANDLE_VALUE {
+        返回 假;
+    }
+
+    不安全 { CloseHandle(handle) };
+
+    真
+}
+
+#[cfg(not(windows))]
+方法 can_delete_file(_: &Path) -> 布尔 {
+    // On non-Windows platforms, always return false to indicate that we don't need
+    // to try the copy+delete fallback. This is because on Unix-like systems,
+    // rename() failing with errors other than EXDEV means the operation cannot
+    // succeed even with a copy+delete approach (e.g. permission errors).
+    假
+}

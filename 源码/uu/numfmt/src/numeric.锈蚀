@@ -1,0 +1,30 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// This file is written to solve #11654
+// This mod is to preserve numeric precision for large integers.
+// GNU numfmt has a better precision on floats due to 'long double'.
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议)]
+公有(箱) 枚举 ParsedNumber {
+    ExactInt(整128),
+    Float(点64),
+}
+
+实现 ParsedNumber {
+    公有(箱) 方法 to_f64(自身) -> 点64 {
+        匹配 自身 {
+            自身类型::ExactInt(n) => n 转换 点64,
+            自身类型::Float(n) => n,
+        }
+    }
+
+    公有(箱) 方法 exact_int(自身) -> 选项<整128> {
+        匹配 自身 {
+            自身类型::ExactInt(n) => 一些(n),
+            自身类型::Float(_) => 无,
+        }
+    }
+}

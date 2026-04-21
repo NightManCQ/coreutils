@@ -1,0 +1,364 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (regex) SKIPTO UPTO ; (vars) ntimes
+
+使用 箱::csplit_error::CsplitError;
+使用 regex::Regex;
+使用 uucore::show_warning;
+使用 uucore::translate;
+
+/// The definition of a pattern to match on a line.
+#[derive(调试协议)]
+公有 枚举 Pattern {
+    /// Copy the file's content to a split up to, not including, the given line number. The number
+    /// of times the pattern is executed is detailed in [`ExecutePattern`].
+    UpToLine(正整数大小, ExecutePattern),
+    /// Copy the file's content to a split up to, not including, the line matching the regex. The
+    /// integer is an offset relative to the matched line of what to include (if positive) or
+    /// to exclude (if negative). The number of times the pattern is executed is detailed in
+    /// [`ExecutePattern`].
+    UpToMatch(Regex, 整32, ExecutePattern),
+    /// Skip the file's content up to, not including, the line matching the regex. The integer
+    /// is an offset relative to the matched line of what to include (if positive) or to exclude
+    /// (if negative). The number of times the pattern is executed is detailed in [`ExecutePattern`].
+    SkipToMatch(Regex, 整32, ExecutePattern),
+}
+
+实现 标准库::格式化::显示协议 循环 Pattern {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::UpToLine(n, _) => write!(f, "{n}"),
+            自身类型::UpToMatch(regex, 0, _) => write!(f, "/{}/", regex.as_str()),
+            自身类型::UpToMatch(regex, offset, _) => write!(f, "/{}/{offset:+}", regex.as_str()),
+            自身类型::SkipToMatch(regex, 0, _) => write!(f, "%{}%", regex.as_str()),
+            自身类型::SkipToMatch(regex, offset, _) => write!(f, "%{}%{offset:+}", regex.as_str()),
+        }
+    }
+}
+
+/// The number of times a pattern can be used.
+#[derive(调试协议)]
+公有 枚举 ExecutePattern {
+    /// Execute the pattern as many times as possible
+    Always,
+    /// Execute the pattern a fixed number of times
+    Times(正整数大小),
+}
+
+实现 ExecutePattern {
+    公有 方法 迭代(&自身) -> ExecutePatternIter {
+        匹配 自身 {
+            自身类型::Times(n) => ExecutePatternIter::新建(一些(*n)),
+            自身类型::Always => ExecutePatternIter::新建(无),
+        }
+    }
+}
+
+公有 结构 ExecutePatternIter {
+    max: 选项<正整数大小>,
+    cur: 正整数大小,
+}
+
+实现 ExecutePatternIter {
+    方法 新建(max: 选项<正整数大小>) -> 自身类型 {
+        自身类型 { max, cur: 0 }
+    }
+}
+
+实现 迭代器协议 循环 ExecutePatternIter {
+    类型 Item = (选项<正整数大小>, 正整数大小);
+
+    方法 next(&可变 自身) -> 选项<(选项<正整数大小>, 正整数大小)> {
+        如果 设 一些(m) = 自身.max {
+            // iterate until m is reached
+            如果 自身.cur == m {
+                无
+            } 否则 {
+                自身.cur += 1;
+                一些((自身.max, 自身.cur))
+            }
+        } 否则 {
+            // no limit, just increment a counter
+            自身.cur += 1;
+            一些((无, 自身.cur))
+        }
+    }
+}
+
+/// Parses the definitions of patterns given on the command line into a list of [`Pattern`]s.
+///
+/// # Errors
+///
+/// If a pattern is incorrect, a [`CsplitError::InvalidPattern`] error is returned, which may be
+/// due to, e.g.,:
+/// - an invalid regular expression;
+/// - an invalid number for, e.g., the offset.
+公有 方法 get_patterns(args: &[&字符串切片]) -> 结果<向量<Pattern>, CsplitError> {
+    设 patterns = extract_patterns(args)?;
+    validate_line_numbers(&patterns)?;
+    好的(patterns)
+}
+
+方法 extract_patterns(args: &[&字符串切片]) -> 结果<向量<Pattern>, CsplitError> {
+    设 可变 patterns = 向量::with_capacity(args.长度());
+    设 to_match_reg =
+        Regex::新建(r"^(/(?P<UPTO>.+)/|%(?P<SKIPTO>.+)%)(?P<OFFSET>[\+-]?[0-9]+)?$").解包();
+    设 execute_ntimes_reg = Regex::新建(r"^\{(?P<TIMES>[0-9]+)|\*\}$").解包();
+    设 可变 迭代 = args.迭代().copied().peekable();
+
+    当 设 一些(arg) = 迭代.next() {
+        // get the number of times a pattern is repeated, which is at least once plus whatever is
+        // in the quantifier.
+        设 execute_ntimes = 匹配 迭代.peek() {
+            无 => ExecutePattern::Times(1),
+            一些(&next_item) => {
+                匹配 execute_ntimes_reg.captures(next_item) {
+                    无 => ExecutePattern::Times(1),
+                    一些(r) => {
+                        // skip the next item
+                        迭代.next();
+                        如果 设 一些(times) = r.name("TIMES") {
+                            ExecutePattern::Times(times.as_str().parse::<正整数大小>().解包() + 1)
+                        } 否则 {
+                            ExecutePattern::Always
+                        }
+                    }
+                }
+            }
+        };
+
+        // get the pattern definition
+        如果 设 一些(captures) = to_match_reg.captures(arg) {
+            设 offset = 匹配 captures.name("OFFSET") {
+                无 => 0,
+                一些(m) => m.as_str().parse().解包(),
+            };
+            如果 设 一些(up_to_match) = captures.name("UPTO") {
+                设 pattern = Regex::新建(up_to_match.as_str())
+                    .map_err(|_| CsplitError::InvalidPattern(arg.to_owned()))?;
+                patterns.压入(Pattern::UpToMatch(pattern, offset, execute_ntimes));
+            } 否则 如果 设 一些(skip_to_match) = captures.name("SKIPTO") {
+                设 pattern = Regex::新建(skip_to_match.as_str())
+                    .map_err(|_| CsplitError::InvalidPattern(arg.to_owned()))?;
+                patterns.压入(Pattern::SkipToMatch(pattern, offset, execute_ntimes));
+            }
+        } 否则 如果 设 好的(line_number) = arg.parse::<正整数大小>() {
+            patterns.压入(Pattern::UpToLine(line_number, execute_ntimes));
+        } 否则 {
+            返回 坏的(CsplitError::InvalidPattern(arg.to_owned()));
+        }
+    }
+    好的(patterns)
+}
+
+/// Asserts the line numbers are in increasing order, starting at 1.
+方法 validate_line_numbers(patterns: &[Pattern]) -> 结果<(), CsplitError> {
+    patterns
+        .迭代()
+        .filter_map(|pattern| 匹配 pattern {
+            Pattern::UpToLine(line_number, _) => 一些(line_number),
+            _ => 无,
+        })
+        .try_fold(0, |prev_ln, &current_ln| 匹配 (prev_ln, current_ln) {
+            // a line number cannot be zero
+            (_, 0) => 坏的(CsplitError::LineNumberIsZero),
+            // two consecutive numbers should not be equal
+            (n, m) 如果 n == m => {
+                show_warning!(
+                    "{}",
+                    translate!("csplit-warning-line-number-same-as-previous", "line_number" => n)
+                );
+                好的(n)
+            }
+            // a number cannot be greater than the one that follows
+            (n, m) 如果 n > m => 坏的(CsplitError::LineNumberSmallerThanPrevious(m, n)),
+            (_, m) => 好的(m),
+        })?;
+    好的(())
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 bad_pattern() {
+        设 input = ["bad"];
+        断言!(get_patterns(&input).is_err());
+    }
+
+    #[test]
+    方法 up_to_line_pattern() {
+        设 input = ["24", "42", "{*}", "50", "{4}"];
+        设 patterns = get_patterns(&input).解包();
+        相等断言!(patterns.长度(), 3);
+        匹配 patterns.first() {
+            一些(Pattern::UpToLine(24, ExecutePattern::Times(1))) => (),
+            _ => 恐慌!("expected UpToLine pattern"),
+        }
+        匹配 patterns.获取(1) {
+            一些(Pattern::UpToLine(42, ExecutePattern::Always)) => (),
+            _ => 恐慌!("expected UpToLine pattern"),
+        }
+        匹配 patterns.获取(2) {
+            一些(Pattern::UpToLine(50, ExecutePattern::Times(5))) => (),
+            _ => 恐慌!("expected UpToLine pattern"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 up_to_match_pattern() {
+        设 input = [
+            "/test1.*end$/",
+            "/test2.*end$/",
+            "{*}",
+            "/test3.*end$/",
+            "{4}",
+            "/test4.*end$/3",
+            "/test5.*end$/+3",
+            "/test6.*end$/-3",
+        ];
+        设 patterns = get_patterns(&input).解包();
+        相等断言!(patterns.长度(), 6);
+        匹配 patterns.first() {
+            一些(Pattern::UpToMatch(reg, 0, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test1.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+        匹配 patterns.获取(1) {
+            一些(Pattern::UpToMatch(reg, 0, ExecutePattern::Always)) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test2.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+        匹配 patterns.获取(2) {
+            一些(Pattern::UpToMatch(reg, 0, ExecutePattern::Times(5))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test3.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+        匹配 patterns.获取(3) {
+            一些(Pattern::UpToMatch(reg, 3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test4.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+        匹配 patterns.获取(4) {
+            一些(Pattern::UpToMatch(reg, 3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test5.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+        匹配 patterns.获取(5) {
+            一些(Pattern::UpToMatch(reg, -3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test6.*end$");
+            }
+            _ => 恐慌!("expected UpToMatch pattern"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 skip_to_match_pattern() {
+        设 input = [
+            "%test1.*end$%",
+            "%test2.*end$%",
+            "{*}",
+            "%test3.*end$%",
+            "{4}",
+            "%test4.*end$%3",
+            "%test5.*end$%+3",
+            "%test6.*end$%-3",
+        ];
+        设 patterns = get_patterns(&input).解包();
+        相等断言!(patterns.长度(), 6);
+        匹配 patterns.first() {
+            一些(Pattern::SkipToMatch(reg, 0, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test1.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+        匹配 patterns.获取(1) {
+            一些(Pattern::SkipToMatch(reg, 0, ExecutePattern::Always)) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test2.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+        匹配 patterns.获取(2) {
+            一些(Pattern::SkipToMatch(reg, 0, ExecutePattern::Times(5))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test3.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+        匹配 patterns.获取(3) {
+            一些(Pattern::SkipToMatch(reg, 3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test4.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+        匹配 patterns.获取(4) {
+            一些(Pattern::SkipToMatch(reg, 3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test5.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+        匹配 patterns.获取(5) {
+            一些(Pattern::SkipToMatch(reg, -3, ExecutePattern::Times(1))) => {
+                设 parsed_reg = 格式化!("{reg}");
+                相等断言!(parsed_reg, "test6.*end$");
+            }
+            _ => 恐慌!("expected SkipToMatch pattern"),
+        }
+    }
+
+    #[test]
+    方法 line_number_zero() {
+        设 patterns = 向量![Pattern::UpToLine(0, ExecutePattern::Times(1))];
+        匹配 validate_line_numbers(&patterns) {
+            坏的(CsplitError::LineNumberIsZero) => (),
+            _ => 恐慌!("expected LineNumberIsZero error"),
+        }
+    }
+
+    #[test]
+    方法 line_number_smaller_than_previous() {
+        设 input = ["10", "5"];
+        匹配 get_patterns(&input) {
+            坏的(CsplitError::LineNumberSmallerThanPrevious(5, 10)) => (),
+            _ => 恐慌!("expected LineNumberSmallerThanPrevious error"),
+        }
+    }
+
+    #[test]
+    方法 line_number_smaller_than_previous_separate() {
+        设 input = ["10", "/20/", "5"];
+        匹配 get_patterns(&input) {
+            坏的(CsplitError::LineNumberSmallerThanPrevious(5, 10)) => (),
+            _ => 恐慌!("expected LineNumberSmallerThanPrevious error"),
+        }
+    }
+
+    #[test]
+    方法 line_number_zero_separate() {
+        设 input = ["10", "/20/", "0"];
+        匹配 get_patterns(&input) {
+            坏的(CsplitError::LineNumberIsZero) => (),
+            _ => 恐慌!("expected LineNumberIsZero error"),
+        }
+    }
+}

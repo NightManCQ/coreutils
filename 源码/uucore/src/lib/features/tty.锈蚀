@@ -1,0 +1,127 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Set of functions to parsing TTY
+使用 标准库::{
+    格式化::{自身, 显示协议, Formatter},
+    路径::PathBuf,
+};
+
+#[derive(调试协议, 克隆协议, 偏等比较协议, 相等比较协议, 哈希协议)]
+公有 枚举 Teletype {
+    Tty(正64),
+    TtyS(正64),
+    Pts(正64),
+    Unknown,
+}
+
+实现 显示协议 循环 Teletype {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        匹配 自身 {
+            自身类型::Tty(id) => write!(f, "/dev/tty{id}"),
+            自身类型::TtyS(id) => write!(f, "/dev/ttyS{id}"),
+            自身类型::Pts(id) => write!(f, "/dev/pts/{id}"),
+            自身类型::Unknown => write!(f, "?"),
+        }
+    }
+}
+
+实现 TryFrom<字符串> 循环 Teletype {
+    类型 错误协议 = ();
+
+    方法 try_from(value: 字符串) -> 结果<自身类型, 自身类型::错误协议> {
+        自身类型::try_from(value.as_str())
+    }
+}
+
+实现 TryFrom<&字符串切片> 循环 Teletype {
+    类型 错误协议 = ();
+
+    方法 try_from(value: &字符串切片) -> 结果<自身类型, 自身类型::错误协议> {
+        如果 value == "?" {
+            返回 好的(自身类型::Unknown);
+        }
+
+        自身类型::try_from(PathBuf::from(value))
+    }
+}
+
+实现 TryFrom<PathBuf> 循环 Teletype {
+    类型 错误协议 = ();
+
+    方法 try_from(value: PathBuf) -> 结果<自身类型, 自身类型::错误协议> {
+        // Three case: /dev/pts/* , /dev/ttyS**, /dev/tty**
+
+        设 可变 迭代 = value.迭代();
+        // Case 1
+
+        // Considering this format: **/**/pts/<num>
+        如果 设 (一些(_), 一些(数字)) = (迭代.寻找(|it| *it == "pts"), 迭代.next()) {
+            返回 数字
+                .to_str()
+                .ok_or(())?
+                .parse::<正64>()
+                .map_err(|_| ())
+                .映射(Teletype::Pts);
+        }
+
+        // Considering this format: **/**/ttyS** then **/**/tty**
+        设 路径 = value.to_str().ok_or(())?;
+
+        设 f = |prefix: &字符串切片| {
+            value
+                .迭代()
+                .next_back()?
+                .to_str()?
+                .strip_prefix(prefix)?
+                .parse::<正64>()
+                .ok()
+        };
+
+        如果 路径.包含("ttyS") {
+            // Case 2
+            f("ttyS").ok_or(()).映射(Teletype::TtyS)
+        } 否则 如果 路径.包含("tty") {
+            // Case 3
+            f("tty").ok_or(()).映射(Teletype::Tty)
+        } 否则 {
+            坏的(())
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_tty_from() {
+        相等断言!(Teletype::try_from("?").解包(), Teletype::Unknown);
+        相等断言!(Teletype::try_from("/dev/tty1").解包(), Teletype::Tty(1));
+        相等断言!(Teletype::try_from("/dev/tty10").解包(), Teletype::Tty(10));
+        相等断言!(Teletype::try_from("/dev/pts/1").解包(), Teletype::Pts(1));
+        相等断言!(
+            Teletype::try_from("/dev/pts/10").解包(),
+            Teletype::Pts(10)
+        );
+        相等断言!(Teletype::try_from("/dev/ttyS1").解包(), Teletype::TtyS(1));
+        相等断言!(
+            Teletype::try_from("/dev/ttyS10").解包(),
+            Teletype::TtyS(10)
+        );
+        相等断言!(Teletype::try_from("ttyS10").解包(), Teletype::TtyS(10));
+
+        断言!(Teletype::try_from("value").is_err());
+        断言!(Teletype::try_from("TtyS10").is_err());
+    }
+
+    #[test]
+    方法 test_terminal_type_display() {
+        相等断言!(Teletype::Pts(10).to_string(), "/dev/pts/10");
+        相等断言!(Teletype::Tty(10).to_string(), "/dev/tty10");
+        相等断言!(Teletype::TtyS(10).to_string(), "/dev/ttyS10");
+        相等断言!(Teletype::Unknown.to_string(), "?");
+    }
+}

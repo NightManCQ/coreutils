@@ -1,0 +1,197 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+模组 operation;
+模组 simd;
+模组 unicode_table;
+
+使用 clap::{Arg, ArgAction, Command, value_parser};
+使用 operation::{
+    DeleteOperation, Sequence, SqueezeOperation, SymbolTranslator, TranslateOperation,
+    flush_output, translate_input,
+};
+使用 simd::process_input;
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{stdin, stdout};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::文件系统::is_stdin_directory;
+使用 uucore::translate;
+使用 uucore::{format_usage, os_str_as_bytes, show};
+
+模组 options {
+    公有 常量 COMPLEMENT: &字符串切片 = "complement";
+    公有 常量 DELETE: &字符串切片 = "delete";
+    公有 常量 SQUEEZE: &字符串切片 = "squeeze-repeats";
+    公有 常量 TRUNCATE_SET1: &字符串切片 = "truncate-set1";
+    公有 常量 SETS: &字符串切片 = "sets";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 delete_flag = matches.get_flag(options::DELETE);
+    设 complement_flag = matches.get_flag(options::COMPLEMENT);
+    设 squeeze_flag = matches.get_flag(options::SQUEEZE);
+    设 truncate_set1_flag = matches.get_flag(options::TRUNCATE_SET1);
+
+    // Ultimately this should be OsString, but we might want to wait for the
+    // pattern API on OsStr
+    设 sets: 向量<_> = matches
+        .get_many::<OsString>(options::SETS)
+        .into_iter()
+        .flatten()
+        .映射(ToOwned::to_owned)
+        .收集();
+
+    如果 sets.为空() {
+        返回 坏的(UUsageError::新建(1, translate!("tr-error-missing-operand")));
+    }
+
+    设 sets_len = sets.长度();
+
+    如果 !(delete_flag || squeeze_flag) && sets_len == 1 {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("tr-error-missing-operand-translating", "set" => sets[0].quote()),
+        ));
+    }
+
+    如果 delete_flag && squeeze_flag && sets_len == 1 {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("tr-error-missing-operand-deleting-squeezing", "set" => sets[0].quote()),
+        ));
+    }
+
+    如果 sets_len > 1 {
+        如果 delete_flag && !squeeze_flag {
+            设 op = sets[1].quote();
+            设 msg = 如果 sets_len == 2 {
+                translate!("tr-error-extra-operand-deleting-without-squeezing", "operand" => op)
+            } 否则 {
+                translate!("tr-error-extra-operand-simple", "operand" => op)
+            };
+            返回 坏的(UUsageError::新建(1, msg));
+        }
+        如果 sets_len > 2 {
+            设 op = sets[2].quote();
+            设 msg = translate!("tr-error-extra-operand-simple", "operand" => op);
+            返回 坏的(UUsageError::新建(1, msg));
+        }
+    }
+
+    如果 设 一些(first) = sets.first() {
+        设 切片 = os_str_as_bytes(first)?;
+        设 trailing_backslashes = 切片.迭代().rev().take_while(|&&c| c == b'\\').计数();
+        如果 trailing_backslashes % 2 == 1 {
+            // The trailing backslash has a non-backslash character before it.
+            show!(USimpleError::新建(
+                0,
+                translate!("tr-warning-unescaped-backslash")
+            ));
+        }
+    }
+
+    设 stdin = stdin();
+    设 可变 locked_stdin = stdin.锁定();
+    设 可变 locked_stdout = stdout().锁定();
+
+    // According to the man page: translating only happens if deleting or if a second set is given
+    设 translating = !delete_flag && sets.长度() > 1;
+    设 可变 sets_iter = sets.迭代().映射(OsString::as_os_str);
+    设 (set1, set2) = Sequence::solve_set_characters(
+        os_str_as_bytes(sets_iter.next().unwrap_or_default())?,
+        os_str_as_bytes(sets_iter.next().unwrap_or_default())?,
+        complement_flag,
+        // if we are not translating then we don't truncate set1
+        truncate_set1_flag && translating,
+        translating,
+    )?;
+
+    如果 is_stdin_directory(&stdin) {
+        返回 坏的(USimpleError::新建(1, translate!("tr-error-read-directory")));
+    }
+
+    // '*_op' are the operations that need to be applied, in order.
+    如果 delete_flag {
+        如果 squeeze_flag {
+            设 delete_op = DeleteOperation::新建(set1);
+            设 squeeze_op = SqueezeOperation::新建(set2);
+            设 op = delete_op.chain(squeeze_op);
+            translate_input(&可变 locked_stdin, &可变 locked_stdout, op)?;
+        } 否则 {
+            设 op = DeleteOperation::新建(set1);
+            process_input(&可变 locked_stdin, &可变 locked_stdout, &op)?;
+        }
+    } 否则 如果 squeeze_flag {
+        如果 sets_len == 1 {
+            设 op = SqueezeOperation::新建(set1);
+            translate_input(&可变 locked_stdin, &可变 locked_stdout, op)?;
+        } 否则 {
+            设 translate_op = TranslateOperation::新建(set1, set2.克隆())?;
+            设 squeeze_op = SqueezeOperation::新建(set2);
+            设 op = translate_op.chain(squeeze_op);
+            translate_input(&可变 locked_stdin, &可变 locked_stdout, op)?;
+        }
+    } 否则 {
+        设 op = TranslateOperation::新建(set1, set2)?;
+        process_input(&可变 locked_stdin, &可变 locked_stdout, &op)?;
+    }
+
+    flush_output(&可变 locked_stdout)?;
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("tr")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("tr"))
+        .about(translate!("tr-about"))
+        .override_usage(format_usage(&translate!("tr-usage")))
+        .after_help(translate!("tr-after-help"))
+        .infer_long_args(真)
+        .trailing_var_arg(真)
+        .arg(
+            Arg::新建(options::COMPLEMENT)
+                .visible_short_alias('C')
+                .short('c')
+                .long(options::COMPLEMENT)
+                .help(translate!("tr-help-complement"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::COMPLEMENT),
+        )
+        .arg(
+            Arg::新建(options::DELETE)
+                .short('d')
+                .long(options::DELETE)
+                .help(translate!("tr-help-delete"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::DELETE),
+        )
+        .arg(
+            Arg::新建(options::SQUEEZE)
+                .long(options::SQUEEZE)
+                .short('s')
+                .help(translate!("tr-help-squeeze"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::SQUEEZE),
+        )
+        .arg(
+            Arg::新建(options::TRUNCATE_SET1)
+                .long(options::TRUNCATE_SET1)
+                .short('t')
+                .help(translate!("tr-help-truncate-set1"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::TRUNCATE_SET1),
+        )
+        .arg(
+            Arg::新建(options::SETS)
+                .num_args(1..)
+                .value_parser(value_parser!(OsString)),
+        )
+}

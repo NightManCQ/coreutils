@@ -1,0 +1,800 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) nonprint nonblank nonprinting ELOOP
+
+模组 platform;
+
+使用 箱::platform::is_unsafe_overwrite;
+使用 clap::{Arg, ArgAction, Command};
+使用 memchr::memchr2;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::{File, metadata};
+使用 标准库::输入输出::{自身, BufWriter, ErrorKind, IsTerminal, Read, Write};
+#[cfg(unix)]
+使用 标准库::操作系统::fd::AsFd;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::FileTypeExt;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, strip_errno};
+使用 uucore::translate;
+使用 uucore::{fast_inc::fast_inc_one, format_usage};
+
+/// Linux splice support
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+模组 splice;
+
+// Allocate 32 digits for the line number.
+// An estimate is that we can print about 1e8 lines/seconds, so 32 digits
+// would be enough for billions of universe lifetimes.
+常量 LINE_NUMBER_BUF_SIZE: 正整数大小 = 32;
+
+结构 LineNumber {
+    buf: [正8; LINE_NUMBER_BUF_SIZE],
+    print_start: 正整数大小,
+    num_start: 正整数大小,
+    num_end: 正整数大小,
+}
+
+// Logic to store a string for the line number. Manually incrementing the value
+// represented in a buffer like this is significantly faster than storing
+// a `usize` and using the standard Rust formatting macros to format a `usize`
+// to a string each time it's needed.
+// Buffer is initialized to "     1\t" and incremented each time `increment` is
+// called, using uucore's fast_inc function that operates on strings.
+实现 LineNumber {
+    方法 新建() -> 自身类型 {
+        设 可变 buf = [b'0'; LINE_NUMBER_BUF_SIZE];
+
+        设 init_str = "     1\t";
+        设 print_start = buf.长度() - init_str.长度();
+        设 num_start = buf.长度() - 2;
+        设 num_end = buf.长度() - 1;
+
+        buf[print_start..].copy_from_slice(init_str.as_bytes());
+
+        自身类型 {
+            buf,
+            print_start,
+            num_start,
+            num_end,
+        }
+    }
+
+    方法 increment(&可变 自身) {
+        fast_inc_one(&可变 自身.buf, &可变 自身.num_start, 自身.num_end);
+        自身.print_start = 自身.print_start.min(自身.num_start);
+    }
+
+    #[inline]
+    方法 to_str(&自身) -> &[正8] {
+        &自身.buf[自身.print_start..]
+    }
+
+    方法 写锁定(&自身, writer: &可变 实现 Write) -> 输入输出::结果<()> {
+        writer.write_all(自身.to_str())
+    }
+}
+
+#[derive(错误协议, 调试协议)]
+枚举 CatError {
+    /// Wrapper around `io::Error`
+    #[错误("{}", strip_errno(.0))]
+    Io(#[from] 输入输出::错误协议),
+    /// Wrapper around `rustix::io::Errno`
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    #[错误("{0}")]
+    Rustix(#[from] rustix::输入输出::Errno),
+    /// Unknown file type; it's not a regular file, socket, etc.
+    #[错误("{}", translate!("cat-error-unknown-filetype", "ft_debug" => .ft_debug))]
+    UnknownFiletype {
+        /// A debug print of the file type
+        ft_debug: 字符串,
+    },
+    #[错误("{}", translate!("cat-error-is-directory"))]
+    IsDirectory,
+    #[cfg(unix)]
+    #[错误("{}", translate!("cat-error-no-such-device-or-address"))]
+    NoSuchDeviceOrAddress,
+    #[错误("{}", translate!("cat-error-input-file-is-output-file"))]
+    OutputIsInput,
+    #[错误("{}", translate!("cat-error-too-many-symbolic-links"))]
+    TooManySymlinks,
+}
+
+类型 CatResult<T> = 结果<T, CatError>;
+
+#[derive(偏等比较协议)]
+枚举 NumberingMode {
+    无,
+    NonEmpty,
+    All,
+}
+
+结构 OutputOptions {
+    /// Line numbering mode
+    number: NumberingMode,
+
+    /// Suppress repeated empty output lines
+    squeeze_blank: 布尔,
+
+    /// display TAB characters as `tab`
+    show_tabs: 布尔,
+
+    /// Show end of lines
+    show_ends: 布尔,
+
+    /// use ^ and M- notation, except for LF (\\n) and TAB (\\t)
+    show_nonprint: 布尔,
+}
+
+实现 OutputOptions {
+    方法 tab(&自身) -> &'静态 字符串切片 {
+        如果 自身.show_tabs { "^I" } 否则 { "\t" }
+    }
+
+    方法 end_of_line(&自身) -> &'静态 字符串切片 {
+        如果 自身.show_ends { "$\n" } 否则 { "\n" }
+    }
+
+    /// We can write fast if we can simply copy the contents of the file to
+    /// stdout, without augmenting the output with e.g. line numbers.
+    方法 can_write_fast(&自身) -> 布尔 {
+        !(自身.show_tabs
+            || 自身.show_nonprint
+            || 自身.show_ends
+            || 自身.squeeze_blank
+            || 自身.number != NumberingMode::无)
+    }
+}
+
+/// State that persists between output of each file. This struct is only used
+/// when we can't write fast.
+结构 OutputState {
+    /// The current line number
+    line_number: LineNumber,
+
+    /// Whether the output cursor is at the beginning of a new line
+    at_line_start: 布尔,
+
+    /// Whether we skipped a \r, which still needs to be printed
+    skipped_carriage_return: 布尔,
+
+    /// Whether we have already printed a blank line
+    one_blank_kept: 布尔,
+}
+
+#[cfg(unix)]
+协议 FdReadable: Read + AsFd {}
+#[cfg(not(unix))]
+协议 FdReadable: Read {}
+
+#[cfg(unix)]
+实现<T> FdReadable 循环 T 何处 T: Read + AsFd {}
+#[cfg(not(unix))]
+实现<T> FdReadable 循环 T 何处 T: Read {}
+
+/// Represents an open file handle, stream, or other device
+结构 InputHandle<R: FdReadable> {
+    reader: R,
+    is_interactive: 布尔,
+}
+
+/// Concrete enum of recognized file types.
+///
+/// *Note*: `cat`-ing a directory should result in an
+/// [`CatError::IsDirectory`]
+枚举 InputType {
+    Directory,
+    File,
+    StdIn,
+    SymLink,
+    #[cfg(unix)]
+    BlockDevice,
+    #[cfg(unix)]
+    CharacterDevice,
+    #[cfg(unix)]
+    Fifo,
+    #[cfg(unix)]
+    Socket,
+}
+
+模组 options {
+    公有 静态 FILE: &字符串切片 = "file";
+    公有 静态 SHOW_ALL: &字符串切片 = "show-all";
+    公有 静态 NUMBER_NONBLANK: &字符串切片 = "number-nonblank";
+    公有 静态 SHOW_NONPRINTING_ENDS: &字符串切片 = "e";
+    公有 静态 SHOW_ENDS: &字符串切片 = "show-ends";
+    公有 静态 NUMBER: &字符串切片 = "number";
+    公有 静态 SQUEEZE_BLANK: &字符串切片 = "squeeze-blank";
+    公有 静态 SHOW_NONPRINTING_TABS: &字符串切片 = "t";
+    公有 静态 SHOW_TABS: &字符串切片 = "show-tabs";
+    公有 静态 SHOW_NONPRINTING: &字符串切片 = "show-nonprinting";
+    公有 静态 IGNORED_U: &字符串切片 = "ignored-u";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 number_mode = 如果 matches.get_flag(options::NUMBER_NONBLANK) {
+        NumberingMode::NonEmpty
+    } 否则 如果 matches.get_flag(options::NUMBER) {
+        NumberingMode::All
+    } 否则 {
+        NumberingMode::无
+    };
+
+    设 show_nonprint = [
+        options::SHOW_ALL,
+        options::SHOW_NONPRINTING_ENDS,
+        options::SHOW_NONPRINTING_TABS,
+        options::SHOW_NONPRINTING,
+    ]
+    .迭代()
+    .任意(|v| matches.get_flag(v));
+
+    设 show_ends = [
+        options::SHOW_ENDS,
+        options::SHOW_ALL,
+        options::SHOW_NONPRINTING_ENDS,
+    ]
+    .迭代()
+    .任意(|v| matches.get_flag(v));
+
+    设 show_tabs = [
+        options::SHOW_ALL,
+        options::SHOW_TABS,
+        options::SHOW_NONPRINTING_TABS,
+    ]
+    .迭代()
+    .任意(|v| matches.get_flag(v));
+
+    设 squeeze_blank = matches.get_flag(options::SQUEEZE_BLANK);
+    #[allow(clippy::unwrap_used, reason = "clap provides '-' by default")]
+    设 files = matches.get_many::<OsString>(options::FILE).解包();
+
+    设 options = OutputOptions {
+        show_ends,
+        number: number_mode,
+        show_nonprint,
+        show_tabs,
+        squeeze_blank,
+    };
+    cat_files(files, &options)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("cat")
+        .version(uucore::crate_version!())
+        .override_usage(format_usage(&translate!("cat-usage")))
+        .about(translate!("cat-about"))
+        .help_template(uucore::localized_help_template("cat"))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(OsString))
+                .default_value("-")
+                .value_hint(clap::ValueHint::FilePath),
+        )
+        .arg(
+            Arg::新建(options::SHOW_ALL)
+                .short('A')
+                .long(options::SHOW_ALL)
+                .help(translate!("cat-help-show-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NUMBER_NONBLANK)
+                .short('b')
+                .long(options::NUMBER_NONBLANK)
+                .help(translate!("cat-help-number-nonblank"))
+                // Note: This MUST NOT .overrides_with(options::NUMBER)!
+                // In clap, overriding is symmetric, so "-b -n" counts as "-n", which is not what we want.
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHOW_NONPRINTING_ENDS)
+                .short('e')
+                .help(translate!("cat-help-show-nonprinting-ends"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHOW_ENDS)
+                .short('E')
+                .long(options::SHOW_ENDS)
+                .help(translate!("cat-help-show-ends"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NUMBER)
+                .short('n')
+                .long(options::NUMBER)
+                .help(translate!("cat-help-number"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SQUEEZE_BLANK)
+                .short('s')
+                .long(options::SQUEEZE_BLANK)
+                .help(translate!("cat-help-squeeze-blank"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHOW_NONPRINTING_TABS)
+                .short('t')
+                .help(translate!("cat-help-show-nonprinting-tabs"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHOW_TABS)
+                .short('T')
+                .long(options::SHOW_TABS)
+                .help(translate!("cat-help-show-tabs"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SHOW_NONPRINTING)
+                .short('v')
+                .long(options::SHOW_NONPRINTING)
+                .help(translate!("cat-help-show-nonprinting"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::IGNORED_U)
+                .short('u')
+                .help(translate!("cat-help-ignored-u"))
+                .action(ArgAction::SetTrue),
+        )
+}
+
+方法 cat_handle<R: FdReadable>(
+    handle: &可变 InputHandle<R>,
+    options: &OutputOptions,
+    state: &可变 OutputState,
+) -> CatResult<()> {
+    如果 options.can_write_fast() {
+        write_fast(handle)
+    } 否则 {
+        write_lines(handle, options, state)
+    }
+}
+
+方法 cat_path(路径: &OsString, options: &OutputOptions, state: &可变 OutputState) -> CatResult<()> {
+    匹配 get_input_type(路径)? {
+        InputType::StdIn => {
+            设 stdin = 输入输出::stdin();
+            如果 is_unsafe_overwrite(&stdin, &输入输出::stdout()) {
+                返回 坏的(CatError::OutputIsInput);
+            }
+            设 可变 handle = InputHandle {
+                reader: stdin,
+                is_interactive: 输入输出::stdin().is_terminal(),
+            };
+            cat_handle(&可变 handle, options, state)
+        }
+        InputType::Directory => 坏的(CatError::IsDirectory),
+        #[cfg(unix)]
+        InputType::Socket => 坏的(CatError::NoSuchDeviceOrAddress),
+        _ => {
+            设 file = File::open(路径)?;
+            如果 is_unsafe_overwrite(&file, &输入输出::stdout()) {
+                返回 坏的(CatError::OutputIsInput);
+            }
+            设 可变 handle = InputHandle {
+                reader: file,
+                is_interactive: 假,
+            };
+            cat_handle(&可变 handle, options, state)
+        }
+    }
+}
+
+方法 cat_files<'a, I>(files: I, options: &OutputOptions) -> UResult<()>
+何处
+    I: 转换为迭代器协议<Item = &'a OsString>,
+{
+    设 可变 state = OutputState {
+        line_number: LineNumber::新建(),
+        at_line_start: 真,
+        skipped_carriage_return: 假,
+        one_blank_kept: 假,
+    };
+    设 可变 error_messages: 向量<字符串> = 向量::新建();
+
+    循环 路径 在 files {
+        如果 设 坏的(err) = cat_path(路径, options, &可变 state) {
+            error_messages.压入(格式化!("{}: {err}", 路径.maybe_quote()));
+        }
+    }
+    如果 state.skipped_carriage_return {
+        打印!("\r");
+    }
+    如果 error_messages.为空() {
+        好的(())
+    } 否则 {
+        // each next line is expected to display "cat: …"
+        设 line_joiner = "\ncat: ";
+
+        坏的(uucore::错误::USimpleError::新建(
+            error_messages.长度() 转换 整32,
+            error_messages.加入(line_joiner),
+        ))
+    }
+}
+
+/// Classifies the `InputType` of file at `path` if possible
+///
+/// # Arguments
+///
+/// * `path` - Path on a file system to classify metadata
+方法 get_input_type(路径: &OsString) -> CatResult<InputType> {
+    如果 路径 == "-" {
+        返回 好的(InputType::StdIn);
+    }
+
+    设 ft = 匹配 metadata(路径) {
+        好的(md) => md.file_type(),
+        坏的(e) => {
+            如果 设 一些(raw_error) = e.raw_os_error() {
+                // On Unix-like systems, the error code for "Too many levels of symbolic links" is 40 (ELOOP).
+                // we want to provide a proper error message in this case.
+                #[cfg(not(任意(target_os = "macos", target_os = "freebsd")))]
+                设 too_many_symlink_code = 40;
+                #[cfg(任意(target_os = "macos", target_os = "freebsd"))]
+                设 too_many_symlink_code = 62;
+                如果 raw_error == too_many_symlink_code {
+                    返回 坏的(CatError::TooManySymlinks);
+                }
+            }
+            返回 坏的(CatError::Io(e));
+        }
+    };
+    匹配 ft {
+        #[cfg(unix)]
+        ft 如果 ft.is_block_device() => 好的(InputType::BlockDevice),
+        #[cfg(unix)]
+        ft 如果 ft.is_char_device() => 好的(InputType::CharacterDevice),
+        #[cfg(unix)]
+        ft 如果 ft.is_fifo() => 好的(InputType::Fifo),
+        #[cfg(unix)]
+        ft 如果 ft.is_socket() => 好的(InputType::Socket),
+        ft 如果 ft.is_dir() => 好的(InputType::Directory),
+        ft 如果 ft.is_file() => 好的(InputType::File),
+        ft 如果 ft.is_symlink() => 好的(InputType::SymLink),
+        _ => 坏的(CatError::UnknownFiletype {
+            ft_debug: 格式化!("{ft:?}"),
+        }),
+    }
+}
+
+/// Writes handle to stdout with no configuration. This allows a
+/// simple memory copy.
+方法 write_fast<R: FdReadable>(handle: &可变 InputHandle<R>) -> CatResult<()> {
+    设 stdout = 输入输出::stdout();
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    设 可变 stdout = stdout;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    {
+        // If we're on Linux or Android, try to use the splice() system call
+        // for faster writing. If it works, we're done.
+        如果 !splice::write_fast_using_splice(handle, &可变 stdout)? {
+            返回 好的(());
+        }
+    }
+    // If we're not on Linux or Android, or the splice() call failed,
+    // fall back on slower writing.
+    设 可变 stdout_lock = stdout.锁定();
+    // stack allocation is overhead when splice succeed
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    设 可变 buf = 向量![0; 1024 * 64];
+    #[cfg(not(任意(target_os = "linux", target_os = "android")))]
+    设 可变 buf = [0; 1024 * 64];
+    无限循环 {
+        匹配 handle.reader.读锁定(&可变 buf) {
+            好的(n) => {
+                如果 n == 0 {
+                    中断;
+                }
+                stdout_lock
+                    .write_all(&buf[..n])
+                    .inspect_err(handle_broken_pipe)?;
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => {}
+            坏的(e) => 返回 坏的(e.into()),
+        }
+    }
+
+    // If the splice() call failed and there has been some data written to
+    // stdout via while loop above AND there will be second splice() call
+    // that will succeed, data pushed through splice will be output before
+    // the data buffered in stdout.lock. Therefore additional explicit flush
+    // is required here.
+    stdout_lock.flush().inspect_err(handle_broken_pipe)?;
+    好的(())
+}
+
+/// Outputs file contents to stdout in a line-by-line fashion,
+/// propagating any errors that might occur.
+方法 write_lines<R: FdReadable>(
+    handle: &可变 InputHandle<R>,
+    options: &OutputOptions,
+    state: &可变 OutputState,
+) -> CatResult<()> {
+    设 可变 in_buf = [0; 1024 * 31];
+    设 stdout = 输入输出::stdout();
+    设 stdout = stdout.锁定();
+    // Add a 32K buffer for stdout - this greatly improves performance.
+    设 可变 writer = BufWriter::with_capacity(32 * 1024, stdout);
+
+    无限循环 {
+        设 n = 匹配 handle.reader.读锁定(&可变 in_buf) {
+            好的(0) => 中断,
+            好的(n) => n,
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => 继续,
+            坏的(e) => 返回 坏的(e.into()),
+        };
+        设 in_buf = &in_buf[..n];
+        设 可变 pos = 0;
+        当 pos < n {
+            // skip empty line_number enumerating them if needed
+            如果 in_buf[pos] == b'\n' {
+                write_new_line(&可变 writer, options, state, handle.is_interactive)?;
+                state.at_line_start = 真;
+                pos += 1;
+                继续;
+            }
+            如果 state.skipped_carriage_return {
+                writer.write_all(b"\r")?;
+                state.skipped_carriage_return = 假;
+                state.at_line_start = 假;
+            }
+            state.one_blank_kept = 假;
+            如果 state.at_line_start && options.number != NumberingMode::无 {
+                state.line_number.写锁定(&可变 writer)?;
+                state.line_number.increment();
+            }
+
+            // print to end of line or end of buffer
+            设 offset = write_end(&可变 writer, &in_buf[pos..], options)?;
+
+            // end of buffer?
+            如果 offset + pos == in_buf.长度() {
+                state.at_line_start = 假;
+                中断;
+            }
+            如果 in_buf[pos + offset] == b'\r' {
+                state.skipped_carriage_return = 真;
+            } 否则 {
+                相等断言!(in_buf[pos + offset], b'\n');
+                // print suitable end of line
+                write_end_of_line(
+                    &可变 writer,
+                    options.end_of_line().as_bytes(),
+                    handle.is_interactive,
+                )?;
+                state.at_line_start = 真;
+            }
+            pos += offset + 1;
+        }
+        // We need to flush the buffer each time around the loop in order to pass GNU tests.
+        // When we are reading the input from a pipe, the `handle.reader.read` call at the top
+        // of this loop will block (indefinitely) whist waiting for more data. The expectation
+        // however is that anything that's ready for output should show up in the meantime,
+        // and not be buffered internally to the `cat` process.
+        // Hence it's necessary to flush our buffer before every time we could potentially block
+        // on a `std::io::Read::read` call.
+        writer.flush().inspect_err(handle_broken_pipe)?;
+    }
+
+    好的(())
+}
+
+/// `\r` followed by `\n` is printed as `^M` when `show_ends` is enabled, so that `\r\n` prints as `^M$`
+方法 write_new_line<W: Write>(
+    writer: &可变 W,
+    options: &OutputOptions,
+    state: &可变 OutputState,
+    is_interactive: 布尔,
+) -> CatResult<()> {
+    如果 state.skipped_carriage_return {
+        如果 options.show_ends {
+            writer.write_all(b"^M")?;
+        } 否则 {
+            writer.write_all(b"\r")?;
+        }
+        state.skipped_carriage_return = 假;
+
+        write_end_of_line(writer, options.end_of_line().as_bytes(), is_interactive)?;
+        返回 好的(());
+    }
+    如果 !state.at_line_start || !options.squeeze_blank || !state.one_blank_kept {
+        state.one_blank_kept = 真;
+        如果 state.at_line_start && options.number == NumberingMode::All {
+            state.line_number.写锁定(writer)?;
+            state.line_number.increment();
+        }
+        write_end_of_line(writer, options.end_of_line().as_bytes(), is_interactive)?;
+    }
+    好的(())
+}
+
+方法 write_end<W: Write>(
+    writer: &可变 W,
+    in_buf: &[正8],
+    options: &OutputOptions,
+) -> 输入输出::结果<正整数大小> {
+    如果 options.show_nonprint {
+        write_nonprint_to_end(in_buf, writer, options.tab().as_bytes())
+    } 否则 如果 options.show_tabs {
+        write_tab_to_end(in_buf, writer)
+    } 否则 {
+        write_to_end(in_buf, writer)
+    }
+}
+
+// write***_to_end methods
+// Write all symbols till \n or \r or end of buffer is reached
+// We need to stop at \r because it may be written as ^M depending on the byte after and settings;
+// however, write_nonprint_to_end doesn't need to stop at \r because it will always write \r as ^M.
+// Return the number of written symbols
+
+方法 write_to_end<W: Write>(in_buf: &[正8], writer: &可变 W) -> 输入输出::结果<正整数大小> {
+    // using memchr2 significantly improves performances
+    如果 设 一些(p) = memchr2(b'\n', b'\r', in_buf) {
+        writer.write_all(&in_buf[..p])?;
+        好的(p)
+    } 否则 {
+        writer.write_all(in_buf)?;
+        好的(in_buf.长度())
+    }
+}
+
+方法 write_tab_to_end<W: Write>(可变 in_buf: &[正8], writer: &可变 W) -> 输入输出::结果<正整数大小> {
+    设 可变 计数 = 0;
+    无限循环 {
+        如果 设 一些(p) = in_buf
+            .迭代()
+            .position(|c| *c == b'\n' || *c == b'\t' || *c == b'\r')
+        {
+            writer.write_all(&in_buf[..p])?;
+            如果 in_buf[p] == b'\t' {
+                writer.write_all(b"^I")?;
+                in_buf = &in_buf[p + 1..];
+                计数 += p + 1;
+            } 否则 {
+                // b'\n' or b'\r'
+                返回 好的(计数 + p);
+            }
+        } 否则 {
+            writer.write_all(in_buf)?;
+            返回 好的(in_buf.长度() + 计数);
+        }
+    }
+}
+
+方法 write_nonprint_to_end<W: Write>(in_buf: &[正8], writer: &可变 W, tab: &[正8]) -> 输入输出::结果<正整数大小> {
+    设 可变 计数 = 0;
+
+    循环 byte 在 in_buf.迭代().copied() {
+        如果 byte == b'\n' {
+            中断;
+        }
+        匹配 byte {
+            9 => writer.write_all(tab),
+            0..=8 | 10..=31 => writer.write_all(&[b'^', byte + 64]),
+            32..=126 => writer.write_all(&[byte]),
+            127 => writer.write_all(b"^?"),
+            128..=159 => writer.write_all(&[b'M', b'-', b'^', byte - 64]),
+            160..=254 => writer.write_all(&[b'M', b'-', byte - 128]),
+            _ => writer.write_all(b"M-^?"),
+        }?;
+        计数 += 1;
+    }
+    好的(计数)
+}
+
+方法 write_end_of_line<W: Write>(
+    writer: &可变 W,
+    end_of_line: &[正8],
+    is_interactive: 布尔,
+) -> CatResult<()> {
+    writer.write_all(end_of_line)?;
+    如果 is_interactive {
+        writer.flush().inspect_err(handle_broken_pipe)?;
+    }
+    好的(())
+}
+
+方法 handle_broken_pipe(错误: &输入输出::错误协议) {
+    // SIGPIPE is not available on Windows.
+    如果 cfg!(target_os = "windows") && 错误.kind() == ErrorKind::BrokenPipe {
+        标准库::进程::exit(13);
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::输入输出::{BufWriter, stdout};
+
+    #[test]
+    方法 test_write_tab_to_end_with_newline() {
+        设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+        设 in_buf = b"a\tb\tc\n";
+        相等断言!(超级::write_tab_to_end(in_buf, &可变 writer).解包(), 5);
+    }
+
+    #[test]
+    方法 test_write_tab_to_end_no_newline() {
+        设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+        设 in_buf = b"a\tb\tc";
+        相等断言!(超级::write_tab_to_end(in_buf, &可变 writer).解包(), 5);
+    }
+
+    #[test]
+    方法 test_write_nonprint_to_end_new_line() {
+        设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+        设 in_buf = b"\n";
+        设 tab = b"";
+        超级::write_nonprint_to_end(in_buf, &可变 writer, tab).解包();
+        相等断言!(writer.buffer().长度(), 0);
+    }
+
+    #[test]
+    方法 test_write_nonprint_to_end_9() {
+        设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+        设 in_buf = &[9正8];
+        设 tab = b"tab";
+        超级::write_nonprint_to_end(in_buf, &可变 writer, tab).解包();
+        相等断言!(writer.buffer(), tab);
+    }
+
+    #[test]
+    方法 test_write_nonprint_to_end_0_to_8() {
+        循环 byte 在 0正8..=8正8 {
+            设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+            设 in_buf = &[byte];
+            设 tab = b"";
+            超级::write_nonprint_to_end(in_buf, &可变 writer, tab).解包();
+            相等断言!(writer.buffer(), [b'^', byte + 64]);
+        }
+    }
+
+    #[test]
+    方法 test_write_nonprint_to_end_10_to_31() {
+        循环 byte 在 11正8..=31正8 {
+            设 可变 writer = BufWriter::with_capacity(1024 * 64, stdout());
+            设 in_buf = &[byte];
+            设 tab = b"";
+            超级::write_nonprint_to_end(in_buf, &可变 writer, tab).解包();
+            相等断言!(writer.buffer(), [b'^', byte + 64]);
+        }
+    }
+
+    #[test]
+    方法 test_incrementing_string() {
+        设 可变 incrementing_string = 超级::LineNumber::新建();
+        相等断言!(b"     1\t", incrementing_string.to_str());
+        incrementing_string.increment();
+        相等断言!(b"     2\t", incrementing_string.to_str());
+        // Run through to 100
+        循环 _ 在 3..=100 {
+            incrementing_string.increment();
+        }
+        相等断言!(b"   100\t", incrementing_string.to_str());
+        // Run through until we overflow the original size.
+        循环 _ 在 101..=1_000_000 {
+            incrementing_string.increment();
+        }
+        // Confirm that the start position moves when we overflow the original size.
+        相等断言!(b"1000000\t", incrementing_string.to_str());
+        incrementing_string.increment();
+        相等断言!(b"1000001\t", incrementing_string.to_str());
+    }
+}

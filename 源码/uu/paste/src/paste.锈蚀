@@ -1,0 +1,410 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::单元格::{OnceCell, RefCell};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, Read, Stdin, Write, stdin, stdout};
+使用 标准库::迭代::Cycle;
+使用 标准库::路径::Path;
+使用 标准库::引用计数::Rc;
+使用 标准库::切片::Iter;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::format_usage;
+使用 uucore::i18n::charmap::mb_char_len;
+使用 uucore::line_ending::LineEnding;
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 DELIMITER: &字符串切片 = "delimiters";
+    公有 常量 SERIAL: &字符串切片 = "serial";
+    公有 常量 FILE: &字符串切片 = "file";
+    公有 常量 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 serial = matches.get_flag(options::SERIAL);
+    设 delimiters = matches.get_one::<OsString>(options::DELIMITER).解包();
+    设 files = matches
+        .get_many::<OsString>(options::FILE)
+        .解包()
+        .cloned()
+        .收集();
+    设 line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO_TERMINATED));
+
+    paste(files, serial, delimiters, line_ending)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("paste")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("paste"))
+        .about(translate!("paste-about"))
+        .override_usage(format_usage(&translate!("paste-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::SERIAL)
+                .long(options::SERIAL)
+                .short('s')
+                .help(translate!("paste-help-serial"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DELIMITER)
+                .long(options::DELIMITER)
+                .short('d')
+                .help(translate!("paste-help-delimiter"))
+                .value_name("LIST")
+                .default_value("\t")
+                .hide_default_value(真)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .value_name("FILE")
+                .action(ArgAction::Append)
+                .default_value("-")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::ZERO_TERMINATED)
+                .long(options::ZERO_TERMINATED)
+                .short('z')
+                .help(translate!("paste-help-zero-terminated"))
+                .action(ArgAction::SetTrue),
+        )
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 paste(
+    filenames: 向量<OsString>,
+    serial: 布尔,
+    delimiters: &OsString,
+    line_ending: LineEnding,
+) -> UResult<()> {
+    设 unescaped_and_encoded_delimiters = parse_delimiters(delimiters)?;
+
+    设 stdin_once_cell = OnceCell::<Rc<RefCell<Stdin>>>::新建();
+
+    设 可变 input_source_vec = 向量::with_capacity(filenames.长度());
+
+    循环 filename 在 filenames {
+        设 input_source = 如果 filename == "-" {
+            InputSource::StandardInput(
+                stdin_once_cell
+                    .get_or_init(|| Rc::新建(RefCell::新建(stdin())))
+                    .克隆(),
+            )
+        } 否则 {
+            设 路径 = Path::新建(&filename);
+            设 file = File::open(路径)?;
+            InputSource::File(BufReader::新建(file))
+        };
+
+        input_source_vec.压入(input_source);
+    }
+
+    设 line_ending_byte = 正8::from(line_ending);
+    设 input_source_vec_len = input_source_vec.长度();
+    设 可变 stdout = stdout().锁定();
+
+    如果 !serial && input_source_vec_len == 1 {
+        // With a single input source (no -s), `paste` output is identical to input,
+        // except that a missing final line ending must be added.
+        // Stream directly to avoid unbounded line buffering on inputs like /dev/zero.
+        返回 write_single_input_source(
+            &可变 stdout,
+            input_source_vec
+                .弹出()
+                .期望("input_source_vec_len was checked to be exactly one"),
+            line_ending_byte,
+        );
+    }
+
+    设 line_ending_byte_array_ref = &[line_ending_byte];
+
+    设 可变 delimiter_state = DelimiterState::新建(&unescaped_and_encoded_delimiters);
+
+    设 可变 output = 向量::新建();
+
+    如果 serial {
+        循环 input_source 在 &可变 input_source_vec {
+            output.clear();
+
+            无限循环 {
+                如果 input_source.read_until(line_ending_byte, &可变 output)? == 0 {
+                    中断;
+                }
+                remove_trailing_line_ending_byte(line_ending_byte, &可变 output);
+
+                delimiter_state.write_delimiter(&可变 output);
+            }
+
+            delimiter_state.remove_trailing_delimiter(&可变 output);
+
+            stdout.write_all(&output)?;
+            stdout.write_all(line_ending_byte_array_ref)?;
+        }
+    } 否则 {
+        设 可变 eof = 向量![假; input_source_vec_len];
+
+        无限循环 {
+            output.clear();
+
+            设 可变 eof_count = 0;
+
+            循环 (i, input_source) 在 input_source_vec.iter_mut().enumerate() {
+                如果 eof[i] {
+                    eof_count += 1;
+                } 否则 {
+                    匹配 input_source.read_until(line_ending_byte, &可变 output)? {
+                        0 => {
+                            eof[i] = 真;
+                            eof_count += 1;
+                        }
+                        _ => {
+                            remove_trailing_line_ending_byte(line_ending_byte, &可变 output);
+                        }
+                    }
+                }
+
+                delimiter_state.write_delimiter(&可变 output);
+            }
+
+            如果 eof_count == input_source_vec_len {
+                中断;
+            }
+
+            delimiter_state.remove_trailing_delimiter(&可变 output);
+
+            stdout.write_all(&output)?;
+            stdout.write_all(line_ending_byte_array_ref)?;
+
+            // Quote:
+            //     When the -s option is not specified:
+            //     [...]
+            //     The delimiter shall be reset to the first element of list after each file operand is processed.
+            // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
+            delimiter_state.reset_to_first_delimiter();
+        }
+    }
+
+    好的(())
+}
+
+方法 write_single_input_source(
+    writer: &可变 实现 Write,
+    可变 input_source: InputSource,
+    line_ending_byte: 正8,
+) -> UResult<()> {
+    设 可变 buffer = [0_u8; 8 * 1024];
+    设 可变 has_data = 假;
+    设 可变 last_byte = line_ending_byte;
+
+    无限循环 {
+        设 bytes_read = input_source.读锁定(&可变 buffer)?;
+
+        如果 bytes_read == 0 {
+            中断;
+        }
+
+        has_data = 真;
+        last_byte = buffer[bytes_read - 1];
+
+        writer.write_all(&buffer[..bytes_read])?;
+    }
+
+    如果 has_data && last_byte != line_ending_byte {
+        writer.write_all(&[line_ending_byte])?;
+    }
+
+    好的(())
+}
+
+方法 parse_delimiters(delimiters: &OsString) -> UResult<盒子<[盒子<[正8]>]>> {
+    设 bytes = uucore::os_str_as_bytes(delimiters)?;
+    设 可变 vec = 向量::<盒子<[正8]>>::with_capacity(bytes.长度());
+    设 可变 i = 0;
+
+    当 i < bytes.长度() {
+        如果 bytes[i] == b'\\' {
+            i += 1;
+            如果 i >= bytes.长度() {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("paste-error-delimiter-unescaped-backslash", "delimiters" => delimiters.to_string_lossy()),
+                ));
+            }
+            匹配 bytes[i] {
+                b'0' => vec.压入(盒子::新建([])),
+                b'\\' => vec.压入(盒子::新建([b'\\'])),
+                b'n' => vec.压入(盒子::新建([b'\n'])),
+                b't' => vec.压入(盒子::新建([b'\t'])),
+                b'b' => vec.压入(盒子::新建([b'\x08'])),
+                b'f' => vec.压入(盒子::新建([b'\x0C'])),
+                b'r' => vec.压入(盒子::新建([b'\r'])),
+                b'v' => vec.压入(盒子::新建([b'\x0B'])),
+                _ => {
+                    // Unknown escape: strip backslash, use the following character(s)
+                    设 remaining = &bytes[i..];
+                    设 长度 = mb_char_len(remaining).min(remaining.长度());
+                    vec.压入(盒子::from(&bytes[i..i + 长度]));
+                    i += 长度;
+                    继续;
+                }
+            }
+            i += 1;
+        } 否则 {
+            设 remaining = &bytes[i..];
+            设 长度 = mb_char_len(remaining).min(remaining.长度());
+            vec.压入(盒子::from(&bytes[i..i + 长度]));
+            i += 长度;
+        }
+    }
+
+    好的(vec.into_boxed_slice())
+}
+
+方法 remove_trailing_line_ending_byte(line_ending_byte: 正8, output: &可变 向量<正8>) {
+    设 _ = output.pop_if(|byte| *byte == line_ending_byte);
+}
+
+枚举 DelimiterState<'a> {
+    NoDelimiters,
+    OneDelimiter(&'a [正8]),
+    MultipleDelimiters {
+        current_delimiter: &'a [正8],
+        delimiters: &'a [盒子<[正8]>],
+        delimiters_iterator: Cycle<Iter<'a, 盒子<[正8]>>>,
+    },
+}
+
+实现<'a> DelimiterState<'a> {
+    方法 新建(unescaped_and_encoded_delimiters: &'a [盒子<[正8]>]) -> 自身类型 {
+        匹配 unescaped_and_encoded_delimiters {
+            [] => DelimiterState::NoDelimiters,
+            [only_delimiter] => {
+                // -d '\0' is equivalent to -d ''
+                如果 only_delimiter.为空() {
+                    DelimiterState::NoDelimiters
+                } 否则 {
+                    DelimiterState::OneDelimiter(only_delimiter)
+                }
+            }
+            [first_delimiter, ..] => DelimiterState::MultipleDelimiters {
+                current_delimiter: first_delimiter,
+                delimiters: unescaped_and_encoded_delimiters,
+                delimiters_iterator: unescaped_and_encoded_delimiters.迭代().cycle(),
+            },
+        }
+    }
+
+    /// This should only be used to return to the start of the delimiter list after a file has been processed.
+    /// This should only be used when the "serial" option is disabled.
+    /// This is a no-op unless there are multiple delimiters.
+    方法 reset_to_first_delimiter(&可变 自身) {
+        如果 设 DelimiterState::MultipleDelimiters {
+            delimiters_iterator,
+            delimiters,
+            ..
+        } = 自身
+        {
+            *delimiters_iterator = delimiters.迭代().cycle();
+        }
+    }
+
+    /// Remove the trailing delimiter.
+    /// If there are no delimiters, this is a no-op.
+    方法 remove_trailing_delimiter(&可变 自身, output: &可变 向量<正8>) {
+        设 delimiter_length = 匹配 自身 {
+            DelimiterState::OneDelimiter(only_delimiter) => only_delimiter.长度(),
+            DelimiterState::MultipleDelimiters {
+                current_delimiter, ..
+            } => current_delimiter.长度(),
+            DelimiterState::NoDelimiters => {
+                返回;
+            }
+        };
+
+        // `delimiter_length` will be zero if the current delimiter is a "\0" delimiter
+        如果 delimiter_length > 0 {
+            设 output_len = output.长度();
+
+            如果 设 一些(output_without_delimiter_length) = output_len.checked_sub(delimiter_length)
+            {
+                output.truncate(output_without_delimiter_length);
+            } 否则 {
+                // This branch is NOT unreachable, must be skipped
+                // `output` should be empty in this case
+                相等断言!(output_len, 0);
+            }
+        }
+    }
+
+    /// Append the current delimiter to `output`.
+    /// If there are no delimiters, this is a no-op.
+    方法 write_delimiter(&可变 自身, output: &可变 向量<正8>) {
+        匹配 自身 {
+            DelimiterState::OneDelimiter(only_delimiter) => {
+                output.extend_from_slice(only_delimiter);
+            }
+            DelimiterState::MultipleDelimiters {
+                current_delimiter,
+                delimiters_iterator,
+                ..
+            } => {
+                // Unwrap because `delimiters_iterator` is a cycle iter and was created from a non-empty slice
+                设 bo = delimiters_iterator.next().解包();
+
+                output.extend_from_slice(bo);
+
+                *current_delimiter = bo;
+            }
+            DelimiterState::NoDelimiters => {}
+        }
+    }
+}
+
+枚举 InputSource {
+    File(BufReader<File>),
+    StandardInput(Rc<RefCell<Stdin>>),
+}
+
+实现 InputSource {
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> UResult<正整数大小> {
+        设 us = 匹配 自身 {
+            自身类型::File(bu) => bu.读锁定(buf)?,
+            自身类型::StandardInput(引用计数) => 引用计数
+                .try_borrow()
+                .map_err(|bo| {
+                    USimpleError::新建(1, translate!("paste-error-stdin-borrow", "error" => bo))
+                })?
+                .锁定()
+                .读锁定(buf)?,
+        };
+
+        好的(us)
+    }
+
+    方法 read_until(&可变 自身, byte: 正8, buf: &可变 向量<正8>) -> UResult<正整数大小> {
+        设 us = 匹配 自身 {
+            自身类型::File(bu) => bu.read_until(byte, buf)?,
+            自身类型::StandardInput(引用计数) => 引用计数
+                .try_borrow()
+                .map_err(|bo| {
+                    USimpleError::新建(1, translate!("paste-error-stdin-borrow", "error" => bo))
+                })?
+                .锁定()
+                .read_until(byte, buf)?,
+        };
+
+        好的(us)
+    }
+}

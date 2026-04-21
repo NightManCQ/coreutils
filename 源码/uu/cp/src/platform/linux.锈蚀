@@ -1,0 +1,605 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore ficlone reflink ftruncate pwrite fiemap lseek
+
+使用 libc::{SEEK_DATA, SEEK_HOLE};
+使用 标准库::文件系统::{File, OpenOptions};
+使用 标准库::输入输出::Read;
+使用 标准库::操作系统::unix::文件系统::FileExt;
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, OpenOptionsExt};
+使用 标准库::操作系统::unix::输入输出::AsRawFd;
+使用 标准库::路径::Path;
+使用 uucore::buf_copy;
+使用 uucore::mode::get_umask;
+使用 uucore::translate;
+
+使用 箱::{
+    CopyDebug, CopyResult, CpError, OffloadReflinkDebug, ReflinkMode, SparseDebug, SparseMode,
+    is_stream,
+};
+
+/// The fallback behavior for [`clone`] on failed system call.
+#[derive(克隆协议, 复制协议)]
+枚举 CloneFallback {
+    /// Raise an error.
+    错误协议,
+
+    /// Use [`std::fs::copy`].
+    FSCopy,
+
+    /// Use [`sparse_copy`]
+    SparseCopy,
+
+    /// Use [`sparse_copy_without_hole`]
+    SparseCopyWithoutHole,
+}
+
+/// Type of method used for copying files
+#[derive(克隆协议, 复制协议)]
+枚举 CopyMethod {
+    /// Do a sparse copy
+    SparseCopy,
+    /// Use [`std::fs::copy`].
+    FSCopy,
+    /// Default (can either be [`CopyMethod::SparseCopy`] or [`CopyMethod::FSCopy`])
+    默认协议,
+    /// Use [`sparse_copy_without_hole`]
+    SparseCopyWithoutHole,
+}
+
+/// Use the Linux `ioctl_ficlone` API to do a copy-on-write clone.
+///
+/// `fallback` controls what to do if the system call fails.
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 克隆<P>(source: P, dest: P, fallback: CloneFallback) -> 标准库::输入输出::结果<()>
+何处
+    P: 作为引用协议<Path>,
+{
+    设 src_file = File::open(&source)?;
+    设 dst_file = File::create(&dest)?;
+    设 src_fd = src_file.as_raw_fd();
+    设 dst_fd = dst_file.as_raw_fd();
+    设 result = 不安全 { libc::ioctl(dst_fd, libc::FICLONE, src_fd) };
+    如果 result == 0 {
+        返回 好的(());
+    }
+    匹配 fallback {
+        CloneFallback::错误协议 => 坏的(标准库::输入输出::错误协议::last_os_error()),
+        CloneFallback::FSCopy => 标准库::文件系统::copy(source, dest).映射(|_| ()),
+        CloneFallback::SparseCopy => sparse_copy(source, dest),
+        CloneFallback::SparseCopyWithoutHole => sparse_copy_without_hole(source, dest),
+    }
+}
+
+/// Checks whether a file contains any non null bytes i.e. any byte != 0x0
+/// This function returns a tuple of (bool, u64, u64) signifying a tuple of (whether a file has
+/// data, its size, no of blocks it has allocated in disk)
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 check_for_data(source: &Path) -> 结果<(布尔, 正64, 正64), 标准库::输入输出::错误协议> {
+    设 可变 src_file = File::open(source)?;
+    设 metadata = src_file.metadata()?;
+
+    设 size = metadata.size();
+    设 blocks = metadata.blocks();
+    // checks edge case of virtual files in /proc which have a size of zero but contains data
+    如果 size == 0 {
+        设 可变 buf: 向量<正8> = 向量![0; metadata.blksize() 转换 正整数大小]; // Directly use metadata.blksize()
+        设 _ = src_file.读锁定(&可变 buf)?;
+        返回 好的((buf.迭代().任意(|&x| x != 0x0), size, 0));
+    }
+
+    设 src_fd = src_file.as_raw_fd();
+
+    设 result = 不安全 { libc::lseek(src_fd, 0, SEEK_DATA) };
+
+    匹配 result {
+        -1 => 好的((假, size, blocks)), // No data found or end of file
+        _ 如果 result >= 0 => 好的((真, size, blocks)), // Data found
+        _ => 坏的(标准库::输入输出::错误协议::last_os_error()),
+    }
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+/// Checks whether a file is sparse i.e. it contains holes, uses the crude heuristic blocks < size / 512
+/// Reference:`<https://doc.rust-lang.org/std/os/unix/fs/trait.MetadataExt.html#tymethod.blocks>`
+方法 check_sparse_detection(source: &Path) -> 结果<布尔, 标准库::输入输出::错误协议> {
+    设 src_file = File::open(source)?;
+    设 metadata = src_file.metadata()?;
+    设 size = metadata.size();
+    设 blocks = metadata.blocks();
+
+    如果 blocks < size / 512 {
+        返回 好的(真);
+    }
+    好的(假)
+}
+
+/// Optimized [`sparse_copy`] doesn't create holes for large sequences of zeros in non `sparse_files`
+/// Used when `--sparse=auto`
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 sparse_copy_without_hole<P>(source: P, dest: P) -> 标准库::输入输出::结果<()>
+何处
+    P: 作为引用协议<Path>,
+{
+    设 src_file = File::open(source)?;
+    设 dst_file = File::create(dest)?;
+    设 dst_fd = dst_file.as_raw_fd();
+
+    设 size = src_file.metadata()?.size();
+    如果 不安全 { libc::ftruncate(dst_fd, size.try_into().解包()) } < 0 {
+        返回 坏的(标准库::输入输出::错误协议::last_os_error());
+    }
+    设 src_fd = src_file.as_raw_fd();
+    设 可变 current_offset: 整数大小 = 0;
+    // Maximize the data read at once to 16 MiB to avoid memory hogging with large files
+    // 16 MiB chunks should saturate an SSD
+    设 step = 标准库::比较::min(size, 16 * 1024 * 1024) 转换 正整数大小;
+    设 可变 buf: 向量<正8> = 向量![0x0; step];
+    无限循环 {
+        设 result = 不安全 { libc::lseek(src_fd, current_offset.try_into().解包(), SEEK_DATA) }
+            .try_into()
+            .解包();
+
+        current_offset = result;
+        设 hole: 整数大小 =
+            不安全 { libc::lseek(src_fd, current_offset.try_into().解包(), SEEK_HOLE) }
+                .try_into()
+                .解包();
+        如果 result == -1 || hole == -1 {
+            中断;
+        }
+        如果 result <= -2 || hole <= -2 {
+            返回 坏的(标准库::输入输出::错误协议::last_os_error());
+        }
+        设 长度: 整数大小 = hole - current_offset;
+        // Read and write data in chunks of `step` while reusing the same buffer
+        循环 i 在 (0..长度).step_by(step) {
+            // Ensure we don't read past the end of the file or the start of the next hole
+            设 read_len = 标准库::比较::min((长度 - i) 转换 正整数大小, step);
+            设 buf = &可变 buf[..read_len];
+            src_file.read_exact_at(buf, (current_offset + i) 转换 正64)?;
+            dst_file.write_all_at(buf, (current_offset + i) 转换 正64)?;
+        }
+        current_offset = hole;
+    }
+    好的(())
+}
+/// Perform a sparse copy from one file to another.
+/// Creates a holes for large sequences of zeros in `non_sparse_files`, used for `--sparse=always`
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 sparse_copy<P>(source: P, dest: P) -> 标准库::输入输出::结果<()>
+何处
+    P: 作为引用协议<Path>,
+{
+    设 可变 src_file = File::open(source)?;
+    设 dst_file = File::create(dest)?;
+    设 dst_fd = dst_file.as_raw_fd();
+
+    设 size: 正整数大小 = src_file.metadata()?.size().try_into().解包();
+    如果 不安全 { libc::ftruncate(dst_fd, size.try_into().解包()) } < 0 {
+        返回 坏的(标准库::输入输出::错误协议::last_os_error());
+    }
+
+    设 blksize = dst_file.metadata()?.blksize();
+    设 可变 buf: 向量<正8> = 向量![0; blksize.try_into().解包()];
+    设 可变 current_offset: 正整数大小 = 0;
+
+    // TODO Perhaps we can employ the "fiemap ioctl" API to get the
+    // file extent mappings:
+    // https://www.kernel.org/doc/html/latest/filesystems/fiemap.html
+    当 current_offset < size {
+        设 this_read = src_file.读锁定(&可变 buf)?;
+        设 buf = &buf[..this_read];
+        如果 buf.迭代().任意(|&x| x != 0) {
+            dst_file.write_all_at(buf, current_offset.try_into().解包())?;
+        }
+        current_offset += this_read;
+    }
+    好的(())
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+/// Checks whether an existing destination is a fifo
+方法 check_dest_is_fifo(dest: &Path) -> 布尔 {
+    // If our destination file exists and its a fifo , we do a standard copy .
+    设 file_type = 标准库::文件系统::metadata(dest);
+    匹配 file_type {
+        好的(f) => f.file_type().is_fifo(),
+
+        _ => 假,
+    }
+}
+
+/// Copy the contents of a stream from `source` to `dest`.
+方法 copy_stream<P>(source: P, dest: P) -> 标准库::输入输出::结果<正64>
+何处
+    P: 作为引用协议<Path>,
+{
+    // For some reason,
+    //
+    //     cp --preserve=ownership --copy-contents fifo fifo2
+    //
+    // causes `fifo2` to be created with limited permissions (mode 622
+    // or maybe 600 it seems), and then after `fifo` is closed, the
+    // permissions get updated to match those of `fifo`. This doesn't
+    // make much sense to me but the behavior appears in
+    // `tests/cp/file-perm-race.sh`.
+    //
+    // So it seems that if `--preserve=ownership` is true then what we
+    // need to do is create the destination file with limited
+    // permissions, copy the contents, then update the permissions. If
+    // `--preserve=ownership` is not true, however, then we can just
+    // match the mode of the source file.
+    //
+    // TODO Update the code below to respect the case where
+    // `--preserve=ownership` is not true.
+    设 可变 src_file = File::open(&source)?;
+    设 mode = 0o622 & !get_umask();
+    设 可变 dst_file = OpenOptions::新建()
+        .create(真)
+        .写锁定(真)
+        .mode(mode)
+        .open(&dest)?;
+
+    设 dest_is_stream = is_stream(&dst_file.metadata()?);
+    如果 !dest_is_stream {
+        // `copy_stream` doesn't clear the dest file, if dest is not a stream, we should clear it manually.
+        dst_file.set_len(0)?;
+    }
+
+    设 num_bytes_copied = buf_copy::copy_stream(&可变 src_file, &可变 dst_file)
+        .map_err(|e| 标准库::输入输出::错误协议::other(格式化!("{e}")))?;
+
+    好的(num_bytes_copied)
+}
+
+/// Copies `source` to `dest` using copy-on-write if possible.
+公有(箱) 方法 copy_on_write(
+    source: &Path,
+    dest: &Path,
+    reflink_mode: ReflinkMode,
+    sparse_mode: SparseMode,
+    context: &字符串切片,
+    source_is_stream: 布尔,
+) -> CopyResult<CopyDebug> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::Unsupported,
+        sparse_detection: SparseDebug::No,
+    };
+    设 result = 匹配 (reflink_mode, sparse_mode) {
+        (ReflinkMode::Never, SparseMode::Always) => {
+            copy_debug.sparse_detection = SparseDebug::Zeros;
+            // Default SparseDebug val for SparseMode::Always
+            copy_debug.reflink = OffloadReflinkDebug::No;
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Avoided;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 可变 copy_method = CopyMethod::默认协议;
+                设 result = handle_reflink_never_sparse_always(source, dest);
+                如果 设 好的((debug, method)) = result {
+                    copy_debug = debug;
+                    copy_method = method;
+                }
+
+                匹配 copy_method {
+                    CopyMethod::FSCopy => 标准库::文件系统::copy(source, dest).映射(|_| ()),
+                    _ => sparse_copy(source, dest),
+                }
+            }
+        }
+        (ReflinkMode::Never, SparseMode::Never) => {
+            copy_debug.reflink = OffloadReflinkDebug::No;
+
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Avoided;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 result = handle_reflink_never_sparse_never(source);
+                如果 设 好的(debug) = result {
+                    copy_debug = debug;
+                }
+                标准库::文件系统::copy(source, dest).映射(|_| ())
+            }
+        }
+        (ReflinkMode::Never, SparseMode::Auto) => {
+            copy_debug.reflink = OffloadReflinkDebug::No;
+
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Avoided;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 可变 copy_method = CopyMethod::默认协议;
+                设 result = handle_reflink_never_sparse_auto(source, dest);
+                如果 设 好的((debug, method)) = result {
+                    copy_debug = debug;
+                    copy_method = method;
+                }
+
+                匹配 copy_method {
+                    CopyMethod::SparseCopyWithoutHole => sparse_copy_without_hole(source, dest),
+                    _ => 标准库::文件系统::copy(source, dest).映射(|_| ()),
+                }
+            }
+        }
+        (ReflinkMode::Auto, SparseMode::Always) => {
+            copy_debug.sparse_detection = SparseDebug::Zeros; // Default SparseDebug val for
+            // SparseMode::Always
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Avoided;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 可变 copy_method = CopyMethod::默认协议;
+                设 result = handle_reflink_auto_sparse_always(source, dest);
+                如果 设 好的((debug, method)) = result {
+                    copy_debug = debug;
+                    copy_method = method;
+                }
+
+                匹配 copy_method {
+                    CopyMethod::FSCopy => 克隆(source, dest, CloneFallback::FSCopy),
+                    _ => 克隆(source, dest, CloneFallback::SparseCopy),
+                }
+            }
+        }
+
+        (ReflinkMode::Auto, SparseMode::Never) => {
+            copy_debug.reflink = OffloadReflinkDebug::No;
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Avoided;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 result = handle_reflink_auto_sparse_never(source);
+                如果 设 好的(debug) = result {
+                    copy_debug = debug;
+                }
+
+                克隆(source, dest, CloneFallback::FSCopy)
+            }
+        }
+        (ReflinkMode::Auto, SparseMode::Auto) => {
+            如果 source_is_stream {
+                copy_debug.offload = OffloadReflinkDebug::Unsupported;
+                copy_stream(source, dest).映射(|_| ())
+            } 否则 {
+                设 可变 copy_method = CopyMethod::默认协议;
+                设 result = handle_reflink_auto_sparse_auto(source, dest);
+                如果 设 好的((debug, method)) = result {
+                    copy_debug = debug;
+                    copy_method = method;
+                }
+
+                匹配 copy_method {
+                    CopyMethod::SparseCopyWithoutHole => {
+                        克隆(source, dest, CloneFallback::SparseCopyWithoutHole)
+                    }
+                    _ => 克隆(source, dest, CloneFallback::FSCopy),
+                }
+            }
+        }
+
+        (ReflinkMode::Always, SparseMode::Auto) => {
+            copy_debug.sparse_detection = SparseDebug::No;
+            copy_debug.reflink = OffloadReflinkDebug::Yes;
+
+            克隆(source, dest, CloneFallback::错误协议)
+        }
+        (ReflinkMode::Always, _) => {
+            返回 坏的(translate!("cp-error-reflink-always-sparse-auto").into());
+        }
+    };
+    result.map_err(|e| CpError::IoErrContext(e, context.to_owned()))?;
+    好的(copy_debug)
+}
+
+/// Handles debug results when flags are "--reflink=auto" and "--sparse=always" and specifies what
+/// type of copy should be used
+方法 handle_reflink_auto_sparse_always(
+    source: &Path,
+    dest: &Path,
+) -> 结果<(CopyDebug, CopyMethod), 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::Unsupported,
+        sparse_detection: SparseDebug::Zeros,
+    };
+    设 可变 copy_method = CopyMethod::默认协议;
+    设 (data_flag, size, blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    如果 data_flag || size < 512 {
+        copy_debug.offload = OffloadReflinkDebug::Avoided;
+    }
+    匹配 (sparse_flag, data_flag, blocks) {
+        (真, 真, 0) => {
+            // Handling funny files with 0 block allocation but has data
+            // in it
+            copy_method = CopyMethod::FSCopy;
+            copy_debug.sparse_detection = SparseDebug::SeekHoleZeros;
+        }
+        (假, 真, 0) => copy_method = CopyMethod::FSCopy,
+
+        (真, 假, 0) => copy_debug.sparse_detection = SparseDebug::SeekHole,
+        (真, 真, _) => copy_debug.sparse_detection = SparseDebug::SeekHoleZeros,
+
+        (真, 假, _) => copy_debug.sparse_detection = SparseDebug::SeekHole,
+
+        (_, _, _) => (),
+    }
+    如果 check_dest_is_fifo(dest) {
+        copy_method = CopyMethod::FSCopy;
+    }
+    好的((copy_debug, copy_method))
+}
+
+/// Handles debug results when flags are "--reflink=auto" and "--sparse=auto" and specifies what
+/// type of copy should be used
+方法 handle_reflink_never_sparse_never(source: &Path) -> 结果<CopyDebug, 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::No,
+        sparse_detection: SparseDebug::No,
+    };
+    设 (data_flag, size, _blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    如果 sparse_flag {
+        copy_debug.sparse_detection = SparseDebug::SeekHole;
+    }
+
+    如果 data_flag || size < 512 {
+        copy_debug.offload = OffloadReflinkDebug::Avoided;
+    }
+    好的(copy_debug)
+}
+
+/// Handles debug results when flags are "--reflink=auto" and "--sparse=never", files will be copied
+/// through cloning them with fallback switching to [`std::fs::copy`]
+方法 handle_reflink_auto_sparse_never(source: &Path) -> 结果<CopyDebug, 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::No,
+        sparse_detection: SparseDebug::No,
+    };
+
+    设 (data_flag, size, _blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    如果 sparse_flag {
+        copy_debug.sparse_detection = SparseDebug::SeekHole;
+    }
+
+    如果 data_flag || size < 512 {
+        copy_debug.offload = OffloadReflinkDebug::Avoided;
+    }
+    好的(copy_debug)
+}
+
+/// Handles debug results when flags are "--reflink=auto" and "--sparse=auto" and specifies what
+/// type of copy should be used
+方法 handle_reflink_auto_sparse_auto(
+    source: &Path,
+    dest: &Path,
+) -> 结果<(CopyDebug, CopyMethod), 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::Unsupported,
+        sparse_detection: SparseDebug::No,
+    };
+
+    设 可变 copy_method = CopyMethod::默认协议;
+    设 (data_flag, size, blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    如果 (data_flag && size != 0) || (size > 0 && size < 512) {
+        copy_debug.offload = OffloadReflinkDebug::Yes;
+    }
+
+    如果 data_flag && size == 0 {
+        // Handling /proc/ files
+        copy_debug.offload = OffloadReflinkDebug::Unsupported;
+    }
+    如果 sparse_flag {
+        如果 blocks == 0 && data_flag {
+            // Handling other "virtual" files
+            copy_debug.offload = OffloadReflinkDebug::Unsupported;
+
+            copy_method = CopyMethod::FSCopy; // Doing a standard copy for the virtual files
+        } 否则 {
+            copy_method = CopyMethod::SparseCopyWithoutHole;
+        } // Since sparse_flag is true, sparse_detection shall be SeekHole for any non virtual
+        // regular sparse file and the file will be sparsely copied
+        copy_debug.sparse_detection = SparseDebug::SeekHole;
+    }
+
+    如果 check_dest_is_fifo(dest) {
+        copy_method = CopyMethod::FSCopy;
+    }
+    好的((copy_debug, copy_method))
+}
+
+/// Handles debug results when flags are "--reflink=never" and "--sparse=auto" and specifies what
+/// type of copy should be used
+方法 handle_reflink_never_sparse_auto(
+    source: &Path,
+    dest: &Path,
+) -> 结果<(CopyDebug, CopyMethod), 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::No,
+        sparse_detection: SparseDebug::No,
+    };
+
+    设 (data_flag, size, blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    设 可变 copy_method = CopyMethod::默认协议;
+    如果 data_flag || size < 512 {
+        copy_debug.offload = OffloadReflinkDebug::Avoided;
+    }
+
+    如果 sparse_flag {
+        如果 blocks == 0 && data_flag {
+            copy_method = CopyMethod::FSCopy; // Handles virtual files which have size > 0 but no
+        // disk allocation
+        } 否则 {
+            copy_method = CopyMethod::SparseCopyWithoutHole; // Handles regular sparse-files
+        }
+        copy_debug.sparse_detection = SparseDebug::SeekHole;
+    }
+
+    如果 check_dest_is_fifo(dest) {
+        copy_method = CopyMethod::FSCopy;
+    }
+    好的((copy_debug, copy_method))
+}
+
+/// Handles debug results when flags are "--reflink=never" and "--sparse=always" and specifies what
+/// type of copy should be used
+方法 handle_reflink_never_sparse_always(
+    source: &Path,
+    dest: &Path,
+) -> 结果<(CopyDebug, CopyMethod), 标准库::输入输出::错误协议> {
+    设 可变 copy_debug = CopyDebug {
+        offload: OffloadReflinkDebug::Unknown,
+        reflink: OffloadReflinkDebug::No,
+        sparse_detection: SparseDebug::Zeros,
+    };
+    设 可变 copy_method = CopyMethod::SparseCopy;
+
+    设 (data_flag, size, blocks) = check_for_data(source)?;
+    设 sparse_flag = check_sparse_detection(source)?;
+
+    如果 data_flag || size < 512 {
+        copy_debug.offload = OffloadReflinkDebug::Avoided;
+    }
+    匹配 (sparse_flag, data_flag, blocks) {
+        (真, 真, 0) => {
+            // Handling funny files with 0 block allocation but has data
+            // in it, e.g. files in /sys and other virtual files
+            copy_method = CopyMethod::FSCopy;
+            copy_debug.sparse_detection = SparseDebug::SeekHoleZeros;
+        }
+        (假, 真, 0) => copy_method = CopyMethod::FSCopy, // Handling data containing zero sized
+        // files in /proc
+        (真, 假, 0) => copy_debug.sparse_detection = SparseDebug::SeekHole, // Handles files
+        // with 0 blocks allocated in disk and
+        (真, 真, _) => copy_debug.sparse_detection = SparseDebug::SeekHoleZeros, // Any
+        // sparse_files with data in it will display SeekHoleZeros
+        (真, 假, _) => {
+            copy_debug.offload = OffloadReflinkDebug::Unknown;
+            copy_debug.sparse_detection = SparseDebug::SeekHole;
+        }
+
+        (_, _, _) => (),
+    }
+    如果 check_dest_is_fifo(dest) {
+        copy_method = CopyMethod::FSCopy;
+    }
+
+    好的((copy_debug, copy_method))
+}

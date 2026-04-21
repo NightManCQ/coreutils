@@ -1,0 +1,768 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Implement GNU-style backup functionality.
+//!
+//! This module implements the backup functionality as described in the [GNU
+//! manual][1]. It provides
+//!
+//! - pre-defined [`clap`-Arguments][2] for inclusion in utilities that
+//!   implement backups
+//! - determination of the [backup mode][3]
+//! - determination of the [backup suffix][4]
+//! - [backup target path construction][5]
+//! - [Error types][6] for backup-related errors
+//! - GNU-compliant [help texts][7] for backup-related errors
+//!
+//! Backup-functionality is implemented by the following utilities:
+//!
+//! - `cp`
+//! - `install`
+//! - `ln`
+//! - `mv`
+//!
+//!
+//! [1]: https://www.gnu.org/software/coreutils/manual/html_node/Backup-options.html
+//! [2]: arguments
+//! [3]: `determine_backup_mode()`
+//! [4]: `determine_backup_suffix()`
+//! [5]: `get_backup_path()`
+//! [6]: `BackupError`
+//! [7]: `BACKUP_CONTROL_LONG_HELP`
+//!
+//!
+//! # Usage example
+//!
+//! ```
+//! #[macro_use]
+//! extern crate uucore;
+//!
+//! use clap::{Command, Arg, ArgMatches};
+//! use std::path::{Path, PathBuf};
+//! use uucore::backup_control::{self, BackupMode};
+//! use uucore::error::{UError, UResult};
+//!
+//! fn main() {
+//!     let usage = String::from("command [OPTION]... ARG");
+//!     let long_usage = String::from("And here's a detailed explanation");
+//!
+//!     let matches = Command::new("command")
+//!         .arg(backup_control::arguments::backup())
+//!         .arg(backup_control::arguments::backup_no_args())
+//!         .arg(backup_control::arguments::suffix())
+//!         .override_usage(usage)
+//!         .after_help(format!(
+//!             "{long_usage}\n{}",
+//!             backup_control::BACKUP_CONTROL_LONG_HELP
+//!         ))
+//!         .get_matches_from(vec![
+//!             "command", "--backup=t", "--suffix=bak~"
+//!         ]);
+//!
+//!     let backup_mode = match backup_control::determine_backup_mode(&matches) {
+//!         Err(e) => {
+//!             show!(e);
+//!             return;
+//!         },
+//!         Ok(mode) => mode,
+//!     };
+//!     let backup_suffix = backup_control::determine_backup_suffix(&matches);
+//!     let target_path = Path::new("/tmp/example");
+//!
+//!     let backup_path = backup_control::get_backup_path(
+//!         backup_mode, target_path, &backup_suffix
+//!     );
+//!
+//!     // Perform your backups here.
+//!
+//! }
+//! ```
+
+// spell-checker:ignore backupopt
+
+使用 箱::{
+    display::Quotable,
+    错误::{UError, UResult},
+};
+使用 clap::ArgMatches;
+使用 标准库::{
+    环境,
+    错误::错误协议,
+    ffi::{OsStr, OsString},
+    格式化::{调试协议, 显示协议},
+    路径::{Path, PathBuf},
+};
+
+公有 静态 BACKUP_CONTROL_VALUES: &[&字符串切片] = &[
+    "simple", "never", "numbered", "t", "existing", "nil", "none", "off",
+];
+
+公有 常量 BACKUP_CONTROL_LONG_HELP: &字符串切片 =
+    "The backup suffix is '~', unless set with --suffix or SIMPLE_BACKUP_SUFFIX.
+The version control method may be selected via the --backup option or through
+the VERSION_CONTROL environment variable.  Here are the values:
+
+  none, off       never make backups (even if --backup is given)
+  numbered, t     make numbered backups
+  existing, nil   numbered if numbered backups exist, simple otherwise
+  simple, never   always make simple backups";
+
+静态 VALID_ARGS_HELP: &字符串切片 = "Valid arguments are:
+  - 'none', 'off'
+  - 'simple', 'never'
+  - 'existing', 'nil'
+  - 'numbered', 't'";
+
+公有 常量 DEFAULT_BACKUP_SUFFIX: &字符串切片 = "~";
+
+/// Available backup modes.
+///
+/// The mapping of the backup modes to the CLI arguments is annotated on the
+/// enum variants.
+#[derive(调试协议, 克隆协议, 复制协议, 相等比较协议, 偏等比较协议, 默认协议)]
+公有 枚举 BackupMode {
+    /// Argument 'none', 'off'
+    #[默认]
+    无,
+    /// Argument 'simple', 'never'
+    Simple,
+    /// Argument 'numbered', 't'
+    Numbered,
+    /// Argument 'existing', 'nil'
+    Existing,
+}
+
+/// Backup error types.
+///
+/// Errors are currently raised by [`determine_backup_mode`] only. All errors
+/// are implemented as [`UError`] for uniform handling across utilities.
+#[derive(调试协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 BackupError {
+    /// An invalid argument (e.g. 'foo') was given as backup type. First
+    /// parameter is the argument, second is the arguments origin (CLI or
+    /// ENV-var)
+    InvalidArgument(字符串, 字符串),
+    /// An ambiguous argument (e.g. 'n') was given as backup type. First
+    /// parameter is the argument, second is the arguments origin (CLI or
+    /// ENV-var)
+    AmbiguousArgument(字符串, 字符串),
+    /// Currently unused
+    BackupImpossible(),
+    // BackupFailed(PathBuf, PathBuf, std::io::Error),
+}
+
+实现 UError 循环 BackupError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::BackupImpossible() => 2,
+            _ => 1,
+        }
+    }
+
+    方法 usage(&自身) -> 布尔 {
+        // Suggested by clippy.
+        matches!(
+            自身,
+            自身类型::InvalidArgument(_, _) | 自身类型::AmbiguousArgument(_, _)
+        )
+    }
+}
+
+实现 错误协议 循环 BackupError {}
+
+实现 显示协议 循环 BackupError {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::InvalidArgument(arg, origin) => write!(
+                f,
+                "invalid argument {} for '{origin}'\n{VALID_ARGS_HELP}",
+                arg.quote(),
+            ),
+            自身类型::AmbiguousArgument(arg, origin) => write!(
+                f,
+                "ambiguous argument {} for '{origin}'\n{VALID_ARGS_HELP}",
+                arg.quote(),
+            ),
+            自身类型::BackupImpossible() => write!(f, "cannot create backup"),
+            // Placeholder for later
+            // Self::BackupFailed(from, to, e) => Display::fmt(
+            //     &uio_error!(e, "failed to backup {} to {}", from.quote(), to.quote()),
+            //     f
+            // ),
+        }
+    }
+}
+
+/// Arguments for backup-related functionality.
+///
+/// Rather than implementing the `clap`-Arguments for every utility, it is
+/// recommended to include the `clap` arguments via the functions provided here.
+/// This way the backup-specific arguments are handled uniformly across
+/// utilities and can be maintained in one central place.
+公有 模组 arguments {
+    使用 clap::ArgAction;
+
+    公有 静态 OPT_BACKUP: &字符串切片 = "backupopt_backup";
+    公有 静态 OPT_BACKUP_NO_ARG: &字符串切片 = "backupopt_b";
+    公有 静态 OPT_SUFFIX: &字符串切片 = "backupopt_suffix";
+
+    /// '--backup' argument
+    公有 方法 backup() -> clap::Arg {
+        clap::Arg::新建(OPT_BACKUP)
+            .long("backup")
+            .help("make a backup of each existing destination file")
+            .action(ArgAction::Set)
+            .require_equals(真)
+            .num_args(0..=1)
+            .value_name("CONTROL")
+    }
+
+    /// '-b' argument
+    公有 方法 backup_no_args() -> clap::Arg {
+        clap::Arg::新建(OPT_BACKUP_NO_ARG)
+            .short('b')
+            .help("like --backup but does not accept an argument")
+            .action(ArgAction::SetTrue)
+    }
+
+    /// '-S, --suffix' argument
+    公有 方法 suffix() -> clap::Arg {
+        clap::Arg::新建(OPT_SUFFIX)
+            .short('S')
+            .long("suffix")
+            .help("override the usual backup suffix")
+            .action(ArgAction::Set)
+            .value_name("SUFFIX")
+            .allow_hyphen_values(真)
+    }
+}
+
+/// Obtain the suffix to use for a backup.
+///
+/// In order of precedence, this function obtains the backup suffix
+///
+/// 1. From the '-S' or '--suffix' CLI argument, if present
+/// 2. From the "SIMPLE_BACKUP_SUFFIX" environment variable, if present
+/// 3. By using the default '~' if none of the others apply, or if they contained slashes
+///
+/// This function directly takes [`ArgMatches`] as argument and looks for
+/// the '-S' and '--suffix' arguments itself.
+公有 方法 determine_backup_suffix(matches: &ArgMatches) -> 字符串 {
+    设 supplied_suffix = matches.get_one::<字符串>(arguments::OPT_SUFFIX);
+    设 suffix = 如果 设 一些(suffix) = supplied_suffix {
+        字符串::from(suffix)
+    } 否则 {
+        环境::var("SIMPLE_BACKUP_SUFFIX").unwrap_or_else(|_| DEFAULT_BACKUP_SUFFIX.to_owned())
+    };
+    如果 suffix.包含('/') {
+        DEFAULT_BACKUP_SUFFIX.to_owned()
+    } 否则 {
+        suffix
+    }
+}
+
+/// Determine the "mode" for the backup operation to perform, if any.
+///
+/// Parses the backup options according to the [GNU manual][1], and converts
+/// them to an instance of `BackupMode` for further processing.
+///
+/// Takes [`ArgMatches`] as argument which **must** contain the options
+/// from [`arguments::backup()`] and [`arguments::backup_no_args()`]. Otherwise
+/// the `NoBackup` mode is returned unconditionally.
+///
+/// It is recommended for anyone who would like to implement the
+/// backup-functionality to use the arguments prepared in the `arguments`
+/// submodule (see examples)
+///
+/// [1]: https://www.gnu.org/software/coreutils/manual/html_node/Backup-options.html
+///
+///
+/// # Errors
+///
+/// If an argument supplied directly to the long `backup` option, or read in
+/// through the `VERSION CONTROL` env var is ambiguous (i.e. may resolve to
+/// multiple backup modes) or invalid, an [`InvalidArgument`][10] or
+/// [`AmbiguousArgument`][11] error is returned, respectively.
+///
+/// [10]: BackupError::InvalidArgument
+/// [11]: BackupError::AmbiguousArgument
+///
+///
+/// # Examples
+///
+/// Here's how one would integrate the backup mode determination into an
+/// application.
+///
+/// ```
+/// #[macro_use]
+/// extern crate uucore;
+/// use uucore::backup_control::{self, BackupMode};
+/// use clap::{Command, Arg, ArgMatches};
+///
+/// fn main() {
+///     let matches = Command::new("command")
+///         .arg(backup_control::arguments::backup())
+///         .arg(backup_control::arguments::backup_no_args())
+///         .get_matches_from(vec![
+///             "command", "-b", "--backup=t"
+///         ]);
+///
+///     let backup_mode = backup_control::determine_backup_mode(&matches).unwrap();
+///     assert_eq!(backup_mode, BackupMode::Numbered)
+/// }
+/// ```
+///
+/// This example shows an ambiguous input, as 'n' may resolve to 4 different
+/// backup modes.
+///
+///
+/// ```
+/// #[macro_use]
+/// extern crate uucore;
+/// use uucore::backup_control::{self, BackupMode, BackupError};
+/// use clap::{Command, Arg, ArgMatches};
+///
+/// fn main() {
+///     let matches = Command::new("command")
+///         .arg(backup_control::arguments::backup())
+///         .arg(backup_control::arguments::backup_no_args())
+///         .get_matches_from(vec![
+///             "command", "-b", "--backup=n"
+///         ]);
+///
+///     let backup_mode = backup_control::determine_backup_mode(&matches);
+///
+///     assert!(backup_mode.is_err());
+///     let err = backup_mode.unwrap_err();
+///     // assert_eq!(err, BackupError::AmbiguousArgument);
+///     // Use uucore functionality to show the error to the user
+///     show!(err);
+/// }
+/// ```
+公有 方法 determine_backup_mode(matches: &ArgMatches) -> UResult<BackupMode> {
+    如果 matches.contains_id(arguments::OPT_BACKUP) {
+        // Use method to determine the type of backups to make. When this option
+        // is used but method is not specified, then the value of the
+        // VERSION_CONTROL environment variable is used. And if VERSION_CONTROL
+        // is not set, the default backup type is 'existing'.
+        如果 设 一些(method) = matches.get_one::<字符串>(arguments::OPT_BACKUP) {
+            // Second argument is for the error string that is returned.
+            match_method(method, "backup type")
+        } 否则 如果 设 好的(method) = 环境::var("VERSION_CONTROL") {
+            // Second argument is for the error string that is returned.
+            match_method(&method, "$VERSION_CONTROL")
+        } 否则 {
+            // Default if no argument is provided to '--backup'
+            好的(BackupMode::Existing)
+        }
+    } 否则 如果 matches.get_flag(arguments::OPT_BACKUP_NO_ARG) {
+        // the short form of this option, -b does not accept any argument.
+        // if VERSION_CONTROL is not set then using -b is equivalent to
+        // using --backup=existing.
+        如果 设 好的(method) = 环境::var("VERSION_CONTROL") {
+            match_method(&method, "$VERSION_CONTROL")
+        } 否则 {
+            好的(BackupMode::Existing)
+        }
+    } 否则 如果 matches.contains_id(arguments::OPT_SUFFIX) {
+        // Suffix option is enough to determine mode even if --backup is not set.
+        // If VERSION_CONTROL is not set, the default backup type is 'existing'.
+        如果 设 好的(method) = 环境::var("VERSION_CONTROL") {
+            match_method(&method, "$VERSION_CONTROL")
+        } 否则 {
+            好的(BackupMode::Existing)
+        }
+    } 否则 {
+        // No option was present at all
+        好的(BackupMode::无)
+    }
+}
+
+/// Match a backup option string to a `BackupMode`.
+///
+/// The GNU manual specifies that abbreviations to options are valid as long as
+/// they aren't ambiguous. This function matches the given `method` argument
+/// against all valid backup options (via `starts_with`), and returns a valid
+/// [`BackupMode`] if exactly one backup option matches the `method` given.
+///
+/// `origin` is required in order to format the generated error message
+/// properly, when an error occurs.
+///
+///
+/// # Errors
+///
+/// If `method` is invalid or ambiguous (i.e. may resolve to multiple backup
+/// modes), an [`InvalidArgument`][10] or [`AmbiguousArgument`][11] error is
+/// returned, respectively.
+///
+/// [10]: BackupError::InvalidArgument
+/// [11]: BackupError::AmbiguousArgument
+方法 match_method(method: &字符串切片, origin: &字符串切片) -> UResult<BackupMode> {
+    设 matches: 向量<&&字符串切片> = BACKUP_CONTROL_VALUES
+        .迭代()
+        .过滤(|val| val.starts_with(method))
+        .收集();
+    如果 matches.长度() == 1 {
+        匹配 *matches[0] {
+            "simple" | "never" => 好的(BackupMode::Simple),
+            "numbered" | "t" => 好的(BackupMode::Numbered),
+            "existing" | "nil" => 好的(BackupMode::Existing),
+            "none" | "off" => 好的(BackupMode::无),
+            _ => 无法到达!(), // cannot happen as we must have exactly one match
+                                 // from the list above.
+        }
+    } 否则 如果 matches.为空() {
+        坏的(BackupError::InvalidArgument(method.to_string(), origin.to_string()).into())
+    } 否则 {
+        坏的(BackupError::AmbiguousArgument(method.to_string(), origin.to_string()).into())
+    }
+}
+
+公有 方法 get_backup_path<S: 作为引用协议<OsStr>>(
+    backup_mode: BackupMode,
+    backup_path: &Path,
+    suffix: S,
+) -> 选项<PathBuf> {
+    匹配 backup_mode {
+        BackupMode::无 => 无,
+        BackupMode::Simple => 一些(simple_backup_path(backup_path, suffix.as_ref())),
+        BackupMode::Numbered => 一些(numbered_backup_path(backup_path)),
+        BackupMode::Existing => 一些(existing_backup_path(backup_path, suffix.as_ref())),
+    }
+}
+
+方法 simple_backup_path<S: 作为引用协议<OsStr>>(路径: &Path, suffix: S) -> PathBuf {
+    设 可变 file_name = 路径.file_name().unwrap_or_default().to_os_string();
+    file_name.压入(suffix.as_ref());
+    路径.with_file_name(file_name)
+}
+
+方法 numbered_backup_path(路径: &Path) -> PathBuf {
+    设 可变 i: 正64 = 1;
+    无限循环 {
+        设 new_path = simple_backup_path(路径, OsString::from(格式化!(".~{i}~")));
+        如果 !new_path.exists() {
+            返回 new_path;
+        }
+        i += 1;
+    }
+}
+
+方法 existing_backup_path<S: 作为引用协议<OsStr>>(路径: &Path, suffix: S) -> PathBuf {
+    设 test_path = simple_backup_path(路径, OsString::from(".~1~"));
+    如果 test_path.exists() {
+        返回 numbered_backup_path(路径);
+    }
+    simple_backup_path(路径, suffix.as_ref())
+}
+
+/// Returns true if the source file is likely to be the simple backup file for the target file.
+///
+/// # Arguments
+///
+/// * `source` - A Path reference that holds the source (backup) file path.
+/// * `target` - A Path reference that holds the target file path.
+/// * `suffix` - Str that holds the backup suffix.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use uucore::backup_control::source_is_target_backup;
+/// let source = Path::new("data.txt~");
+/// let target = Path::new("data.txt");
+/// let suffix = String::from("~");
+///
+/// assert_eq!(source_is_target_backup(&source, &target, &suffix), true);
+/// ```
+///
+公有 方法 source_is_target_backup(source: &Path, target: &Path, suffix: &字符串切片) -> 布尔 {
+    设 source_filename = source.as_os_str();
+    设 可变 target_backup_filename = target.as_os_str().to_owned();
+    target_backup_filename.压入(suffix);
+    source_filename == target_backup_filename
+}
+
+//
+// Tests for this module
+//
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    // Required to instantiate mutex in shared context
+    使用 clap::Command;
+    使用 标准库::同步::互斥锁;
+
+    // The mutex is required here as by default all tests are run as separate
+    // threads under the same parent process. As environment variables are
+    // specific to processes (and thus shared among threads), data races *will*
+    // occur if no precautions are taken. Thus we have all tests that rely on
+    // environment variables lock this empty mutex to ensure they don't access
+    // it concurrently.
+    静态 TEST_MUTEX: 互斥锁<()> = 互斥锁::新建(());
+
+    // Environment variable for "VERSION_CONTROL"
+    静态 ENV_VERSION_CONTROL: &字符串切片 = "VERSION_CONTROL";
+
+    方法 make_app() -> Command {
+        Command::新建("command")
+            .arg(arguments::backup())
+            .arg(arguments::backup_no_args())
+            .arg(arguments::suffix())
+    }
+
+    // Defaults to --backup=existing
+    #[test]
+    方法 test_backup_mode_short_only() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "-b"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Existing);
+    }
+
+    // --backup takes precedence over -b
+    #[test]
+    方法 test_backup_mode_long_preferred_over_short() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "-b", "--backup=none"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::无);
+    }
+
+    // --backup can be passed without an argument
+    #[test]
+    方法 test_backup_mode_long_without_args_no_env() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--backup"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Existing);
+    }
+
+    // --backup can be passed with an argument only
+    #[test]
+    方法 test_backup_mode_long_with_args() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--backup=simple"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Simple);
+    }
+
+    // --backup errors on invalid argument
+    #[test]
+    方法 test_backup_mode_long_with_args_invalid() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--backup=foobar"]);
+
+        设 result = determine_backup_mode(&matches);
+
+        断言!(result.is_err());
+        设 text = 格式化!("{}", result.unwrap_err());
+        断言!(text.包含("invalid argument 'foobar' for 'backup type'"));
+    }
+
+    // --backup errors on ambiguous argument
+    #[test]
+    方法 test_backup_mode_long_with_args_ambiguous() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--backup=n"]);
+
+        设 result = determine_backup_mode(&matches);
+
+        断言!(result.is_err());
+        设 text = 格式化!("{}", result.unwrap_err());
+        断言!(text.包含("ambiguous argument 'n' for 'backup type'"));
+    }
+
+    // --backup accepts shortened arguments (si for simple)
+    #[test]
+    方法 test_backup_mode_long_with_arg_shortened() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--backup=si"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Simple);
+    }
+
+    // -b doesn't ignores the "VERSION_CONTROL" environment variable
+    #[test]
+    方法 test_backup_mode_short_does_not_ignore_env() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "numbered") };
+        设 matches = make_app().get_matches_from(向量!["command", "-b"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Numbered);
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    // --backup can be passed without an argument, but reads env var if existent
+    #[test]
+    方法 test_backup_mode_long_without_args_with_env() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "none") };
+        设 matches = make_app().get_matches_from(向量!["command", "--backup"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::无);
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    // --backup errors on invalid VERSION_CONTROL env var
+    #[test]
+    方法 test_backup_mode_long_with_env_var_invalid() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "foobar") };
+        设 matches = make_app().get_matches_from(向量!["command", "--backup"]);
+
+        设 result = determine_backup_mode(&matches);
+
+        断言!(result.is_err());
+        设 text = 格式化!("{}", result.unwrap_err());
+        断言!(text.包含("invalid argument 'foobar' for '$VERSION_CONTROL'"));
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    // --backup errors on ambiguous VERSION_CONTROL env var
+    #[test]
+    方法 test_backup_mode_long_with_env_var_ambiguous() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "n") };
+        设 matches = make_app().get_matches_from(向量!["command", "--backup"]);
+
+        设 result = determine_backup_mode(&matches);
+
+        断言!(result.is_err());
+        设 text = 格式化!("{}", result.unwrap_err());
+        断言!(text.包含("ambiguous argument 'n' for '$VERSION_CONTROL'"));
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    // --backup accepts shortened env vars (si for simple)
+    #[test]
+    方法 test_backup_mode_long_with_env_var_shortened() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "si") };
+        设 matches = make_app().get_matches_from(向量!["command", "--backup"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Simple);
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    // Using --suffix without --backup defaults to --backup=existing
+    #[test]
+    方法 test_backup_mode_suffix_without_backup_option() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "--suffix", ".bak"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Existing);
+    }
+
+    // Using --suffix without --backup uses env var if existing
+    #[test]
+    方法 test_backup_mode_suffix_without_backup_option_with_env_var() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        不安全 { 环境::set_var(ENV_VERSION_CONTROL, "numbered") };
+        设 matches = make_app().get_matches_from(向量!["command", "--suffix", ".bak"]);
+
+        设 result = determine_backup_mode(&matches).解包();
+
+        相等断言!(result, BackupMode::Numbered);
+        不安全 { 环境::remove_var(ENV_VERSION_CONTROL) };
+    }
+
+    #[test]
+    方法 test_suffix_takes_hyphen_value() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches = make_app().get_matches_from(向量!["command", "-b", "--suffix", "-v"]);
+
+        设 result = determine_backup_suffix(&matches);
+        相等断言!(result, "-v");
+    }
+
+    #[test]
+    方法 test_suffix_rejects_path_traversal() {
+        设 _dummy = TEST_MUTEX.锁定().解包();
+        设 matches =
+            make_app().get_matches_from(向量!["command", "-b", "--suffix", "_/../../dest"]);
+
+        设 result = determine_backup_suffix(&matches);
+        相等断言!(result, DEFAULT_BACKUP_SUFFIX);
+    }
+
+    #[test]
+    方法 test_numbered_backup_path() {
+        相等断言!(numbered_backup_path(Path::新建("")), PathBuf::from(".~1~"));
+        相等断言!(numbered_backup_path(Path::新建("/")), PathBuf::from("/.~1~"));
+        相等断言!(
+            numbered_backup_path(Path::新建("/hello/world")),
+            PathBuf::from("/hello/world.~1~")
+        );
+        相等断言!(
+            numbered_backup_path(Path::新建("/hello/world/")),
+            PathBuf::from("/hello/world.~1~")
+        );
+    }
+
+    #[test]
+    方法 test_simple_backup_path() {
+        相等断言!(
+            simple_backup_path(Path::新建(""), ".bak"),
+            PathBuf::from(".bak")
+        );
+        相等断言!(
+            simple_backup_path(Path::新建("/"), ".bak"),
+            PathBuf::from("/.bak")
+        );
+        相等断言!(
+            simple_backup_path(Path::新建("/hello/world"), ".bak"),
+            PathBuf::from("/hello/world.bak")
+        );
+        相等断言!(
+            simple_backup_path(Path::新建("/hello/world/"), ".bak"),
+            PathBuf::from("/hello/world.bak")
+        );
+    }
+
+    #[test]
+    方法 test_source_is_target_backup() {
+        设 source = Path::新建("data.txt.bak");
+        设 target = Path::新建("data.txt");
+        设 suffix = 字符串::from(".bak");
+
+        断言!(source_is_target_backup(source, target, &suffix));
+    }
+
+    #[test]
+    方法 test_source_is_not_target_backup() {
+        设 source = Path::新建("data.txt");
+        设 target = Path::新建("backup.txt");
+        设 suffix = 字符串::from(".bak");
+
+        断言!(!source_is_target_backup(source, target, &suffix));
+    }
+
+    #[test]
+    方法 test_source_is_target_backup_with_tilde_suffix() {
+        设 source = Path::新建("example~");
+        设 target = Path::新建("example");
+        设 suffix = 字符串::from("~");
+
+        断言!(source_is_target_backup(source, target, &suffix));
+    }
+}

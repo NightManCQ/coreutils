@@ -1,0 +1,54 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Exit status codes produced by `timeout`.
+使用 uucore::错误::UError;
+
+/// Enumerates the exit statuses produced by `timeout`.
+///
+/// Use [`Into::into`] (or [`From::from`]) to convert an enumeration
+/// member into a numeric status code. You can also convert into a
+/// [`UError`].
+///
+/// # Examples
+///
+/// Convert into an [`i32`]:
+///
+/// ```rust,ignore
+/// assert_eq!(i32::from(ExitStatus::CommandTimedOut), 124);
+/// ```
+公有(箱) 枚举 ExitStatus {
+    /// When the child process times out.
+    CommandTimedOut,
+
+    /// When `timeout` itself fails.
+    TimeoutFailed,
+
+    /// When command is found but cannot be invoked (permission denied, etc.).
+    CannotInvoke,
+
+    /// When command cannot be found.
+    CommandNotFound,
+
+    /// When a signal is sent to the child process or `timeout` itself.
+    SignalSent(正整数大小),
+}
+
+实现 转换协议<ExitStatus> 循环 整32 {
+    方法 from(exit_status: ExitStatus) -> 自身类型 {
+        匹配 exit_status {
+            ExitStatus::CommandTimedOut => 124,
+            ExitStatus::TimeoutFailed => 125,
+            ExitStatus::CannotInvoke => 126,
+            ExitStatus::CommandNotFound => 127,
+            ExitStatus::SignalSent(s) => 128 + s 转换 自身类型,
+        }
+    }
+}
+
+实现 转换协议<ExitStatus> 循环 盒子<动态 UError> {
+    方法 from(exit_status: ExitStatus) -> 自身类型 {
+        盒子::from(整32::from(exit_status))
+    }
+}

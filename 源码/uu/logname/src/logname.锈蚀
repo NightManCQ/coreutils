@@ -1,0 +1,43 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) getlogin userlogin
+
+使用 clap::Command;
+使用 标准库::ffi::CStr;
+使用 标准库::输入输出::{Write, stdout};
+使用 uucore::translate;
+使用 uucore::{错误::UResult, show_error};
+
+方法 get_userlogin() -> 选项<字符串> {
+    设 login_ptr = 不安全 { libc::getlogin() };
+    如果 login_ptr.is_null() {
+        无
+    } 否则 {
+        一些(字符串::from_utf8_lossy(不安全 { CStr::from_ptr(login_ptr) }.to_bytes()).to_string())
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 _ = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    如果 设 一些(userlogin) = get_userlogin() {
+        writeln!(stdout(), "{userlogin}")?;
+    } 否则 {
+        show_error!("{}", translate!("logname-error-no-login-name"));
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("logname")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("logname"))
+        .override_usage(translate!("logname-usage"))
+        .about(translate!("logname-about"))
+        .infer_long_args(真)
+}

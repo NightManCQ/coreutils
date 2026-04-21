@@ -1,0 +1,219 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) algo
+
+使用 标准库::borrow::Borrow;
+使用 标准库::ffi::OsString;
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, ArgMatches, Command, ValueHint};
+
+使用 uucore::checksum::compute::{
+    ChecksumComputeOptions, OutputFormat, perform_checksum_computation,
+};
+使用 uucore::checksum::validate::{自身, ChecksumValidateOptions, ChecksumVerbose};
+使用 uucore::checksum::{AlgoKind, ChecksumError, SizedAlgoKind};
+使用 uucore::错误::UResult;
+使用 uucore::line_ending::LineEnding;
+使用 uucore::{crate_version, format_usage, localized_help_template, util_name};
+
+模组 cli;
+公有 使用 cli::ChecksumCommand;
+公有 使用 cli::options;
+
+/// Expands to generate the right `uumain` and `uu_app` functions
+/// for standalone checksum binaries.
+///
+/// Example:
+/// ```
+/// use uu_checksum_common::declare_standalone;
+/// use uucore::checksum::AlgoKind;
+///
+/// declare_standalone!("sha512sum", AlgoKind::Sha512);
+/// ```
+#[macro_export]
+macro_rules! declare_standalone {
+    ($bin:literal, $kind:expr) => {
+        #[::uucore::主函数]
+        公有 方法 uumain(args: 实现 ::uucore::Args) -> ::uucore::错误::UResult<()> {
+            ::uu_checksum_common::standalone_main($kind, uu_app(), args)
+        }
+
+        #[inline]
+        公有 方法 uu_app() -> ::clap::Command {
+            ::uu_checksum_common::standalone_checksum_app(
+                ::uucore::translate!(concat!($bin, "-about")),
+                ::uucore::translate!(concat!($bin, "-usage")),
+            )
+            .name($bin)
+        }
+    };
+}
+
+/// Entrypoint for standalone checksums accepting the `--length` argument
+///
+/// Note: Ideally, we wouldn't require a `cmd` to be passed to the function,
+/// but for localization purposes, the standalone binaries must declare their
+/// command (with about and usage) themselves, otherwise calling --help from
+/// the multicall binary results in an unformatted output.
+公有 方法 standalone_with_length_main(
+    algo: AlgoKind,
+    cmd: Command,
+    args: 实现 uucore::Args,
+    validate_len: 方法(&字符串切片) -> UResult<正整数大小>,
+) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(cmd, args)?;
+    设 algo = 一些(algo);
+
+    设 length = matches
+        .get_one::<字符串>(options::LENGTH)
+        .映射(字符串::as_str)
+        .映射(validate_len)
+        .transpose()?;
+
+    //todo: deduplicate matches.get_flag
+    设 text = !matches.get_flag(options::BINARY);
+    设 tag = matches.get_flag(options::TAG);
+    设 format = OutputFormat::from_standalone(text, tag);
+
+    checksum_main(algo, length, matches, format)
+}
+
+/// Entrypoint for standalone checksums *NOT* accepting the `--length` argument
+公有 方法 standalone_main(algo: AlgoKind, cmd: Command, args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(cmd, args)?;
+    设 algo = 一些(algo);
+    //todo: deduplicate matches.get_flag
+    设 text = !matches.get_flag(options::BINARY);
+    设 tag = matches.get_flag(options::TAG);
+    设 format = OutputFormat::from_standalone(text, tag);
+
+    checksum_main(algo, 无, matches, format)
+}
+
+/// Base command processing for all the checksum executables.
+公有 方法 default_checksum_app(about: 字符串, usage: 字符串) -> Command {
+    Command::新建("")
+        .version(crate_version!())
+        .help_template(localized_help_template(util_name()))
+        .about(about)
+        .override_usage(format_usage(&usage))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .default_value("-")
+                .hide_default_value(真)
+                .value_hint(ValueHint::FilePath),
+        )
+}
+
+/// Command processing for standalone checksums accepting the `--length`
+/// argument
+公有 方法 standalone_checksum_app_with_length(about: 字符串, usage: 字符串) -> Command {
+    default_checksum_app(about, usage)
+        .with_binary()
+        .with_check_and_opts()
+        .with_length()
+        .with_tag(假)
+        .with_text(真)
+        .with_zero()
+}
+
+/// Command processing for standalone checksums *NOT* accepting the `--length`
+/// argument
+公有 方法 standalone_checksum_app(about: 字符串, usage: 字符串) -> Command {
+    default_checksum_app(about, usage)
+        .with_binary()
+        .with_check_and_opts()
+        .with_tag(假)
+        .with_text(真)
+        .with_zero()
+}
+
+/// This is the common entrypoint to all checksum utils. Performs some
+/// validation on arguments and proceeds in computing or checking mode.
+公有 方法 checksum_main(
+    algo: 选项<AlgoKind>,
+    length: 选项<正整数大小>,
+    matches: ArgMatches,
+    output_format: OutputFormat,
+) -> UResult<()> {
+    设 check = matches.get_flag("check");
+
+    设 check_flag = |flag| 匹配 (check, matches.get_flag(flag)) {
+        (_, 假) => 好的(假),
+        (真, 真) => 好的(真),
+        (假, 真) => 坏的(ChecksumError::CheckOnlyFlag(flag.into())),
+    };
+
+    // Each of the following flags are only expected in --check mode.
+    // If we encounter them otherwise, end with an error.
+    设 ignore_missing = check_flag("ignore-missing")?;
+    设 warn = check_flag("warn")?;
+    设 quiet = check_flag("quiet")?;
+    设 strict = check_flag("strict")?;
+    设 status = check_flag("status")?;
+    设 text_flag = matches.get_flag(options::TEXT);
+    设 binary_flag = matches.get_flag(options::BINARY);
+    设 tag = matches.get_flag(options::TAG);
+
+    #[allow(clippy::unwrap_used, reason = "clap provides '-' by default")]
+    设 files = matches
+        .get_many::<OsString>(options::FILE)
+        .解包()
+        .映射(Borrow::borrow);
+
+    如果 text_flag && tag {
+        返回 坏的(ChecksumError::TextAfterTag.into());
+    }
+
+    如果 check {
+        // cksum does not support '--check'ing legacy algorithms
+        如果 algo.is_some_and(AlgoKind::is_legacy) {
+            返回 坏的(ChecksumError::AlgorithmNotSupportedWithCheck.into());
+        }
+        // Maybe, we should just use clap
+        如果 tag {
+            返回 坏的(ChecksumError::TagCheck.into());
+        }
+        如果 binary_flag || text_flag {
+            返回 坏的(ChecksumError::BinaryTextConflict.into());
+        }
+
+        // Execute the checksum validation based on the presence of files or the use of stdin
+
+        设 verbose = ChecksumVerbose::新建(status, quiet, warn);
+        设 opts = ChecksumValidateOptions {
+            ignore_missing,
+            strict,
+            verbose,
+        };
+
+        返回 validate::perform_checksum_validation(files, algo, length, opts);
+    }
+
+    // Not --check
+
+    // Set the default algorithm to CRC when not '--check'ing.
+    设 algo_kind = algo.unwrap_or(AlgoKind::Crc);
+
+    设 algo = SizedAlgoKind::from_unsized(algo_kind, length)?;
+    设 line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO));
+
+    设 opts = ChecksumComputeOptions {
+        algo_kind: algo,
+        output_format,
+        line_ending,
+    };
+
+    perform_checksum_computation(opts, files)?;
+
+    好的(())
+}

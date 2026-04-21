@@ -1,0 +1,59 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! WASI single-threaded sort: read all input into memory, sort, and output.
+//! Threads are not available on WASI, so we bypass the chunked/threaded path.
+
+使用 标准库::比较::排序顺序;
+使用 标准库::输入输出::Read;
+
+使用 itertools::Itertools;
+使用 uucore::错误::UResult;
+
+使用 箱::Output;
+使用 箱::chunks::{自身, Chunk};
+使用 箱::tmp_dir::TmpDirWrapper;
+使用 箱::{GlobalSettings, compare_by, print_sorted, sort_by};
+
+/// Sort files by reading all input into memory, sorting in a single thread, and outputting directly.
+公有 方法 ext_sort(
+    files: &可变 实现 迭代器协议<Item = UResult<盒子<动态 Read + Send>>>,
+    settings: &GlobalSettings,
+    output: Output,
+    _tmp_dir: &可变 TmpDirWrapper,
+) -> UResult<()> {
+    设 separator = settings.line_ending.into();
+    // Read all input into memory at once. Unlike the threaded path which uses
+    // chunked buffered reads, WASI has no threads so we accept the memory cost.
+    // Note: there is no size limit here — WASI targets are expected to handle
+    // moderately sized inputs; very large files may cause OOM.
+    设 可变 input = 向量::新建();
+    循环 file 在 files {
+        file?.read_to_end(&可变 input)?;
+    }
+    如果 input.为空() {
+        返回 好的(());
+    }
+    设 可变 chunk = Chunk::try_new(input, |buffer| {
+        好的::<_, 盒子<动态 uucore::错误::UError>>(chunks::parse_into_chunk(
+            buffer, separator, settings,
+        ))
+    })?;
+    chunk.with_dependent_mut(|_, contents| {
+        sort_by(&可变 contents.lines, settings, &contents.line_data);
+    });
+    如果 settings.unique {
+        print_sorted(
+            chunk.lines().迭代().dedup_by(|a, b| {
+                compare_by(a, b, settings, chunk.line_data(), chunk.line_data()) == 排序顺序::Equal
+            }),
+            settings,
+            output,
+        )?;
+    } 否则 {
+        print_sorted(chunk.lines().迭代(), settings, output)?;
+    }
+    好的(())
+}

@@ -1,0 +1,113 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (vars)
+//! Iterate over lines, including the line ending character(s).
+//!
+//! This module provides the [`lines`] function, similar to the
+//! [`BufRead::lines`] method. While the [`BufRead::lines`] method
+//! yields [`String`] instances that do not include the line ending
+//! characters (`"\n"` or `"\r\n"`), our functions yield
+//! [`Vec`]<['u8']> instances that include the line ending
+//! characters. This is useful if the input data does not end with a
+//! newline character and you want to preserve the exact form of the
+//! input data.
+使用 标准库::输入输出::BufRead;
+
+/// Returns an iterator over the lines, including line ending characters.
+///
+/// This function is just like [`BufRead::lines`], but it includes the
+/// line ending characters in each yielded [`String`] if the input
+/// data has them. Set the `sep` parameter to the line ending
+/// character; for Unix line endings, use `b'\n'`.
+///
+/// # Examples
+///
+/// Use `sep` to specify an alternate character for line endings. For
+/// example, if lines are terminated by the null character `b'\0'`:
+///
+/// ```rust,ignore
+/// use std::io::BufRead;
+/// use std::io::Cursor;
+///
+/// let cursor = Cursor::new(b"x\0y\0z\0");
+/// let mut it = lines(cursor, b'\0').map(|l| l.unwrap());
+///
+/// assert_eq!(it.next(), Some(Vec::from("x\0")));
+/// assert_eq!(it.next(), Some(Vec::from("y\0")));
+/// assert_eq!(it.next(), Some(Vec::from("z\0")));
+/// assert_eq!(it.next(), None);
+/// ```
+///
+/// If the input data does not end with a newline character (`'\n'`),
+/// then the last [`String`] yielded by this iterator also does not
+/// end with a newline:
+///
+/// ```rust,ignore
+/// let cursor = Cursor::new(b"x\ny\nz");
+/// let mut it = lines(cursor, b'\n').map(|l| l.unwrap());
+///
+/// assert_eq!(it.next(), Some(Vec::from("x\n")));
+/// assert_eq!(it.next(), Some(Vec::from("y\n")));
+/// assert_eq!(it.next(), Some(Vec::from("z")));
+/// assert_eq!(it.next(), None);
+/// ```
+公有 方法 lines<B>(reader: B, sep: 正8) -> Lines<B>
+何处
+    B: BufRead,
+{
+    Lines { buf: reader, sep }
+}
+
+/// An iterator over the lines of an instance of `BufRead`.
+///
+/// This struct is generally created by calling [`lines`] on a `BufRead`.
+/// Please see the documentation of [`lines`] for more details.
+公有 结构 Lines<B> {
+    buf: B,
+    sep: 正8,
+}
+
+实现<B: BufRead> 迭代器协议 循环 Lines<B> {
+    类型 Item = 标准库::输入输出::结果<向量<正8>>;
+
+    方法 next(&可变 自身) -> 选项<标准库::输入输出::结果<向量<正8>>> {
+        设 可变 buf = 向量::新建();
+        匹配 自身.buf.read_until(自身.sep, &可变 buf) {
+            好的(0) => 无,
+            好的(_n) => 一些(好的(buf)),
+            坏的(e) => 一些(坏的(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::lines::lines;
+    使用 标准库::输入输出::Cursor;
+
+    #[test]
+    方法 test_lines() {
+        设 cursor = Cursor::新建(b"x\ny\nz");
+        设 可变 it = lines(cursor, b'\n').映射(|l| l.解包());
+
+        相等断言!(it.next(), 一些(向量::from("x\n")));
+        相等断言!(it.next(), 一些(向量::from("y\n")));
+        相等断言!(it.next(), 一些(向量::from("z")));
+        相等断言!(it.next(), 无);
+    }
+
+    #[test]
+    方法 test_lines_zero_terminated() {
+        使用 标准库::输入输出::Cursor;
+
+        设 cursor = Cursor::新建(b"x\0y\0z\0");
+        设 可变 it = lines(cursor, b'\0').映射(|l| l.解包());
+
+        相等断言!(it.next(), 一些(向量::from("x\0")));
+        相等断言!(it.next(), 一些(向量::from("y\0")));
+        相等断言!(it.next(), 一些(向量::from("z\0")));
+        相等断言!(it.next(), 无);
+    }
+}

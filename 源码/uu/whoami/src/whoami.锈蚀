@@ -1,0 +1,34 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::Command;
+使用 标准库::ffi::OsString;
+使用 uucore::display::println_verbatim;
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::translate;
+
+模组 platform;
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 username = whoami()?;
+    println_verbatim(username).map_err_context(|| translate!("whoami-error-failed-to-print"))?;
+    好的(())
+}
+
+/// Get the current username
+公有 方法 whoami() -> UResult<OsString> {
+    platform::get_username().map_err_context(|| translate!("whoami-error-failed-to-get"))
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("whoami")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("whoami"))
+        .about(translate!("whoami-about"))
+        .override_usage(translate!("whoami-usage"))
+        .infer_long_args(真)
+}

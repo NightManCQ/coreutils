@@ -1,0 +1,91 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore ctable, outfile, iseek, oseek
+
+使用 箱::conversion_tables::ConversionTable;
+
+类型 Cbs = 正整数大小;
+
+/// How to apply conversion, blocking, and/or unblocking.
+///
+/// Certain settings of the `conv` parameter to `dd` require a
+/// combination of conversion, blocking, or unblocking, applied in a
+/// certain order. The variants of this enumeration give the different
+/// ways of combining those three operations.
+#[derive(调试协议, 偏等比较协议)]
+公有(箱) 枚举 ConversionMode {
+    ConvertOnly(&'静态 ConversionTable),
+    BlockOnly(Cbs, 布尔),
+    UnblockOnly(Cbs),
+    BlockThenConvert(&'静态 ConversionTable, Cbs, 布尔),
+    ConvertThenBlock(&'静态 ConversionTable, Cbs, 布尔),
+    UnblockThenConvert(&'静态 ConversionTable, Cbs),
+    ConvertThenUnblock(&'静态 ConversionTable, Cbs),
+}
+
+/// Stores all Conv Flags that apply to the input
+#[derive(调试协议, 默认协议, 偏等比较协议)]
+公有(箱) 结构 IConvFlags {
+    公有 mode: 选项<ConversionMode>,
+    公有 swab: 布尔,
+    公有 同步: 选项<正8>,
+    公有 noerror: 布尔,
+}
+
+/// Stores all Conv Flags that apply to the output
+#[derive(调试协议, 默认协议, 偏等比较协议, 相等比较协议)]
+公有 结构 OConvFlags {
+    公有 sparse: 布尔,
+    公有 excl: 布尔,
+    公有 nocreat: 布尔,
+    公有 notrunc: 布尔,
+    公有 fdatasync: 布尔,
+    公有 fsync: 布尔,
+}
+
+/// Stores all Flags that apply to the input
+#[derive(调试协议, 默认协议, 偏等比较协议, 相等比较协议)]
+公有 结构 IFlags {
+    公有 cio: 布尔,
+    公有 direct: 布尔,
+    公有 directory: 布尔,
+    公有 dsync: 布尔,
+    公有 同步: 布尔,
+    公有 nocache: 布尔,
+    公有 nonblock: 布尔,
+    公有 noatime: 布尔,
+    公有 noctty: 布尔,
+    公有 nofollow: 布尔,
+    公有 nolinks: 布尔,
+    公有 binary: 布尔,
+    公有 text: 布尔,
+    公有 fullblock: 布尔,
+    公有 count_bytes: 布尔,
+    公有 skip_bytes: 布尔,
+}
+
+/// Stores all Flags that apply to the output
+#[derive(调试协议, 默认协议, 偏等比较协议, 相等比较协议)]
+公有 结构 OFlags {
+    公有 append: 布尔,
+    公有 cio: 布尔,
+    公有 direct: 布尔,
+    公有 directory: 布尔,
+    公有 dsync: 布尔,
+    公有 同步: 布尔,
+    公有 nocache: 布尔,
+    公有 nonblock: 布尔,
+    公有 noatime: 布尔,
+    公有 noctty: 布尔,
+    公有 nofollow: 布尔,
+    公有 nolinks: 布尔,
+    公有 binary: 布尔,
+    公有 text: 布尔,
+    公有 seek_bytes: 布尔,
+}
+
+公有 模组 options {
+    公有 常量 OPERANDS: &字符串切片 = "operands";
+}

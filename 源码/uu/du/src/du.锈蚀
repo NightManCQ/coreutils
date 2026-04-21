@@ -1,0 +1,1550 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore fstatat openat dirfd
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command, builder::PossibleValue};
+使用 glob::Pattern;
+使用 rustc_hash::FxHashSet 转换 哈希集合;
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::{自身, DirEntry, File, Metadata};
+使用 标准库::输入输出::{BufRead, BufReader, stdout};
+#[cfg(not(windows))]
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+#[cfg(windows)]
+使用 标准库::操作系统::windows::输入输出::AsRawHandle;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::字符串切片::FromStr;
+使用 标准库::同步::mpsc;
+使用 标准库::线程;
+使用 thiserror::错误协议;
+使用 uucore::display::{Quotable, print_verbatim};
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError, set_exit_code};
+使用 uucore::fsext::{MetadataTimeField, metadata_get_time};
+使用 uucore::line_ending::LineEnding;
+#[cfg(全部(unix, not(target_os = "redox")))]
+使用 uucore::safe_traversal::{DirFd, SymlinkBehavior};
+使用 uucore::translate;
+
+使用 uucore::parser::parse_block_size;
+使用 uucore::parser::parse_glob;
+使用 uucore::parser::parse_size::{ParseSizeError, parse_size_u64};
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::时间::{FormatSystemTimeFallback, format, format_system_time};
+使用 uucore::{format_usage, show, show_error, show_warning};
+#[cfg(windows)]
+使用 windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+使用 windows_sys::Win32::Storage::FileSystem::{
+    FILE_ID_128, FILE_ID_INFO, FILE_STANDARD_INFO, FileIdInfo, FileStandardInfo,
+    GetFileInformationByHandleEx,
+};
+
+模组 options {
+    公有 常量 HELP: &字符串切片 = "help";
+    公有 常量 NULL: &字符串切片 = "0";
+    公有 常量 ALL: &字符串切片 = "all";
+    公有 常量 APPARENT_SIZE: &字符串切片 = "apparent-size";
+    公有 常量 BLOCK_SIZE: &字符串切片 = "block-size";
+    公有 常量 BYTES: &字符串切片 = "b";
+    公有 常量 TOTAL: &字符串切片 = "c";
+    公有 常量 MAX_DEPTH: &字符串切片 = "d";
+    公有 常量 HUMAN_READABLE: &字符串切片 = "h";
+    公有 常量 BLOCK_SIZE_1K: &字符串切片 = "k";
+    公有 常量 COUNT_LINKS: &字符串切片 = "l";
+    公有 常量 BLOCK_SIZE_1M: &字符串切片 = "m";
+    公有 常量 SEPARATE_DIRS: &字符串切片 = "S";
+    公有 常量 SUMMARIZE: &字符串切片 = "s";
+    公有 常量 THRESHOLD: &字符串切片 = "threshold";
+    公有 常量 SI: &字符串切片 = "si";
+    公有 常量 TIME: &字符串切片 = "time";
+    公有 常量 TIME_STYLE: &字符串切片 = "time-style";
+    公有 常量 ONE_FILE_SYSTEM: &字符串切片 = "one-file-system";
+    公有 常量 DEREFERENCE: &字符串切片 = "dereference";
+    公有 常量 DEREFERENCE_ARGS: &字符串切片 = "dereference-args";
+    公有 常量 NO_DEREFERENCE: &字符串切片 = "no-dereference";
+    公有 常量 INODES: &字符串切片 = "inodes";
+    公有 常量 EXCLUDE: &字符串切片 = "exclude";
+    公有 常量 EXCLUDE_FROM: &字符串切片 = "exclude-from";
+    公有 常量 FILES0_FROM: &字符串切片 = "files0-from";
+    公有 常量 VERBOSE: &字符串切片 = "verbose";
+    公有 常量 FILE: &字符串切片 = "FILE";
+}
+
+结构 TraversalOptions {
+    全部: 布尔,
+    separate_dirs: 布尔,
+    one_file_system: 布尔,
+    dereference: Deref,
+    count_links: 布尔,
+    verbose: 布尔,
+    excludes: 向量<Pattern>,
+}
+
+结构 StatPrinter {
+    total: 布尔,
+    inodes: 布尔,
+    max_depth: 选项<正整数大小>,
+    threshold: 选项<Threshold>,
+    apparent_size: 布尔,
+    size_format: SizeFormat,
+    时间: 选项<MetadataTimeField>,
+    time_format: 字符串,
+    line_ending: LineEnding,
+    summarize: 布尔,
+    total_text: 字符串,
+}
+
+#[derive(偏等比较协议, 克隆协议)]
+枚举 Deref {
+    All,
+    Args(向量<PathBuf>),
+    无,
+}
+
+#[derive(克隆协议)]
+枚举 SizeFormat {
+    HumanDecimal,
+    HumanBinary,
+    BlockSize(正64),
+}
+
+#[derive(偏等比较协议, 相等比较协议, 哈希协议, 克隆协议, 复制协议)]
+结构 FileInfo {
+    file_id: 正128,
+    dev_id: 正64,
+}
+
+结构 Stat {
+    路径: PathBuf,
+    size: 正64,
+    blocks: 正64,
+    inodes: 正64,
+    inode: 选项<FileInfo>,
+    metadata: Metadata,
+}
+
+实现 Stat {
+    方法 新建(
+        路径: &Path,
+        dir_entry: 选项<&DirEntry>,
+        options: &TraversalOptions,
+    ) -> 标准库::输入输出::结果<自身类型> {
+        // Determine whether to dereference (follow) the symbolic link
+        设 should_dereference = 匹配 &options.dereference {
+            Deref::All => 真,
+            Deref::Args(paths) => paths.包含(&路径.to_path_buf()),
+            Deref::无 => 假,
+        };
+
+        设 metadata = 如果 should_dereference {
+            // Get metadata, following symbolic links if necessary
+            文件系统::metadata(路径)
+        } 否则 如果 设 一些(dir_entry) = dir_entry {
+            // Get metadata directly from the DirEntry, which is faster on Windows
+            dir_entry.metadata()
+        } 否则 {
+            // Get metadata from the filesystem without following symbolic links
+            文件系统::symlink_metadata(路径)
+        }?;
+
+        设 file_info = get_file_info(路径, &metadata);
+        设 blocks = get_blocks(路径, &metadata);
+
+        好的(自身类型 {
+            路径: 路径.to_path_buf(),
+            size: 如果 metadata.is_dir() { 0 } 否则 { metadata.长度() },
+            blocks,
+            inodes: 1,
+            inode: file_info,
+            metadata,
+        })
+    }
+
+    /// Create a Stat using safe traversal methods with `DirFd` for the root directory
+    #[cfg(全部(unix, not(target_os = "redox")))]
+    方法 new_from_dirfd(dir_fd: &DirFd, full_path: &Path) -> 标准库::输入输出::结果<自身类型> {
+        // Get metadata for the directory itself using fstat
+        设 safe_metadata = dir_fd.metadata()?;
+
+        // Create file info from the safe metadata
+        设 file_info = safe_metadata.file_info();
+        设 file_info_option = 一些(FileInfo {
+            file_id: file_info.inode() 转换 正128,
+            dev_id: file_info.device(),
+        });
+
+        设 blocks = safe_metadata.blocks();
+
+        // Create a temporary std::fs::Metadata by reading the same path
+        // This is still needed for compatibility but should work since we're dealing with
+        // the root path which should be accessible
+        设 std_metadata = 文件系统::symlink_metadata(full_path)?;
+
+        好的(自身类型 {
+            路径: full_path.to_path_buf(),
+            size: 如果 safe_metadata.is_dir() {
+                0
+            } 否则 {
+                safe_metadata.长度()
+            },
+            blocks,
+            inodes: 1,
+            inode: file_info_option,
+            metadata: std_metadata,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+方法 get_blocks(_path: &Path, metadata: &Metadata) -> 正64 {
+    metadata.blocks()
+}
+
+#[cfg(windows)]
+方法 get_blocks(路径: &Path, _metadata: &Metadata) -> 正64 {
+    设 可变 size_on_disk = 0;
+
+    // bind file so it stays in scope until end of function
+    // if it goes out of scope the handle below becomes invalid
+    设 好的(file) = File::open(路径) 否则 {
+        返回 size_on_disk; // opening directories will fail
+    };
+
+    不安全 {
+        设 可变 file_info: FILE_STANDARD_INFO = core::内存::zeroed();
+        设 file_info_ptr: *可变 FILE_STANDARD_INFO = &raw 可变 file_info;
+
+        设 success = GetFileInformationByHandleEx(
+            file.as_raw_handle() 转换 HANDLE,
+            FileStandardInfo,
+            file_info_ptr.cast(),
+            size_of::<FILE_STANDARD_INFO>() 转换 正32,
+        );
+
+        如果 success != 0 {
+            size_on_disk = file_info.AllocationSize 转换 正64;
+        }
+    }
+
+    size_on_disk / 1024 * 2
+}
+
+#[cfg(not(windows))]
+#[期望(
+    clippy::unnecessary_wraps,
+    reason = "fn sig must match on all platforms"
+)]
+方法 get_file_info(_path: &Path, metadata: &Metadata) -> 选项<FileInfo> {
+    一些(FileInfo {
+        file_id: metadata.ino() 转换 正128,
+        dev_id: metadata.dev(),
+    })
+}
+
+#[cfg(windows)]
+方法 get_file_info(路径: &Path, _metadata: &Metadata) -> 选项<FileInfo> {
+    设 可变 result = 无;
+
+    设 好的(file) = File::open(路径) 否则 {
+        返回 result;
+    };
+
+    不安全 {
+        设 可变 file_info: FILE_ID_INFO = core::内存::zeroed();
+        设 file_info_ptr: *可变 FILE_ID_INFO = &raw 可变 file_info;
+
+        设 success = GetFileInformationByHandleEx(
+            file.as_raw_handle() 转换 HANDLE,
+            FileIdInfo,
+            file_info_ptr.cast(),
+            size_of::<FILE_ID_INFO>() 转换 正32,
+        );
+
+        如果 success != 0 {
+            result = 一些(FileInfo {
+                file_id: 标准库::内存::transmute::<FILE_ID_128, 正128>(file_info.FileId),
+                dev_id: file_info.VolumeSerialNumber,
+            });
+        }
+    }
+
+    result
+}
+
+方法 read_block_size(s: 选项<&字符串切片>) -> UResult<正64> {
+    如果 设 一些(s) = s {
+        parse_size_u64(s)
+            .map_err(|e| USimpleError::新建(1, format_error_message(&e, s, options::BLOCK_SIZE)))
+    } 否则 如果 设 一些(bytes) =
+        parse_block_size::block_size_from_env(&["DU_BLOCK_SIZE", "BLOCK_SIZE", "BLOCKSIZE"]).found()
+    {
+        好的(bytes)
+    } 否则 {
+        好的(parse_block_size::default_block_size())
+    }
+}
+
+#[cfg(全部(unix, not(target_os = "redox")))]
+// Implement safe_du on Unix (except Redox which lacks full stat support)
+// This is done for TOCTOU safety
+方法 safe_du(
+    路径: &Path,
+    options: &TraversalOptions,
+    depth: 正整数大小,
+    seen_inodes: &可变 哈希集合<FileInfo>,
+    print_tx: &mpsc::发送器<UResult<StatPrintInfo>>,
+    parent_fd: 选项<&DirFd>,
+    initial_stat: 选项<标准库::输入输出::结果<Stat>>,
+) -> 结果<Stat, 盒子<mpsc::SendError<UResult<StatPrintInfo>>>> {
+    // Get initial stat for this path - use DirFd if available to avoid path length issues
+    设 可变 my_stat = 如果 设 一些(parent_fd) = parent_fd {
+        // We have a parent fd, this is a subdirectory - use openat
+        设 dir_name = 路径.file_name().unwrap_or(路径.as_os_str());
+        匹配 parent_fd.metadata_at(dir_name, SymlinkBehavior::NoFollow) {
+            好的(safe_metadata) => {
+                // Create Stat from safe metadata
+                设 file_info = safe_metadata.file_info();
+                设 file_info_option = 一些(FileInfo {
+                    file_id: file_info.inode() 转换 正128,
+                    dev_id: file_info.device(),
+                });
+                设 blocks = safe_metadata.blocks();
+
+                // For compatibility, still try to get std::fs::Metadata
+                // but fallback to a minimal approach if it fails
+                设 std_metadata = 文件系统::symlink_metadata(路径).unwrap_or_else(|_| {
+                    // If we can't get std metadata, create a minimal fake one
+                    // This should rarely happen but provides a fallback
+                    文件系统::symlink_metadata("/").期望("root should be accessible")
+                });
+
+                Stat {
+                    路径: 路径.to_path_buf(),
+                    size: 如果 safe_metadata.is_dir() {
+                        0
+                    } 否则 {
+                        safe_metadata.长度()
+                    },
+                    blocks,
+                    inodes: 1,
+                    inode: file_info_option,
+                    metadata: std_metadata,
+                }
+            }
+            坏的(e) => {
+                设 错误 = e.map_err_context(
+                    || translate!("du-error-cannot-access", "path" => 路径.quote()),
+                );
+                如果 设 坏的(send_error) = print_tx.发送(坏的(错误)) {
+                    返回 坏的(盒子::新建(send_error));
+                }
+                返回 坏的(盒子::新建(mpsc::SendError(坏的(USimpleError::新建(
+                    0,
+                    "Error already handled",
+                )))));
+            }
+        }
+    } 否则 {
+        // This is the initial directory - try regular Stat::new first, then fallback to DirFd
+        设 initial_stat = 匹配 initial_stat {
+            一些(s) => s,
+            无 => Stat::新建(路径, 无, options),
+        };
+
+        匹配 initial_stat {
+            好的(s) => s,
+            坏的(_e) => {
+                // Try using our new DirFd method for the root directory
+                匹配 DirFd::open(路径, SymlinkBehavior::Follow) {
+                    好的(dir_fd) => 匹配 Stat::new_from_dirfd(&dir_fd, 路径) {
+                        好的(s) => s,
+                        坏的(e) => {
+                            设 错误 = e.map_err_context(
+                                || translate!("du-error-cannot-access", "path" => 路径.quote()),
+                            );
+                            如果 设 坏的(send_error) = print_tx.发送(坏的(错误)) {
+                                返回 坏的(盒子::新建(send_error));
+                            }
+                            返回 坏的(盒子::新建(mpsc::SendError(坏的(USimpleError::新建(
+                                0,
+                                "Error already handled",
+                            )))));
+                        }
+                    },
+                    坏的(e) => {
+                        设 错误 = e.map_err_context(
+                            || translate!("du-error-cannot-access", "path" => 路径.quote()),
+                        );
+                        如果 设 坏的(send_error) = print_tx.发送(坏的(错误)) {
+                            返回 坏的(盒子::新建(send_error));
+                        }
+                        返回 坏的(盒子::新建(mpsc::SendError(坏的(USimpleError::新建(
+                            0,
+                            "Error already handled",
+                        )))));
+                    }
+                }
+            }
+        }
+    };
+    如果 !my_stat.metadata.is_dir() {
+        返回 好的(my_stat);
+    }
+
+    // Open the directory using DirFd
+    设 open_result = 匹配 parent_fd {
+        一些(parent) => parent.open_subdir(
+            路径.file_name().unwrap_or(路径.as_os_str()),
+            SymlinkBehavior::Follow,
+        ),
+        无 => DirFd::open(路径, SymlinkBehavior::Follow),
+    };
+
+    设 dir_fd = 匹配 open_result {
+        好的(fd) => fd,
+        坏的(e) => {
+            print_tx.发送(坏的(e.map_err_context(
+                || translate!("du-error-cannot-read-directory", "path" => 路径.quote()),
+            )))?;
+            返回 好的(my_stat);
+        }
+    };
+
+    // Read directory entries
+    设 entries = 匹配 dir_fd.read_dir() {
+        好的(entries) => entries,
+        坏的(e) => {
+            print_tx.发送(坏的(e.map_err_context(
+                || translate!("du-error-cannot-read-directory", "path" => 路径.quote()),
+            )))?;
+            返回 好的(my_stat);
+        }
+    };
+
+    'file_loop: 循环 entry_name 在 entries {
+        // First get the lstat (without following symlinks) to check if it's a symlink
+        设 lstat = 匹配 dir_fd.stat_at(&entry_name, SymlinkBehavior::NoFollow) {
+            好的(stat) => stat,
+            坏的(e) => {
+                设 entry_path = 路径.加入(&entry_name);
+                print_tx.发送(坏的(e.map_err_context(
+                    || translate!("du-error-cannot-access", "path" => entry_path.quote()),
+                )))?;
+                继续;
+            }
+        };
+
+        // Check if it's a symlink
+        常量 S_IFMT: 正32 = 0o170_000;
+        常量 S_IFDIR: 正32 = 0o040_000;
+        常量 S_IFLNK: 正32 = 0o120_000;
+        #[allow(clippy::unnecessary_cast)]
+        设 is_symlink = (lstat.st_mode 转换 正32 & S_IFMT) == S_IFLNK;
+
+        // Handle symlinks with -L option
+        // For safe traversal with -L, we skip symlinks to directories entirely
+        // and let the non-safe traversal handle them at the top level
+        如果 is_symlink && options.dereference == Deref::All {
+            // Skip symlinks to directories when using safe traversal with -L
+            // They will be handled by regular traversal
+            继续;
+        }
+
+        #[allow(clippy::unnecessary_cast)]
+        设 is_dir = (lstat.st_mode 转换 正32 & S_IFMT) == S_IFDIR;
+        设 entry_stat = lstat;
+
+        #[allow(clippy::unnecessary_cast)]
+        设 file_info = (entry_stat.st_ino != 0).then_some(FileInfo {
+            file_id: entry_stat.st_ino 转换 正128,
+            dev_id: entry_stat.st_dev 转换 正64,
+        });
+
+        // For safe traversal, we need to handle stats differently
+        // We can't use std::fs::Metadata since that requires the full path
+        设 this_stat = 如果 is_dir {
+            // For directories, recurse using safe_du
+            Stat {
+                路径: 路径.加入(&entry_name),
+                size: 0,
+                #[allow(clippy::unnecessary_cast)]
+                blocks: entry_stat.st_blocks 转换 正64,
+                inodes: 1,
+                inode: file_info,
+                // We need a fake metadata - create one from symlink_metadata of parent
+                // This is a workaround since we can't get real metadata without the full path
+                metadata: my_stat.metadata.克隆(),
+            }
+        } 否则 {
+            // For files
+            Stat {
+                路径: 路径.加入(&entry_name),
+                #[allow(clippy::unnecessary_cast)]
+                size: entry_stat.st_size 转换 正64,
+                #[allow(clippy::unnecessary_cast)]
+                blocks: entry_stat.st_blocks 转换 正64,
+                inodes: 1,
+                inode: file_info,
+                metadata: my_stat.metadata.克隆(),
+            }
+        };
+
+        // Check excludes
+        循环 pattern 在 &options.excludes {
+            如果 pattern.matches(&this_stat.路径.to_string_lossy())
+                || pattern.matches(&entry_name.to_string_lossy())
+            {
+                如果 options.verbose {
+                    打印行!(
+                        "{}",
+                        translate!("du-verbose-ignored", "path" => this_stat.路径.quote())
+                    );
+                }
+                继续 'file_loop;
+            }
+        }
+
+        // Handle inodes
+        如果 设 一些(inode) = this_stat.inode {
+            如果 seen_inodes.包含(&inode) && !options.count_links {
+                继续;
+            }
+            seen_inodes.插入(inode);
+        }
+
+        // Process directories recursively
+        如果 is_dir {
+            如果 options.one_file_system {
+                如果 设 (一些(this_inode), 一些(my_inode)) = (this_stat.inode, my_stat.inode) {
+                    如果 this_inode.dev_id != my_inode.dev_id {
+                        继续;
+                    }
+                }
+            }
+
+            设 this_stat = safe_du(
+                &this_stat.路径,
+                options,
+                depth + 1,
+                seen_inodes,
+                print_tx,
+                一些(&dir_fd),
+                无,
+            )?;
+
+            如果 !options.separate_dirs {
+                my_stat.size += this_stat.size;
+                my_stat.blocks += this_stat.blocks;
+                my_stat.inodes += this_stat.inodes;
+            }
+            print_tx.发送(好的(StatPrintInfo {
+                stat: this_stat,
+                depth: depth + 1,
+            }))?;
+        } 否则 {
+            my_stat.size += this_stat.size;
+            my_stat.blocks += this_stat.blocks;
+            my_stat.inodes += 1;
+            如果 options.全部 {
+                print_tx.发送(好的(StatPrintInfo {
+                    stat: this_stat,
+                    depth: depth + 1,
+                }))?;
+            }
+        }
+    }
+
+    好的(my_stat)
+}
+
+// this takes `my_stat` to avoid having to stat files multiple times.
+// Only used on non-Linux platforms
+// Regular traversal using std::fs
+// Used on non-Linux platforms and as fallback for symlinks on Linux
+#[allow(clippy::cognitive_complexity)]
+方法 du_regular(
+    可变 my_stat: Stat,
+    options: &TraversalOptions,
+    depth: 正整数大小,
+    seen_inodes: &可变 哈希集合<FileInfo>,
+    print_tx: &mpsc::发送器<UResult<StatPrintInfo>>,
+    ancestors: 选项<&可变 哈希集合<FileInfo>>,
+    symlink_depth: 选项<正整数大小>,
+) -> 结果<Stat, 盒子<mpsc::SendError<UResult<StatPrintInfo>>>> {
+    设 可变 default_ancestors = 哈希集合::默认();
+    设 ancestors = ancestors.unwrap_or(&可变 default_ancestors);
+    设 symlink_depth = symlink_depth.unwrap_or(0);
+    // Maximum symlink depth to prevent infinite loops
+    常量 MAX_SYMLINK_DEPTH: 正整数大小 = 40;
+
+    // Add current directory to ancestors if it's a directory
+    设 my_inode = 如果 my_stat.metadata.is_dir() {
+        my_stat.inode
+    } 否则 {
+        无
+    };
+
+    如果 设 一些(inode) = my_inode {
+        ancestors.插入(inode);
+    }
+    如果 my_stat.metadata.is_dir() {
+        设 读锁定 = 匹配 文件系统::read_dir(&my_stat.路径) {
+            好的(读锁定) => 读锁定,
+            坏的(e) => {
+                print_tx.发送(坏的(e.map_err_context(
+                    || translate!("du-error-cannot-read-directory", "path" => my_stat.路径.quote()),
+                )))?;
+                返回 好的(my_stat);
+            }
+        };
+
+        'file_loop: 循环 f 在 读锁定 {
+            匹配 f {
+                好的(entry) => {
+                    设 entry_path = entry.路径();
+
+                    // Check if this is a symlink when using -L
+                    设 可变 current_symlink_depth = symlink_depth;
+                    设 is_symlink = 匹配 entry.file_type() {
+                        好的(ft) => ft.is_symlink(),
+                        坏的(_) => 假,
+                    };
+
+                    如果 is_symlink && options.dereference == Deref::All {
+                        // Increment symlink depth
+                        current_symlink_depth += 1;
+
+                        // Check symlink depth limit
+                        如果 current_symlink_depth > MAX_SYMLINK_DEPTH {
+                            print_tx.发送(坏的(标准库::输入输出::错误协议::新建(
+                                标准库::输入输出::ErrorKind::InvalidData,
+                                "Too many levels of symbolic links",
+                            ).map_err_context(
+                                || translate!("du-error-cannot-access", "path" => entry_path.quote()),
+                            )))?;
+                            继续 'file_loop;
+                        }
+                    }
+
+                    匹配 Stat::新建(&entry_path, 一些(&entry), options) {
+                        好的(this_stat) => {
+                            // Check if symlink with -L points to an ancestor (cycle detection)
+                            如果 is_symlink
+                                && options.dereference == Deref::All
+                                && this_stat.metadata.is_dir()
+                            {
+                                如果 设 一些(inode) = this_stat.inode {
+                                    如果 ancestors.包含(&inode) {
+                                        // This symlink points to an ancestor directory - skip to avoid cycle
+                                        继续 'file_loop;
+                                    }
+                                }
+                            }
+
+                            // We have an exclude list
+                            循环 pattern 在 &options.excludes {
+                                // Look at all patterns with both short and long paths
+                                // if we have 'du foo' but search to exclude 'foo/bar'
+                                // we need the full path
+                                如果 pattern.matches(&this_stat.路径.to_string_lossy())
+                                    || pattern.matches(&entry.file_name().into_string().解包())
+                                {
+                                    // if the directory is ignored, leave early
+                                    如果 options.verbose {
+                                        打印行!(
+                                            "{}",
+                                            translate!("du-verbose-ignored", "path" => this_stat.路径.quote())
+                                        );
+                                    }
+                                    // Go to the next file
+                                    继续 'file_loop;
+                                }
+                            }
+
+                            如果 设 一些(inode) = this_stat.inode {
+                                // Check if the inode has been seen before and if we should skip it
+                                如果 seen_inodes.包含(&inode) && !options.count_links {
+                                    // Skip further processing for this inode
+                                    继续;
+                                }
+                                // Mark this inode as seen
+                                seen_inodes.插入(inode);
+                            }
+
+                            如果 this_stat.metadata.is_dir() {
+                                如果 options.one_file_system {
+                                    如果 设 (一些(this_inode), 一些(my_inode)) =
+                                        (this_stat.inode, my_stat.inode)
+                                    {
+                                        如果 this_inode.dev_id != my_inode.dev_id {
+                                            继续;
+                                        }
+                                    }
+                                }
+
+                                设 this_stat = du_regular(
+                                    this_stat,
+                                    options,
+                                    depth + 1,
+                                    seen_inodes,
+                                    print_tx,
+                                    一些(ancestors),
+                                    一些(current_symlink_depth),
+                                )?;
+
+                                如果 !options.separate_dirs {
+                                    my_stat.size += this_stat.size;
+                                    my_stat.blocks += this_stat.blocks;
+                                    my_stat.inodes += this_stat.inodes;
+                                }
+                                print_tx.发送(好的(StatPrintInfo {
+                                    stat: this_stat,
+                                    depth: depth + 1,
+                                }))?;
+                            } 否则 {
+                                my_stat.size += this_stat.size;
+                                my_stat.blocks += this_stat.blocks;
+                                my_stat.inodes += 1;
+                                如果 options.全部 {
+                                    print_tx.发送(好的(StatPrintInfo {
+                                        stat: this_stat,
+                                        depth: depth + 1,
+                                    }))?;
+                                }
+                            }
+                        }
+                        坏的(e) => {
+                            print_tx.发送(坏的(e.map_err_context(
+                                    || translate!("du-error-cannot-access", "path" => entry_path.quote()),
+                                )))?;
+                        }
+                    }
+                }
+                坏的(错误) => print_tx.发送(坏的(错误.into()))?,
+            }
+        }
+    }
+
+    // Remove current directory from ancestors before returning
+    如果 设 一些(inode) = my_inode {
+        ancestors.移除(&inode);
+    }
+
+    好的(my_stat)
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 DuError {
+    #[错误("{}", translate!("du-error-invalid-max-depth", "depth" => _0.quote()))]
+    InvalidMaxDepthArg(字符串),
+
+    #[错误("{}", translate!("du-error-summarize-depth-conflict", "depth" => _0.maybe_quote()))]
+    SummarizeDepthConflict(字符串),
+
+    #[错误("{}", translate!("du-error-invalid-time-style", "style" => _0.quote(), "help" => uucore::execution_phrase()))]
+    InvalidTimeStyleArg(字符串),
+
+    #[错误("{}", translate!("du-error-invalid-glob", "error" => _0))]
+    InvalidGlob(字符串),
+}
+
+实现 UError 循环 DuError {}
+
+/// Read a file and return each line in a vector of String
+方法 file_as_vec(filename: 实现 作为引用协议<Path>) -> 向量<字符串> {
+    设 file = File::open(filename).期望("no such file");
+    设 buf = BufReader::新建(file);
+
+    buf.lines()
+        .映射(|l| l.期望("Could not parse line"))
+        .收集()
+}
+
+/// Given the `--exclude-from` and/or `--exclude` arguments, returns the globset lists
+/// to ignore the files
+方法 build_exclude_patterns(matches: &ArgMatches) -> UResult<向量<Pattern>> {
+    设 exclude_from_iterator = matches
+        .get_many::<字符串>(options::EXCLUDE_FROM)
+        .unwrap_or_default()
+        .flat_map(file_as_vec);
+
+    设 excludes_iterator = matches
+        .get_many::<字符串>(options::EXCLUDE)
+        .unwrap_or_default()
+        .cloned();
+
+    设 可变 exclude_patterns = 向量::新建();
+    循环 f 在 excludes_iterator.chain(exclude_from_iterator) {
+        如果 matches.get_flag(options::VERBOSE) {
+            打印行!(
+                "{}",
+                translate!("du-verbose-adding-to-exclude-list", "pattern" => f.克隆())
+            );
+        }
+        匹配 parse_glob::from_str(&f) {
+            好的(glob) => exclude_patterns.压入(glob),
+            坏的(err) => 返回 坏的(DuError::InvalidGlob(err.to_string()).into()),
+        }
+    }
+    好的(exclude_patterns)
+}
+
+结构 StatPrintInfo {
+    stat: Stat,
+    depth: 正整数大小,
+}
+
+实现 StatPrinter {
+    方法 choose_size(&自身, stat: &Stat) -> 正64 {
+        如果 自身.inodes {
+            stat.inodes
+        } 否则 如果 自身.apparent_size {
+            stat.size
+        } 否则 {
+            // The st_blocks field indicates the number of blocks allocated to the file, 512-byte units.
+            // See: http://linux.die.net/man/2/stat
+            stat.blocks * 512
+        }
+    }
+
+    方法 print_stats(&自身, rx: &mpsc::接收器<UResult<StatPrintInfo>>) -> UResult<()> {
+        设 可变 grand_total = 0;
+        无限循环 {
+            设 received = rx.接收();
+
+            匹配 received {
+                好的(message) => 匹配 message {
+                    好的(stat_info) => {
+                        设 size = 自身.choose_size(&stat_info.stat);
+
+                        如果 stat_info.depth == 0 {
+                            grand_total += size;
+                        }
+
+                        如果 !自身
+                            .threshold
+                            .is_some_and(|threshold| threshold.should_exclude(size))
+                            && 自身
+                                .max_depth
+                                .is_none_or(|max_depth| stat_info.depth <= max_depth)
+                            && (!自身.summarize || stat_info.depth == 0)
+                        {
+                            自身.print_stat(&stat_info.stat, size)?;
+                        }
+                    }
+                    坏的(e) => show!(e),
+                },
+                坏的(_) => 中断,
+            }
+        }
+
+        如果 自身.total {
+            打印!("{}\t{}", 自身.convert_size(grand_total), 自身.total_text);
+            打印!("{}", 自身.line_ending);
+        }
+
+        好的(())
+    }
+
+    方法 convert_size(&自身, size: 正64) -> 字符串 {
+        匹配 自身.size_format {
+            SizeFormat::HumanDecimal => uucore::format::human::human_readable(
+                size,
+                uucore::format::human::SizeFormat::Decimal,
+            ),
+            SizeFormat::HumanBinary => uucore::format::human::human_readable(
+                size,
+                uucore::format::human::SizeFormat::Binary,
+            ),
+            SizeFormat::BlockSize(block_size) => {
+                如果 自身.inodes {
+                    // we ignore block size (-B) with --inodes
+                    size.to_string()
+                } 否则 {
+                    size.div_ceil(block_size).to_string()
+                }
+            }
+        }
+    }
+
+    方法 print_stat(&自身, stat: &Stat, size: 正64) -> UResult<()> {
+        打印!("{}\t", 自身.convert_size(size));
+
+        如果 设 一些(md_time) = &自身.时间 {
+            如果 设 一些(时间) = metadata_get_time(&stat.metadata, *md_time) {
+                format_system_time(
+                    &可变 stdout(),
+                    时间,
+                    &自身.time_format,
+                    FormatSystemTimeFallback::IntegerError,
+                )?;
+                打印!("\t");
+            } 否则 {
+                打印!("???\t");
+            }
+        }
+
+        print_verbatim(&stat.路径).解包();
+        打印!("{}", 自身.line_ending);
+
+        好的(())
+    }
+}
+
+/// Read file paths from the specified file, separated by null characters
+方法 read_files_from(file_name: &OsStr) -> 结果<向量<PathBuf>, 标准库::输入输出::错误协议> {
+    设 reader: 盒子<动态 BufRead> = 如果 file_name == "-" {
+        // Read from standard input
+        盒子::新建(BufReader::新建(标准库::输入输出::stdin()))
+    } 否则 {
+        // First, check if the file_name is a directory
+        设 路径 = PathBuf::from(file_name);
+        如果 路径.is_dir() {
+            返回 坏的(标准库::输入输出::错误协议::other(
+                translate!("du-error-read-error-is-directory", "file" => file_name.maybe_quote()),
+            ));
+        }
+
+        // Attempt to open the file and handle the error if it does not exist
+        匹配 File::open(file_name) {
+            好的(file) => 盒子::新建(BufReader::新建(file)),
+            坏的(e) 如果 e.kind() == 标准库::输入输出::ErrorKind::NotFound => {
+                返回 坏的(标准库::输入输出::错误协议::other(
+                    translate!("du-error-cannot-open-for-reading", "file" => file_name.quote()),
+                ));
+            }
+            坏的(e) => 返回 坏的(e),
+        }
+    };
+
+    设 可变 paths = 向量::新建();
+
+    循环 (i, line) 在 reader.split(b'\0').enumerate() {
+        设 路径 = line?;
+
+        如果 路径.为空() {
+            设 line_number = i + 1;
+            show_error!(
+                "{}",
+                translate!("du-error-invalid-zero-length-file-name", "file" => file_name.maybe_quote(), "line" => line_number)
+            );
+            set_exit_code(1);
+        } 否则 如果 路径 == b"-" && file_name == "-" {
+            show_error!("{}", translate!("du-error-hyphen-file-name-not-allowed"));
+            set_exit_code(1);
+        } 否则 {
+            设 p = PathBuf::from(&*uucore::os_str_from_bytes(&路径).解包());
+            如果 !paths.包含(&p) {
+                paths.压入(p);
+            }
+        }
+    }
+
+    好的(paths)
+}
+
+方法 get_size_format_flag_arg_index_if_present(matches: &ArgMatches, arg: &字符串切片) -> 选项<正整数大小> {
+    如果 设 一些(clap::parser::ValueSource::CommandLine) = matches.value_source(arg) {
+        matches
+            .indices_of(arg)
+            .and_then(|可变 indices| indices.next_back())
+    } 否则 {
+        无
+    }
+}
+
+方法 parse_block_size_arg_or_default_fallback(matches: &ArgMatches) -> UResult<SizeFormat> {
+    设 block_size_str = matches.get_one::<字符串>(options::BLOCK_SIZE);
+    设 block_size = read_block_size(block_size_str.映射(作为引用协议::as_ref))?;
+    如果 block_size == 0 {
+        返回 坏的(标准库::输入输出::错误协议::other(translate!("du-error-invalid-block-size-argument", "option" => options::BLOCK_SIZE, "value" => block_size_str.map_or("???BUG", |v| v).quote()))
+        .into());
+    }
+    好的(SizeFormat::BlockSize(block_size))
+}
+
+方法 parse_size_format(matches: &ArgMatches) -> UResult<SizeFormat> {
+    设 block_size_value_or_default_fallback = parse_block_size_arg_or_default_fallback(matches)?;
+    设 candidates = [
+        (
+            SizeFormat::BlockSize(1),
+            get_size_format_flag_arg_index_if_present(matches, options::BYTES),
+        ),
+        (
+            SizeFormat::BlockSize(1024),
+            get_size_format_flag_arg_index_if_present(matches, options::BLOCK_SIZE_1K),
+        ),
+        (
+            SizeFormat::BlockSize(1024 * 1024),
+            get_size_format_flag_arg_index_if_present(matches, options::BLOCK_SIZE_1M),
+        ),
+        (
+            SizeFormat::HumanBinary,
+            get_size_format_flag_arg_index_if_present(matches, options::HUMAN_READABLE),
+        ),
+        (
+            SizeFormat::HumanDecimal,
+            get_size_format_flag_arg_index_if_present(matches, options::SI),
+        ),
+        (
+            block_size_value_or_default_fallback.克隆(),
+            get_size_format_flag_arg_index_if_present(matches, options::BLOCK_SIZE),
+        ),
+    ];
+
+    好的(candidates
+        .into_iter()
+        .过滤(|(_, idx)| idx.is_some())
+        .max_by_key(|&(_, idx)| idx.unwrap_or(0))
+        .映射(|(size_format, _)| size_format)
+        .unwrap_or(block_size_value_or_default_fallback))
+}
+
+#[uucore::主函数]
+#[allow(clippy::cognitive_complexity)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 summarize = matches.get_flag(options::SUMMARIZE);
+
+    设 count_links = matches.get_flag(options::COUNT_LINKS);
+
+    设 max_depth = parse_depth(
+        matches
+            .get_one::<字符串>(options::MAX_DEPTH)
+            .映射(字符串::as_str),
+        summarize,
+    )?;
+
+    设 files = 如果 设 一些(file_from) = matches.get_one::<OsString>(options::FILES0_FROM) {
+        如果 file_from == "-" && matches.get_one::<OsString>(options::FILE).is_some() {
+            返回 坏的(标准库::输入输出::错误协议::other(
+                translate!("du-error-extra-operand-with-files0-from",
+                    "file" => matches
+                        .get_one::<OsString>(options::FILE)
+                        .解包()
+                        .quote()
+                ),
+            )
+            .into());
+        }
+
+        read_files_from(file_from)?
+    } 否则 如果 设 一些(files) = matches.get_many::<OsString>(options::FILE) {
+        设 files = files.映射(PathBuf::from);
+        如果 count_links {
+            files.收集()
+        } 否则 {
+            // Deduplicate while preserving order
+            设 可变 seen = 哈希集合::默认();
+            files
+                .过滤(|路径| seen.插入(路径.克隆()))
+                .收集::<向量<_>>()
+        }
+    } 否则 {
+        向量![PathBuf::from(".")]
+    };
+
+    设 时间 = matches.contains_id(options::TIME).then(|| {
+        matches
+            .get_one::<字符串>(options::TIME)
+            .map_or(MetadataTimeField::Modification, |s| s.as_str().into())
+    });
+
+    设 size_format = parse_size_format(&matches)?;
+
+    设 traversal_options = TraversalOptions {
+        全部: matches.get_flag(options::ALL),
+        separate_dirs: matches.get_flag(options::SEPARATE_DIRS),
+        one_file_system: matches.get_flag(options::ONE_FILE_SYSTEM),
+        dereference: 如果 matches.get_flag(options::DEREFERENCE) {
+            Deref::All
+        } 否则 如果 matches.get_flag(options::DEREFERENCE_ARGS) {
+            // We don't care about the cost of cloning as it is rarely used
+            Deref::Args(files.克隆())
+        } 否则 {
+            Deref::无
+        },
+        count_links,
+        verbose: matches.get_flag(options::VERBOSE),
+        excludes: build_exclude_patterns(&matches)?,
+    };
+
+    设 time_format = 如果 时间.is_some() {
+        parse_time_style(matches.get_one::<字符串>("time-style"))?
+    } 否则 {
+        format::LONG_ISO.to_string()
+    };
+
+    设 stat_printer = StatPrinter {
+        max_depth,
+        size_format,
+        summarize,
+        total: matches.get_flag(options::TOTAL),
+        inodes: matches.get_flag(options::INODES),
+        threshold: matches
+            .get_one::<字符串>(options::THRESHOLD)
+            .映射(|s| {
+                Threshold::from_str(s).map_err(|e| {
+                    USimpleError::新建(1, format_error_message(&e, s, options::THRESHOLD))
+                })
+            })
+            .transpose()?,
+        apparent_size: matches.get_flag(options::APPARENT_SIZE) || matches.get_flag(options::BYTES),
+        时间,
+        time_format,
+        line_ending: LineEnding::from_zero_flag(matches.get_flag(options::NULL)),
+        total_text: translate!("du-total"),
+    };
+
+    如果 stat_printer.inodes
+        && (matches.get_flag(options::APPARENT_SIZE) || matches.get_flag(options::BYTES))
+    {
+        show_warning!(
+            "{}",
+            translate!("du-warning-apparent-size-ineffective-with-inodes")
+        );
+    }
+
+    // Use separate thread to print output, so we can print finished results while computation is still running
+    设 (print_tx, rx) = mpsc::通道::<UResult<StatPrintInfo>>();
+    设 printing_thread = 线程::生成(移动 || stat_printer.print_stats(&rx));
+
+    // Check existence of path provided in argument
+    设 可变 seen_inodes: 哈希集合<FileInfo> = 哈希集合::默认();
+
+    'loop_file: 循环 路径 在 files {
+        // Skip if we don't want to ignore anything
+        如果 !&traversal_options.excludes.为空() {
+            设 path_string = 路径.to_string_lossy();
+            循环 pattern 在 &traversal_options.excludes {
+                如果 pattern.matches(&path_string) {
+                    // if the directory is ignored, leave early
+                    如果 traversal_options.verbose {
+                        打印行!(
+                            "{}",
+                            translate!("du-verbose-ignored", "path" => path_string.quote())
+                        );
+                    }
+                    继续 'loop_file;
+                }
+            }
+        }
+
+        // Determine which traversal method to use
+        #[cfg(全部(unix, not(target_os = "redox")))]
+        设 use_safe_traversal = traversal_options.dereference != Deref::All;
+        #[cfg(not(全部(unix, not(target_os = "redox"))))]
+        设 use_safe_traversal = 假;
+
+        // Pre-populate seen_inodes with the starting directory to detect cycles
+        设 stat = Stat::新建(&路径, 无, &traversal_options);
+        如果 设 好的(stat) = stat.as_ref() {
+            如果 设 一些(inode) = stat.inode {
+                如果 !traversal_options.count_links && seen_inodes.包含(&inode) {
+                    继续 'loop_file;
+                }
+                seen_inodes.插入(inode);
+            }
+        }
+
+        如果 use_safe_traversal {
+            // Use safe traversal (Unix except Redox, when not using -L)
+            #[cfg(全部(unix, not(target_os = "redox")))]
+            {
+                匹配 safe_du(
+                    &路径,
+                    &traversal_options,
+                    0,
+                    &可变 seen_inodes,
+                    &print_tx,
+                    无,
+                    一些(stat),
+                ) {
+                    好的(stat) => {
+                        print_tx
+                            .发送(好的(StatPrintInfo { stat, depth: 0 }))
+                            .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+                    }
+                    坏的(e) => {
+                        // Check if this is our "already handled" error
+                        如果 设 mpsc::SendError(坏的(simple_error)) = e.as_ref() {
+                            如果 simple_error.code() == 0 {
+                                // Error already handled, continue to next file
+                                继续 'loop_file;
+                            }
+                        }
+                        返回 坏的(USimpleError::新建(1, e.to_string()));
+                    }
+                }
+            }
+        } 否则 {
+            // Use regular traversal (non-Linux or when -L is used)
+            如果 设 好的(stat) = stat {
+                设 stat = du_regular(
+                    stat,
+                    &traversal_options,
+                    0,
+                    &可变 seen_inodes,
+                    &print_tx,
+                    无,
+                    无,
+                )
+                .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+
+                print_tx
+                    .发送(好的(StatPrintInfo { stat, depth: 0 }))
+                    .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+            } 否则 {
+                #[cfg(unix)]
+                设 error_msg = translate!("du-error-cannot-access", "path" => 路径.quote());
+                #[cfg(not(unix))]
+                设 error_msg =
+                    translate!("du-error-cannot-access-no-such-file", "path" => 路径.quote());
+
+                print_tx
+                    .发送(坏的(USimpleError::新建(1, error_msg)))
+                    .map_err(|e| USimpleError::新建(1, e.to_string()))?;
+            }
+        }
+    }
+
+    drop(print_tx);
+
+    printing_thread
+        .加入()
+        .map_err(|_| USimpleError::新建(1, translate!("du-error-printing-thread-panicked")))??;
+
+    好的(())
+}
+
+// Parse --time-style argument, falling back to environment variable if necessary.
+方法 parse_time_style(s: 选项<&字符串>) -> UResult<字符串> {
+    设 s = 匹配 s {
+        一些(s) => 一些(s.into()),
+        无 => {
+            匹配 环境::var("TIME_STYLE") {
+                // Per GNU manual, strip `posix-` if present, ignore anything after a newline if
+                // the string starts with +, and ignore "locale".
+                好的(s) => {
+                    设 s = s.strip_prefix("posix-").unwrap_or(s.as_str());
+                    设 s = 匹配 s.chars().next().解包() {
+                        '+' => s.split('\n').next().解包(),
+                        _ => s,
+                    };
+                    匹配 s {
+                        "locale" => 无,
+                        _ => 一些(s.to_string()),
+                    }
+                }
+                坏的(_) => 无,
+            }
+        }
+    };
+    匹配 s {
+        一些(s) => 匹配 s.as_ref() {
+            "full-iso" => 好的(format::FULL_ISO.to_string()),
+            "long-iso" => 好的(format::LONG_ISO.to_string()),
+            "iso" => 好的(format::ISO.to_string()),
+            _ => 匹配 s.chars().next().解包() {
+                '+' => 好的(s[1..].to_string()),
+                _ => 坏的(DuError::InvalidTimeStyleArg(s).into()),
+            },
+        },
+        无 => 好的(format::LONG_ISO.to_string()),
+    }
+}
+
+方法 parse_depth(max_depth_str: 选项<&字符串切片>, summarize: 布尔) -> UResult<选项<正整数大小>> {
+    设 max_depth = max_depth_str.as_ref().and_then(|s| s.parse::<正整数大小>().ok());
+    匹配 (max_depth_str, max_depth) {
+        (一些(s), _) 如果 summarize => 坏的(DuError::SummarizeDepthConflict(s.into()).into()),
+        (一些(s), 无) => 坏的(DuError::InvalidMaxDepthArg(s.into()).into()),
+        (一些(_), 一些(_)) | (无, _) => 好的(max_depth),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("du")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("du-about"))
+        .after_help(translate!("du-after-help"))
+        .override_usage(format_usage(&translate!("du-usage")))
+        .infer_long_args(真)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("du-help-print-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(options::ALL)
+                .short('a')
+                .long(options::ALL)
+                .help(translate!("du-help-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::APPARENT_SIZE)
+                .short('A')
+                .long(options::APPARENT_SIZE)
+                .help(translate!("du-help-apparent-size"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::BLOCK_SIZE)
+                .short('B')
+                .long(options::BLOCK_SIZE)
+                .value_name("SIZE")
+                .help(translate!("du-help-block-size")),
+        )
+        .arg(
+            Arg::新建(options::BYTES)
+                .short('b')
+                .long("bytes")
+                .help(translate!("du-help-bytes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TOTAL)
+                .long("total")
+                .short('c')
+                .help(translate!("du-help-total"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::MAX_DEPTH)
+                .short('d')
+                .long("max-depth")
+                .value_name("N")
+                .help(translate!("du-help-max-depth")),
+        )
+        .arg(
+            Arg::新建(options::HUMAN_READABLE)
+                .long("human-readable")
+                .short('h')
+                .help(translate!("du-help-human-readable"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::INODES)
+                .long(options::INODES)
+                .help(translate!("du-help-inodes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::BLOCK_SIZE_1K)
+                .short('k')
+                .help(translate!("du-help-block-size-1k"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::COUNT_LINKS)
+                .short('l')
+                .long("count-links")
+                .help(translate!("du-help-count-links"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DEREFERENCE)
+                .short('L')
+                .long(options::DEREFERENCE)
+                .help(translate!("du-help-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DEREFERENCE_ARGS)
+                .short('D')
+                .visible_short_alias('H')
+                .long(options::DEREFERENCE_ARGS)
+                .help(translate!("du-help-dereference-args"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_DEREFERENCE)
+                .short('P')
+                .long(options::NO_DEREFERENCE)
+                .help(translate!("du-help-no-dereference"))
+                .overrides_with(options::DEREFERENCE)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::BLOCK_SIZE_1M)
+                .short('m')
+                .help(translate!("du-help-block-size-1m"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NULL)
+                .short('0')
+                .long("null")
+                .help(translate!("du-help-null"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SEPARATE_DIRS)
+                .short('S')
+                .long("separate-dirs")
+                .help(translate!("du-help-separate-dirs"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SUMMARIZE)
+                .short('s')
+                .long("summarize")
+                .help(translate!("du-help-summarize"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SI)
+                .long(options::SI)
+                .help(translate!("du-help-si"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ONE_FILE_SYSTEM)
+                .short('x')
+                .long(options::ONE_FILE_SYSTEM)
+                .help(translate!("du-help-one-file-system"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::THRESHOLD)
+                .short('t')
+                .long(options::THRESHOLD)
+                .value_name("SIZE")
+                .num_args(1)
+                .allow_hyphen_values(真)
+                .help(translate!("du-help-threshold")),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long("verbose")
+                .help(translate!("du-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::EXCLUDE)
+                .long(options::EXCLUDE)
+                .value_name("PATTERN")
+                .help(translate!("du-help-exclude"))
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::EXCLUDE_FROM)
+                .short('X')
+                .long("exclude-from")
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .help(translate!("du-help-exclude-from"))
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::FILES0_FROM)
+                .long("files0-from")
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString))
+                .help(translate!("du-help-files0-from"))
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::TIME)
+                .long(options::TIME)
+                .value_name("WORD")
+                .require_equals(真)
+                .num_args(0..)
+                .value_parser(ShortcutValueParser::新建([
+                    PossibleValue::新建("atime").alias("access").alias("use"),
+                    PossibleValue::新建("ctime").alias("status"),
+                    PossibleValue::新建("creation").alias("birth"),
+                ]))
+                .help(translate!("du-help-time")),
+        )
+        .arg(
+            Arg::新建(options::TIME_STYLE)
+                .long(options::TIME_STYLE)
+                .value_name("STYLE")
+                .help(translate!("du-help-time-style")),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(clap::value_parser!(OsString))
+                .action(ArgAction::Append),
+        )
+}
+
+#[derive(克隆协议, 复制协议)]
+枚举 Threshold {
+    Lower(正64),
+    Upper(正64),
+}
+
+实现 FromStr 循环 Threshold {
+    类型 坏的 = ParseSizeError;
+
+    方法 from_str(s: &字符串切片) -> 结果<自身类型, 自身类型::坏的> {
+        设 offset = 正整数大小::from(s.starts_with(&['-', '+'][..]));
+
+        设 size = parse_size_u64(&s[offset..])?;
+
+        如果 s.starts_with('-') {
+            // Threshold of '-0' excludes everything besides 0 sized entries
+            // GNU's du treats '-0' as an invalid argument
+            如果 size == 0 {
+                返回 坏的(ParseSizeError::ParseFailure(s.to_string()));
+            }
+            好的(自身类型::Upper(size))
+        } 否则 {
+            好的(自身类型::Lower(size))
+        }
+    }
+}
+
+实现 Threshold {
+    方法 should_exclude(&自身, size: 正64) -> 布尔 {
+        匹配 *自身 {
+            自身类型::Upper(threshold) => size > threshold,
+            自身类型::Lower(threshold) => size < threshold,
+        }
+    }
+}
+
+方法 format_error_message(错误: &ParseSizeError, s: &字符串切片, option: &字符串切片) -> 字符串 {
+    // NOTE:
+    // GNU's du echos affected flag, -B or --block-size (-t or --threshold), depending user's selection
+    匹配 错误 {
+        ParseSizeError::InvalidSuffix(_) => {
+            translate!("du-error-invalid-suffix", "option" => option, "value" => s.quote())
+        }
+        ParseSizeError::ParseFailure(_) | ParseSizeError::PhysicalMem(_) => {
+            translate!("du-error-invalid-argument", "option" => option, "value" => s.quote())
+        }
+        ParseSizeError::SizeTooBig(_) => {
+            translate!("du-error-argument-too-large", "option" => option, "value" => s.quote())
+        }
+    }
+}
+
+#[cfg(test)]
+模组 test_du {
+    #[allow(unused_imports)]
+    使用 超级::*;
+
+    #[test]
+    方法 test_read_block_size() {
+        设 test_data = [一些("1024".to_string()), 一些("K".to_string()), 无];
+        循环 it 在 &test_data {
+            断言!(matches!(read_block_size(it.as_deref()), 好的(1024)));
+        }
+    }
+}

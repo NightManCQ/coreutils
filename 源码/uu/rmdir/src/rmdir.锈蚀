@@ -1,0 +1,215 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) ENOTDIR
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::{read_dir, remove_dir};
+使用 标准库::输入输出;
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, set_exit_code, strip_errno};
+使用 uucore::translate;
+
+使用 uucore::{format_usage, show_error};
+
+静态 OPT_IGNORE_FAIL_NON_EMPTY: &字符串切片 = "ignore-fail-on-non-empty";
+静态 OPT_PARENTS: &字符串切片 = "parents";
+静态 OPT_VERBOSE: &字符串切片 = "verbose";
+
+静态 ARG_DIRS: &字符串切片 = "dirs";
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 opts = Opts {
+        ignore: matches.get_flag(OPT_IGNORE_FAIL_NON_EMPTY),
+        parents: matches.get_flag(OPT_PARENTS),
+        verbose: matches.get_flag(OPT_VERBOSE),
+    };
+
+    循环 路径 在 matches
+        .get_many::<OsString>(ARG_DIRS)
+        .unwrap_or_default()
+        .映射(Path::新建)
+    {
+        如果 设 坏的(错误) = 移除(路径, opts) {
+            设 错误协议 { 错误, 路径 } = 错误;
+
+            如果 opts.ignore && dir_not_empty(&错误, 路径) {
+                继续;
+            }
+
+            set_exit_code(1);
+
+            // If `foo` is a symlink to a directory then `rmdir foo/` may give
+            // a "not a directory" error. This is confusing as `rm foo/` says
+            // "is a directory".
+            // This differs from system to system. Some don't give an error.
+            // Windows simply allows calling RemoveDirectory on symlinks so we
+            // don't need to worry about it here.
+            // GNU rmdir seems to print "Symbolic link not followed" if:
+            // - It has a trailing slash
+            // - It's a symlink
+            // - It either points to a directory or dangles
+            #[cfg(unix)]
+            {
+                使用 标准库::ffi::OsStr;
+                使用 标准库::操作系统::unix::ffi::OsStrExt;
+
+                方法 points_to_directory(路径: &Path) -> 输入输出::结果<布尔> {
+                    好的(路径.metadata()?.file_type().is_dir())
+                }
+
+                设 可变 bytes = 路径.as_os_str().as_bytes();
+                如果 错误.raw_os_error() == 一些(libc::ENOTDIR) && bytes.ends_with(b"/") {
+                    // Strip the trailing slash or .symlink_metadata() will follow the symlink
+                    bytes = strip_trailing_slashes_from_path(bytes);
+                    设 no_slash: &Path = OsStr::from_bytes(bytes).as_ref();
+                    如果 no_slash.is_symlink() && points_to_directory(no_slash).unwrap_or(真) {
+                        show_error!(
+                            "{}",
+                            translate!("rmdir-error-symbolic-link-not-followed", "path" => 路径.quote())
+                        );
+                        继续;
+                    }
+                }
+            }
+
+            show_error!(
+                "{}",
+                translate!("rmdir-error-failed-to-remove", "path" => 路径.quote(), "err" => strip_errno(&错误))
+            );
+        }
+    }
+
+    好的(())
+}
+
+结构 错误协议<'a> {
+    错误: 输入输出::错误协议,
+    路径: &'a Path,
+}
+
+方法 移除(可变 路径: &Path, opts: Opts) -> 结果<(), 错误协议<'_>> {
+    remove_single(路径, opts)?;
+    如果 opts.parents {
+        当 设 一些(新建) = 路径.parent() {
+            路径 = 新建;
+            如果 路径.as_os_str().为空() {
+                中断;
+            }
+            remove_single(路径, opts)?;
+        }
+    }
+    好的(())
+}
+
+方法 remove_single(路径: &Path, opts: Opts) -> 结果<(), 错误协议<'_>> {
+    如果 opts.verbose {
+        打印行!(
+            "{}",
+            translate!("rmdir-verbose-removing-directory", "util_name" => "rmdir", "path" => 路径.quote())
+        );
+    }
+    remove_dir(路径).map_err(|错误| 错误协议 { 错误, 路径 })
+}
+
+#[cfg(unix)]
+方法 strip_trailing_slashes_from_path(路径: &[正8]) -> &[正8] {
+    设 可变 end = 路径.长度();
+    当 end > 0 && 路径[end - 1] == b'/' {
+        end -= 1;
+    }
+    &路径[..end]
+}
+
+// POSIX: https://pubs.opengroup.org/onlinepubs/009696799/functions/rmdir.html
+#[cfg(not(windows))]
+常量 NOT_EMPTY_CODES: &[整32] = &[libc::ENOTEMPTY, libc::EEXIST];
+
+// 145 is ERROR_DIR_NOT_EMPTY, determined experimentally.
+#[cfg(windows)]
+常量 NOT_EMPTY_CODES: &[整32] = &[145];
+
+// Other error codes you might get for directories that could be found and are
+// not empty.
+// This is a subset of the error codes listed in rmdir(2) from the Linux man-pages
+// project. Maybe other systems have additional codes that apply?
+#[cfg(not(windows))]
+常量 PERHAPS_EMPTY_CODES: &[整32] = &[libc::EACCES, libc::EBUSY, libc::EPERM, libc::EROFS];
+
+// Probably incomplete, I can't find a list of possible errors for
+// RemoveDirectory anywhere.
+#[cfg(windows)]
+常量 PERHAPS_EMPTY_CODES: &[整32] = &[
+    5, // ERROR_ACCESS_DENIED, found experimentally.
+];
+
+方法 dir_not_empty(错误: &输入输出::错误协议, 路径: &Path) -> 布尔 {
+    如果 设 一些(code) = 错误.raw_os_error() {
+        如果 NOT_EMPTY_CODES.包含(&code) {
+            返回 真;
+        }
+        // If --ignore-fail-on-non-empty is used then we want to ignore all errors
+        // for non-empty directories, even if the error was e.g. because there's
+        // no permission. So we do an additional check.
+        如果 PERHAPS_EMPTY_CODES.包含(&code) {
+            如果 设 好的(可变 iterator) = read_dir(路径) {
+                如果 iterator.next().is_some() {
+                    返回 真;
+                }
+            }
+        }
+    }
+    假
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+结构 Opts {
+    ignore: 布尔,
+    parents: 布尔,
+    verbose: 布尔,
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("rmdir")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("rmdir"))
+        .about(translate!("rmdir-about"))
+        .override_usage(format_usage(&translate!("rmdir-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_IGNORE_FAIL_NON_EMPTY)
+                .long(OPT_IGNORE_FAIL_NON_EMPTY)
+                .help(translate!("rmdir-help-ignore-fail-non-empty"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PARENTS)
+                .short('p')
+                .long(OPT_PARENTS)
+                .help(translate!("rmdir-help-parents"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .short('v')
+                .long(OPT_VERBOSE)
+                .help(translate!("rmdir-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_DIRS)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .required(真)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::DirPath),
+        )
+}

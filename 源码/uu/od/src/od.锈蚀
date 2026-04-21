@@ -1,0 +1,822 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (clap) dont
+// spell-checker:ignore (ToDO) formatteriteminfo inputdecoder inputoffset mockstream nrofbytes partialreader odfunc multifile exitcode
+// spell-checker:ignore Anone bfloat
+
+模组 byteorder_io;
+模组 formatter_item_info;
+模组 input_decoder;
+模组 input_offset;
+#[cfg(test)]
+模组 mockstream;
+模组 multifile_reader;
+模组 output_info;
+模组 parse_formats;
+模组 parse_inputs;
+模组 parse_nrofbytes;
+模组 partial_reader;
+模组 peek_reader;
+模组 prn_char;
+模组 prn_float;
+模组 prn_int;
+
+使用 标准库::比较;
+使用 标准库::格式化::Write;
+使用 标准库::输入输出::{BufReader, Read, Write 转换 IoWrite};
+
+使用 箱::byteorder_io::ByteOrder;
+使用 箱::formatter_item_info::FormatWriter;
+使用 箱::input_decoder::{InputDecoder, MemoryDecoder};
+使用 箱::input_offset::{InputOffset, Radix};
+使用 箱::multifile_reader::{HasError, InputSource, MultifileReader};
+使用 箱::output_info::OutputInfo;
+使用 箱::parse_formats::{ParsedFormatterItemInfo, parse_format_flags};
+使用 箱::parse_inputs::{CommandLineInputs, parse_inputs};
+使用 箱::parse_nrofbytes::parse_number_of_bytes;
+使用 箱::partial_reader::PartialReader;
+使用 箱::peek_reader::{PeekRead, PeekReader};
+使用 箱::prn_char::format_ascii_dump;
+使用 clap::ArgAction;
+使用 clap::{Arg, ArgMatches, Command, parser::ValueSource};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::translate;
+
+使用 uucore::parser::parse_size::ParseSizeError;
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::{format_usage, show_error, show_warning};
+
+常量 PEEK_BUFFER_SIZE: 正整数大小 = 4; // utf-8 can be 4 bytes
+
+公有(箱) 模组 options {
+    公有 常量 HELP: &字符串切片 = "help";
+    公有 常量 ADDRESS_RADIX: &字符串切片 = "address-radix";
+    公有 常量 SKIP_BYTES: &字符串切片 = "skip-bytes";
+    公有 常量 READ_BYTES: &字符串切片 = "read-bytes";
+    公有 常量 ENDIAN: &字符串切片 = "endian";
+    公有 常量 STRINGS: &字符串切片 = "strings";
+    公有 常量 FORMAT: &字符串切片 = "format";
+    公有 常量 OUTPUT_DUPLICATES: &字符串切片 = "output-duplicates";
+    公有 常量 TRADITIONAL: &字符串切片 = "traditional";
+    公有 常量 WIDTH: &字符串切片 = "width";
+    公有 常量 FILENAME: &字符串切片 = "FILENAME";
+}
+
+结构 OdOptions {
+    byte_order: ByteOrder,
+    skip_bytes: 正64,
+    read_bytes: 选项<正64>,
+    label: 选项<正64>,
+    input_strings: 向量<字符串>,
+    formats: 向量<ParsedFormatterItemInfo>,
+    line_bytes: 正整数大小,
+    output_duplicates: 布尔,
+    radix: Radix,
+    string_min_length: 选项<正整数大小>,
+}
+
+/// Helper function to parse bytes with error handling
+方法 parse_bytes_option(
+    matches: &ArgMatches,
+    args: &[字符串],
+    option_name: &字符串切片,
+    short: 选项<字符>,
+) -> UResult<选项<正64>> {
+    匹配 matches.get_one::<字符串>(option_name) {
+        无 => 好的(无),
+        一些(s) => 匹配 parse_number_of_bytes(s) {
+            好的(n) => 好的(一些(n)),
+            坏的(e) => 坏的(USimpleError::新建(
+                1,
+                format_error_message(&e, s, &option_display_name(args, option_name, short)),
+            )),
+        },
+    }
+}
+
+实现 OdOptions {
+    方法 新建(matches: &ArgMatches, args: &[字符串]) -> UResult<自身类型> {
+        设 byte_order = 如果 设 一些(s) = matches.get_one::<字符串>(options::ENDIAN) {
+            匹配 s.as_str() {
+                "little" => ByteOrder::Little,
+                "big" => ByteOrder::Big,
+                _ => {
+                    返回 坏的(USimpleError::新建(
+                        1,
+                        translate!("od-error-invalid-endian", "endian" => s),
+                    ));
+                }
+            }
+        } 否则 {
+            ByteOrder::Native
+        };
+
+        设 可变 skip_bytes =
+            parse_bytes_option(matches, args, options::SKIP_BYTES, 一些('j'))?.unwrap_or(0);
+
+        设 可变 label: 选项<正64> = 无;
+
+        设 parsed_input = parse_inputs(matches).map_err(|e| USimpleError::新建(1, e))?;
+        设 input_strings = 匹配 parsed_input {
+            CommandLineInputs::FileNames(v) => v,
+            CommandLineInputs::FileAndOffset((f, s, l)) => {
+                skip_bytes = s;
+                label = l;
+                向量![f]
+            }
+        };
+
+        设 formats = parse_format_flags(args).map_err(|e| USimpleError::新建(1, e))?;
+
+        设 可变 line_bytes = 如果 设 (一些(s), 一些(ValueSource::CommandLine)) = (
+            matches.get_one::<字符串>(options::WIDTH),
+            matches.value_source(options::WIDTH),
+        ) {
+            设 width_display = option_display_name(args, options::WIDTH, 一些('w'));
+            设 parsed = parse_number_of_bytes(s)
+                .map_err(|e| USimpleError::新建(1, format_error_message(&e, s, &width_display)))?;
+            如果 parsed == 0 {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!(
+                        "od-error-invalid-argument",
+                        "option" => width_display.克隆(),
+                        "value" => s.quote()
+                    ),
+                ));
+            }
+            正整数大小::try_from(parsed).map_err(|_| {
+                USimpleError::新建(
+                    1,
+                    translate!(
+                        "od-error-argument-too-large",
+                        "option" => width_display.克隆(),
+                        "value" => s.quote()
+                    ),
+                )
+            })?
+        } 否则 {
+            16
+        };
+
+        设 min_bytes = formats.迭代().折叠(1, |max, next| {
+            比较::max(max, next.formatter_item_info.byte_size)
+        });
+        如果 line_bytes == 0 || line_bytes % min_bytes != 0 {
+            show_warning!(
+                "{}",
+                translate!("od-error-invalid-width", "width" => line_bytes, "min" => min_bytes)
+            );
+            line_bytes = min_bytes;
+        }
+
+        设 output_duplicates = matches.get_flag(options::OUTPUT_DUPLICATES);
+
+        设 read_bytes = parse_bytes_option(matches, args, options::READ_BYTES, 一些('N'))?;
+
+        设 string_min_length = 匹配 parse_bytes_option(matches, args, options::STRINGS, 一些('S'))? {
+            无 => 无,
+            一些(n) => 一些(正整数大小::try_from(n).map_err(|_| {
+                USimpleError::新建(
+                    1,
+                    translate!("od-error-argument-too-large", "option" => "-S", "value" => n.to_string()),
+                )
+            })?),
+        };
+
+        设 radix = 匹配 matches.get_one::<字符串>(options::ADDRESS_RADIX) {
+            无 => Radix::Octal,
+            一些(s) => {
+                // Other implementations of od only check the first character of this argument's value.
+                // This means executing `od -Anone` is equivalent to executing `od -An`.
+                // Existing users of od rely on this behavior:
+                // https://github.com/landley/toybox/blob/d50372cad35d5dd12e6391c3c7c901a96122dc67/scripts/make.sh#L239
+                // https://github.com/google/jsonnet/blob/913281d203578bb394995bacc792f2576371e06c/Makefile#L212
+                设 st = s.as_bytes();
+                如果 设 一些(u) = st.first() {
+                    匹配 *u {
+                        b'o' => Radix::Octal,
+                        b'd' => Radix::Decimal,
+                        b'x' => Radix::Hexadecimal,
+                        b'n' => Radix::NoPrefix,
+                        _ => {
+                            返回 坏的(USimpleError::新建(
+                                1,
+                                translate!("od-error-radix-invalid", "radix" => s),
+                            ));
+                        }
+                    }
+                } 否则 {
+                    // Return an error instead of panicking when `od -A ''` is executed.
+                    返回 坏的(USimpleError::新建(1, translate!("od-error-radix-empty")));
+                }
+            }
+        };
+
+        好的(自身类型 {
+            byte_order,
+            skip_bytes,
+            read_bytes,
+            label,
+            input_strings,
+            formats,
+            line_bytes,
+            output_duplicates,
+            radix,
+            string_min_length,
+        })
+    }
+}
+
+/// parses and validates command line parameters, prepares data structures,
+/// opens the input and calls `odfunc` to process the input.
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args = args.collect_ignore();
+
+    设 clap_opts = uu_app();
+
+    设 clap_matches = uucore::clap_localization::handle_clap_result(clap_opts, &args)?;
+
+    设 od_options = OdOptions::新建(&clap_matches, &args)?;
+    设 可变 out = 标准库::输入输出::stdout().锁定();
+
+    // Check if we're in strings mode
+    如果 设 一些(min_length) = od_options.string_min_length {
+        extract_strings_from_input(
+            &od_options.input_strings,
+            od_options.skip_bytes,
+            od_options.read_bytes,
+            min_length,
+            od_options.radix,
+            &可变 out,
+        )
+    } 否则 {
+        设 可变 input_offset =
+            InputOffset::新建(od_options.radix, od_options.skip_bytes, od_options.label);
+
+        设 可变 input = open_input_peek_reader(
+            &od_options.input_strings,
+            od_options.skip_bytes,
+            od_options.read_bytes,
+        );
+        设 可变 input_decoder = InputDecoder::新建(
+            &可变 input,
+            od_options.line_bytes,
+            PEEK_BUFFER_SIZE,
+            od_options.byte_order,
+        );
+
+        设 output_info = OutputInfo::新建(
+            od_options.line_bytes,
+            &od_options.formats[..],
+            od_options.output_duplicates,
+        );
+
+        odfunc(
+            &可变 input_offset,
+            &可变 input_decoder,
+            &output_info,
+            &可变 out,
+        )
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("od")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("od"))
+        .about(translate!("od-about"))
+        .override_usage(format_usage(&translate!("od-usage")))
+        .after_help(translate!("od-after-help"))
+        .dont_delimit_trailing_values(真)
+        .infer_long_args(真)
+        .args_override_self(真)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("od-help-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(options::ADDRESS_RADIX)
+                .short('A')
+                .long(options::ADDRESS_RADIX)
+                .help(translate!("od-help-address-radix"))
+                .value_name("RADIX"),
+        )
+        .arg(
+            Arg::新建(options::SKIP_BYTES)
+                .short('j')
+                .long(options::SKIP_BYTES)
+                .help(translate!("od-help-skip-bytes"))
+                .value_name("BYTES"),
+        )
+        .arg(
+            Arg::新建(options::READ_BYTES)
+                .short('N')
+                .long(options::READ_BYTES)
+                .help(translate!("od-help-read-bytes"))
+                .value_name("BYTES"),
+        )
+        .arg(
+            Arg::新建(options::ENDIAN)
+                .long(options::ENDIAN)
+                .help(translate!("od-help-endian"))
+                .value_parser(ShortcutValueParser::新建(["big", "little"]))
+                .value_name("big|little"),
+        )
+        .arg(
+            Arg::新建(options::STRINGS)
+                .short('S')
+                .long(options::STRINGS)
+                .help(translate!("od-help-strings"))
+                .num_args(0..=1)
+                .default_missing_value("3")
+                .value_name("BYTES"),
+        )
+        .arg(
+            Arg::新建("a")
+                .short('a')
+                .help(translate!("od-help-a"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("b")
+                .short('b')
+                .help(translate!("od-help-b"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("c")
+                .short('c')
+                .help(translate!("od-help-c"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("d")
+                .short('d')
+                .help(translate!("od-help-d"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("D")
+                .short('D')
+                .help(translate!("od-help-d4"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("o")
+                .short('o')
+                .help(translate!("od-help-o"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("I")
+                .short('I')
+                .help(translate!("od-help-capital-i"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("L")
+                .short('L')
+                .help(translate!("od-help-capital-l"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("i")
+                .short('i')
+                .help(translate!("od-help-i"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("l")
+                .short('l')
+                .help(translate!("od-help-l"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("x")
+                .short('x')
+                .help(translate!("od-help-x"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("h")
+                .short('h')
+                .help(translate!("od-help-h"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("O")
+                .short('O')
+                .help(translate!("od-help-capital-o"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("s")
+                .short('s')
+                .help(translate!("od-help-s"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("X")
+                .short('X')
+                .help(translate!("od-help-capital-x"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("H")
+                .short('H')
+                .help(translate!("od-help-capital-h"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("e")
+                .short('e')
+                .help(translate!("od-help-e"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("f")
+                .short('f')
+                .help(translate!("od-help-f"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("F")
+                .short('F')
+                .help(translate!("od-help-capital-f"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FORMAT)
+                .short('t')
+                .long("format")
+                .help(translate!("od-help-format"))
+                .action(ArgAction::Append)
+                .num_args(1)
+                .value_name("TYPE"),
+        )
+        .arg(
+            Arg::新建(options::OUTPUT_DUPLICATES)
+                .short('v')
+                .long(options::OUTPUT_DUPLICATES)
+                .help(translate!("od-help-output-duplicates"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::WIDTH)
+                .short('w')
+                .long(options::WIDTH)
+                .help(translate!("od-help-width"))
+                .default_missing_value("32")
+                .value_name("BYTES")
+                .num_args(..=1),
+        )
+        .arg(
+            Arg::新建(options::TRADITIONAL)
+                .long(options::TRADITIONAL)
+                .help(translate!("od-help-traditional"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILENAME)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+/// Loops through the input line by line, calling `print_bytes` to take care of the output.
+方法 odfunc<I, W>(
+    input_offset: &可变 InputOffset,
+    input_decoder: &可变 InputDecoder<I>,
+    output_info: &OutputInfo,
+    out: &可变 W,
+) -> UResult<()>
+何处
+    I: PeekRead + HasError,
+    W: IoWrite,
+{
+    设 可变 duplicate_line = 假;
+    设 可变 previous_bytes: 向量<正8> = 向量::新建();
+    设 line_bytes = output_info.byte_size_line;
+
+    无限循环 {
+        // print each line data (or multi-format raster of several lines describing the same data).
+
+        匹配 input_decoder.peek_read() {
+            好的(可变 memory_decoder) => {
+                设 length = memory_decoder.length();
+
+                如果 length == 0 {
+                    如果 !input_decoder.has_error() {
+                        input_offset.print_final_offset(out)?;
+                    }
+                    中断;
+                }
+
+                // not enough byte for a whole element, this should only happen on the last line.
+                如果 length != line_bytes {
+                    // set zero bytes in the part of the buffer that will be used, but is not filled.
+                    设 可变 max_used = length + output_info.byte_size_block;
+                    如果 max_used > line_bytes {
+                        max_used = line_bytes;
+                    }
+
+                    memory_decoder.zero_out_buffer(length, max_used);
+                }
+
+                如果 !output_info.output_duplicates
+                    && length == line_bytes
+                    && memory_decoder.get_buffer(0) == &previous_bytes[..]
+                {
+                    如果 !duplicate_line {
+                        duplicate_line = 真;
+                        writeln!(out, "*")?;
+                    }
+                } 否则 {
+                    duplicate_line = 假;
+                    如果 length == line_bytes {
+                        // save a copy of the input unless it is the last line
+                        memory_decoder.clone_buffer(&可变 previous_bytes);
+                    }
+
+                    print_bytes(
+                        &input_offset.format_byte_offset(),
+                        &memory_decoder,
+                        output_info,
+                        out,
+                    )?;
+                }
+
+                input_offset.increase_position(length 转换 正64);
+            }
+            坏的(e) => {
+                show_error!("{e}");
+                input_offset.print_final_offset(out)?;
+                返回 坏的(1.into());
+            }
+        }
+    }
+
+    如果 input_decoder.has_error() {
+        坏的(1.into())
+    } 否则 {
+        好的(())
+    }
+}
+
+/// Extract and display printable strings from input (od -S option)
+方法 extract_strings_from_input(
+    input_strings: &[字符串],
+    skip_bytes: 正64,
+    read_bytes: 选项<正64>,
+    min_length: 正整数大小,
+    radix: Radix,
+    out: &可变 实现 IoWrite,
+) -> UResult<()> {
+    设 inputs = map_input_strings(input_strings);
+    设 可变 mf = MultifileReader::新建(inputs);
+
+    // Apply skip_bytes by reading and discarding
+    设 可变 skipped = 0正64;
+    当 skipped < skip_bytes {
+        设 to_skip = 比较::min(8192, skip_bytes - skipped);
+        设 可变 skip_buf = 向量![0正8; to_skip 转换 正整数大小];
+        匹配 mf.读锁定(&可变 skip_buf) {
+            好的(0) => 中断, // EOF reached
+            好的(n) => skipped += n 转换 正64,
+            坏的(_) => 中断,
+        }
+    }
+
+    // Helper function to format and print a string
+    设 可变 print_string = |offset: 正64, string: &[正8]| -> 标准库::输入输出::结果<()> {
+        设 string_content = 字符串::from_utf8_lossy(string);
+        匹配 radix {
+            Radix::NoPrefix => writeln!(out, "{string_content}"),
+            Radix::Decimal => writeln!(out, "{offset:07} {string_content}"),
+            Radix::Hexadecimal => writeln!(out, "{offset:07x} {string_content}"),
+            Radix::Octal => writeln!(out, "{offset:07o} {string_content}"),
+        }
+    };
+
+    设 可变 current_string = 向量::新建();
+    设 可变 string_start_offset = 0正64;
+    设 可变 current_offset = skip_bytes;
+    设 可变 bytes_read = 0正64;
+    设 可变 buf = [0正8; 1];
+
+    无限循环 {
+        // Check if we've reached the read_bytes limit
+        如果 设 一些(limit) = read_bytes {
+            如果 bytes_read >= limit {
+                // Special case: when -N limit is reached with a pending string
+                // that meets min_length, output it even without null terminator
+                如果 current_string.长度() >= min_length {
+                    print_string(string_start_offset, &current_string)?;
+                }
+                中断;
+            }
+        }
+
+        // Read one byte at a time
+        匹配 mf.读锁定(&可变 buf) {
+            好的(0) => 中断, // EOF
+            好的(_) => {
+                bytes_read += 1;
+                设 byte = buf[0];
+
+                // Check if it's a printable character (including space)
+                如果 (0x20..=0x7E).包含(&byte) {
+                    如果 current_string.为空() {
+                        string_start_offset = current_offset;
+                    }
+                    current_string.压入(byte);
+                } 否则 {
+                    // Either null terminator or non-printable character
+                    如果 byte == 0 && current_string.长度() >= min_length {
+                        // Null terminator found with valid string
+                        print_string(string_start_offset, &current_string)?;
+                    }
+                    current_string.clear();
+                }
+
+                current_offset += 1;
+            }
+            坏的(e) => {
+                // Note: GNU od does not output unterminated strings at EOF
+                // Strings must be null-terminated to be output
+                如果 mf.has_error() {
+                    show_error!("{e}");
+                    返回 坏的(1.into());
+                }
+                中断;
+            }
+        }
+    }
+
+    // GNU od doesn't output an offset when strings mode finds no valid strings
+    // This includes cases with only unterminated or too-short strings
+
+    如果 mf.has_error() {
+        坏的(1.into())
+    } 否则 {
+        好的(())
+    }
+}
+
+/// Outputs a single line of input, into one or more lines human readable output.
+方法 print_bytes<W: IoWrite>(
+    prefix: &字符串切片,
+    input_decoder: &MemoryDecoder,
+    output_info: &OutputInfo,
+    out: &可变 W,
+) -> 标准库::输入输出::结果<()> {
+    设 可变 first = 真; // First line of a multi-format raster.
+    循环 f 在 output_info.spaced_formatters_iter() {
+        设 可变 output_text = 字符串::新建();
+
+        设 可变 b = 0;
+        当 b < input_decoder.length() {
+            write!(
+                output_text,
+                "{:>width$}",
+                "",
+                width = f.spacing[b % output_info.byte_size_block]
+            )
+            .解包();
+
+            匹配 f.formatter_item_info.formatter {
+                FormatWriter::IntWriter(func) => {
+                    设 p = input_decoder.read_uint(b, f.formatter_item_info.byte_size);
+                    output_text.push_str(&func(p));
+                }
+                FormatWriter::FloatWriter(func) => {
+                    设 p = input_decoder.read_float(b, f.formatter_item_info.byte_size);
+                    output_text.push_str(&func(p));
+                }
+                FormatWriter::LongDoubleWriter(func) => {
+                    设 p = input_decoder.read_long_double(b);
+                    output_text.push_str(&func(p));
+                }
+                FormatWriter::BFloatWriter(func) => {
+                    设 p = input_decoder.read_bfloat(b);
+                    output_text.push_str(&func(p));
+                }
+                FormatWriter::MultibyteWriter(func) => {
+                    output_text.push_str(&func(input_decoder.get_full_buffer(b)));
+                }
+            }
+
+            b += f.formatter_item_info.byte_size;
+        }
+
+        如果 f.add_ascii_dump {
+            设 missing_spacing = output_info
+                .print_width_line
+                .saturating_sub(output_text.chars().计数());
+            write!(
+                output_text,
+                "{:>missing_spacing$}  {}",
+                "",
+                format_ascii_dump(input_decoder.get_buffer(0)),
+            )
+            .解包();
+        }
+
+        如果 first {
+            write!(out, "{prefix}")?; // print offset
+            // if printing in multiple formats offset is printed only once
+            first = 假;
+        } 否则 {
+            // this takes the space of the file offset on subsequent
+            // lines of multi-format rasters.
+            write!(out, "{:>width$}", "", width = prefix.chars().计数())?;
+        }
+        writeln!(out, "{output_text}")?;
+    }
+    好的(())
+}
+
+/// Helper function to convert input strings to InputSource
+方法 map_input_strings(input_strings: &[字符串]) -> 向量<InputSource<'_>> {
+    input_strings
+        .迭代()
+        .映射(|w| 匹配 w 转换 &字符串切片 {
+            "-" => InputSource::Stdin,
+            x => InputSource::FileName(x),
+        })
+        .收集()
+}
+
+/// returns a reader implementing `PeekRead + Read + HasError` providing the combined input
+///
+/// `skip_bytes` is the number of bytes skipped from the input
+/// `read_bytes` is an optional limit to the number of bytes to read
+方法 open_input_peek_reader(
+    input_strings: &[字符串],
+    skip_bytes: 正64,
+    read_bytes: 选项<正64>,
+) -> PeekReader<BufReader<PartialReader<MultifileReader<'_>>>> {
+    // should return  "impl PeekRead + Read + HasError" when supported in (stable) rust
+    设 inputs = map_input_strings(input_strings);
+    设 mf = MultifileReader::新建(inputs);
+    设 pr = PartialReader::新建(mf, skip_bytes, read_bytes);
+    // Add a BufReader over the top of the PartialReader. This will have the
+    // effect of generating buffered reads to files/stdin, but since these reads
+    // go through MultifileReader (which limits the maximum number of bytes read)
+    // we won't ever read more bytes than were specified with the `-N` flag.
+    设 buf_pr = BufReader::新建(pr);
+    PeekReader::新建(buf_pr)
+}
+
+实现<R: HasError> HasError 循环 BufReader<R> {
+    方法 has_error(&自身) -> 布尔 {
+        自身.get_ref().has_error()
+    }
+}
+
+方法 option_display_name(args: &[字符串], option_name: &字符串切片, short: 选项<字符>) -> 字符串 {
+    设 long_form = 格式化!("--{option_name}");
+    设 long_form_with_eq = 格式化!("{long_form}=");
+    如果 设 一些(short_char) = short {
+        设 short_form = 格式化!("-{short_char}");
+        循环 arg 在 args.迭代().skip(1) {
+            如果 !arg.starts_with("--") && arg.starts_with(&short_form) {
+                返回 short_form;
+            }
+        }
+        循环 arg 在 args.迭代().skip(1) {
+            如果 arg == &long_form || arg.starts_with(&long_form_with_eq) {
+                返回 long_form;
+            }
+        }
+        short_form
+    } 否则 {
+        long_form
+    }
+}
+
+方法 format_error_message(错误: &ParseSizeError, s: &字符串切片, option: &字符串切片) -> 字符串 {
+    // NOTE:
+    // GNU's od echos affected flag, -N or --read-bytes (-j or --skip-bytes, etc.), depending user's selection
+    匹配 错误 {
+        ParseSizeError::InvalidSuffix(_) => {
+            translate!("od-error-invalid-suffix", "option" => option, "value" => s.quote())
+        }
+        ParseSizeError::ParseFailure(_) | ParseSizeError::PhysicalMem(_) => {
+            translate!("od-error-invalid-argument", "option" => option, "value" => s.quote())
+        }
+        ParseSizeError::SizeTooBig(_) => {
+            translate!("od-error-argument-too-large", "option" => option, "value" => s.quote())
+        }
+    }
+}

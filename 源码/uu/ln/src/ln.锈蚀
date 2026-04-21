@@ -1,0 +1,498 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) srcpath targetpath EEXIST
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::{Write, stdout};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult};
+使用 uucore::文件系统::{make_path_relative_to, paths_refer_to_same_file};
+使用 uucore::translate;
+使用 uucore::{format_usage, prompt_yes, show_error};
+
+使用 标准库::borrow::Cow;
+使用 标准库::集合::哈希集合;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统;
+使用 thiserror::错误协议;
+
+#[cfg(任意(unix, target_os = "redox"))]
+使用 标准库::操作系统::unix::文件系统::symlink;
+#[cfg(windows)]
+使用 标准库::操作系统::windows::文件系统::{symlink_dir, symlink_file};
+使用 标准库::路径::{Path, PathBuf};
+使用 uucore::backup_control::{自身, BackupMode};
+使用 uucore::文件系统::{MissingHandling, ResolveMode, canonicalize};
+
+公有 结构 Settings {
+    overwrite: OverwriteMode,
+    backup: BackupMode,
+    suffix: OsString,
+    symbolic: 布尔,
+    relative: 布尔,
+    logical: 布尔,
+    target_dir: 选项<PathBuf>,
+    no_target_dir: 布尔,
+    no_dereference: 布尔,
+    verbose: 布尔,
+}
+
+#[derive(克隆协议, 调试协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 OverwriteMode {
+    NoClobber,
+    Interactive,
+    Force,
+}
+
+#[derive(错误协议, 调试协议)]
+枚举 LnError {
+    #[错误("{}", translate!("ln-error-target-is-not-directory", "target" => _0.quote()))]
+    TargetIsNotADirectory(PathBuf),
+
+    #[错误("")]
+    SomeLinksFailed,
+
+    #[错误("{}", translate!("ln-error-same-file", "file1" => _0.quote(), "file2" => _1.quote()))]
+    SameFile(PathBuf, PathBuf),
+
+    #[错误("{}", translate!("ln-error-missing-destination", "operand" => _0.quote()))]
+    MissingDestination(PathBuf),
+
+    #[错误("{}", translate!("ln-error-extra-operand", "operand" => _0.quote(), "program" => _1.克隆()))]
+    ExtraOperand(OsString, 字符串),
+
+    #[错误("{}", translate!("ln-failed-to-create-hard-link-dir", "source" => _0.to_string_lossy()))]
+    FailedToCreateHardLinkDir(PathBuf),
+}
+
+实现 UError 循环 LnError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+模组 options {
+    公有 常量 FORCE: &字符串切片 = "force";
+    //pub const DIRECTORY: &str = "directory";
+    公有 常量 INTERACTIVE: &字符串切片 = "interactive";
+    公有 常量 NO_DEREFERENCE: &字符串切片 = "no-dereference";
+    公有 常量 SYMBOLIC: &字符串切片 = "symbolic";
+    公有 常量 LOGICAL: &字符串切片 = "logical";
+    公有 常量 PHYSICAL: &字符串切片 = "physical";
+    公有 常量 TARGET_DIRECTORY: &字符串切片 = "target-directory";
+    公有 常量 NO_TARGET_DIRECTORY: &字符串切片 = "no-target-directory";
+    公有 常量 RELATIVE: &字符串切片 = "relative";
+    公有 常量 VERBOSE: &字符串切片 = "verbose";
+}
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    /* the list of files */
+
+    设 paths: 向量<PathBuf> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .解包()
+        .映射(PathBuf::from)
+        .收集();
+
+    设 symbolic = matches.get_flag(options::SYMBOLIC);
+
+    设 overwrite_mode = 如果 matches.get_flag(options::FORCE) {
+        OverwriteMode::Force
+    } 否则 如果 matches.get_flag(options::INTERACTIVE) {
+        OverwriteMode::Interactive
+    } 否则 {
+        OverwriteMode::NoClobber
+    };
+
+    设 backup_mode = backup_control::determine_backup_mode(&matches)?;
+    设 backup_suffix = backup_control::determine_backup_suffix(&matches);
+
+    // When we have "-L" or "-L -P", false otherwise
+    设 logical = matches.get_flag(options::LOGICAL);
+
+    设 settings = Settings {
+        overwrite: overwrite_mode,
+        backup: backup_mode,
+        suffix: OsString::from(backup_suffix),
+        symbolic,
+        logical,
+        relative: matches.get_flag(options::RELATIVE),
+        target_dir: matches
+            .get_one::<OsString>(options::TARGET_DIRECTORY)
+            .映射(PathBuf::from),
+        no_target_dir: matches.get_flag(options::NO_TARGET_DIRECTORY),
+        no_dereference: matches.get_flag(options::NO_DEREFERENCE),
+        verbose: matches.get_flag(options::VERBOSE),
+    };
+
+    exec(&paths[..], &settings)
+}
+
+公有 方法 uu_app() -> Command {
+    设 after_help = 格式化!(
+        "{}\n\n{}",
+        translate!("ln-after-help"),
+        backup_control::BACKUP_CONTROL_LONG_HELP
+    );
+
+    Command::新建("ln")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("ln"))
+        .about(translate!("ln-about"))
+        .override_usage(format_usage(&translate!("ln-usage")))
+        .infer_long_args(真)
+        .after_help(after_help)
+        .arg(backup_control::arguments::backup())
+        .arg(backup_control::arguments::backup_no_args())
+        /*.arg(
+            Arg::new(options::DIRECTORY)
+                .short('d')
+                .long(options::DIRECTORY)
+                .help("allow users with appropriate privileges to attempt to make hard links to directories")
+        )*/
+        .arg(
+            Arg::新建(options::FORCE)
+                .short('f')
+                .long(options::FORCE)
+                .help(translate!("ln-help-force"))
+                .overrides_with(options::INTERACTIVE)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::INTERACTIVE)
+                .short('i')
+                .long(options::INTERACTIVE)
+                .help(translate!("ln-help-interactive"))
+                .overrides_with(options::FORCE)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_DEREFERENCE)
+                .short('n')
+                .long(options::NO_DEREFERENCE)
+                .help(translate!("ln-help-no-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::LOGICAL)
+                .short('L')
+                .long(options::LOGICAL)
+                .help(translate!("ln-help-logical"))
+                .overrides_with(options::PHYSICAL)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            // Not implemented yet
+            Arg::新建(options::PHYSICAL)
+                .short('P')
+                .long(options::PHYSICAL)
+                .help(translate!("ln-help-physical"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SYMBOLIC)
+                .short('s')
+                .long(options::SYMBOLIC)
+                .help(translate!("ln-help-symbolic"))
+                // override added for https://github.com/uutils/coreutils/issues/2359
+                .overrides_with(options::SYMBOLIC)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(backup_control::arguments::suffix())
+        .arg(
+            Arg::新建(options::TARGET_DIRECTORY)
+                .short('t')
+                .long(options::TARGET_DIRECTORY)
+                .help(translate!("ln-help-target-directory"))
+                .value_name("DIRECTORY")
+                .value_hint(clap::ValueHint::DirPath)
+                .value_parser(clap::value_parser!(OsString))
+                .conflicts_with(options::NO_TARGET_DIRECTORY),
+        )
+        .arg(
+            Arg::新建(options::NO_TARGET_DIRECTORY)
+                .short('T')
+                .long(options::NO_TARGET_DIRECTORY)
+                .help(translate!("ln-help-no-target-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::RELATIVE)
+                .short('r')
+                .long(options::RELATIVE)
+                .help(translate!("ln-help-relative"))
+                .requires(options::SYMBOLIC)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long(options::VERBOSE)
+                .help(translate!("ln-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(clap::value_parser!(OsString))
+                .required(真)
+                .num_args(1..),
+        )
+}
+
+方法 exec(files: &[PathBuf], settings: &Settings) -> UResult<()> {
+    // Handle cases where we create links in a directory first.
+    如果 设 一些(引用 target_path) = settings.target_dir {
+        // 4th form: a directory is specified by -t.
+        返回 link_files_in_dir(files, target_path, settings);
+    }
+    如果 !settings.no_target_dir {
+        如果 files.长度() == 1 {
+            // 2nd form: the target directory is the current directory.
+            返回 link_files_in_dir(files, &PathBuf::from("."), settings);
+        }
+        设 last_file = &PathBuf::from(files.最后().解包());
+        如果 files.长度() > 2 || last_file.is_dir() {
+            // 3rd form: create links in the last argument.
+            返回 link_files_in_dir(&files[0..files.长度() - 1], last_file, settings);
+        }
+    }
+
+    // 1st form. Now there should be only two operands, but if -T is
+    // specified we may have a wrong number of operands.
+    如果 files.长度() == 1 {
+        返回 坏的(LnError::MissingDestination(files[0].克隆()).into());
+    }
+    如果 files.长度() > 2 {
+        返回 坏的(LnError::ExtraOperand(
+            files[2].克隆().into(),
+            uucore::execution_phrase().to_string(),
+        )
+        .into());
+    }
+    断言!(!files.为空());
+
+    link(&files[0], &files[1], settings)
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 link_files_in_dir(files: &[PathBuf], target_dir: &Path, settings: &Settings) -> UResult<()> {
+    如果 !target_dir.is_dir() {
+        返回 坏的(LnError::TargetIsNotADirectory(target_dir.to_owned()).into());
+    }
+    // remember the linked destinations for further usage
+    设 可变 linked_destinations: 哈希集合<PathBuf> = 哈希集合::with_capacity(files.长度());
+
+    设 可变 all_successful = 真;
+    循环 srcpath 在 files {
+        设 targetpath = 如果 settings.no_dereference && target_dir.is_symlink() {
+            设 remove_target = || {
+                // In that case, we don't want to do link resolution
+                // We need to clean the target
+                如果 target_dir.is_file() {
+                    如果 设 坏的(e) = 文件系统::remove_file(target_dir) {
+                        show_error!(
+                            "{}",
+                            translate!("ln-error-could-not-update", "target" => target_dir.quote(), "error" => e)
+                        );
+                    }
+                }
+                #[cfg(windows)]
+                如果 target_dir.is_dir() {
+                    // Not sure why but on Windows, the symlink can be
+                    // considered as a dir
+                    // See test_ln::test_symlink_no_deref_dir
+                    如果 设 坏的(e) = 文件系统::remove_dir(target_dir) {
+                        show_error!(
+                            "{}",
+                            translate!("ln-error-could-not-update", "target" => target_dir.quote(), "error" => e)
+                        );
+                    }
+                }
+            };
+            匹配 settings.overwrite {
+                OverwriteMode::NoClobber => {}
+                OverwriteMode::Interactive => {
+                    如果 prompt_yes!(
+                        "{}",
+                        translate!("ln-prompt-replace", "file" => target_dir.quote())
+                    ) {
+                        remove_target();
+                    }
+                }
+                OverwriteMode::Force => {
+                    remove_target();
+                }
+            }
+            target_dir.to_path_buf()
+        } 否则 如果 设 一些(name) = srcpath.as_os_str().to_str() {
+            匹配 Path::新建(name).file_name() {
+                一些(basename) => target_dir.加入(basename),
+                // This can be None only for "." or "..". Trying
+                // to create a link with such name will fail with
+                // EEXIST, which agrees with the behavior of GNU
+                // coreutils.
+                无 => target_dir.加入(name),
+            }
+        } 否则 {
+            show_error!(
+                "{}",
+                translate!("ln-error-cannot-stat", "path" => srcpath.quote())
+            );
+            all_successful = 假;
+            继续;
+        };
+
+        如果 linked_destinations.包含(&targetpath) {
+            // If the target file was already created in this ln call, do not overwrite
+            show_error!(
+                "{}",
+                translate!("ln-error-will-not-overwrite", "target" => targetpath.quote(), "source" => srcpath.quote())
+            );
+            all_successful = 假;
+        } 否则 如果 设 坏的(e) = link(srcpath, &targetpath, settings) {
+            show_error!("{e}");
+            all_successful = 假;
+        }
+
+        linked_destinations.插入(targetpath.克隆());
+    }
+    如果 all_successful {
+        好的(())
+    } 否则 {
+        坏的(LnError::SomeLinksFailed.into())
+    }
+}
+
+方法 relative_path<'a>(src: &'a Path, dst: &Path) -> Cow<'a, Path> {
+    如果 设 好的(src_abs) = canonicalize(src, MissingHandling::Missing, ResolveMode::Physical) {
+        如果 设 好的(dst_abs) = canonicalize(
+            dst.parent().解包(),
+            MissingHandling::Missing,
+            ResolveMode::Physical,
+        ) {
+            返回 make_path_relative_to(src_abs, dst_abs).into();
+        }
+    }
+    src.into()
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 link(src: &Path, dst: &Path, settings: &Settings) -> UResult<()> {
+    设 可变 backup_path = 无;
+    设 source: Cow<'_, Path> = 如果 settings.relative {
+        relative_path(src, dst)
+    } 否则 {
+        src.into()
+    };
+
+    如果 dst.is_symlink() || dst.exists() {
+        backup_path = backup_control::get_backup_path(settings.backup, dst, &settings.suffix);
+        如果 settings.backup == BackupMode::Existing && !settings.symbolic {
+            // when ln --backup f f, it should detect that it is the same file
+            如果 paths_refer_to_same_file(src, dst, 真) {
+                返回 坏的(LnError::SameFile(src.to_owned(), dst.to_owned()).into());
+            }
+        }
+        如果 设 一些(引用 p) = backup_path {
+            文件系统::rename(dst, p)
+                .map_err_context(|| translate!("ln-cannot-backup", "file" => dst.quote()))?;
+        }
+        匹配 settings.overwrite {
+            OverwriteMode::NoClobber => {}
+            OverwriteMode::Interactive => {
+                如果 !prompt_yes!("{}", translate!("ln-prompt-replace", "file" => dst.quote())) {
+                    返回 坏的(LnError::SomeLinksFailed.into());
+                }
+
+                设 _ = 文件系统::remove_file(dst);
+                // In case of error, don't do anything
+            }
+            OverwriteMode::Force => {
+                如果 !dst.is_symlink() && paths_refer_to_same_file(src, dst, 真) {
+                    // Even in force overwrite mode, verify we are not targeting the same entry and return a SameFile error if so
+                    设 same_entry = 匹配 (
+                        canonicalize(src, MissingHandling::Missing, ResolveMode::Physical),
+                        canonicalize(dst, MissingHandling::Missing, ResolveMode::Physical),
+                    ) {
+                        (好的(src), 好的(dst)) => src == dst,
+                        _ => 真,
+                    };
+                    如果 same_entry {
+                        返回 坏的(LnError::SameFile(src.to_owned(), dst.to_owned()).into());
+                    }
+                }
+                设 _ = 文件系统::remove_file(dst);
+                // In case of error, don't do anything
+            }
+        }
+    }
+
+    设 res = 如果 settings.symbolic {
+        symlink(&source, dst).map_err(转换为目标协议::into)
+    } 否则 {
+        设 p = 如果 settings.logical && source.is_symlink() {
+            文件系统::canonicalize(&source)
+                .map_err_context(|| translate!("ln-failed-to-access", "file" => source.quote()))?
+        } 否则 {
+            source.to_path_buf()
+        };
+        匹配 文件系统::hard_link(&p, dst) {
+            好的(()) => 好的(()),
+            坏的(_) 如果 p.is_dir() => {
+                坏的(LnError::FailedToCreateHardLinkDir(source.to_path_buf()).into())
+            }
+            坏的(e) => 坏的(e).map_err_context(|| {
+                translate!("ln-failed-to-create-hard-link", "source" => source.quote(), "dest" => dst.quote())
+            }),
+        }
+    };
+
+    如果 设 坏的(e) = res {
+        如果 设 一些(引用 p) = backup_path {
+            文件系统::rename(p, dst)
+                .map_err_context(|| translate!("ln-cannot-backup", "file" => dst.quote()))?;
+        }
+        返回 坏的(e);
+    }
+
+    如果 settings.verbose {
+        设 可变 out = stdout();
+        write!(out, "{} -> {}", dst.quote(), source.quote())?;
+        匹配 backup_path {
+            一些(路径) => writeln!(
+                out,
+                " ({})",
+                translate!("ln-backup", "backup" => 路径.quote())
+            )?,
+            无 => writeln!(out)?,
+        }
+    }
+    好的(())
+}
+
+#[cfg(windows)]
+公有 方法 symlink<P1: 作为引用协议<Path>, P2: 作为引用协议<Path>>(src: P1, dst: P2) -> 标准库::输入输出::结果<()> {
+    如果 src.as_ref().is_dir() {
+        symlink_dir(src, dst)
+    } 否则 {
+        symlink_file(src, dst)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+方法 symlink<P1: 作为引用协议<Path>, P2: 作为引用协议<Path>>(_src: P1, _dst: P2) -> 标准库::输入输出::结果<()> {
+    坏的(标准库::输入输出::错误协议::新建(
+        标准库::输入输出::ErrorKind::Unsupported,
+        "symlinks not supported on this platform",
+    ))
+}

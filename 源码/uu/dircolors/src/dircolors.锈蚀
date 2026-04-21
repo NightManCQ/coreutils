@@ -1,0 +1,551 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) clrtoeol dircolors eightbit endcode fnmatch leftcode multihardlink rightcode setenv sgid suid colorterm disp
+
+使用 标准库::borrow::Borrow;
+使用 标准库::环境;
+使用 标准库::ffi::OsString;
+使用 标准库::格式化::Write 转换 _;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, Write, stdout};
+使用 标准库::路径::Path;
+
+使用 clap::{Arg, ArgAction, Command};
+使用 uucore::colors::{FILE_ATTRIBUTE_CODES, FILE_COLORS, FILE_TYPES, TERMS};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::translate;
+
+使用 uucore::{format_usage, parser::parse_glob};
+
+模组 options {
+    公有 常量 BOURNE_SHELL: &字符串切片 = "bourne-shell";
+    公有 常量 C_SHELL: &字符串切片 = "c-shell";
+    公有 常量 PRINT_DATABASE: &字符串切片 = "print-database";
+    公有 常量 PRINT_LS_COLORS: &字符串切片 = "print-ls-colors";
+    公有 常量 FILE: &字符串切片 = "FILE";
+}
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+公有 枚举 OutputFmt {
+    Shell,
+    CShell,
+    显示协议,
+    Unknown,
+}
+
+公有 方法 guess_syntax() -> OutputFmt {
+    匹配 环境::var("SHELL") {
+        好的(引用 s) 如果 !s.为空() => {
+            设 shell_path: &Path = s.as_ref();
+            如果 设 一些(name) = shell_path.file_name() {
+                如果 name == "csh" || name == "tcsh" {
+                    OutputFmt::CShell
+                } 否则 {
+                    OutputFmt::Shell
+                }
+            } 否则 {
+                OutputFmt::Shell
+            }
+        }
+        _ => OutputFmt::Unknown,
+    }
+}
+
+方法 get_colors_format_strings(格式化: &OutputFmt) -> (字符串, 字符串) {
+    设 prefix = 匹配 格式化 {
+        OutputFmt::Shell => "LS_COLORS='".to_string(),
+        OutputFmt::CShell => "setenv LS_COLORS '".to_string(),
+        OutputFmt::显示协议 => 字符串::新建(),
+        OutputFmt::Unknown => 无法到达!(),
+    };
+
+    设 suffix = 匹配 格式化 {
+        OutputFmt::Shell => "';\nexport LS_COLORS".to_string(),
+        OutputFmt::CShell => "'".to_string(),
+        OutputFmt::显示协议 => 字符串::新建(),
+        OutputFmt::Unknown => 无法到达!(),
+    };
+
+    (prefix, suffix)
+}
+
+公有 方法 generate_type_output(格式化: &OutputFmt) -> 字符串 {
+    匹配 格式化 {
+        OutputFmt::显示协议 => FILE_TYPES
+            .迭代()
+            .映射(|&(_, key, val)| 格式化!("\x1b[{val}m{key}\t{val}\x1b[0m"))
+            .收集::<向量<字符串>>()
+            .加入("\n"),
+        _ => {
+            // Existing logic for other formats
+            FILE_TYPES
+                .迭代()
+                .映射(|&(_, v1, v2)| 格式化!("{v1}={v2}"))
+                .收集::<向量<字符串>>()
+                .加入(":")
+        }
+    }
+}
+
+方法 generate_ls_colors(格式化: &OutputFmt, sep: &字符串切片) -> 字符串 {
+    如果 设 OutputFmt::显示协议 = 格式化 {
+        设 可变 display_parts = 向量![];
+        设 type_output = generate_type_output(格式化);
+        display_parts.压入(type_output);
+        循环 &(extension, code) 在 FILE_COLORS {
+            设 prefix = 如果 extension.starts_with('*') { "" } 否则 { "*" };
+            设 formatted_extension = 格式化!("\x1b[{code}m{prefix}{extension}\t{code}\x1b[0m");
+            display_parts.压入(formatted_extension);
+        }
+        display_parts.加入("\n")
+    } 否则 {
+        // existing logic for other formats
+        设 可变 parts = 向量![];
+        循环 &(extension, code) 在 FILE_COLORS {
+            设 prefix = 如果 extension.starts_with('*') { "" } 否则 { "*" };
+            设 formatted_extension = 格式化!("{prefix}{extension}");
+            parts.压入(格式化!("{formatted_extension}={code}"));
+        }
+        设 (prefix, suffix) = get_colors_format_strings(格式化);
+        设 ls_colors = parts.加入(sep);
+        格式化!("{prefix}{}:{ls_colors}:{suffix}", generate_type_output(格式化))
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 files = matches
+        .get_many::<OsString>(options::FILE)
+        .map_or(向量![], 迭代器协议::收集);
+
+    // clap provides .conflicts_with / .conflicts_with_all, but we want to
+    // manually handle conflicts so we can match the output of GNU coreutils
+    如果 (matches.get_flag(options::C_SHELL) || matches.get_flag(options::BOURNE_SHELL))
+        && (matches.get_flag(options::PRINT_DATABASE) || matches.get_flag(options::PRINT_LS_COLORS))
+    {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("dircolors-error-shell-and-output-exclusive"),
+        ));
+    }
+
+    如果 matches.get_flag(options::PRINT_DATABASE) && matches.get_flag(options::PRINT_LS_COLORS) {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("dircolors-error-print-database-and-ls-colors-exclusive"),
+        ));
+    }
+
+    如果 matches.get_flag(options::PRINT_DATABASE) {
+        如果 !files.为空() {
+            返回 坏的(UUsageError::新建(
+                1,
+                translate!("dircolors-error-extra-operand-print-database", "operand" => files[0].quote()),
+            ));
+        }
+
+        writeln!(stdout(), "{}", generate_dircolors_config())?;
+        返回 好的(());
+    }
+
+    设 可变 out_format = 如果 matches.get_flag(options::C_SHELL) {
+        OutputFmt::CShell
+    } 否则 如果 matches.get_flag(options::BOURNE_SHELL) {
+        OutputFmt::Shell
+    } 否则 如果 matches.get_flag(options::PRINT_LS_COLORS) {
+        OutputFmt::显示协议
+    } 否则 {
+        OutputFmt::Unknown
+    };
+
+    如果 out_format == OutputFmt::Unknown {
+        匹配 guess_syntax() {
+            OutputFmt::Unknown => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("dircolors-error-no-shell-environment"),
+                ));
+            }
+            格式化 => out_format = 格式化,
+        }
+    }
+
+    设 result;
+    如果 files.为空() {
+        writeln!(stdout(), "{}", generate_ls_colors(&out_format, ":"))?;
+        返回 好的(());
+        /*
+        // Check if data is being piped into the program
+        if std::io::stdin().is_terminal() {
+            // No data piped, use default behavior
+            writeln!(stdout(), "{}", generate_ls_colors(&out_format, ":"))?;
+            return Ok(());
+        } else {
+            // Data is piped, process the input from stdin
+            let fin = BufReader::new(std::io::stdin());
+            result = parse(fin.lines().map_while(Result::ok), &out_format, "-");
+        }
+         */
+    } 否则 如果 files.长度() > 1 {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("dircolors-error-extra-operand", "operand" => files[1].quote()),
+        ));
+    } 否则 如果 files[0] == "-" {
+        设 fin = BufReader::新建(标准库::输入输出::stdin());
+        // For example, for echo "owt 40;33"|dircolors -b -
+        result = parse(
+            fin.lines().map_while(结果::ok),
+            &out_format,
+            &files[0].to_string_lossy(),
+        );
+    } 否则 {
+        设 路径 = Path::新建(&files[0]);
+        如果 路径.is_dir() {
+            返回 坏的(USimpleError::新建(
+                2,
+                translate!("dircolors-error-expected-file-got-directory", "path" => 路径.quote()),
+            ));
+        }
+        匹配 File::open(路径) {
+            好的(f) => {
+                设 fin = BufReader::新建(f);
+                result = parse(
+                    fin.lines().map_while(结果::ok),
+                    &out_format,
+                    &路径.to_string_lossy(),
+                );
+            }
+            坏的(e) => {
+                返回 坏的(USimpleError::新建(1, 格式化!("{}: {e}", 路径.maybe_quote())));
+            }
+        }
+    }
+
+    匹配 result {
+        好的(s) => {
+            writeln!(stdout(), "{s}")?;
+            好的(())
+        }
+        坏的(s) => 坏的(USimpleError::新建(1, s)),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("dircolors")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("dircolors"))
+        .about(translate!("dircolors-about"))
+        .after_help(translate!("dircolors-after-help"))
+        .override_usage(format_usage(&translate!("dircolors-usage")))
+        .args_override_self(真)
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::BOURNE_SHELL)
+                .long("sh")
+                .short('b')
+                .visible_alias("bourne-shell")
+                .overrides_with(options::C_SHELL)
+                .help(translate!("dircolors-help-bourne-shell"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::C_SHELL)
+                .long("csh")
+                .short('c')
+                .visible_alias("c-shell")
+                .overrides_with(options::BOURNE_SHELL)
+                .help(translate!("dircolors-help-c-shell"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PRINT_DATABASE)
+                .long("print-database")
+                .short('p')
+                .help(translate!("dircolors-help-print-database"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PRINT_LS_COLORS)
+                .long("print-ls-colors")
+                .help(translate!("dircolors-help-print-ls-colors"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString))
+                .action(ArgAction::Append),
+        )
+}
+
+公有 协议 StrUtils {
+    /// Remove comments and trim whitespace
+    方法 purify(&自身) -> &自身类型;
+    /// Like `split_whitespace()` but only produce 2 parts
+    方法 split_two(&自身) -> (&字符串切片, &字符串切片);
+    方法 fnmatch(&自身, pattern: &字符串切片) -> 布尔;
+}
+
+实现 StrUtils 循环 字符串切片 {
+    方法 purify(&自身) -> &自身类型 {
+        设 可变 line = 自身;
+        循环 (n, _) 在 自身
+            .as_bytes()
+            .迭代()
+            .enumerate()
+            .过滤(|(_, c)| **c == b'#')
+        {
+            // Ignore the content after '#'
+            // only if it is preceded by at least one whitespace
+            匹配 自身[..n].chars().最后() {
+                一些(c) 如果 c.is_whitespace() => {
+                    line = &自身[..n - c.len_utf8()];
+                    中断;
+                }
+                无 => {
+                    // n == 0
+                    line = &自身[..0];
+                    中断;
+                }
+                _ => (),
+            }
+        }
+        line.trim()
+    }
+
+    方法 split_two(&自身) -> (&字符串切片, &字符串切片) {
+        如果 设 一些(b) = 自身.寻找(字符::is_whitespace) {
+            设 key = &自身[..b];
+            如果 设 一些(e) = 自身[b..].寻找(|c: 字符| !c.is_whitespace()) {
+                (key, &自身[b + e..])
+            } 否则 {
+                (key, "")
+            }
+        } 否则 {
+            ("", "")
+        }
+    }
+
+    方法 fnmatch(&自身, pat: &字符串切片) -> 布尔 {
+        parse_glob::from_str(pat).解包().matches(自身)
+    }
+}
+
+#[derive(偏等比较协议)]
+枚举 ParseState {
+    Global,
+    Matched,
+    Continue,
+    Pass,
+}
+
+方法 parse<T>(user_input: T, 格式化: &OutputFmt, fp: &字符串切片) -> 结果<字符串, 字符串>
+何处
+    T: 转换为迭代器协议,
+    T::Item: Borrow<字符串切片>,
+{
+    设 可变 result = 字符串::with_capacity(1790);
+    设 (prefix, suffix) = get_colors_format_strings(格式化);
+
+    result.push_str(&prefix);
+
+    // Get environment variables once at the start
+    设 term = 环境::var("TERM").unwrap_or_else(|_| "none".to_owned());
+    设 colorterm = 环境::var("COLORTERM").unwrap_or_default();
+
+    设 可变 state = ParseState::Global;
+    设 可变 saw_colorterm_match = 假;
+
+    循环 (数字, line) 在 (1..).zip(user_input) {
+        设 line = line.borrow().purify();
+        如果 line.为空() {
+            继续;
+        }
+
+        设 line = escape(line);
+
+        设 (key, val) = line.split_two();
+        如果 val.为空() {
+            返回 坏的(
+                translate!("dircolors-error-invalid-line-missing-token", "file" => fp.maybe_quote(), "line" => 数字),
+            );
+        }
+
+        设 lower = key.to_lowercase();
+        匹配 lower.as_str() {
+            "term" => {
+                如果 term.fnmatch(val) {
+                    state = ParseState::Matched;
+                } 否则 如果 state == ParseState::Global {
+                    state = ParseState::Pass;
+                }
+            }
+            "colorterm" => {
+                // For COLORTERM ?*, only match if COLORTERM is non-empty
+                设 matches = 如果 val == "?*" {
+                    !colorterm.为空()
+                } 否则 {
+                    colorterm.fnmatch(val)
+                };
+                如果 matches {
+                    state = ParseState::Matched;
+                    saw_colorterm_match = 真;
+                } 否则 如果 !saw_colorterm_match && state == ParseState::Global {
+                    state = ParseState::Pass;
+                }
+            }
+            _ => {
+                如果 state == ParseState::Matched {
+                    // prevent subsequent mismatched TERM from
+                    // cancelling the input
+                    state = ParseState::Continue;
+                }
+                如果 state != ParseState::Pass {
+                    append_entry(&可变 result, 格式化, key, &lower, val)?;
+                }
+            }
+        }
+    }
+
+    如果 格式化 == &OutputFmt::显示协议 {
+        // remove latest "\n"
+        result.弹出();
+    }
+    result.push_str(&suffix);
+
+    好的(result)
+}
+
+方法 append_entry(
+    result: &可变 字符串,
+    格式化: &OutputFmt,
+    key: &字符串切片,
+    lower: &字符串切片,
+    val: &字符串切片,
+) -> 结果<(), 字符串> {
+    如果 key.starts_with(['.', '*']) {
+        设 entry = 如果 key.starts_with('.') {
+            格式化!("*{key}")
+        } 否则 {
+            key.to_string()
+        };
+        设 disp = 如果 *格式化 == OutputFmt::显示协议 {
+            格式化!("\x1b[{val}m{entry}\t{val}\x1b[0m\n")
+        } 否则 {
+            格式化!("{entry}={val}:")
+        };
+        result.push_str(&disp);
+        返回 好的(());
+    }
+
+    匹配 lower {
+        "options" | "color" | "eightbit" => 好的(()), // Slackware only, ignore
+        _ => {
+            如果 设 一些((_, s)) = FILE_ATTRIBUTE_CODES.迭代().寻找(|&&(key, _)| key == lower) {
+                设 disp = 如果 *格式化 == OutputFmt::显示协议 {
+                    格式化!("\x1b[{val}m{s}\t{val}\x1b[0m\n")
+                } 否则 {
+                    格式化!("{s}={val}:")
+                };
+                result.push_str(&disp);
+                好的(())
+            } 否则 {
+                坏的(translate!("dircolors-error-unrecognized-keyword", "keyword" => key))
+            }
+        }
+    }
+}
+
+/// Escape single quotes because they are not allowed between single quotes in shell code, and code
+/// enclosed by single quotes is what is returned by `parse()`.
+///
+/// We also escape ":" to make the "quote" test pass in the GNU test suite:
+/// <https://github.com/coreutils/coreutils/blob/master/tests/misc/dircolors.pl>
+方法 escape(s: &字符串切片) -> 字符串 {
+    设 可变 result = 字符串::新建();
+    设 可变 previous = ' ';
+
+    循环 c 在 s.chars() {
+        匹配 c {
+            '\'' => result.push_str("'\\''"),
+            ':' 如果 previous != '\\' => result.push_str("\\:"),
+            _ => result.压入(c),
+        }
+        previous = c;
+    }
+
+    result
+}
+
+公有 方法 generate_dircolors_config() -> 字符串 {
+    设 可变 config = 字符串::新建();
+
+    config.push_str(
+        "\
+         # Configuration file for dircolors, a utility to help you set the\n\
+         # LS_COLORS environment variable used by GNU ls with the --color option.\n\
+         # The keywords COLOR, OPTIONS, and EIGHTBIT (honored by the\n\
+         # slackware version of dircolors) are recognized but ignored.\n\
+         # Global config options can be specified before TERM or COLORTERM entries\n\
+         # Below are TERM or COLORTERM entries, which can be glob patterns, which\n\
+         # restrict following config to systems with matching environment variables.\n\
+        ",
+    );
+    config.push_str("COLORTERM ?*\n");
+    循环 term 在 TERMS {
+        设 _ = writeln!(config, "TERM {term}");
+    }
+
+    config.push_str(
+        "\
+        # Below are the color init strings for the basic file types.\n\
+        # One can use codes for 256 or more colors supported by modern terminals.\n\
+        # The default color codes use the capabilities of an 8 color terminal\n\
+        # with some additional attributes as per the following codes:\n\
+        # Attribute codes:\n\
+        # 00=none 01=bold 04=underscore 05=blink 07=reverse 08=concealed\n\
+        # Text color codes:\n\
+        # 30=black 31=red 32=green 33=yellow 34=blue 35=magenta 36=cyan 37=white\n\
+        # Background color codes:\n\
+        # 40=black 41=red 42=green 43=yellow 44=blue 45=magenta 46=cyan 47=white\n\
+        #NORMAL 00 # no color code at all\n\
+        #FILE 00 # regular file: use no color at all\n\
+        ",
+    );
+
+    循环 (name, _, code) 在 FILE_TYPES {
+        设 _ = writeln!(config, "{name} {code}");
+    }
+
+    config.push_str("# List any file extensions like '.gz' or '.tar' that you would like ls\n");
+    config.push_str("# to color below. Put the extension, a space, and the color init string.\n");
+
+    循环 (ext, color) 在 FILE_COLORS {
+        设 _ = writeln!(config, "{ext} {color}");
+    }
+    config.push_str("# Subsequent TERM or COLORTERM entries, can be used to add / override\n");
+    config.push_str("# config specific to those matching environment variables.");
+
+    config
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::escape;
+
+    #[test]
+    方法 test_escape() {
+        相等断言!("", escape(""));
+        相等断言!("'\\''", escape("'"));
+        相等断言!("\\:", escape(":"));
+        相等断言!("\\:", escape("\\:"));
+    }
+}

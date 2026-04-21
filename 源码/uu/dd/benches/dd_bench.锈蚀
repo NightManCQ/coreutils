@@ -1,0 +1,259 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::TempDir;
+使用 uu_dd::uumain;
+使用 uucore::benchmark::{binary_data, fs_utils, run_util_function};
+
+/// Benchmark basic dd copy with default settings
+#[divan::bench]
+方法 dd_copy_default(bencher: Bencher) {
+    设 size_mb = 32;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd copy with 4KB block size (common page size)
+#[divan::bench]
+方法 dd_copy_4k_blocks(bencher: Bencher) {
+    设 size_mb = 24;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=4K",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd copy with 64KB block size
+#[divan::bench]
+方法 dd_copy_64k_blocks(bencher: Bencher) {
+    设 size_mb = 64;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=64K",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd copy with 1MB block size
+#[divan::bench]
+方法 dd_copy_1m_blocks(bencher: Bencher) {
+    设 size_mb = 128;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=1M",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd copy with separate input and output block sizes
+#[divan::bench]
+方法 dd_copy_separate_blocks(bencher: Bencher) {
+    设 size_mb = 48;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "ibs=8K",
+                "obs=16K",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd with count limit (partial copy)
+#[divan::bench]
+方法 dd_copy_partial(bencher: Bencher) {
+    设 size_mb = 32;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=4K",
+                "count=1024",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd with skip (seeking in input)
+#[divan::bench]
+方法 dd_copy_with_skip(bencher: Bencher) {
+    设 size_mb = 48;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=4K",
+                "skip=256",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd with seek (seeking in output)
+#[divan::bench]
+方法 dd_copy_with_seek(bencher: Bencher) {
+    设 size_mb = 48;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=4K",
+                "seek=256",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+/// Benchmark dd with different block sizes for comparison
+#[divan::bench]
+方法 dd_copy_8k_blocks(bencher: Bencher) {
+    设 size_mb = 32;
+    设 temp_dir = TempDir::新建().解包();
+    设 input = temp_dir.路径().加入("input.bin");
+    设 output = temp_dir.路径().加入("output.bin");
+
+    binary_data::create_file(&input, size_mb, b'x');
+
+    设 input_str = input.to_str().解包();
+    设 output_str = output.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&output);
+        black_box(run_util_function(
+            uumain,
+            &[
+                &格式化!("if={input_str}"),
+                &格式化!("of={output_str}"),
+                "bs=8K",
+                "status=none",
+            ],
+        ));
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

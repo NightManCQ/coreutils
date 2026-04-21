@@ -1,0 +1,52 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::环境;
+使用 标准库::文件系统;
+使用 标准库::路径::PathBuf;
+使用 tempfile::TempDir;
+使用 uu_df::uumain;
+使用 uucore::benchmark::run_util_function;
+
+方法 create_deep_directory(base_dir: &标准库::路径::Path, depth: 正整数大小) -> PathBuf {
+    设 可变 current = base_dir.to_path_buf();
+    环境::set_current_dir(&current).解包();
+
+    循环 _ 在 0..depth {
+        current = current.加入("d");
+        文件系统::create_dir("d").解包();
+        环境::set_current_dir("d").解包();
+    }
+    current
+}
+
+#[divan::bench]
+方法 df_deep_directory(bencher: Bencher) {
+    常量 DEPTH: 正整数大小 = 20000;
+
+    设 original_dir = 环境::current_dir().解包();
+    设 temp_dir = TempDir::新建().解包();
+    设 _deep_path = create_deep_directory(temp_dir.路径(), DEPTH);
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[] 转换 &[&字符串切片]));
+    });
+
+    环境::set_current_dir(original_dir).解包();
+}
+
+#[divan::bench]
+方法 df_with_path(bencher: Bencher) {
+    设 temp_dir = TempDir::新建().解包();
+    设 temp_path_str = temp_dir.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[temp_path_str]));
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

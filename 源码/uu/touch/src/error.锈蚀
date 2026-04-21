@@ -1,0 +1,49 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (misc) uioerror
+使用 filetime::FileTime;
+使用 标准库::路径::PathBuf;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UError, UIoError};
+使用 uucore::translate;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 TouchError {
+    #[错误("{}", translate!("touch-error-unable-to-parse-date", "date" => .0.克隆()))]
+    InvalidDateFormat(字符串),
+
+    /// The source time couldn't be converted to a [`jiff::Zoned`]
+    #[错误("{}", translate!("touch-error-invalid-filetime", "time" => .0))]
+    InvalidFiletime(FileTime),
+
+    /// The reference file's attributes could not be found or read
+    #[错误("{}", translate!("touch-error-reference-file-inaccessible", "path" => .0.quote(), "error" => to_uioerror(.1)))]
+    ReferenceFileInaccessible(PathBuf, 标准库::输入输出::错误协议),
+
+    /// An error getting a path to stdout on Windows
+    #[错误("{}", translate!("touch-error-windows-stdout-path-failed", "code" => .0.克隆()))]
+    WindowsStdoutPathError(字符串),
+
+    /// An error encountered on a specific file
+    #[错误("{error}")]
+    TouchFileError {
+        路径: PathBuf,
+        index: 正整数大小,
+        错误: 盒子<动态 UError>,
+    },
+}
+
+方法 to_uioerror(err: &标准库::输入输出::错误协议) -> UIoError {
+    设 copy = 如果 设 一些(code) = err.raw_os_error() {
+        标准库::输入输出::错误协议::from_raw_os_error(code)
+    } 否则 {
+        标准库::输入输出::错误协议::from(err.kind())
+    };
+    UIoError::from(copy)
+}
+
+实现 UError 循环 TouchError {}

@@ -1,0 +1,94 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::同步::OnceLock;
+
+使用 icu_locale::{Locale, locale};
+
+#[cfg(feature = "i18n-charmap")]
+公有 模组 charmap;
+#[cfg(feature = "i18n-collator")]
+公有 模组 collator;
+#[cfg(feature = "i18n-datetime")]
+公有 模组 datetime;
+#[cfg(feature = "i18n-decimal")]
+公有 模组 decimal;
+
+/// The encoding specified by the locale, if specified
+/// Currently only supports ASCII and UTF-8 for the sake of simplicity.
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议, 复制协议)]
+公有 枚举 UEncoding {
+    Ascii,
+    Utf8,
+}
+
+// Use "und" (undefined) as the marker for C/POSIX locale
+// This ensures real locales like "en-US" won't match
+常量 DEFAULT_LOCALE: Locale = locale!("und");
+
+/// Look at 3 environment variables in the following order
+///
+/// 1. LC_ALL
+/// 2. `locale_name`
+/// 3. LANG
+///
+/// Or fallback on Posix locale, with ASCII encoding.
+公有 方法 get_locale_from_env(locale_name: &字符串切片) -> (Locale, UEncoding) {
+    设 locale_var = ["LC_ALL", locale_name, "LANG"]
+        .迭代()
+        .find_map(|&key| 标准库::环境::var(key).ok());
+
+    如果 设 一些(locale_var_str) = locale_var {
+        设 可变 split = locale_var_str.split(&['.', '@']);
+
+        如果 设 一些(simple) = split.next() {
+            // Handle explicit C and POSIX locales - these should always use byte comparison
+            如果 simple == "C" || simple == "POSIX" {
+                返回 (DEFAULT_LOCALE, UEncoding::Ascii);
+            }
+
+            // Naively convert the locale name to BCP47 tag format.
+            //
+            // See https://en.wikipedia.org/wiki/IETF_language_tag
+            设 bcp47 = simple.replace('_', "-");
+            设 locale = Locale::try_from_str(&bcp47).unwrap_or(DEFAULT_LOCALE);
+
+            // If locale parsing failed, parse the encoding part of the
+            // locale. Treat the special case of the given locale being "C"
+            // which becomes the default locale.
+            设 encoding = 如果 (locale != DEFAULT_LOCALE || bcp47 == "C")
+                && split.next().is_some_and(|enc| {
+                    设 lower = enc.to_lowercase();
+                    lower == "utf-8" || lower == "utf8"
+                }) {
+                UEncoding::Utf8
+            } 否则 {
+                UEncoding::Ascii
+            };
+            返回 (locale, encoding);
+        }
+    }
+    // Default POSIX locale representing LC_ALL=C
+    (DEFAULT_LOCALE, UEncoding::Ascii)
+}
+
+/// Get the collating locale from the environment
+公有 方法 get_collating_locale() -> &'静态 (Locale, UEncoding) {
+    静态 COLLATING_LOCALE: OnceLock<(Locale, UEncoding)> = OnceLock::新建();
+
+    COLLATING_LOCALE.get_or_init(|| get_locale_from_env("LC_COLLATE"))
+}
+
+/// Get the numeric locale from the environment
+公有 方法 get_numeric_locale() -> &'静态 (Locale, UEncoding) {
+    静态 NUMERIC_LOCALE: OnceLock<(Locale, UEncoding)> = OnceLock::新建();
+
+    NUMERIC_LOCALE.get_or_init(|| get_locale_from_env("LC_NUMERIC"))
+}
+
+/// Return the encoding deduced from the locale environment variable.
+公有 方法 get_locale_encoding() -> UEncoding {
+    get_collating_locale().1
+}

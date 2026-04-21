@@ -1,0 +1,187 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore hashset Addrs addrs
+
+使用 标准库::输入输出::{Write, stdout};
+#[cfg(not(任意(target_os = "freebsd", target_os = "openbsd")))]
+使用 标准库::网络::ToSocketAddrs;
+使用 标准库::字符串切片;
+使用 标准库::{集合::hash_set::哈希集合, ffi::OsString};
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+
+#[cfg(任意(target_os = "freebsd", target_os = "openbsd"))]
+使用 dns_lookup::lookup_host;
+使用 uucore::translate;
+
+使用 uucore::{
+    错误::{FromIo, UResult},
+    format_usage,
+};
+
+静态 OPT_DOMAIN: &字符串切片 = "domain";
+静态 OPT_IP_ADDRESS: &字符串切片 = "ip-address";
+静态 OPT_FQDN: &字符串切片 = "fqdn";
+静态 OPT_SHORT: &字符串切片 = "short";
+静态 OPT_HOST: &字符串切片 = "host";
+
+#[cfg(windows)]
+模组 wsa {
+    使用 标准库::输入输出;
+
+    使用 windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
+
+    公有(超级) 结构 WsaHandle(());
+
+    公有(超级) 方法 start() -> 输入输出::结果<WsaHandle> {
+        设 可变 data = 标准库::内存::MaybeUninit::<WSADATA>::uninit();
+        设 err = 不安全 { WSAStartup(0x0202, data.as_mut_ptr()) };
+        如果 err == 0 {
+            好的(WsaHandle(()))
+        } 否则 {
+            坏的(输入输出::错误协议::from_raw_os_error(err))
+        }
+    }
+
+    实现 Drop 循环 WsaHandle {
+        方法 drop(&可变 自身) {
+            // This possibly returns an error but we can't handle it
+            设 _ = 不安全 { WSACleanup() };
+        }
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    #[cfg(windows)]
+    设 _handle = wsa::start().map_err_context(|| translate!("hostname-error-winsock"))?;
+
+    匹配 matches.get_one::<OsString>(OPT_HOST) {
+        无 => display_hostname(&matches),
+        一些(host) => {
+            hostname::set(host).map_err_context(|| translate!("hostname-error-set-hostname"))
+        }
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("hostname")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("hostname-about"))
+        .override_usage(format_usage(&translate!("hostname-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_DOMAIN)
+                .short('d')
+                .long("domain")
+                .overrides_with_all([OPT_DOMAIN, OPT_IP_ADDRESS, OPT_FQDN, OPT_SHORT])
+                .help(translate!("hostname-help-domain"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_IP_ADDRESS)
+                .short('i')
+                .long("ip-address")
+                .overrides_with_all([OPT_DOMAIN, OPT_IP_ADDRESS, OPT_FQDN, OPT_SHORT])
+                .help(translate!("hostname-help-ip-address"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_FQDN)
+                .short('f')
+                .long("fqdn")
+                .overrides_with_all([OPT_DOMAIN, OPT_IP_ADDRESS, OPT_FQDN, OPT_SHORT])
+                .help(translate!("hostname-help-fqdn"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SHORT)
+                .short('s')
+                .long("short")
+                .overrides_with_all([OPT_DOMAIN, OPT_IP_ADDRESS, OPT_FQDN, OPT_SHORT])
+                .help(translate!("hostname-help-short"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_HOST)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::Hostname),
+        )
+}
+
+方法 display_hostname(matches: &ArgMatches) -> UResult<()> {
+    设 hostname = hostname::获取()
+        .map_err_context(|| "failed to get hostname".to_owned())?
+        .to_string_lossy()
+        .into_owned();
+
+    如果 matches.get_flag(OPT_IP_ADDRESS) {
+        设 addresses;
+
+        #[cfg(not(任意(target_os = "freebsd", target_os = "openbsd")))]
+        {
+            设 hostname = hostname + ":1";
+            设 addrs = hostname
+                .to_socket_addrs()
+                .map_err_context(|| "failed to resolve socket addresses".to_owned())?;
+            addresses = addrs;
+        }
+
+        // DNS reverse lookup via "hostname:1" does not work on FreeBSD and OpenBSD
+        // use dns-lookup crate instead
+        #[cfg(任意(target_os = "freebsd", target_os = "openbsd"))]
+        {
+            设 addrs: 向量<标准库::网络::IpAddr> = lookup_host(hostname.as_str())
+                .map_err_context(|| "failed to lookup hostname".to_owned())?
+                .收集();
+            addresses = addrs;
+        }
+
+        设 可变 hashset = 哈希集合::新建();
+        设 可变 output = 字符串::新建();
+        循环 addr 在 addresses {
+            // XXX: not sure why this is necessary...
+            如果 !hashset.包含(&addr) {
+                设 可变 ip = addr.to_string();
+                如果 ip.ends_with(":1") {
+                    设 长度 = ip.长度();
+                    ip.truncate(长度 - 2);
+                }
+                output.push_str(&ip);
+                output.压入(' ');
+                hashset.插入(addr);
+            }
+        }
+        设 长度 = output.长度();
+        如果 长度 > 0 {
+            writeln!(stdout(), "{}", &output[0..长度 - 1])?;
+        }
+
+        好的(())
+    } 否则 {
+        如果 matches.get_flag(OPT_SHORT) || matches.get_flag(OPT_DOMAIN) {
+            设 可变 it = hostname.char_indices().过滤(|&ci| ci.1 == '.');
+            如果 设 一些(ci) = it.next() {
+                如果 matches.get_flag(OPT_SHORT) {
+                    writeln!(stdout(), "{}", &hostname[0..ci.0])?;
+                } 否则 {
+                    writeln!(stdout(), "{}", &hostname[ci.0 + 1..])?;
+                }
+            } 否则 如果 matches.get_flag(OPT_SHORT) {
+                writeln!(stdout(), "{hostname}")?;
+            }
+            返回 好的(());
+        }
+
+        writeln!(stdout(), "{hostname}")?;
+
+        好的(())
+    }
+}

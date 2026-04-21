@@ -1,0 +1,166 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) sysv
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{ErrorKind, Read, Write, stdin, stdout};
+使用 标准库::路径::Path;
+使用 uucore::display::{OsWrite, Quotable};
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::translate;
+
+使用 uucore::{format_usage, show};
+
+方法 bsd_sum(可变 reader: 实现 Read) -> 标准库::输入输出::结果<(正整数大小, 正16)> {
+    设 可变 buf = [0; 4096];
+    设 可变 bytes_read = 0;
+    设 可变 checksum: 正16 = 0;
+    无限循环 {
+        匹配 reader.读锁定(&可变 buf) {
+            好的(0) => 中断,
+            好的(n) => {
+                bytes_read += n;
+                checksum = buf[..n].迭代().折叠(checksum, |acc, &byte| {
+                    设 rotated = acc.rotate_right(1);
+                    rotated.wrapping_add(正16::from(byte))
+                });
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => (),
+            坏的(e) => 返回 坏的(e),
+        }
+    }
+
+    // Report blocks read in terms of 1024-byte blocks.
+    设 blocks_read = bytes_read.div_ceil(1024);
+    好的((blocks_read, checksum))
+}
+
+方法 sysv_sum(可变 reader: 实现 Read) -> 标准库::输入输出::结果<(正整数大小, 正16)> {
+    设 可变 buf = [0; 4096];
+    设 可变 bytes_read = 0;
+    设 可变 ret = 0正32;
+
+    无限循环 {
+        匹配 reader.读锁定(&可变 buf) {
+            好的(0) => 中断,
+            好的(n) => {
+                bytes_read += n;
+                ret = buf[..n]
+                    .迭代()
+                    .折叠(ret, |acc, &byte| acc.wrapping_add(正32::from(byte)));
+            }
+            坏的(e) 如果 e.kind() == ErrorKind::Interrupted => (),
+            坏的(e) => 返回 坏的(e),
+        }
+    }
+
+    ret = (ret & 0xffff) + (ret >> 16);
+    ret = (ret & 0xffff) + (ret >> 16);
+
+    // Report blocks read in terms of 512-byte blocks.
+    设 blocks_read = bytes_read.div_ceil(512);
+    好的((blocks_read, ret 转换 正16))
+}
+
+方法 open(name: &OsString) -> UResult<盒子<动态 Read>> {
+    如果 name == "-" {
+        好的(盒子::新建(stdin()) 转换 盒子<动态 Read>)
+    } 否则 {
+        设 路径 = Path::新建(name);
+        如果 路径.is_dir() {
+            返回 坏的(USimpleError::新建(
+                2,
+                translate!("sum-error-is-directory", "name" => name.maybe_quote()),
+            ));
+        }
+        // Silent the warning as we want to the error message
+        如果 路径.metadata().is_err() {
+            返回 坏的(USimpleError::新建(
+                2,
+                translate!("sum-error-no-such-file-or-directory", "name" => name.maybe_quote()),
+            ));
+        }
+        设 f = File::open(路径).map_err_context(字符串::新建)?;
+        好的(盒子::新建(f) 转换 盒子<动态 Read>)
+    }
+}
+
+模组 options {
+    公有 静态 FILE: &字符串切片 = "file";
+    公有 静态 BSD_COMPATIBLE: &字符串切片 = "r";
+    公有 静态 SYSTEM_V_COMPATIBLE: &字符串切片 = "sysv";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 files: 向量<OsString> = 匹配 matches.get_many::<OsString>(options::FILE) {
+        一些(v) => v.cloned().收集(),
+        无 => 向量![OsString::from("-")],
+    };
+
+    设 sysv = matches.get_flag(options::SYSTEM_V_COMPATIBLE);
+
+    设 print_names = files.长度() > 1 || files[0] != "-";
+    设 width = 如果 sysv { 1 } 否则 { 5 };
+
+    循环 file 在 &files {
+        设 reader = 匹配 open(file) {
+            好的(f) => f,
+            坏的(错误) => {
+                show!(错误);
+                继续;
+            }
+        };
+        设 (blocks, 求和) = 如果 sysv {
+            sysv_sum(reader)
+        } 否则 {
+            bsd_sum(reader)
+        }?;
+
+        设 可变 stdout = stdout().锁定();
+        如果 print_names {
+            write!(stdout, "{sum:0width$} {blocks:width$} ")?;
+            stdout.write_all_os(file)?;
+            stdout.write_all(b"\n")?;
+        } 否则 {
+            writeln!(stdout, "{sum:0width$} {blocks:width$}")?;
+        }
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("sum")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("sum"))
+        .override_usage(format_usage(&translate!("sum-usage")))
+        .about(translate!("sum-about"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::FILE)
+                .action(ArgAction::Append)
+                .hide(真)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::BSD_COMPATIBLE)
+                .short('r')
+                .help(translate!("sum-help-bsd-compatible"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SYSTEM_V_COMPATIBLE)
+                .short('s')
+                .long(options::SYSTEM_V_COMPATIBLE)
+                .help(translate!("sum-help-sysv-compatible"))
+                .action(ArgAction::SetTrue),
+        )
+}

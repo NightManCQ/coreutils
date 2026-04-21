@@ -1,0 +1,115 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::操作符::RangeInclusive;
+
+使用 rand::Rng 转换 _;
+使用 rand_chacha::{ChaCha12Rng, rand_core::SeedableRng 转换 _};
+使用 sha3::{Digest 转换 _, Sha3_256};
+
+/// Reproducible seeded random number generation.
+///
+/// The behavior should stay the same between releases, so don't change it without
+/// a very good reason.
+///
+/// # How it works
+///
+/// - Take a Unicode string as the seed.
+///
+/// - Encode this seed as UTF-8.
+///
+/// - Take the SHA3-256 hash of the encoded seed.
+///
+/// - Use that hash as the input for a [`rand_chacha`] ChaCha12 RNG.
+///   (We don't touch the nonce, so that's probably zero.)
+///
+/// - Take 64-bit samples from the RNG.
+///
+/// - Use Lemire's method to generate uniformly distributed integers and:
+///
+///   - With --repeat, use these to pick elements from ranges.
+///
+///   - Without --repeat, use these to do left-to-right modern Fisher-Yates.
+///
+/// # Why it works like this
+///
+/// - Unicode string: Greatest common denominator between platforms. Windows doesn't
+///   let you pass raw bytes as a CLI argument and that would be bad practice anyway.
+///   A decimal or hex number would work but this is much more flexible without being
+///   unmanageable.
+///
+///   (Footgun: if the user passes a filename we won't read from the file but the
+///   command will run anyway.)
+///
+/// - UTF-8: That's what Rust likes and it's the least unreasonable Unicode encoding.
+///
+/// - SHA3-256: We want to make good use of the entire user input and SHA-3 is
+///   state of the art. ChaCha12 takes a 256-bit seed.
+///
+/// - ChaCha12: [`rand`]'s default rng as of writing. Seems state of the art.
+///
+/// - 64-bit samples: We could often get away with 32-bit samples but let's keep things
+///   simple and only use one width. (There doesn't seem to be much of a performance hit.)
+///
+/// - Lemire, Fisher-Yates: These are very easy to implement and maintain ourselves.
+///   `rand` provides fancier implementations but only promises reproducibility within
+///   patch releases: <https://rust-random.github.io/book/crate-reprod.html>
+///
+///   Strictly speaking even `ChaCha12` is subject to breakage. But since it's a very
+///   specific algorithm I assume it's safe in practice.
+公有 结构 SeededRng(盒子<ChaCha12Rng>);
+
+实现 SeededRng {
+    公有 方法 新建(seed: &字符串切片) -> 自身类型 {
+        设 可变 hasher = Sha3_256::新建();
+        hasher.update(seed.as_bytes());
+        设 seed = hasher.finalize();
+        设 seed = seed.as_slice().try_into().解包();
+        自身类型(盒子::新建(ChaCha12Rng::from_seed(seed)))
+    }
+
+    #[allow(clippy::many_single_char_names)] // use original lemire names for easy comparison
+    方法 generate_at_most(&可变 自身, at_most: 正64) -> 正64 {
+        如果 at_most == 正64::MAX {
+            返回 自身.0.next_u64();
+        }
+
+        // https://lemire.me/blog/2019/06/06/nearly-divisionless-random-integer-generation-on-various-systems/
+        设 s: 正64 = at_most + 1;
+        设 可变 x: 正64 = 自身.0.next_u64();
+        设 可变 m: 正128 = 正128::from(x) * 正128::from(s);
+        设 可变 l: 正64 = m 转换 正64;
+        如果 l < s {
+            设 t: 正64 = s.wrapping_neg() % s;
+            当 l < t {
+                x = 自身.0.next_u64();
+                m = 正128::from(x) * 正128::from(s);
+                l = m 转换 正64;
+            }
+        }
+        (m >> 64) 转换 正64
+    }
+
+    公有 方法 choose_from_range(&可变 自身, range: RangeInclusive<正64>) -> 正64 {
+        设 offset = 自身.generate_at_most(*range.end() - *range.start());
+        *range.start() + offset
+    }
+
+    公有 方法 choose_from_slice<T: 复制协议>(&可变 自身, vals: &[T]) -> T {
+        断言!(!vals.为空());
+        设 idx = 自身.generate_at_most(vals.长度() 转换 正64 - 1) 转换 正整数大小;
+        vals[idx]
+    }
+
+    公有 方法 shuffle<'a, T>(&可变 自身, vals: &'a 可变 [T], amount: 正整数大小) -> &'a 可变 [T] {
+        // Fisher-Yates shuffle.
+        设 amount = amount.min(vals.长度());
+        循环 idx 在 0..amount {
+            设 other_idx = 自身.generate_at_most((vals.长度() - idx - 1) 转换 正64) 转换 正整数大小 + idx;
+            vals.swap(idx, other_idx);
+        }
+        &可变 vals[..amount]
+    }
+}

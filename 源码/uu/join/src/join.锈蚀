@@ -1,0 +1,1158 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) autoformat FILENUM whitespaces pairable unpairable nocheck memmem
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, Command};
+使用 memchr::{Memchr3, memchr_iter, memmem::Finder};
+使用 标准库::比较::排序顺序;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Split, Stdin, Write, stdin, stdout};
+使用 标准库::数字::IntErrorKind;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError, set_exit_code};
+使用 uucore::format_usage;
+使用 uucore::i18n::collator::{
+    AlternateHandling, CollatorOptions, locale_cmp, should_use_locale_collation, try_init_collator,
+};
+使用 uucore::line_ending::LineEnding;
+使用 uucore::translate;
+
+#[derive(调试协议, 错误协议)]
+枚举 JoinError {
+    #[错误("{}", translate!("join-error-io", "error" => .0))]
+    IOError(#[from] 标准库::输入输出::错误协议),
+
+    #[错误("{0}")]
+    UnorderedInput(字符串),
+}
+
+// If you still need the UError implementation for compatibility:
+实现 UError 循环 JoinError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+}
+
+#[derive(复制协议, 克隆协议, 偏等比较协议)]
+枚举 FileNum {
+    File1,
+    File2,
+}
+
+#[derive(克隆协议)]
+枚举 SepSetting {
+    /// Any single-byte separator.
+    Byte(正8),
+    /// A single character more than one byte long.
+    Char(向量<正8>),
+    /// No separators, join on the entire line.
+    Line,
+    /// Whitespace separators.
+    Whitespaces,
+}
+
+协议 Separator: 克隆协议 {
+    /// Using this separator, return the start and end index of all fields in the haystack.
+    方法 field_ranges(&自身, haystack: &[正8], len_guess: 正整数大小) -> 向量<(正整数大小, 正整数大小)>;
+    /// The separator as it appears when in the output.
+    方法 output_separator(&自身) -> &[正8];
+}
+
+/// Simple separators one byte in length.
+#[derive(复制协议, 克隆协议)]
+结构 OneByteSep {
+    byte: [正8; 1],
+}
+
+实现 Separator 循环 OneByteSep {
+    方法 field_ranges(&自身, haystack: &[正8], len_guess: 正整数大小) -> 向量<(正整数大小, 正整数大小)> {
+        设 可变 field_ranges = 向量::with_capacity(len_guess);
+        设 可变 last_end = 0;
+
+        循环 i 在 memchr_iter(自身.byte[0], haystack) {
+            field_ranges.压入((last_end, i));
+            last_end = i + 1;
+        }
+        field_ranges.压入((last_end, haystack.长度()));
+        field_ranges
+    }
+
+    方法 output_separator(&自身) -> &[正8] {
+        &自身.byte
+    }
+}
+
+/// Multi-byte (but still single character) separators.
+#[derive(克隆协议)]
+结构 MultiByteSep<'a> {
+    finder: Finder<'a>,
+}
+
+实现 Separator 循环 MultiByteSep<'_> {
+    方法 field_ranges(&自身, haystack: &[正8], len_guess: 正整数大小) -> 向量<(正整数大小, 正整数大小)> {
+        设 可变 field_ranges = 向量::with_capacity(len_guess);
+        设 可变 last_end = 0;
+
+        循环 i 在 自身.finder.find_iter(haystack) {
+            field_ranges.压入((last_end, i));
+            last_end = i + 自身.finder.needle().长度();
+        }
+        field_ranges.压入((last_end, haystack.长度()));
+        field_ranges
+    }
+
+    方法 output_separator(&自身) -> &[正8] {
+        自身.finder.needle()
+    }
+}
+
+/// Whole-line separator.
+#[derive(复制协议, 克隆协议)]
+结构 LineSep {}
+
+实现 Separator 循环 LineSep {
+    方法 field_ranges(&自身, haystack: &[正8], _len_guess: 正整数大小) -> 向量<(正整数大小, 正整数大小)> {
+        向量![(0, haystack.长度())]
+    }
+
+    方法 output_separator(&自身) -> &[正8] {
+        &[]
+    }
+}
+
+/// Default whitespace separator.
+#[derive(复制协议, 克隆协议)]
+结构 WhitespaceSep {}
+
+实现 Separator 循环 WhitespaceSep {
+    方法 field_ranges(&自身, haystack: &[正8], len_guess: 正整数大小) -> 向量<(正整数大小, 正整数大小)> {
+        设 可变 field_ranges = 向量::with_capacity(len_guess);
+        设 可变 last_end = 0;
+
+        // GNU join used Bourne shell field splitters by default
+        // FIXME: but now uses locale-dependent whitespace
+        循环 i 在 Memchr3::新建(b' ', b'\t', b'\n', haystack) {
+            // leading whitespace should be dropped, contiguous whitespace merged
+            如果 i > last_end {
+                field_ranges.压入((last_end, i));
+            }
+            last_end = i + 1;
+        }
+        field_ranges.压入((last_end, haystack.长度()));
+        field_ranges
+    }
+
+    方法 output_separator(&自身) -> &[正8] {
+        b" "
+    }
+}
+
+#[derive(复制协议, 克隆协议, 偏等比较协议)]
+枚举 CheckOrder {
+    默认协议,
+    Disabled,
+    Enabled,
+}
+
+结构 Settings {
+    key1: 正整数大小,
+    key2: 正整数大小,
+    print_unpaired1: 布尔,
+    print_unpaired2: 布尔,
+    print_joined: 布尔,
+    ignore_case: 布尔,
+    line_ending: LineEnding,
+    separator: SepSetting,
+    autoformat: 布尔,
+    format: 向量<Spec>,
+    empty: 向量<正8>,
+    check_order: CheckOrder,
+    headers: 布尔,
+}
+
+实现 默认协议 循环 Settings {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            key1: 0,
+            key2: 0,
+            print_unpaired1: 假,
+            print_unpaired2: 假,
+            print_joined: 真,
+            ignore_case: 假,
+            line_ending: LineEnding::Newline,
+            separator: SepSetting::Whitespaces,
+            autoformat: 假,
+            format: 向量![],
+            empty: 向量![],
+            check_order: CheckOrder::默认协议,
+            headers: 假,
+        }
+    }
+}
+
+/// Output representation.
+结构 Repr<'a, Sep: Separator> {
+    line_ending: LineEnding,
+    separator: Sep,
+    format: 向量<Spec>,
+    empty: &'a [正8],
+}
+
+实现<'a, Sep: Separator> Repr<'a, Sep> {
+    方法 新建(line_ending: LineEnding, separator: Sep, format: 向量<Spec>, empty: &'a [正8]) -> 自身类型 {
+        Repr {
+            line_ending,
+            separator,
+            format,
+            empty,
+        }
+    }
+
+    方法 uses_format(&自身) -> 布尔 {
+        !自身.format.为空()
+    }
+
+    /// Write the field or empty filler if the field is not set.
+    方法 write_field(
+        &自身,
+        writer: &可变 实现 Write,
+        field: 选项<&[正8]>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        设 value = 匹配 field {
+            一些(field) => field,
+            无 => 自身.empty,
+        };
+
+        writer.write_all(value)
+    }
+
+    /// Write each field except the one at the index.
+    方法 write_fields(
+        &自身,
+        writer: &可变 实现 Write,
+        line: &Line,
+        index: 正整数大小,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        循环 i 在 0..line.field_ranges.长度() {
+            如果 i != index {
+                writer.write_all(自身.separator.output_separator())?;
+                writer.write_all(line.get_field(i).解包())?;
+            }
+        }
+        好的(())
+    }
+
+    /// Write each field or the empty filler if the field is not set.
+    方法 write_format<F>(&自身, writer: &可变 实现 Write, f: F) -> 结果<(), 标准库::输入输出::错误协议>
+    何处
+        F: Fn(&Spec) -> 选项<&'a [正8]>,
+    {
+        循环 i 在 0..自身.format.长度() {
+            如果 i > 0 {
+                writer.write_all(自身.separator.output_separator())?;
+            }
+
+            设 field = 匹配 f(&自身.format[i]) {
+                一些(value) => value,
+                无 => 自身.empty,
+            };
+
+            writer.write_all(field)?;
+        }
+        好的(())
+    }
+
+    方法 write_line_ending(&自身, writer: &可变 实现 Write) -> 结果<(), 标准库::输入输出::错误协议> {
+        writer.write_all(&[自身.line_ending 转换 正8])
+    }
+}
+
+/// Byte slice wrapper whose Ord implementation is case-insensitive on ASCII.
+#[derive(相等比较协议)]
+结构 CaseInsensitiveSlice<'a> {
+    v: &'a [正8],
+}
+
+实现 序比较协议 循环 CaseInsensitiveSlice<'_> {
+    方法 比较(&自身, other: &自身类型) -> 排序顺序 {
+        如果 设 一些((s, o)) =
+            标准库::迭代::zip(自身.v.迭代(), other.v.迭代()).寻找(|(s, o)| !s.eq_ignore_ascii_case(o))
+        {
+            // first characters that differ, return the case-insensitive comparison
+            设 s = s.to_ascii_lowercase();
+            设 o = o.to_ascii_lowercase();
+            s.比较(&o)
+        } 否则 {
+            // one of the strings is a substring or equal of the other
+            自身.v.长度().比较(&other.v.长度())
+        }
+    }
+}
+
+实现 偏序比较协议 循环 CaseInsensitiveSlice<'_> {
+    方法 partial_cmp(&自身, other: &自身类型) -> 选项<排序顺序> {
+        一些(自身.比较(other))
+    }
+}
+
+实现 偏等比较协议 循环 CaseInsensitiveSlice<'_> {
+    方法 eq(&自身, other: &自身类型) -> 布尔 {
+        自身.v.eq_ignore_ascii_case(other.v)
+    }
+}
+
+/// Input processing parameters.
+结构 Input<Sep: Separator> {
+    separator: Sep,
+    ignore_case: 布尔,
+    check_order: CheckOrder,
+    use_locale: 布尔,
+}
+
+实现<Sep: Separator> Input<Sep> {
+    方法 新建(separator: Sep, ignore_case: 布尔, check_order: CheckOrder, use_locale: 布尔) -> 自身类型 {
+        自身类型 {
+            separator,
+            ignore_case,
+            check_order,
+            use_locale,
+        }
+    }
+
+    方法 compare(&自身, field1: 选项<&[正8]>, field2: 选项<&[正8]>) -> 排序顺序 {
+        如果 设 (一些(field1), 一些(field2)) = (field1, field2) {
+            如果 自身.ignore_case {
+                设 field1 = CaseInsensitiveSlice { v: field1 };
+                设 field2 = CaseInsensitiveSlice { v: field2 };
+                field1.比较(&field2)
+            } 否则 如果 自身.use_locale {
+                locale_cmp(field1, field2)
+            } 否则 {
+                field1.比较(field2)
+            }
+        } 否则 {
+            匹配 field1 {
+                一些(_) => 排序顺序::Greater,
+                无 => 匹配 field2 {
+                    一些(_) => 排序顺序::Less,
+                    无 => 排序顺序::Equal,
+                },
+            }
+        }
+    }
+}
+
+枚举 Spec {
+    Key,
+    Field(FileNum, 正整数大小),
+}
+
+实现 Spec {
+    方法 parse(format: &字符串切片) -> UResult<自身类型> {
+        设 可变 chars = format.chars();
+
+        设 file_num = 匹配 chars.next() {
+            一些('0') => {
+                // Must be all alone without a field specifier.
+                如果 chars.next().is_none() {
+                    返回 好的(自身类型::Key);
+                }
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("join-error-invalid-field-specifier", "spec" => format.quote()),
+                ));
+            }
+            一些('1') => FileNum::File1,
+            一些('2') => FileNum::File2,
+            _ => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("join-error-invalid-file-number", "spec" => format.quote()),
+                ));
+            }
+        };
+
+        如果 设 一些('.') = chars.next() {
+            返回 好的(自身类型::Field(file_num, parse_field_number(chars.as_str())?));
+        }
+
+        坏的(USimpleError::新建(
+            1,
+            translate!("join-error-invalid-field-specifier", "spec" => format.quote()),
+        ))
+    }
+}
+
+结构 Line {
+    field_ranges: 向量<(正整数大小, 正整数大小)>,
+    string: 向量<正8>,
+}
+
+实现 Line {
+    方法 新建<Sep: Separator>(string: 向量<正8>, separator: &Sep, len_guess: 正整数大小) -> 自身类型 {
+        设 field_ranges = separator.field_ranges(&string, len_guess);
+
+        自身类型 {
+            field_ranges,
+            string,
+        }
+    }
+
+    /// Get field at index.
+    方法 get_field(&自身, index: 正整数大小) -> 选项<&[正8]> {
+        如果 index < 自身.field_ranges.长度() {
+            设 (low, high) = 自身.field_ranges[index];
+            一些(&自身.string[low..high])
+        } 否则 {
+            无
+        }
+    }
+}
+
+结构 State<'a> {
+    key: 正整数大小,
+    file_name: &'a OsString,
+    file_num: FileNum,
+    print_unpaired: 布尔,
+    lines: Split<盒子<动态 BufRead + 'a>>,
+    max_len: 正整数大小,
+    seq: 向量<Line>,
+    line_num: 正整数大小,
+    has_failed: 布尔,
+    has_unpaired: 布尔,
+}
+
+实现<'a> State<'a> {
+    方法 新建(
+        file_num: FileNum,
+        name: &'a OsString,
+        stdin: &'a Stdin,
+        key: 正整数大小,
+        line_ending: LineEnding,
+        print_unpaired: 布尔,
+    ) -> UResult<自身类型> {
+        设 file_buf = 如果 name == "-" {
+            盒子::新建(stdin.锁定()) 转换 盒子<动态 BufRead>
+        } 否则 {
+            设 file = File::open(name).map_err_context(|| 格式化!("{}", name.maybe_quote()))?;
+            盒子::新建(BufReader::新建(file)) 转换 盒子<动态 BufRead>
+        };
+
+        好的(State {
+            key,
+            file_name: name,
+            file_num,
+            print_unpaired,
+            lines: file_buf.split(line_ending 转换 正8),
+            max_len: 1,
+            seq: 向量::新建(),
+            line_num: 0,
+            has_failed: 假,
+            has_unpaired: 假,
+        })
+    }
+
+    /// Skip the current unpaired line.
+    方法 skip_line<Sep: Separator>(
+        &可变 自身,
+        writer: &可变 实现 Write,
+        input: &Input<Sep>,
+        repr: &Repr<'a, Sep>,
+    ) -> UResult<()> {
+        如果 自身.print_unpaired {
+            自身.write_first_line(writer, repr)?;
+        }
+
+        自身.reset_next_line(input)?;
+        好的(())
+    }
+
+    /// Keep reading line sequence until the key does not change, return
+    /// the first line whose key differs.
+    方法 extend<Sep: Separator>(&可变 自身, input: &Input<Sep>) -> UResult<选项<Line>> {
+        当 设 一些(line) = 自身.next_line(input)? {
+            设 diff = input.compare(自身.get_current_key(), line.get_field(自身.key));
+
+            如果 diff == 排序顺序::Equal {
+                自身.seq.压入(line);
+            } 否则 {
+                返回 好的(一些(line));
+            }
+        }
+
+        好的(无)
+    }
+
+    /// Write lines in the buffers as headers.
+    方法 write_headers<Sep: Separator>(
+        &自身,
+        writer: &可变 实现 Write,
+        other: &State,
+        repr: &Repr<'a, Sep>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        如果 自身.has_line() {
+            如果 other.has_line() {
+                自身.combine(writer, other, repr)?;
+            } 否则 {
+                自身.write_first_line(writer, repr)?;
+            }
+        } 否则 如果 other.has_line() {
+            other.write_first_line(writer, repr)?;
+        }
+
+        好的(())
+    }
+
+    /// Combine two line sequences.
+    方法 combine<Sep: Separator>(
+        &自身,
+        writer: &可变 实现 Write,
+        other: &State,
+        repr: &Repr<'a, Sep>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        设 key = 自身.get_current_key();
+
+        循环 line1 在 &自身.seq {
+            循环 line2 在 &other.seq {
+                如果 repr.uses_format() {
+                    repr.write_format(writer, |spec| 匹配 *spec {
+                        Spec::Key => key,
+                        Spec::Field(file_num, field_num) => {
+                            如果 file_num == 自身.file_num {
+                                返回 line1.get_field(field_num);
+                            }
+
+                            如果 file_num == other.file_num {
+                                返回 line2.get_field(field_num);
+                            }
+
+                            无
+                        }
+                    })?;
+                } 否则 {
+                    repr.write_field(writer, key)?;
+                    repr.write_fields(writer, line1, 自身.key)?;
+                    repr.write_fields(writer, line2, other.key)?;
+                }
+
+                repr.write_line_ending(writer)?;
+            }
+        }
+
+        好的(())
+    }
+
+    /// Reset with the next line.
+    方法 reset(&可变 自身, next_line: 选项<Line>) {
+        自身.seq.clear();
+
+        如果 设 一些(line) = next_line {
+            自身.seq.压入(line);
+        }
+    }
+
+    方法 reset_read_line<Sep: Separator>(
+        &可变 自身,
+        input: &Input<Sep>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        设 line = 自身.read_line(&input.separator)?;
+        自身.reset(line);
+        好的(())
+    }
+
+    方法 reset_next_line<Sep: Separator>(&可变 自身, input: &Input<Sep>) -> 结果<(), JoinError> {
+        设 line = 自身.next_line(input)?;
+        自身.reset(line);
+        好的(())
+    }
+
+    方法 has_line(&自身) -> 布尔 {
+        !自身.seq.为空()
+    }
+
+    方法 initialize<Sep: Separator>(
+        &可变 自身,
+        read_sep: &Sep,
+        autoformat: 布尔,
+    ) -> 标准库::输入输出::结果<正整数大小> {
+        如果 设 一些(line) = 自身.read_line(read_sep)? {
+            自身.seq.压入(line);
+
+            如果 autoformat {
+                返回 好的(自身.seq[0].field_ranges.长度());
+            }
+        }
+        好的(0)
+    }
+
+    方法 finalize<Sep: Separator>(
+        &可变 自身,
+        writer: &可变 实现 Write,
+        input: &Input<Sep>,
+        repr: &Repr<'a, Sep>,
+    ) -> UResult<()> {
+        如果 自身.has_line() {
+            如果 自身.print_unpaired {
+                自身.write_first_line(writer, repr)?;
+            }
+
+            设 可变 next_line = 自身.next_line(input)?;
+            当 设 一些(line) = &next_line {
+                如果 自身.print_unpaired {
+                    自身.write_line(writer, line, repr)?;
+                }
+                自身.reset(next_line);
+                next_line = 自身.next_line(input)?;
+            }
+        }
+
+        好的(())
+    }
+
+    /// Get the next line without the order check.
+    方法 read_line<Sep: Separator>(&可变 自身, sep: &Sep) -> 结果<选项<Line>, 标准库::输入输出::错误协议> {
+        匹配 自身.lines.next() {
+            一些(value) => {
+                自身.line_num += 1;
+                设 line = Line::新建(value?, sep, 自身.max_len);
+                如果 line.field_ranges.长度() > 自身.max_len {
+                    自身.max_len = line.field_ranges.长度();
+                }
+                好的(一些(line))
+            }
+            无 => 好的(无),
+        }
+    }
+
+    /// Get the next line with the order check.
+    方法 next_line<Sep: Separator>(&可变 自身, input: &Input<Sep>) -> 结果<选项<Line>, JoinError> {
+        如果 设 一些(line) = 自身.read_line(&input.separator)? {
+            如果 input.check_order == CheckOrder::Disabled {
+                返回 好的(一些(line));
+            }
+
+            设 diff = input.compare(自身.get_current_key(), line.get_field(自身.key));
+
+            如果 diff == 排序顺序::Greater
+                && (input.check_order == CheckOrder::Enabled
+                    || (自身.has_unpaired && !自身.has_failed))
+            {
+                设 err_msg = translate!("join-error-not-sorted", "file" => 自身.file_name.maybe_quote(), "line_num" => 自身.line_num, "content" => 字符串::from_utf8_lossy(&line.string));
+                // This is fatal if the check is enabled.
+                如果 input.check_order == CheckOrder::Enabled {
+                    返回 坏的(JoinError::UnorderedInput(err_msg));
+                }
+                错误打印行!("{}: {err_msg}", uucore::execution_phrase());
+                自身.has_failed = 真;
+            }
+
+            好的(一些(line))
+        } 否则 {
+            好的(无)
+        }
+    }
+
+    /// Gets the key value of the lines stored in seq.
+    方法 get_current_key(&自身) -> 选项<&[正8]> {
+        自身.seq[0].get_field(自身.key)
+    }
+
+    方法 write_line<Sep: Separator>(
+        &自身,
+        writer: &可变 实现 Write,
+        line: &Line,
+        repr: &Repr<'a, Sep>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        如果 repr.uses_format() {
+            repr.write_format(writer, |spec| 匹配 *spec {
+                Spec::Key => line.get_field(自身.key),
+                Spec::Field(file_num, field_num) => {
+                    如果 file_num == 自身.file_num {
+                        line.get_field(field_num)
+                    } 否则 {
+                        无
+                    }
+                }
+            })?;
+        } 否则 {
+            repr.write_field(writer, line.get_field(自身.key))?;
+            repr.write_fields(writer, line, 自身.key)?;
+        }
+
+        repr.write_line_ending(writer)
+    }
+
+    方法 write_first_line<Sep: Separator>(
+        &自身,
+        writer: &可变 实现 Write,
+        repr: &Repr<'a, Sep>,
+    ) -> 结果<(), 标准库::输入输出::错误协议> {
+        自身.write_line(writer, &自身.seq[0], repr)
+    }
+}
+
+方法 parse_separator(value_os: &OsString) -> UResult<SepSetting> {
+    // Five possible separator values:
+    // No argument supplied, separate on whitespace; handled implicitly as the default elsewhere
+    // An empty string arg, whole line separation
+    // On unix-likes only, a single arbitrary byte
+    // The two-character "\0" string, interpreted as a single 0 byte
+    // A single scalar valid in the locale encoding (currently only UTF-8)
+
+    如果 value_os.为空() {
+        返回 好的(SepSetting::Line);
+    }
+
+    #[cfg(unix)]
+    {
+        设 value = value_os.as_bytes();
+        如果 value.长度() == 1 {
+            返回 好的(SepSetting::Byte(value[0]));
+        }
+    }
+
+    设 一些(value) = value_os.to_str() 否则 {
+        #[cfg(unix)]
+        返回 坏的(USimpleError::新建(1, translate!("join-error-non-utf8-tab")));
+        #[cfg(not(unix))]
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("join-error-unprintable-separators"),
+        ));
+    };
+
+    设 可变 chars = value.chars();
+    设 c = chars.next().期望("valid string with at least one byte");
+    匹配 chars.next() {
+        无 => 好的(SepSetting::Char(value.into())),
+        一些('0') 如果 c == '\\' => 好的(SepSetting::Byte(0)),
+        _ => 坏的(USimpleError::新建(
+            1,
+            translate!("join-error-multi-character-tab", "value" => value),
+        )),
+    }
+}
+
+方法 parse_print_settings(matches: &clap::ArgMatches) -> UResult<(布尔, 布尔, 布尔)> {
+    设 可变 print_joined = 真;
+    设 可变 print_unpaired1 = 假;
+    设 可变 print_unpaired2 = 假;
+
+    设 v_values = matches.get_many::<字符串>("v");
+    如果 v_values.is_some() {
+        print_joined = 假;
+    }
+
+    设 unpaired = v_values
+        .unwrap_or_default()
+        .chain(matches.get_many("a").unwrap_or_default());
+    循环 file_num 在 unpaired {
+        匹配 parse_file_number(file_num)? {
+            FileNum::File1 => print_unpaired1 = 真,
+            FileNum::File2 => print_unpaired2 = 真,
+        }
+    }
+
+    好的((print_joined, print_unpaired1, print_unpaired2))
+}
+
+方法 get_and_parse_field_number(matches: &clap::ArgMatches, key: &字符串切片) -> UResult<选项<正整数大小>> {
+    设 value = matches.get_one::<字符串>(key).映射(字符串::as_str);
+    parse_field_number_option(value)
+}
+
+/// Parses the command-line arguments and constructs a `Settings` struct.
+///
+/// This function takes the matches from the command-line arguments, processes them,
+/// and returns a `Settings` struct that encapsulates the configuration for the program.
+#[allow(clippy::field_reassign_with_default)]
+方法 parse_settings(matches: &clap::ArgMatches) -> UResult<Settings> {
+    设 keys = get_and_parse_field_number(matches, "j")?;
+    设 key1 = get_and_parse_field_number(matches, "1")?;
+    设 key2 = get_and_parse_field_number(matches, "2")?;
+
+    设 (print_joined, print_unpaired1, print_unpaired2) = parse_print_settings(matches)?;
+
+    设 可变 settings = Settings::默认();
+
+    settings.print_joined = print_joined;
+    settings.print_unpaired1 = print_unpaired1;
+    settings.print_unpaired2 = print_unpaired2;
+
+    settings.ignore_case = matches.get_flag("i");
+    settings.key1 = get_field_number(keys, key1)?;
+    settings.key2 = get_field_number(keys, key2)?;
+    如果 设 一些(value_os) = matches.get_one::<OsString>("t") {
+        settings.separator = parse_separator(value_os)?;
+    }
+    如果 设 一些(format) = matches.get_one::<字符串>("o") {
+        如果 format == "auto" {
+            settings.autoformat = 真;
+        } 否则 {
+            设 可变 specs = 向量![];
+            循环 part 在 format.split([' ', ',', '\t']) {
+                specs.压入(Spec::parse(part)?);
+            }
+            settings.format = specs;
+        }
+    }
+
+    如果 设 一些(empty) = matches.get_one::<字符串>("e") {
+        settings.empty = empty.as_bytes().to_vec();
+    }
+
+    如果 matches.get_flag("nocheck-order") {
+        settings.check_order = CheckOrder::Disabled;
+    }
+
+    如果 matches.get_flag("check-order") {
+        settings.check_order = CheckOrder::Enabled;
+    }
+
+    如果 matches.get_flag("header") {
+        settings.headers = 真;
+    }
+
+    settings.line_ending = LineEnding::from_zero_flag(matches.get_flag("z"));
+
+    好的(settings)
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 可变 opts = CollatorOptions::默认();
+    opts.alternate_handling = 一些(AlternateHandling::Shifted);
+    设 _ = try_init_collator(opts);
+
+    设 settings = parse_settings(&matches)?;
+
+    设 file1 = matches.get_one::<OsString>("file1").解包();
+    设 file2 = matches.get_one::<OsString>("file2").解包();
+
+    如果 file1 == "-" && file2 == "-" {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("join-error-both-files-stdin"),
+        ));
+    }
+
+    设 sep = settings.separator.克隆();
+    匹配 sep {
+        SepSetting::Byte(byte) => exec(file1, file2, settings, OneByteSep { byte: [byte] }),
+        SepSetting::Char(c) => exec(
+            file1,
+            file2,
+            settings,
+            MultiByteSep {
+                finder: Finder::新建(&c),
+            },
+        ),
+        SepSetting::Whitespaces => exec(file1, file2, settings, WhitespaceSep {}),
+        SepSetting::Line => exec(file1, file2, settings, LineSep {}),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("join")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("join-about"))
+        .override_usage(format_usage(&translate!("join-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建("a")
+                .short('a')
+                .action(ArgAction::Append)
+                .num_args(1)
+                .value_parser(["1", "2"])
+                .value_name("FILENUM")
+                .help(translate!("join-help-a")),
+        )
+        .arg(
+            Arg::新建("v")
+                .short('v')
+                .action(ArgAction::Append)
+                .num_args(1)
+                .value_parser(["1", "2"])
+                .value_name("FILENUM")
+                .help(translate!("join-help-v")),
+        )
+        .arg(
+            Arg::新建("e")
+                .short('e')
+                .value_name("EMPTY")
+                .help(translate!("join-help-e")),
+        )
+        .arg(
+            Arg::新建("i")
+                .short('i')
+                .long("ignore-case")
+                .help(translate!("join-help-i"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("j")
+                .short('j')
+                .value_name("FIELD")
+                .help(translate!("join-help-j")),
+        )
+        .arg(
+            Arg::新建("o")
+                .short('o')
+                .value_name("FORMAT")
+                .help(translate!("join-help-o")),
+        )
+        .arg(
+            Arg::新建("t")
+                .short('t')
+                .value_name("CHAR")
+                .value_parser(ValueParser::os_string())
+                .help(translate!("join-help-t")),
+        )
+        .arg(
+            Arg::新建("1")
+                .short('1')
+                .value_name("FIELD")
+                .help(translate!("join-help-1")),
+        )
+        .arg(
+            Arg::新建("2")
+                .short('2')
+                .value_name("FIELD")
+                .help(translate!("join-help-2")),
+        )
+        .arg(
+            Arg::新建("check-order")
+                .long("check-order")
+                .help(translate!("join-help-check-order"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("nocheck-order")
+                .long("nocheck-order")
+                .help(translate!("join-help-nocheck-order"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("header")
+                .long("header")
+                .help(translate!("join-help-header"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("z")
+                .short('z')
+                .long("zero-terminated")
+                .help(translate!("join-help-z"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("file1")
+                .required(真)
+                .value_name("FILE1")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString))
+                .hide(真),
+        )
+        .arg(
+            Arg::新建("file2")
+                .required(真)
+                .value_name("FILE2")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString))
+                .hide(真),
+        )
+}
+
+方法 exec<Sep: Separator>(
+    file1: &OsString,
+    file2: &OsString,
+    settings: Settings,
+    sep: Sep,
+) -> UResult<()> {
+    设 stdin = stdin();
+
+    设 可变 state1 = State::新建(
+        FileNum::File1,
+        file1,
+        &stdin,
+        settings.key1,
+        settings.line_ending,
+        settings.print_unpaired1,
+    )?;
+
+    设 可变 state2 = State::新建(
+        FileNum::File2,
+        file2,
+        &stdin,
+        settings.key2,
+        settings.line_ending,
+        settings.print_unpaired2,
+    )?;
+
+    设 input = Input::新建(
+        sep.克隆(),
+        settings.ignore_case,
+        settings.check_order,
+        should_use_locale_collation(),
+    );
+
+    设 format = 如果 settings.autoformat {
+        设 可变 format = 向量![Spec::Key];
+        设 可变 initialize = |state: &可变 State| -> UResult<()> {
+            设 max_fields = state.initialize(&sep, settings.autoformat)?;
+            循环 i 在 0..max_fields {
+                如果 i != state.key {
+                    format.压入(Spec::Field(state.file_num, i));
+                }
+            }
+            好的(())
+        };
+        initialize(&可变 state1)?;
+        initialize(&可变 state2)?;
+        format
+    } 否则 {
+        state1.initialize(&sep, settings.autoformat)?;
+        state2.initialize(&sep, settings.autoformat)?;
+        settings.format
+    };
+
+    设 repr = Repr::新建(settings.line_ending, sep, format, &settings.empty);
+
+    设 stdout = stdout();
+    设 可变 writer = BufWriter::新建(stdout.锁定());
+
+    如果 settings.headers {
+        state1.write_headers(&可变 writer, &state2, &repr)?;
+        state1.reset_read_line(&input)?;
+        state2.reset_read_line(&input)?;
+    }
+
+    当 state1.has_line() && state2.has_line() {
+        设 diff = input.compare(state1.get_current_key(), state2.get_current_key());
+
+        匹配 diff {
+            排序顺序::Less => {
+                如果 设 坏的(e) = state1.skip_line(&可变 writer, &input, &repr) {
+                    writer.flush()?;
+                    返回 坏的(e);
+                }
+                state1.has_unpaired = 真;
+                state2.has_unpaired = 真;
+            }
+            排序顺序::Greater => {
+                如果 设 坏的(e) = state2.skip_line(&可变 writer, &input, &repr) {
+                    writer.flush()?;
+                    返回 坏的(e);
+                }
+                state1.has_unpaired = 真;
+                state2.has_unpaired = 真;
+            }
+            排序顺序::Equal => {
+                设 next_line1 = 匹配 state1.extend(&input) {
+                    好的(line) => line,
+                    坏的(e) => {
+                        writer.flush()?;
+                        返回 坏的(e);
+                    }
+                };
+                设 next_line2 = 匹配 state2.extend(&input) {
+                    好的(line) => line,
+                    坏的(e) => {
+                        writer.flush()?;
+                        返回 坏的(e);
+                    }
+                };
+
+                如果 settings.print_joined {
+                    state1.combine(&可变 writer, &state2, &repr)?;
+                }
+
+                state1.reset(next_line1);
+                state2.reset(next_line2);
+            }
+        }
+    }
+
+    如果 设 坏的(e) = state1.finalize(&可变 writer, &input, &repr) {
+        writer.flush()?;
+        返回 坏的(e);
+    }
+    如果 设 坏的(e) = state2.finalize(&可变 writer, &input, &repr) {
+        writer.flush()?;
+        返回 坏的(e);
+    }
+
+    writer.flush()?;
+
+    如果 state1.has_failed || state2.has_failed {
+        错误打印行!(
+            "{}: {}",
+            uucore::execution_phrase(),
+            translate!("join-error-input-not-sorted")
+        );
+        set_exit_code(1);
+    }
+    好的(())
+}
+
+/// Check that keys for both files and for a particular file are not
+/// contradictory and return the key index.
+方法 get_field_number(keys: 选项<正整数大小>, key: 选项<正整数大小>) -> UResult<正整数大小> {
+    如果 设 一些(keys) = keys {
+        如果 设 一些(key) = key {
+            如果 keys != key {
+                // Show zero-based field numbers as one-based.
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("join-error-incompatible-fields", "field1" => (keys + 1), "field2" => (key + 1)),
+                ));
+            }
+        }
+
+        返回 好的(keys);
+    }
+
+    好的(key.unwrap_or(0))
+}
+
+/// Parse the specified field string as a natural number and return
+/// the zero-based field number.
+方法 parse_field_number(value: &字符串切片) -> UResult<正整数大小> {
+    匹配 value.parse::<正整数大小>() {
+        好的(result) 如果 result > 0 => 好的(result - 1),
+        坏的(e) 如果 e.kind() == &IntErrorKind::PosOverflow => 好的(正整数大小::MAX),
+        _ => 坏的(USimpleError::新建(
+            1,
+            translate!("join-error-invalid-field-number", "value" => value.quote()),
+        )),
+    }
+}
+
+方法 parse_file_number(value: &字符串切片) -> UResult<FileNum> {
+    匹配 value {
+        "1" => 好的(FileNum::File1),
+        "2" => 好的(FileNum::File2),
+        value => 坏的(USimpleError::新建(
+            1,
+            translate!("join-error-invalid-file-number-simple", "value" => value.quote()),
+        )),
+    }
+}
+
+方法 parse_field_number_option(value: 选项<&字符串切片>) -> UResult<选项<正整数大小>> {
+    匹配 value {
+        无 => 好的(无),
+        一些(val) => 好的(一些(parse_field_number(val)?)),
+    }
+}

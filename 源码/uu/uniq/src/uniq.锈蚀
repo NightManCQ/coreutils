@@ -1,0 +1,851 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore badoption CTYPE
+使用 clap::{
+    Arg, ArgAction, ArgMatches, Command, builder::ValueParser, 错误::ContextKind, 错误::错误协议,
+    错误::ErrorKind,
+};
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Write, stdin, stdout};
+使用 标准库::数字::IntErrorKind;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError};
+使用 uucore::format_usage;
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::posix::{OBSOLETE, posix_version};
+使用 uucore::translate;
+
+公有 模组 options {
+    公有 静态 ALL_REPEATED: &字符串切片 = "all-repeated";
+    公有 静态 CHECK_CHARS: &字符串切片 = "check-chars";
+    公有 静态 COUNT: &字符串切片 = "count";
+    公有 静态 IGNORE_CASE: &字符串切片 = "ignore-case";
+    公有 静态 REPEATED: &字符串切片 = "repeated";
+    公有 静态 SKIP_FIELDS: &字符串切片 = "skip-fields";
+    公有 静态 SKIP_CHARS: &字符串切片 = "skip-chars";
+    公有 静态 UNIQUE: &字符串切片 = "unique";
+    公有 静态 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+    公有 静态 GROUP: &字符串切片 = "group";
+}
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+#[derive(偏等比较协议, 克隆协议, 复制协议)]
+枚举 Delimiters {
+    Append,
+    Prepend,
+    Separate,
+    Both,
+    无,
+}
+
+常量 OUTPUT_BUFFER_CAPACITY: 正整数大小 = 128 * 1024;
+
+结构 Uniq {
+    repeats_only: 布尔,
+    uniques_only: 布尔,
+    all_repeated: 布尔,
+    delimiters: Delimiters,
+    show_counts: 布尔,
+    skip_fields: 选项<正整数大小>,
+    slice_start: 选项<正整数大小>,
+    slice_stop: 选项<正整数大小>,
+    ignore_case: 布尔,
+    zero_terminated: 布尔,
+}
+
+#[derive(默认协议)]
+结构 LineMeta {
+    key_start: 正整数大小,
+    key_end: 正整数大小,
+}
+
+macro_rules! write_line_terminator {
+    ($writer:expr, $line_terminator:expr) => {
+        $writer
+            .write_all(&[$line_terminator])
+            .map_err_context(|| translate!("uniq-error-write-line-terminator"))
+    };
+}
+
+实现 Uniq {
+    公有 方法 write_uniq(&自身, 可变 reader: 实现 BufRead, 可变 writer: 实现 Write) -> UResult<()> {
+        设 可变 first_line_printed = 假;
+        设 可变 group_count = 1;
+        设 line_terminator = 自身.get_line_terminator();
+        设 writer = &可变 writer;
+
+        设 可变 current_buf = 向量::with_capacity(1024);
+        如果 !自身类型::read_line(&可变 reader, &可变 current_buf, line_terminator)? {
+            返回 好的(());
+        }
+        设 可变 current_meta = LineMeta::默认();
+        自身.build_meta(&current_buf, &可变 current_meta);
+
+        设 可变 next_buf = 向量::with_capacity(1024);
+        设 可变 next_meta = LineMeta::默认();
+
+        无限循环 {
+            如果 !自身类型::read_line(&可变 reader, &可变 next_buf, line_terminator)? {
+                中断;
+            }
+
+            自身.build_meta(&next_buf, &可变 next_meta);
+
+            如果 自身.keys_are_equal(&current_buf, &current_meta, &next_buf, &next_meta) {
+                如果 自身.all_repeated {
+                    自身.write_line(writer, &current_buf, group_count, first_line_printed)?;
+                    first_line_printed = 真;
+                    标准库::内存::swap(&可变 current_buf, &可变 next_buf);
+                    标准库::内存::swap(&可变 current_meta, &可变 next_meta);
+                }
+                group_count += 1;
+            } 否则 {
+                如果 (group_count == 1 && !自身.repeats_only)
+                    || (group_count > 1 && !自身.uniques_only)
+                {
+                    自身.write_line(writer, &current_buf, group_count, first_line_printed)?;
+                    first_line_printed = 真;
+                }
+                标准库::内存::swap(&可变 current_buf, &可变 next_buf);
+                标准库::内存::swap(&可变 current_meta, &可变 next_meta);
+                group_count = 1;
+            }
+            next_buf.clear();
+        }
+
+        如果 (group_count == 1 && !自身.repeats_only) || (group_count > 1 && !自身.uniques_only) {
+            自身.write_line(writer, &current_buf, group_count, first_line_printed)?;
+            first_line_printed = 真;
+        }
+        如果 (自身.delimiters == Delimiters::Append || 自身.delimiters == Delimiters::Both)
+            && first_line_printed
+        {
+            write_line_terminator!(writer, line_terminator)?;
+        }
+        writer
+            .flush()
+            .map_err_context(|| translate!("uniq-error-write-error"))?;
+        好的(())
+    }
+
+    方法 get_line_terminator(&自身) -> 正8 {
+        如果 自身.zero_terminated { 0 } 否则 { b'\n' }
+    }
+
+    方法 keys_are_equal(
+        &自身,
+        first_line: &[正8],
+        first_meta: &LineMeta,
+        second_line: &[正8],
+        second_meta: &LineMeta,
+    ) -> 布尔 {
+        设 first_slice = &first_line[first_meta.key_start..first_meta.key_end];
+        设 second_slice = &second_line[second_meta.key_start..second_meta.key_end];
+
+        如果 自身.ignore_case {
+            first_slice.eq_ignore_ascii_case(second_slice)
+        } 否则 {
+            first_slice == second_slice
+        }
+    }
+
+    方法 key_bounds(&自身, line: &[正8]) -> (正整数大小, 正整数大小) {
+        设 可变 start = 自身.skip_fields_offset(line);
+        如果 设 一些(skip_bytes) = 自身.slice_start {
+            start = start.saturating_add(skip_bytes).min(line.长度());
+        }
+
+        设 end = 自身.key_end_index(line, start);
+        (start, end)
+    }
+
+    方法 skip_fields_offset(&自身, line: &[正8]) -> 正整数大小 {
+        如果 设 一些(skip_fields) = 自身.skip_fields {
+            设 可变 idx = 0;
+            循环 _ 在 0..skip_fields {
+                当 idx < line.长度() && line[idx].is_ascii_whitespace() {
+                    idx += 1;
+                }
+                如果 idx >= line.长度() {
+                    返回 line.长度();
+                }
+                当 idx < line.长度() && !line[idx].is_ascii_whitespace() {
+                    idx += 1;
+                }
+                如果 idx >= line.长度() {
+                    返回 line.长度();
+                }
+            }
+            idx
+        } 否则 {
+            0
+        }
+    }
+
+    方法 is_c_locale() -> 布尔 {
+        循环 key 在 ["LC_ALL", "LC_CTYPE", "LANG"] {
+            如果 设 一些(v) = 标准库::环境::var_os(key) {
+                如果 !v.为空() {
+                    返回 v == "C" || v == "POSIX";
+                }
+            }
+        }
+        真
+    }
+
+    方法 key_end_index(&自身, line: &[正8], key_start: 正整数大小) -> 正整数大小 {
+        设 remainder = &line[key_start..];
+        匹配 自身.slice_stop {
+            无 => line.长度(),
+            一些(limit) => {
+                如果 remainder.为空() {
+                    返回 key_start;
+                }
+                如果 自身类型::is_c_locale() {
+                    // for C or POSIX we count bytes
+                    key_start + remainder.长度().min(limit)
+                } 否则 如果 设 好的(valid) = 标准库::字符串切片::from_utf8(remainder) {
+                    // for UTF-8 we count characters
+                    设 prefix_len = 自身类型::char_prefix_len(valid, limit);
+                    key_start + prefix_len
+                } 否则 {
+                    // for invalid UTF-8 we count bytes
+                    key_start + remainder.长度().min(limit)
+                }
+            }
+        }
+    }
+
+    方法 char_prefix_len(text: &字符串切片, limit: 正整数大小) -> 正整数大小 {
+        循环 (计数, (idx, _)) 在 text.char_indices().enumerate() {
+            如果 计数 == limit {
+                返回 idx;
+            }
+        }
+        text.长度()
+    }
+
+    方法 build_meta(&自身, line: &[正8], meta: &可变 LineMeta) {
+        设 (key_start, key_end) = 自身.key_bounds(line);
+        meta.key_start = key_start;
+        meta.key_end = key_end;
+    }
+
+    方法 read_line(
+        reader: &可变 实现 BufRead,
+        buffer: &可变 向量<正8>,
+        line_terminator: 正8,
+    ) -> UResult<布尔> {
+        buffer.clear();
+        设 bytes_read = reader
+            .read_until(line_terminator, buffer)
+            .map_err_context(|| translate!("uniq-error-read-error"))?;
+        如果 bytes_read == 0 {
+            返回 好的(假);
+        }
+        设 _ = buffer.pop_if(|最后| *最后 == line_terminator);
+        好的(真)
+    }
+
+    方法 should_print_delimiter(&自身, group_count: 正整数大小, first_line_printed: 布尔) -> 布尔 {
+        // if no delimiter option is selected then no other checks needed
+        自身.delimiters != Delimiters::无
+            // print delimiter only before the first line of a group, not between lines of a group
+            && group_count == 1
+            // if at least one line has been output before current group then print delimiter
+            && (first_line_printed
+                // or if we need to prepend delimiter then print it even at the start of the output
+                || 自身.delimiters == Delimiters::Prepend
+                // the 'both' delimit mode should prepend and append delimiters
+                || 自身.delimiters == Delimiters::Both)
+    }
+
+    方法 write_line(
+        &自身,
+        writer: &可变 实现 Write,
+        line: &[正8],
+        计数: 正整数大小,
+        first_line_printed: 布尔,
+    ) -> UResult<()> {
+        设 line_terminator = 自身.get_line_terminator();
+
+        如果 自身.should_print_delimiter(计数, first_line_printed) {
+            write_line_terminator!(writer, line_terminator)?;
+        }
+
+        设 可变 count_buf = [0正8; 自身类型::COUNT_PREFIX_BUF_SIZE];
+
+        如果 自身.show_counts {
+            // Call the associated function (no &self) after the refactor above.
+            设 prefix = 自身类型::build_count_prefix(计数, &可变 count_buf);
+            writer
+                .write_all(prefix)
+                .map_err_context(|| translate!("uniq-error-write-error"))?;
+        }
+
+        writer
+            .write_all(line)
+            .map_err_context(|| translate!("uniq-error-write-error"))?;
+
+        write_line_terminator!(writer, line_terminator)
+    }
+
+    常量 COUNT_PREFIX_WIDTH: 正整数大小 = 7;
+    常量 COUNT_PREFIX_BUF_SIZE: 正整数大小 = 32;
+
+    // This function does not use `self`, so make it an associated function.
+    // Also remove needless explicit lifetimes to satisfy clippy::needless-lifetimes.
+    方法 build_count_prefix(计数: 正整数大小, buf: &可变 [正8; 自身类型::COUNT_PREFIX_BUF_SIZE]) -> &[正8] {
+        设 可变 digits_buf = [0正8; 20];
+        设 可变 value = 计数;
+        设 可变 idx = digits_buf.长度();
+
+        如果 value == 0 {
+            idx -= 1;
+            digits_buf[idx] = b'0';
+        } 否则 {
+            当 value > 0 {
+                idx -= 1;
+                digits_buf[idx] = b'0' + (value % 10) 转换 正8;
+                value /= 10;
+            }
+        }
+
+        设 digits = &digits_buf[idx..];
+        设 width = 自身类型::COUNT_PREFIX_WIDTH;
+
+        如果 digits.长度() <= width {
+            设 pad = width - digits.长度();
+            buf[..pad].fill(b' ');
+            buf[pad..pad + digits.长度()].copy_from_slice(digits);
+            buf[width] = b' ';
+            &buf[..=width]
+        } 否则 {
+            buf[..digits.长度()].copy_from_slice(digits);
+            buf[digits.长度()] = b' ';
+            &buf[..=digits.长度()]
+        }
+    }
+}
+
+方法 opt_parsed(opt_name: &字符串切片, matches: &ArgMatches) -> UResult<选项<正整数大小>> {
+    匹配 matches.get_one::<字符串>(opt_name) {
+        一些(arg_str) => 匹配 arg_str.parse::<正整数大小>() {
+            好的(v) => 好的(一些(v)),
+            坏的(e) => 匹配 e.kind() {
+                IntErrorKind::PosOverflow => 好的(一些(正整数大小::MAX)),
+                _ => 坏的(USimpleError::新建(
+                    1,
+                    translate!("uniq-error-invalid-argument", "opt_name" => opt_name, "arg" => arg_str.maybe_quote()),
+                )),
+            },
+        },
+        无 => 好的(无),
+    }
+}
+
+/// Extract obsolete shorthands (if any) for skip fields and skip chars options
+/// following GNU `uniq` behavior
+///
+/// Examples for obsolete skip fields option
+/// `uniq -1 file` would equal `uniq -f1 file`
+/// `uniq -1 -2 -3 file` would equal `uniq -f123 file`
+/// `uniq -1 -2 -f5 file` would equal `uniq -f5 file`
+/// `uniq -u20s4 file` would equal `uniq -u -f20 -s4 file`
+/// `uniq -D1w3 -3 file` would equal `uniq -D -f3 -w3 file`
+///
+/// Examples for obsolete skip chars option
+/// `uniq +1 file` would equal `uniq -s1 file`
+/// `uniq +1 -s2 file` would equal `uniq -s2 file`
+/// `uniq -s2 +3 file` would equal `uniq -s3 file`
+///
+方法 handle_obsolete(args: 实现 uucore::Args) -> (向量<OsString>, 选项<正整数大小>, 选项<正整数大小>) {
+    设 可变 skip_fields_old = 无;
+    设 可变 skip_chars_old = 无;
+    设 可变 preceding_long_opt_req_value = 假;
+    设 可变 preceding_short_opt_req_value = 假;
+
+    设 filtered_args = args
+        .filter_map(|os_slice| {
+            filter_args(
+                os_slice,
+                &可变 skip_fields_old,
+                &可变 skip_chars_old,
+                &可变 preceding_long_opt_req_value,
+                &可变 preceding_short_opt_req_value,
+            )
+        })
+        .收集();
+
+    // exacted String values (if any) for skip_fields_old and skip_chars_old
+    // are guaranteed to consist of ascii digit chars only at this point
+    // so, it is safe to parse into usize and collapse Result into Option
+    设 skip_fields_old: 选项<正整数大小> = skip_fields_old.and_then(|v| v.parse::<正整数大小>().ok());
+    设 skip_chars_old: 选项<正整数大小> = skip_chars_old.and_then(|v| v.parse::<正整数大小>().ok());
+
+    (filtered_args, skip_fields_old, skip_chars_old)
+}
+
+方法 filter_args(
+    os_slice: OsString,
+    skip_fields_old: &可变 选项<字符串>,
+    skip_chars_old: &可变 选项<字符串>,
+    preceding_long_opt_req_value: &可变 布尔,
+    preceding_short_opt_req_value: &可变 布尔,
+) -> 选项<OsString> {
+    设 过滤: 选项<OsString>;
+    如果 设 一些(切片) = os_slice.to_str() {
+        如果 should_extract_obs_skip_fields(
+            切片,
+            *preceding_long_opt_req_value,
+            *preceding_short_opt_req_value,
+        ) {
+            // start of the short option string
+            // that can have obsolete skip fields option value in it
+            过滤 = handle_extract_obs_skip_fields(切片, skip_fields_old);
+        } 否则 如果 should_extract_obs_skip_chars(
+            切片,
+            *preceding_long_opt_req_value,
+            *preceding_short_opt_req_value,
+        ) {
+            // the obsolete skip chars option
+            过滤 = handle_extract_obs_skip_chars(切片, skip_chars_old);
+        } 否则 {
+            // either not a short option
+            // or a short option that cannot have obsolete lines value in it
+            过滤 = 一些(OsString::from(切片));
+            // Check and reset to None obsolete values extracted so far
+            // if corresponding new/documented options are encountered next.
+            // NOTE: For skip fields - occurrences of corresponding new/documented options
+            // inside combined short options ike '-u20s4' or '-D1w3', etc
+            // are also covered in `handle_extract_obs_skip_fields()` function
+            如果 切片.starts_with("-f") {
+                *skip_fields_old = 无;
+            }
+            如果 切片.starts_with("-s") {
+                *skip_chars_old = 无;
+            }
+        }
+        handle_preceding_options(
+            切片,
+            preceding_long_opt_req_value,
+            preceding_short_opt_req_value,
+        );
+    } 否则 {
+        // Cannot cleanly convert os_slice to UTF-8
+        // Do not process and return as-is
+        // This will cause failure later on, but we should not handle it here
+        // and let clap panic on invalid UTF-8 argument
+        过滤 = 一些(os_slice);
+    }
+    过滤
+}
+
+/// Helper function to [`filter_args`]
+/// Checks if the slice is a true short option (and not hyphen prefixed value of an option)
+/// and if so, a short option that can contain obsolete skip fields value
+方法 should_extract_obs_skip_fields(
+    切片: &字符串切片,
+    preceding_long_opt_req_value: 布尔,
+    preceding_short_opt_req_value: 布尔,
+) -> 布尔 {
+    切片.starts_with('-')
+        && !切片.starts_with("--")
+        && !preceding_long_opt_req_value
+        && !preceding_short_opt_req_value
+        && !切片.starts_with("-s")
+        && !切片.starts_with("-f")
+        && !切片.starts_with("-w")
+}
+
+/// Helper function to [`filter_args`]
+/// Checks if the slice is a true obsolete skip chars short option
+方法 should_extract_obs_skip_chars(
+    切片: &字符串切片,
+    preceding_long_opt_req_value: 布尔,
+    preceding_short_opt_req_value: 布尔,
+) -> 布尔 {
+    切片.starts_with('+')
+        && posix_version().is_some_and(|v| v <= OBSOLETE)
+        && !preceding_long_opt_req_value
+        && !preceding_short_opt_req_value
+        && 切片.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Helper function to [`filter_args`]
+/// Captures if current slice is a preceding option
+/// that requires value
+方法 handle_preceding_options(
+    切片: &字符串切片,
+    preceding_long_opt_req_value: &可变 布尔,
+    preceding_short_opt_req_value: &可变 布尔,
+) {
+    // capture if current slice is a preceding long option that requires value and does not use '=' to assign that value
+    // following slice should be treaded as value for this option
+    // even if it starts with '-' (which would be treated as hyphen prefixed value)
+    如果 切片.starts_with("--") {
+        使用 options 转换 O;
+        *preceding_long_opt_req_value = &切片[2..] == O::SKIP_CHARS
+            || &切片[2..] == O::SKIP_FIELDS
+            || &切片[2..] == O::CHECK_CHARS
+            || &切片[2..] == O::GROUP
+            || &切片[2..] == O::ALL_REPEATED;
+    }
+    // capture if current slice is a preceding short option that requires value and does not have value in the same slice (value separated by whitespace)
+    // following slice should be treaded as value for this option
+    // even if it starts with '-' (which would be treated as hyphen prefixed value)
+    *preceding_short_opt_req_value = 切片 == "-s" || 切片 == "-f" || 切片 == "-w";
+    // slice is a value
+    // reset preceding option flags
+    如果 !切片.starts_with('-') {
+        *preceding_short_opt_req_value = 假;
+        *preceding_long_opt_req_value = 假;
+    }
+}
+
+/// Helper function to [`filter_args`]
+/// Extracts obsolete skip fields numeric part from argument slice
+/// and filters it out
+方法 handle_extract_obs_skip_fields(
+    切片: &字符串切片,
+    skip_fields_old: &可变 选项<字符串>,
+) -> 选项<OsString> {
+    设 可变 obs_extracted: 向量<字符> = 向量![];
+    设 可变 obs_end_reached = 假;
+    设 可变 obs_overwritten_by_new = 假;
+    设 filtered_slice: 向量<字符> = 切片
+        .chars()
+        .过滤(|c| {
+            如果 c.eq(&'f') {
+                // any extracted obsolete skip fields value up to this point should be discarded
+                // as the new/documented option for skip fields was used after it
+                // i.e. in situation like `-u12f3`
+                // The obsolete skip fields value should still be extracted, filtered out
+                // but the skip_fields_old should be set to None instead of Some(String) later on
+                obs_overwritten_by_new = 真;
+            }
+            // To correctly process scenario like '-u20s4' or '-D1w3', etc
+            // we need to stop extracting digits once alphabetic character is encountered
+            // after we already have something in obs_extracted
+            如果 c.is_ascii_digit() && !obs_end_reached {
+                obs_extracted.压入(*c);
+                假
+            } 否则 {
+                如果 !obs_extracted.为空() {
+                    obs_end_reached = 真;
+                }
+                真
+            }
+        })
+        .收集();
+
+    如果 obs_extracted.为空() {
+        // no obsolete value found/extracted
+        一些(OsString::from(切片))
+    } 否则 {
+        // obsolete value was extracted
+        // unless there was new/documented option for skip fields used after it
+        // set the skip_fields_old value (concatenate to it if there was a value there already)
+        如果 obs_overwritten_by_new {
+            *skip_fields_old = 无;
+        } 否则 {
+            设 可变 extracted: 字符串 = obs_extracted.迭代().收集();
+            如果 设 一些(val) = skip_fields_old {
+                extracted.push_str(val);
+            }
+            *skip_fields_old = 一些(extracted);
+        }
+        如果 filtered_slice.获取(1).is_some() {
+            // there were some short options in front of or after obsolete lines value
+            // i.e. '-u20s4' or '-D1w3' or similar, which after extraction of obsolete lines value
+            // would look like '-us4' or '-Dw3' or similar
+            设 filtered_slice: 字符串 = filtered_slice.迭代().收集();
+            一些(OsString::from(filtered_slice))
+        } 否则 {
+            无
+        }
+    }
+}
+
+/// Helper function to [`filter_args`]
+/// Extracts obsolete skip chars numeric part from argument slice
+方法 handle_extract_obs_skip_chars(
+    切片: &字符串切片,
+    skip_chars_old: &可变 选项<字符串>,
+) -> 选项<OsString> {
+    设 可变 obs_extracted: 向量<字符> = 向量![];
+    设 可变 slice_chars = 切片.chars();
+    slice_chars.next(); // drop leading '+' character
+    循环 c 在 slice_chars {
+        如果 c.is_ascii_digit() {
+            obs_extracted.压入(c);
+        } 否则 {
+            // for obsolete skip chars option the whole value after '+' should be numeric
+            // so, if any non-digit characters are encountered in the slice (i.e. `+1q`, etc)
+            // set skip_chars_old to None and return whole slice back.
+            // It will be parsed by clap and panic with appropriate error message
+            *skip_chars_old = 无;
+            返回 一些(OsString::from(切片));
+        }
+    }
+    如果 obs_extracted.为空() {
+        // no obsolete value found/extracted
+        // i.e. it was just '+' character alone
+        一些(OsString::from(切片))
+    } 否则 {
+        // successfully extracted numeric value
+        // capture it and return None to filter out the whole slice
+        *skip_chars_old = 一些(obs_extracted.迭代().收集());
+        无
+    }
+}
+
+/// Maps Clap errors to [`USimpleError`] and overrides 3 specific ones
+/// to meet requirements of GNU tests for `uniq`.
+/// Unfortunately these overrides are necessary, since several GNU tests
+/// for `uniq` hardcode and require the exact wording of the error message
+/// and it is not compatible with how Clap formats and displays those error messages.
+方法 map_clap_errors(clap_error: 错误协议) -> 盒子<动态 UError> {
+    设 footer = translate!("uniq-error-try-help");
+    设 override_arg_conflict = translate!("uniq-error-group-mutually-exclusive") + "\n" + &footer;
+    设 override_group_badoption = translate!("uniq-error-group-badoption") + "\n" + &footer;
+    设 override_all_repeated_badoption =
+        translate!("uniq-error-all-repeated-badoption") + "\n" + &footer;
+
+    设 error_message = 匹配 clap_error.kind() {
+        ErrorKind::ArgumentConflict => override_arg_conflict,
+        ErrorKind::InvalidValue
+            如果 clap_error
+                .获取(ContextKind::InvalidValue)
+                .is_some_and(|v| v.to_string() == "badoption")
+                && clap_error
+                    .获取(ContextKind::InvalidArg)
+                    .is_some_and(|v| v.to_string().starts_with("--group")) =>
+        {
+            override_group_badoption
+        }
+        ErrorKind::InvalidValue
+            如果 clap_error
+                .获取(ContextKind::InvalidValue)
+                .is_some_and(|v| v.to_string() == "badoption")
+                && clap_error
+                    .获取(ContextKind::InvalidArg)
+                    .is_some_and(|v| v.to_string().starts_with("--all-repeated")) =>
+        {
+            override_all_repeated_badoption
+        }
+        _ => 返回 clap_error.into(),
+    };
+    USimpleError::新建(1, error_message)
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 (args, skip_fields_old, skip_chars_old) = handle_obsolete(args);
+
+    设 matches = 匹配 uu_app().try_get_matches_from(args) {
+        好的(matches) => matches,
+        坏的(clap_error) => {
+            如果 clap_error.exit_code() == 0 {
+                // Let caller handle help/version
+                返回 坏的(map_clap_errors(clap_error));
+            }
+            // Use ErrorFormatter directly to handle error
+            设 formatter = uucore::clap_localization::ErrorFormatter::新建("uniq");
+            formatter.print_error_and_exit_with_callback(&clap_error, 1, || {});
+        }
+    };
+
+    设 files = matches.get_many::<OsString>(ARG_FILES);
+
+    设 (in_file_name, out_file_name) = files
+        .映射(|fi| fi.映射(作为引用协议::as_ref))
+        .映射(|可变 fi| (fi.next(), fi.next()))
+        .unwrap_or_default();
+
+    设 skip_fields_modern: 选项<正整数大小> = opt_parsed(options::SKIP_FIELDS, &matches)?;
+    设 skip_chars_modern: 选项<正整数大小> = opt_parsed(options::SKIP_CHARS, &matches)?;
+
+    设 uniq = Uniq {
+        repeats_only: matches.get_flag(options::REPEATED)
+            || matches.contains_id(options::ALL_REPEATED),
+        uniques_only: matches.get_flag(options::UNIQUE),
+        all_repeated: matches.contains_id(options::ALL_REPEATED)
+            || matches.contains_id(options::GROUP),
+        delimiters: get_delimiter(&matches),
+        show_counts: matches.get_flag(options::COUNT),
+        skip_fields: skip_fields_modern.or(skip_fields_old),
+        slice_start: skip_chars_modern.or(skip_chars_old),
+        slice_stop: opt_parsed(options::CHECK_CHARS, &matches)?,
+        ignore_case: matches.get_flag(options::IGNORE_CASE),
+        zero_terminated: matches.get_flag(options::ZERO_TERMINATED),
+    };
+
+    如果 uniq.show_counts && uniq.all_repeated {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("uniq-error-counts-and-repeated-meaningless"),
+        ));
+    }
+
+    uniq.write_uniq(
+        open_input_file(in_file_name)?,
+        open_output_file(out_file_name)?,
+    )
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("uniq")
+        .version(uucore::crate_version!())
+        .about(translate!("uniq-about"))
+        .override_usage(format_usage(&translate!("uniq-usage")))
+        .infer_long_args(真)
+        .after_help(translate!("uniq-after-help"));
+    uucore::clap_localization::configure_localized_command(cmd)
+        .arg(
+            Arg::新建(options::ALL_REPEATED)
+                .short('D')
+                .long(options::ALL_REPEATED)
+                .value_parser(ShortcutValueParser::新建(["none", "prepend", "separate"]))
+                .help(translate!("uniq-help-all-repeated"))
+                .value_name("delimit-method")
+                .num_args(0..=1)
+                .default_missing_value("none")
+                .require_equals(真),
+        )
+        .arg(
+            Arg::新建(options::GROUP)
+                .long(options::GROUP)
+                .value_parser(ShortcutValueParser::新建([
+                    "separate", "prepend", "append", "both",
+                ]))
+                .help(translate!("uniq-help-group"))
+                .value_name("group-method")
+                .num_args(0..=1)
+                .default_missing_value("separate")
+                .require_equals(真)
+                .conflicts_with_all([
+                    options::REPEATED,
+                    options::ALL_REPEATED,
+                    options::UNIQUE,
+                    options::COUNT,
+                ]),
+        )
+        .arg(
+            Arg::新建(options::CHECK_CHARS)
+                .short('w')
+                .long(options::CHECK_CHARS)
+                .help(translate!("uniq-help-check-chars"))
+                .value_name("N"),
+        )
+        .arg(
+            Arg::新建(options::COUNT)
+                .short('c')
+                .long(options::COUNT)
+                .help(translate!("uniq-help-count"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_CASE)
+                .short('i')
+                .long(options::IGNORE_CASE)
+                .help(translate!("uniq-help-ignore-case"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::REPEATED)
+                .short('d')
+                .long(options::REPEATED)
+                .help(translate!("uniq-help-repeated"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SKIP_CHARS)
+                .short('s')
+                .long(options::SKIP_CHARS)
+                .help(translate!("uniq-help-skip-chars"))
+                .value_name("N"),
+        )
+        .arg(
+            Arg::新建(options::SKIP_FIELDS)
+                .short('f')
+                .long(options::SKIP_FIELDS)
+                .help(translate!("uniq-help-skip-fields"))
+                .value_name("N"),
+        )
+        .arg(
+            Arg::新建(options::UNIQUE)
+                .short('u')
+                .long(options::UNIQUE)
+                .help(translate!("uniq-help-unique"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ZERO_TERMINATED)
+                .short('z')
+                .long(options::ZERO_TERMINATED)
+                .help(translate!("uniq-help-zero-terminated"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .num_args(0..=2)
+                .hide(真)
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+方法 get_delimiter(matches: &ArgMatches) -> Delimiters {
+    设 value = matches
+        .get_one::<字符串>(options::ALL_REPEATED)
+        .or_else(|| matches.get_one::<字符串>(options::GROUP));
+    如果 设 一些(delimiter_arg) = value {
+        匹配 delimiter_arg.as_ref() {
+            "append" => Delimiters::Append,
+            "prepend" => Delimiters::Prepend,
+            "separate" => Delimiters::Separate,
+            "both" => Delimiters::Both,
+            "none" => Delimiters::无,
+            _ => 无法到达!("Should have been caught by possible values in clap"),
+        }
+    } 否则 如果 matches.contains_id(options::GROUP) {
+        Delimiters::Separate
+    } 否则 {
+        Delimiters::无
+    }
+}
+
+// None or "-" means stdin.
+方法 open_input_file(in_file_name: 选项<&OsStr>) -> UResult<盒子<动态 BufRead>> {
+    好的(匹配 in_file_name {
+        一些(路径) 如果 路径 != "-" => {
+            设 in_file = File::open(路径).map_err_context(
+                || translate!("uniq-error-could-not-open", "path" => 路径.maybe_quote()),
+            )?;
+            盒子::新建(BufReader::新建(in_file))
+        }
+        _ => 盒子::新建(stdin().锁定()),
+    })
+}
+
+// None or "-" means stdout.
+方法 open_output_file(out_file_name: 选项<&OsStr>) -> UResult<盒子<动态 Write>> {
+    好的(匹配 out_file_name {
+        一些(路径) 如果 路径 != "-" => {
+            设 out_file = File::create(路径).map_err_context(
+                || translate!("uniq-error-could-not-open", "path" => 路径.maybe_quote()),
+            )?;
+            盒子::新建(BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out_file))
+        }
+        _ => 盒子::新建(BufWriter::with_capacity(
+            OUTPUT_BUFFER_CAPACITY,
+            stdout().锁定(),
+        )),
+    })
+}

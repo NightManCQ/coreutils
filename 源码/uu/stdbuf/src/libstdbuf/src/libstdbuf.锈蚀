@@ -1,0 +1,249 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) getreent reent IOFBF IOLBF IONBF setvbuf stderrp stdinp stdoutp fdopen
+
+使用 ctor::ctor;
+使用 libc::{_IOFBF, _IOLBF, _IONBF, FILE, c_char, c_int, fileno, size_t};
+使用 标准库::输入输出::{Write, stderr};
+使用 标准库::{环境, 指针};
+
+// This runs automatically when the library is loaded via LD_PRELOAD
+#[ctor]
+方法 init() {
+    不安全 { __stdbuf() };
+}
+
+/// # Safety
+/// This function is unsafe because it calls a C API
+#[不安全(no_mangle)]
+公有 不安全 外部 "C" 方法 __stdbuf_get_stdin() -> *可变 FILE {
+    #[cfg(任意(target_os = "macos", target_os = "freebsd"))]
+    {
+        不安全 外部 "C" {
+            方法 __stdinp() -> *可变 FILE;
+        }
+        不安全 { __stdinp() }
+    }
+
+    #[cfg(target_os = "openbsd")]
+    {
+        不安全 外部 "C" {
+            静态 可变 __stdin: *可变 FILE;
+        }
+        不安全 { __stdin }
+    }
+
+    #[cfg(target_os = "netbsd")]
+    {
+        不安全 { libc::fdopen(0, c"r".as_ptr()) }
+    }
+
+    #[cfg(target_os = "cygwin")]
+    {
+        // _getreent()->_std{in,out,err}
+        // see:
+        // echo '#include <stdio.h>\nstd{in,out,err}' | gcc -E -xc - -std=c23 | tail -n1
+        // echo '#include <stdio.h>' | grep -E -xc - -std=c23 | grep 'struct _reent' -A91 | grep 580 -A91 | tail -n+2
+
+        #[repr(C)]
+        结构 _reent {
+            _errno: c_int,
+            _stdin: *可变 FILE,
+            _stdout: *可变 FILE,
+            _stderr: *可变 FILE,
+            // other stuff
+        }
+
+        不安全 外部 "C" {
+            方法 __getreent() -> *可变 _reent;
+        }
+
+        不安全 { (*__getreent())._stdin }
+    }
+
+    #[cfg(not(任意(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "cygwin"
+    )))]
+    {
+        不安全 外部 "C" {
+            静态 可变 stdin: *可变 FILE;
+        }
+        不安全 { stdin }
+    }
+}
+
+/// # Safety
+/// This function is unsafe because it calls a C API
+#[不安全(no_mangle)]
+公有 不安全 外部 "C" 方法 __stdbuf_get_stdout() -> *可变 FILE {
+    #[cfg(任意(target_os = "macos", target_os = "freebsd"))]
+    {
+        不安全 外部 "C" {
+            方法 __stdoutp() -> *可变 FILE;
+        }
+        不安全 { __stdoutp() }
+    }
+
+    #[cfg(target_os = "openbsd")]
+    {
+        不安全 外部 "C" {
+            静态 可变 __stdout: *可变 FILE;
+        }
+        不安全 { __stdout }
+    }
+
+    #[cfg(target_os = "netbsd")]
+    {
+        不安全 { libc::fdopen(1, c"w".as_ptr()) }
+    }
+
+    #[cfg(target_os = "cygwin")]
+    {
+        // _getreent()->_std{in,out,err}
+        // see:
+        // echo '#include <stdio.h>\nstd{in,out,err}' | gcc -E -xc - -std=c23 | tail -n1
+        // echo '#include <stdio.h>' | grep -E -xc - -std=c23 | grep 'struct _reent' -A91 | grep 580 -A91 | tail -n+2
+
+        #[repr(C)]
+        结构 _reent {
+            _errno: c_int,
+            _stdin: *可变 FILE,
+            _stdout: *可变 FILE,
+            _stderr: *可变 FILE,
+            // other stuff
+        }
+
+        不安全 外部 "C" {
+            方法 __getreent() -> *可变 _reent;
+        }
+
+        不安全 { (*__getreent())._stdout }
+    }
+
+    #[cfg(not(任意(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "cygwin"
+    )))]
+    {
+        不安全 外部 "C" {
+            静态 可变 stdout: *可变 FILE;
+        }
+        不安全 { stdout }
+    }
+}
+
+/// # Safety
+/// This function is unsafe because it calls a C API
+#[不安全(no_mangle)]
+公有 不安全 外部 "C" 方法 __stdbuf_get_stderr() -> *可变 FILE {
+    #[cfg(任意(target_os = "macos", target_os = "freebsd"))]
+    {
+        不安全 外部 "C" {
+            方法 __stderrp() -> *可变 FILE;
+        }
+        不安全 { __stderrp() }
+    }
+
+    #[cfg(target_os = "openbsd")]
+    {
+        不安全 外部 "C" {
+            静态 可变 __stderr: *可变 FILE;
+        }
+        不安全 { __stderr }
+    }
+
+    #[cfg(target_os = "netbsd")]
+    {
+        不安全 { libc::fdopen(2, c"w".as_ptr()) }
+    }
+
+    #[cfg(target_os = "cygwin")]
+    {
+        // _getreent()->_std{in,out,err}
+        // see:
+        // echo '#include <stdio.h>\nstd{in,out,err}' | gcc -E -xc - -std=c23 | tail -n1
+        // echo '#include <stdio.h>' | grep -E -xc - -std=c23 | grep 'struct _reent' -A91 | grep 580 -A91 | tail -n+2
+
+        #[repr(C)]
+        结构 _reent {
+            _errno: c_int,
+            _stdin: *可变 FILE,
+            _stdout: *可变 FILE,
+            _stderr: *可变 FILE,
+            // other stuff
+        }
+
+        不安全 外部 "C" {
+            方法 __getreent() -> *可变 _reent;
+        }
+
+        不安全 { (*__getreent())._stdin }
+    }
+
+    #[cfg(not(任意(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "cygwin"
+    )))]
+    {
+        不安全 外部 "C" {
+            静态 可变 stderr: *可变 FILE;
+        }
+        不安全 { stderr }
+    }
+}
+
+方法 set_buffer(stream: *可变 FILE, value: &字符串切片) {
+    设 (mode, size): (c_int, size_t) = 匹配 value {
+        "0" => (_IONBF, 0_usize),
+        "L" => (_IOLBF, 0_usize),
+        input => {
+            设 好的(buff_size) = input.parse::<正整数大小>() 否则 {
+                设 _ = writeln!(stderr(), "failed to allocate a {value} byte stdio buffer");
+                标准库::进程::exit(1);
+            };
+            (_IOFBF, buff_size 转换 size_t)
+        }
+    };
+    设 res: c_int;
+    不安全 {
+        设 buffer: *可变 c_char = 指针::null_mut();
+        断言!(buffer.is_null());
+        res = libc::setvbuf(stream, buffer, mode, size);
+    }
+    如果 res != 0 {
+        设 _ = writeln!(
+            stderr(),
+            "could not set buffering of {} to mode {mode}",
+            不安全 { fileno(stream) }
+        );
+    }
+}
+
+/// # Safety
+/// This function is intended to be called automatically when the library is loaded via LD_PRELOAD.
+/// It assumes that the standard streams are valid and that calling setvbuf on them is safe.
+/// The caller must ensure this function is only called in a compatible runtime environment.
+#[不安全(no_mangle)]
+公有 不安全 外部 "C" 方法 __stdbuf() {
+    如果 设 好的(val) = 环境::var("_STDBUF_E") {
+        set_buffer(不安全 { __stdbuf_get_stderr() }, &val);
+    }
+    如果 设 好的(val) = 环境::var("_STDBUF_I") {
+        set_buffer(不安全 { __stdbuf_get_stdin() }, &val);
+    }
+    如果 设 好的(val) = 环境::var("_STDBUF_O") {
+        set_buffer(不安全 { __stdbuf_get_stdout() }, &val);
+    }
+}

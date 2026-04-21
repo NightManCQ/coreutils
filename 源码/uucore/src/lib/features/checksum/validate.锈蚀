@@ -1,0 +1,1304 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore rsplit hexdigit bitlen invalidchecksum inva idchecksum xffname
+
+使用 箱::util_name;
+
+使用 标准库::ffi::OsStr;
+使用 标准库::格式化::显示协议;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufReader, Read, Write, stderr, stdin};
+
+使用 os_display::Quotable;
+
+使用 箱::checksum::{
+    AlgoKind, BlakeLength, ChecksumError, ReadingMode, ShaLength, SizedAlgoKind, digest_reader,
+    parse_blake_length, unescape_filename,
+};
+使用 箱::错误::{FromIo, UError, UIoError, UResult, USimpleError};
+使用 箱::quoting_style::{QuotingStyle, locale_aware_escape_name};
+使用 箱::求和::{自身, Blake2b, Blake3, DigestOutput};
+使用 箱::{
+    os_str_as_bytes, os_str_from_bytes, read_os_string_lines, show, show_warning_caps, translate,
+};
+
+/// To what level should checksum validation print logging info.
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 偏序比较协议, 克隆协议, 复制协议, 默认协议)]
+公有 枚举 ChecksumVerbose {
+    Status,
+    Quiet,
+    #[默认]
+    Normal,
+    Warning,
+}
+
+实现 ChecksumVerbose {
+    公有 方法 新建(status: 布尔, quiet: 布尔, warn: 布尔) -> 自身类型 {
+        使用 ChecksumVerbose::*;
+
+        // Assume only one of the three booleans will be enabled at once.
+        // This is ensured by clap's overriding arguments.
+        匹配 (status, quiet, warn) {
+            (真, _, _) => Status,
+            (_, 真, _) => Quiet,
+            (_, _, 真) => Warning,
+            _ => Normal,
+        }
+    }
+
+    #[inline]
+    公有 方法 over_status(自身) -> 布尔 {
+        自身 > 自身类型::Status
+    }
+
+    #[inline]
+    公有 方法 over_quiet(自身) -> 布尔 {
+        自身 > 自身类型::Quiet
+    }
+
+    #[inline]
+    公有 方法 at_least_warning(自身) -> 布尔 {
+        自身 >= 自身类型::Warning
+    }
+}
+
+/// This struct regroups CLI flags.
+#[derive(调试协议, 默认协议, 克隆协议, 复制协议)]
+公有 结构 ChecksumValidateOptions {
+    公有 ignore_missing: 布尔,
+    公有 strict: 布尔,
+    公有 verbose: ChecksumVerbose,
+}
+
+/// This structure holds the count of checksum test lines' outcomes.
+#[derive(默认协议)]
+结构 ChecksumResult {
+    /// Number of lines in the file where the computed checksum MATCHES
+    /// the expectation.
+    公有 correct: 正32,
+    /// Number of lines in the file where the computed checksum DIFFERS
+    /// from the expectation.
+    公有 failed_cksum: 正32,
+    公有 failed_open_file: 正32,
+    /// Number of improperly formatted lines.
+    公有 bad_format: 正32,
+    /// Total number of non-empty, non-comment lines.
+    公有 total: 正32,
+}
+
+实现 ChecksumResult {
+    #[inline]
+    方法 total_properly_formatted(&自身) -> 正32 {
+        自身.total - 自身.bad_format
+    }
+}
+
+/// Represents a reason for which the processing of a checksum line
+/// could not proceed to digest comparison.
+枚举 LineCheckError {
+    /// a generic UError was encountered in sub-functions
+    UError(盒子<动态 UError>),
+    /// the computed checksum digest differs from the expected one
+    DigestMismatch,
+    /// the line is empty or is a comment
+    Skipped,
+    /// the line has a formatting error
+    ImproperlyFormatted,
+    /// file exists but is impossible to read
+    CantOpenFile,
+    /// there is nothing at the given path
+    FileNotFound,
+    /// the given path leads to a directory
+    FileIsDirectory,
+}
+
+实现 转换协议<盒子<动态 UError>> 循环 LineCheckError {
+    方法 from(value: 盒子<动态 UError>) -> 自身类型 {
+        自身类型::UError(value)
+    }
+}
+
+实现 转换协议<ChecksumError> 循环 LineCheckError {
+    方法 from(value: ChecksumError) -> 自身类型 {
+        自身类型::UError(盒子::新建(value))
+    }
+}
+
+/// Represents an error that was encountered when processing a checksum file.
+枚举 FileCheckError {
+    /// a generic UError was encountered in sub-functions
+    UError(盒子<动态 UError>),
+    /// reading of the checksum file failed
+    CantOpenChecksumFile,
+    /// processing of the file is considered as a failure regarding the
+    /// provided flags. This however does not stop the processing of
+    /// further files.
+    Failed,
+}
+
+实现 转换协议<盒子<动态 UError>> 循环 FileCheckError {
+    方法 from(value: 盒子<动态 UError>) -> 自身类型 {
+        自身类型::UError(value)
+    }
+}
+
+实现 转换协议<ChecksumError> 循环 FileCheckError {
+    方法 from(value: ChecksumError) -> 自身类型 {
+        自身类型::UError(盒子::新建(value))
+    }
+}
+
+方法 print_cksum_report(res: &ChecksumResult) {
+    如果 res.bad_format > 0 {
+        show_warning_caps!(
+            "{}",
+            translate!("checksum-bad-format", "count" => res.bad_format)
+        );
+    }
+
+    如果 res.failed_cksum > 0 {
+        show_warning_caps!(
+            "{}",
+            translate!("checksum-failed-cksum", "count" => res.failed_cksum)
+        );
+    }
+
+    如果 res.failed_open_file > 0 {
+        show_warning_caps!(
+            "{}",
+            translate!("checksum-failed-open-file", "count" => res.failed_open_file)
+        );
+    }
+}
+
+/// Print a "no properly formatted lines" message in stderr
+#[inline]
+方法 log_no_properly_formatted(filename: 实现 显示协议) {
+    设 _ = writeln!(
+        stderr(),
+        "{}: {}",
+        util_name(),
+        translate!("checksum-no-properly-formatted", "checksum_file" => filename)
+    );
+}
+
+/// Print a "no file was verified" message in stderr
+#[inline]
+方法 log_no_file_verified(filename: 实现 显示协议) {
+    设 _ = writeln!(
+        stderr(),
+        "{}: {}",
+        util_name(),
+        translate!("checksum-no-file-verified", "checksum_file" => filename)
+    );
+}
+
+/// Represents the different outcomes that can happen to a file
+/// that is being checked.
+#[derive(调试协议, 克隆协议, 复制协议)]
+枚举 FileChecksumResult {
+    好的,
+    Failed,
+    CantOpen,
+}
+
+实现 FileChecksumResult {
+    /// Creates a `FileChecksumResult` from a digest comparison that
+    /// either succeeded or failed.
+    方法 from_bool(checksum_correct: 布尔) -> 自身类型 {
+        如果 checksum_correct {
+            自身类型::好的
+        } 否则 {
+            自身类型::Failed
+        }
+    }
+
+    /// The cli options might prevent to display on the outcome of the
+    /// comparison on STDOUT.
+    方法 can_display(自身, verbose: ChecksumVerbose) -> 布尔 {
+        匹配 自身 {
+            自身类型::好的 => verbose.over_quiet(),
+            自身类型::Failed => verbose.over_status(),
+            自身类型::CantOpen => 真,
+        }
+    }
+}
+
+实现 显示协议 循环 FileChecksumResult {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::好的 => write!(f, "OK"),
+            自身类型::Failed => write!(f, "FAILED"),
+            自身类型::CantOpen => write!(f, "FAILED open or read"),
+        }
+    }
+}
+
+/// Write to the given buffer the checksum validation status of a file which
+/// name might contain non-utf-8 characters.
+方法 write_file_report<W: Write>(
+    可变 w: W,
+    filename: &[正8],
+    result: FileChecksumResult,
+    prefix: &字符串切片,
+    verbose: ChecksumVerbose,
+) {
+    如果 result.can_display(verbose) {
+        设 _ = write!(w, "{prefix}");
+        设 _ = w.write_all(filename);
+        设 _ = writeln!(w, ": {result}");
+    }
+}
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议, 复制协议)]
+枚举 LineFormat {
+    AlgoBased,
+    SingleSpace,
+    Untagged,
+}
+
+实现 LineFormat {
+    /// parse [tagged output format]
+    /// Normally the format is simply space separated but openssl does not
+    /// respect the gnu definition.
+    ///
+    /// [tagged output format]: https://www.gnu.org/software/coreutils/manual/html_node/cksum-output-modes.html#cksum-output-modes-1
+    方法 parse_algo_based(line: &[正8]) -> 选项<LineInfo> {
+        //   r"\MD5 (a\\ b) = abc123",
+        //   BLAKE2b(44)= a45a4c4883cce4b50d844fab460414cc2080ca83690e74d850a9253e757384366382625b218c8585daee80f34dc9eb2f2fde5fb959db81cd48837f9216e7b0fa
+        设 trimmed = line.trim_ascii_start();
+        设 algo_start = 正整数大小::from(trimmed.starts_with(b"\\"));
+        设 rest = &trimmed[algo_start..];
+
+        枚举 SubCase {
+            Posix,
+            OpenSSL,
+        }
+        // find the next parenthesis  using byte search (not next whitespace) because openssl's
+        // tagged format does not put a space before (filename)
+
+        设 par_idx = rest.迭代().position(|&b| b == b'(')?;
+        设 sub_case = 如果 rest[par_idx - 1] == b' ' {
+            SubCase::Posix
+        } 否则 {
+            SubCase::OpenSSL
+        };
+
+        设 algo_substring = 匹配 sub_case {
+            SubCase::Posix => &rest[..par_idx - 1],
+            SubCase::OpenSSL => &rest[..par_idx],
+        };
+        设 可变 algo_parts = algo_substring.splitn(2, |&b| b == b'-');
+        设 algo = algo_parts.next()?;
+
+        // Parse algo_bits if present
+        设 algo_bits = algo_parts
+            .next()
+            .and_then(|s| 标准库::字符串切片::from_utf8(s).ok()?.parse::<正整数大小>().ok());
+
+        // Check algo format: uppercase ASCII or digits or "BLAKE2b"
+        设 is_valid_algo = algo == b"BLAKE2b"
+            || algo
+                .迭代()
+                .全部(|&b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        如果 !is_valid_algo {
+            返回 无;
+        }
+        // SAFETY: we just validated the contents of algo, we can unsafely make a
+        // String from it
+        设 algo_utf8 = 不安全 { 字符串::from_utf8_unchecked(algo.to_vec()) };
+        // stripping '(' not ' (' since we matched on ( not whitespace because of openssl.
+        设 after_paren = rest.获取(par_idx + 1..)?;
+        设 (filename, checksum) = 匹配 sub_case {
+            SubCase::Posix => ByteSliceExt::rsplit_once(after_paren, b") = ")?,
+            SubCase::OpenSSL => ByteSliceExt::rsplit_once(after_paren, b")= ")?,
+        };
+
+        设 checksum_utf8 = 自身类型::validate_checksum_format(checksum)?;
+
+        一些(LineInfo {
+            algo_name: 一些(algo_utf8),
+            algo_bit_len: algo_bits,
+            checksum: checksum_utf8,
+            filename: filename.to_vec(),
+            format: 自身类型::AlgoBased,
+        })
+    }
+
+    #[allow(rustdoc::invalid_html_tags)]
+    /// parse [untagged output format]
+    /// The format is simple, either "<checksum>  <filename>" or
+    /// "<checksum> *<filename>"
+    ///
+    /// [untagged output format]: https://www.gnu.org/software/coreutils/manual/html_node/cksum-output-modes.html#cksum-output-modes-1
+    方法 parse_untagged(line: &[正8]) -> 选项<LineInfo> {
+        设 space_idx = line.迭代().position(|&b| b == b' ')?;
+        设 checksum = &line[..space_idx];
+
+        设 checksum_utf8 = 自身类型::validate_checksum_format(checksum)?;
+
+        设 rest = &line[space_idx..];
+        设 filename = rest
+            .strip_prefix(b"  ")
+            .or_else(|| rest.strip_prefix(b" *"))?;
+
+        一些(LineInfo {
+            algo_name: 无,
+            algo_bit_len: 无,
+            checksum: checksum_utf8,
+            filename: filename.to_vec(),
+            format: 自身类型::Untagged,
+        })
+    }
+
+    #[allow(rustdoc::invalid_html_tags)]
+    /// parse [untagged output format]
+    /// Normally the format is simple, either "<checksum>  <filename>" or
+    /// "<checksum> *<filename>"
+    /// But the bsd tests expect special single space behavior where
+    /// checksum and filename are separated only by a space, meaning the second
+    /// space or asterisk is part of the file name.
+    /// This parser accounts for this variation
+    ///
+    /// [untagged output format]: https://www.gnu.org/software/coreutils/manual/html_node/cksum-output-modes.html#cksum-output-modes-1
+    方法 parse_single_space(line: &[正8]) -> 选项<LineInfo> {
+        // Find first space
+        设 space_idx = line.迭代().position(|&b| b == b' ')?;
+        设 checksum = &line[..space_idx];
+        如果 !checksum.迭代().全部(|&b| b.is_ascii_hexdigit()) || checksum.为空() {
+            返回 无;
+        }
+        // SAFETY: we just validated the contents of checksum, we can unsafely make a
+        // String from it
+        设 checksum_utf8 = 不安全 { 字符串::from_utf8_unchecked(checksum.to_vec()) };
+
+        设 filename = line.获取(space_idx + 1..)?; // Skip single space
+
+        一些(LineInfo {
+            algo_name: 无,
+            algo_bit_len: 无,
+            checksum: checksum_utf8,
+            filename: filename.to_vec(),
+            format: 自身类型::SingleSpace,
+        })
+    }
+
+    /// Ensure that the given checksum is syntactically valid (that it is either
+    /// hexadecimal or base64 encoded).
+    方法 validate_checksum_format(checksum: &[正8]) -> 选项<字符串> {
+        如果 checksum.为空() {
+            返回 无;
+        }
+
+        设 可变 is_base64 = 假;
+
+        循环 index 在 0..checksum.长度() {
+            匹配 checksum[index..] {
+                // ASCII alphanumeric
+                [b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9', ..] => (),
+                // Base64 special character
+                [b'+' | b'/', ..] => is_base64 = 真,
+                // Base64 end of string padding
+                [b'='] | [b'=', b'='] | [b'=', b'=', b'='] => {
+                    is_base64 = 真;
+                    中断;
+                }
+                // Any other character means the checksum is wrong
+                _ => 返回 无,
+            }
+        }
+
+        // If base64 characters were encountered, make sure the checksum has a
+        // length multiple of 4.
+        //
+        // This check is not enough because it may allow base64-encoded
+        // checksums that are fully alphanumeric. Another check happens later
+        // when we are provided with a length hint to detect ambiguous
+        // base64-encoded checksums.
+        如果 is_base64 && !checksum.长度().is_multiple_of(4) {
+            返回 无;
+        }
+
+        // SAFETY: we just validated the contents of checksum, we can unsafely make a
+        // String from it
+        一些(不安全 { 字符串::from_utf8_unchecked(checksum.to_vec()) })
+    }
+}
+
+// Helper trait for byte slice operations
+协议 ByteSliceExt {
+    /// Look for a pattern from right to left, return surrounding parts if found.
+    方法 rsplit_once(&自身, pattern: &[正8]) -> 选项<(&自身类型, &自身类型)>;
+}
+
+实现 ByteSliceExt 循环 [正8] {
+    方法 rsplit_once(&自身, pattern: &[正8]) -> 选项<(&自身类型, &自身类型)> {
+        设 pos = 自身
+            .windows(pattern.长度())
+            .rev()
+            .position(|w| w == pattern)?;
+        一些((
+            &自身[..自身.长度() - pattern.长度() - pos],
+            &自身[自身.长度() - pos..],
+        ))
+    }
+}
+
+/// Hold the data extracted from a checksum line.
+结构 LineInfo {
+    algo_name: 选项<字符串>,
+    algo_bit_len: 选项<正整数大小>,
+    checksum: 字符串,
+    filename: 向量<正8>,
+    format: LineFormat,
+}
+
+实现 LineInfo {
+    /// Returns a `LineInfo` parsed from a checksum line.
+    /// The function will run 3 parsers against the line and select the first one that matches
+    /// to populate the fields of the struct.
+    /// However, there is a catch to handle regarding the handling of `cached_line_format`.
+    /// In case of non-algo-based format, if `cached_line_format` is Some, it must take the priority
+    /// over the detected format. Otherwise, we must set it the the detected format.
+    /// This specific behavior is emphasized by the test
+    /// `test_md5sum::test_check_md5sum_only_one_space`.
+    方法 parse(s: 实现 作为引用协议<OsStr>, cached_line_format: &可变 选项<LineFormat>) -> 选项<自身类型> {
+        设 line_bytes = os_str_as_bytes(s.as_ref()).ok()?;
+
+        如果 设 一些(info) = LineFormat::parse_algo_based(line_bytes) {
+            返回 一些(info);
+        }
+        如果 设 一些(cached_format) = cached_line_format {
+            匹配 cached_format {
+                LineFormat::Untagged => LineFormat::parse_untagged(line_bytes),
+                LineFormat::SingleSpace => LineFormat::parse_single_space(line_bytes),
+                LineFormat::AlgoBased => 无法到达!("we never catch the algo based format"),
+            }
+        } 否则 如果 设 一些(info) = LineFormat::parse_untagged(line_bytes) {
+            *cached_line_format = 一些(LineFormat::Untagged);
+            一些(info)
+        } 否则 如果 设 一些(info) = LineFormat::parse_single_space(line_bytes) {
+            *cached_line_format = 一些(LineFormat::SingleSpace);
+            一些(info)
+        } 否则 {
+            无
+        }
+    }
+}
+
+/// Extract the expected digest from the checksum string and decode it
+方法 get_raw_expected_digest(checksum: &字符串切片, bit_len_hint: 选项<正整数大小>) -> 选项<向量<正8>> {
+    // If the length of the digest is not a multiple of 2, then it must be
+    // improperly formatted (1 byte is 2 hex digits, and base64 strings should
+    // always be a multiple of 4).
+    如果 !checksum.长度().is_multiple_of(2) {
+        返回 无;
+    }
+
+    设 byte_len_hint = bit_len_hint.映射(|n| n.div_ceil(8));
+
+    设 checks_hint = |长度| byte_len_hint.is_none_or(|hint| hint == 长度);
+
+    // If the length of the string matches the one to be expected (in case it's
+    // given) AND the digest can be decoded as hexadecimal, just go with it.
+    如果 checks_hint(checksum.长度() / 2) {
+        如果 设 好的(raw_ck) = hex::decode(checksum) {
+            返回 一些(raw_ck);
+        }
+    }
+
+    // If the checksum cannot be decoded as hexadecimal, interpret it as Base64
+    // instead.
+
+    // But first, verify the encoded checksum length, which should be a
+    // multiple of 4.
+    //
+    // It is important to check it before trying to decode, because the
+    // forgiving mode of decoding will ignore if padding characters '=' are
+    // MISSING, but to match GNU's behavior, we must reject it.
+    如果 !checksum.长度().is_multiple_of(4) {
+        返回 无;
+    }
+
+    // Perform the decoding and be FORGIVING about it, to allow for checksums
+    // with INVALID padding to still be decoded. This is enforced by
+    // `test_untagged_base64_matching_tag` in `test_cksum.rs`
+
+    base64_simd::forgiving_decode_to_vec(checksum.as_bytes())
+        .ok()
+        .过滤(|raw| checks_hint(raw.长度()))
+}
+
+/// Returns a reader that reads from the specified file, or from stdin if `filename_to_check` is "-".
+方法 get_file_to_check(
+    filename: &OsStr,
+    opts: ChecksumValidateOptions,
+) -> 结果<盒子<动态 Read>, LineCheckError> {
+    设 filename_bytes = os_str_as_bytes(filename).map_err(|e| LineCheckError::UError(e.into()))?;
+
+    如果 filename == "-" {
+        好的(盒子::新建(stdin())) // Use stdin if "-" is specified in the checksum file
+    } 否则 {
+        设 failed_open = || {
+            write_file_report(
+                输入输出::stdout(),
+                filename_bytes,
+                FileChecksumResult::CantOpen,
+                "",
+                opts.verbose,
+            );
+        };
+        设 print_error = |err: 输入输出::错误协议| {
+            show!(err.map_err_context(|| {
+                locale_aware_escape_name(filename, QuotingStyle::SHELL_ESCAPE)
+                    // This is non destructive thanks to the escaping
+                    .to_string_lossy()
+                    .to_string()
+            }));
+        };
+        匹配 File::open(filename) {
+            好的(f) => {
+                如果 f.metadata()
+                    .map_err(|_| LineCheckError::CantOpenFile)?
+                    .is_dir()
+                {
+                    print_error(输入输出::错误协议::新建(
+                        输入输出::ErrorKind::IsADirectory,
+                        "Is a directory",
+                    ));
+                    // also regarded as a failed open
+                    failed_open();
+                    坏的(LineCheckError::FileIsDirectory)
+                } 否则 {
+                    好的(盒子::新建(f))
+                }
+            }
+            坏的(err) => {
+                如果 !opts.ignore_missing {
+                    // yes, we have both stderr and stdout here
+                    print_error(err);
+                    failed_open();
+                }
+                // we could not open the file but we want to continue
+                坏的(LineCheckError::FileNotFound)
+            }
+        }
+    }
+}
+
+/// Returns a reader to the list of checksums
+方法 get_input_file(filename: &OsStr) -> UResult<盒子<动态 Read>> {
+    匹配 File::open(filename) {
+        好的(f) => {
+            如果 f.metadata()?.is_dir() {
+                坏的(输入输出::错误协议::other(
+                    translate!("error-is-a-directory", "file" => filename.maybe_quote()),
+                )
+                .into())
+            } 否则 {
+                好的(盒子::新建(f))
+            }
+        }
+        坏的(_) => 坏的(输入输出::错误协议::other(格式化!(
+            "{}: {}",
+            filename.maybe_quote(),
+            translate!("error-file-not-found")
+        ))
+        .into()),
+    }
+}
+
+/// Gets the algorithm name and length from the `LineInfo` if the algo-based format is matched.
+方法 identify_algo_name_and_length(
+    line_info: &LineInfo,
+    algo_name_input: 选项<AlgoKind>,
+    last_algo: &可变 选项<字符串>,
+) -> 结果<(AlgoKind, 选项<正整数大小>), LineCheckError> {
+    使用 AlgoKind 转换 ak;
+    设 algo_from_line = line_info.algo_name.克隆().unwrap_or_default();
+    设 好的(line_algo) = AlgoKind::from_cksum(algo_from_line.to_lowercase()) 否则 {
+        // Unknown algorithm
+        返回 坏的(LineCheckError::ImproperlyFormatted);
+    };
+    *last_algo = 一些(algo_from_line);
+
+    // check if we are called with XXXsum (example: md5sum) but we detected a
+    // different algo parsing the file (for example SHA1 (f) = d...)
+    //
+    // Also handle the case cksum -s sm3 but the file contains other formats
+    如果 设 一些(algo_name_input) = algo_name_input {
+        匹配 (algo_name_input, line_algo) {
+            (l, r) 如果 l == r => (),
+            // Edge case for SHA2, which matches SHA(224|256|384|512)
+            (ak::Sha2, ak::Sha224 | ak::Sha256 | ak::Sha384 | ak::Sha512) => (),
+            _ => 返回 坏的(LineCheckError::ImproperlyFormatted),
+        }
+    }
+
+    设 bytes = 如果 设 一些(bitlen) = line_info.algo_bit_len {
+        匹配 line_algo {
+            algo @ (ak::Blake2b | ak::Blake3) => {
+                匹配 parse_blake_length(algo, BlakeLength::Int(bitlen)) {
+                    好的(长度) => 一些(长度),
+                    坏的(_) => 返回 坏的(LineCheckError::ImproperlyFormatted),
+                }
+            }
+            ak::Sha2 | ak::Sha3 如果 [224, 256, 384, 512].包含(&bitlen) => 一些(bitlen),
+            ak::Shake128 | ak::Shake256 => 一些(bitlen),
+            // Either
+            //  the algo based line is provided with a bit length with an
+            //  algorithm that does not support it (only Blake2b, Blake3, sha2,
+            //  and sha3 do).
+            //
+            //  eg: MD5-128 (foo.txt) = fffffffff
+            //          ^ This is illegal
+            // OR
+            //  the given length is wrong because it's not a multiple of 8.
+            _ => 返回 坏的(LineCheckError::ImproperlyFormatted),
+        }
+    } 否则 如果 line_algo == ak::Blake2b {
+        // Default length with BLAKE2b,
+        一些(Blake2b::DEFAULT_BYTE_SIZE)
+    } 否则 如果 line_algo == ak::Blake3 {
+        // Default length with BLAKE3,
+        一些(Blake3::DEFAULT_BYTE_SIZE)
+    } 否则 {
+        无
+    };
+
+    好的((line_algo, bytes))
+}
+
+/// Given a filename and an algorithm, compute the digest and compare it with
+/// the expected one.
+方法 compute_and_check_digest_from_file(
+    filename: &[正8],
+    expected_checksum: &[正8],
+    algo: SizedAlgoKind,
+    opts: ChecksumValidateOptions,
+) -> 结果<(), LineCheckError> {
+    设 (filename_to_check_unescaped, prefix) = unescape_filename(filename);
+    设 real_filename_to_check = os_str_from_bytes(&filename_to_check_unescaped)?;
+
+    // Open the input file
+    设 file_to_check = get_file_to_check(&real_filename_to_check, opts)?;
+    设 可变 file_reader = BufReader::新建(file_to_check);
+
+    // Read the file and calculate the checksum
+    设 可变 digest = algo.create_digest();
+
+    // Set binary to false because --binary is not supported with --check
+
+    设 (calculated_checksum, _) =
+        匹配 digest_reader(&可变 digest, &可变 file_reader, ReadingMode::Text) {
+            好的(result) => result,
+            坏的(err) => {
+                show!(err.map_err_context(|| {
+                    locale_aware_escape_name(&real_filename_to_check, QuotingStyle::SHELL_ESCAPE)
+                        .to_string_lossy()
+                        .to_string()
+                }));
+
+                write_file_report(
+                    输入输出::stdout(),
+                    filename,
+                    FileChecksumResult::CantOpen,
+                    prefix,
+                    opts.verbose,
+                );
+                返回 坏的(LineCheckError::CantOpenFile);
+            }
+        };
+
+    // Do the checksum validation
+    设 checksum_correct = 匹配 calculated_checksum {
+        DigestOutput::向量(data) => data == expected_checksum,
+        DigestOutput::Crc(n) => n.to_be_bytes() == expected_checksum,
+        DigestOutput::U16(n) => n.to_be_bytes() == expected_checksum,
+    };
+    write_file_report(
+        输入输出::stdout(),
+        filename,
+        FileChecksumResult::from_bool(checksum_correct),
+        prefix,
+        opts.verbose,
+    );
+
+    如果 checksum_correct {
+        好的(())
+    } 否则 {
+        坏的(LineCheckError::DigestMismatch)
+    }
+}
+
+/// Check a digest checksum with non-algo based pre-treatment.
+方法 process_algo_based_line(
+    line_info: &LineInfo,
+    cli_algo_kind: 选项<AlgoKind>,
+    opts: ChecksumValidateOptions,
+    last_algo: &可变 选项<字符串>,
+) -> 结果<(), LineCheckError> {
+    设 filename_to_check = line_info.filename.as_slice();
+
+    设 (algo_kind, algo_len) = identify_algo_name_and_length(line_info, cli_algo_kind, last_algo)?;
+
+    // If the digest bitlen is known, we can check the format of the expected
+    // checksum with it.
+    设 digest_bit_length_hint = 匹配 (algo_kind, algo_len) {
+        (AlgoKind::Blake2b | AlgoKind::Blake3, 一些(byte_len)) => 一些(byte_len * 8),
+        (AlgoKind::Shake128 | AlgoKind::Shake256, 一些(bit_len)) => 一些(bit_len),
+        (AlgoKind::Shake128, 无) => 一些(求和::Shake128::DEFAULT_BIT_SIZE),
+        (AlgoKind::Shake256, 无) => 一些(求和::Shake256::DEFAULT_BIT_SIZE),
+        _ => 无,
+    };
+
+    设 expected_checksum = get_raw_expected_digest(&line_info.checksum, digest_bit_length_hint)
+        .ok_or(LineCheckError::ImproperlyFormatted)?;
+
+    设 algo = SizedAlgoKind::from_unsized(algo_kind, algo_len)
+        .map_err(|_| LineCheckError::ImproperlyFormatted)?;
+
+    compute_and_check_digest_from_file(filename_to_check, &expected_checksum, algo, opts)
+}
+
+/// Check a digest checksum with non-algo based pre-treatment.
+方法 process_non_algo_based_line(
+    line_number: 正整数大小,
+    line_info: &LineInfo,
+    cli_algo_kind: AlgoKind,
+    cli_algo_length: 选项<正整数大小>,
+    opts: ChecksumValidateOptions,
+) -> 结果<(), LineCheckError> {
+    使用 AlgoKind 转换 ak;
+    设 可变 filename_to_check = line_info.filename.as_slice();
+    如果 filename_to_check.starts_with(b"*")
+        && line_number == 0
+        && line_info.format == LineFormat::SingleSpace
+    {
+        // Remove the leading asterisk if present - only for the first line
+        filename_to_check = &filename_to_check[1..];
+    }
+
+    设 expected_digest_sum = cli_algo_kind.expected_digest_bit_len();
+    设 expected_checksum = get_raw_expected_digest(&line_info.checksum, expected_digest_sum)
+        .ok_or(LineCheckError::ImproperlyFormatted)?;
+
+    // When a specific algorithm name is input, use it and use the provided
+    // bits except when dealing with blake2b, sha2 and sha3, where we will
+    // detect the length.
+    设 algo_byte_len = 匹配 cli_algo_kind {
+        ak::Blake2b | ak::Blake3 => 一些(expected_checksum.长度()),
+        ak::Sha2 | ak::Sha3 => {
+            // multiplication by 8 to get the number of bits
+            一些(
+                ShaLength::try_from(expected_checksum.长度() * 8)
+                    .map_err(|_| LineCheckError::ImproperlyFormatted)?
+                    .as_usize(),
+            )
+        }
+        _ => cli_algo_length,
+    };
+
+    设 algo = SizedAlgoKind::from_unsized(cli_algo_kind, algo_byte_len)?;
+
+    compute_and_check_digest_from_file(filename_to_check, &expected_checksum, algo, opts)
+}
+
+/// Parses a checksum line, detect the algorithm to use, read the file and produce
+/// its digest, and compare it to the expected value.
+///
+/// Returns `Ok(bool)` if the comparison happened, bool indicates if the digest
+/// matched the expected.
+/// If the comparison didn't happen, return a `LineChecksumError`.
+方法 process_checksum_line(
+    line: &OsStr,
+    i: 正整数大小,
+    cli_algo_name: 选项<AlgoKind>,
+    cli_algo_length: 选项<正整数大小>,
+    opts: ChecksumValidateOptions,
+    cached_line_format: &可变 选项<LineFormat>,
+    last_algo: &可变 选项<字符串>,
+) -> 结果<(), LineCheckError> {
+    设 line_bytes = os_str_as_bytes(line).map_err(|e| LineCheckError::UError(盒子::新建(e)))?;
+
+    // Early return on empty or commented lines.
+    如果 line.为空() || line_bytes.starts_with(b"#") {
+        返回 坏的(LineCheckError::Skipped);
+    }
+
+    // Use `LineInfo` to extract the data of a line.
+    // Then, depending on its format, apply a different pre-treatment.
+    设 一些(line_info) = LineInfo::parse(line, cached_line_format) 否则 {
+        返回 坏的(LineCheckError::ImproperlyFormatted);
+    };
+
+    如果 line_info.format == LineFormat::AlgoBased {
+        process_algo_based_line(&line_info, cli_algo_name, opts, last_algo)
+    } 否则 如果 设 一些(cli_algo) = cli_algo_name {
+        // If we match a non-algo based parser, we expect a cli argument
+        // to give us the algorithm to use
+        process_non_algo_based_line(i, &line_info, cli_algo, cli_algo_length, opts)
+    } 否则 {
+        // We have no clue of what algorithm to use
+        坏的(LineCheckError::ImproperlyFormatted)
+    }
+}
+
+方法 process_checksum_file(
+    filename_input: &OsStr,
+    cli_algo_kind: 选项<AlgoKind>,
+    cli_algo_length: 选项<正整数大小>,
+    opts: ChecksumValidateOptions,
+) -> 结果<(), FileCheckError> {
+    设 可变 res = ChecksumResult::默认();
+
+    设 input_is_stdin = filename_input == OsStr::新建("-");
+
+    设 file: 盒子<动态 Read> = 如果 input_is_stdin {
+        // Use stdin if "-" is specified
+        盒子::新建(stdin())
+    } 否则 {
+        匹配 get_input_file(filename_input) {
+            好的(f) => f,
+            坏的(e) => {
+                // Could not read the file, show the error and continue to the next file
+                设 _ = writeln!(stderr(), "{}: {e}", util_name());
+                返回 坏的(FileCheckError::CantOpenChecksumFile);
+            }
+        }
+    };
+
+    设 reader = BufReader::新建(file);
+
+    // cached_line_format is used to ensure that several non algo-based checksum line
+    // will use the same parser.
+    设 可变 cached_line_format = 无;
+    // last_algo caches the algorithm used in the last line to print a warning
+    // message for the current line if improperly formatted.
+    // Behavior tested in gnu_cksum_c::test_warn
+    设 可变 last_algo = 无;
+
+    循环 (i, line_res) 在 read_os_string_lines(reader).enumerate() {
+        设 line = line_res.map_err(|e| {
+            USimpleError::新建(
+                UIoError::from(e).code(),
+                格式化!("{}: read error", filename_input.maybe_quote()),
+            )
+        })?;
+
+        设 line_result = process_checksum_line(
+            &line,
+            i,
+            cli_algo_kind,
+            cli_algo_length,
+            opts,
+            &可变 cached_line_format,
+            &可变 last_algo,
+        );
+
+        // Match a first time to elude critical UErrors, and increment the total
+        // in all cases except on skipped.
+        使用 LineCheckError::*;
+        匹配 line_result {
+            坏的(UError(e)) => 返回 坏的(e.into()),
+            坏的(Skipped) => (),
+            _ => res.total += 1,
+        }
+
+        // Match a second time to update the right field of `res`.
+        匹配 line_result {
+            好的(()) => res.correct += 1,
+            坏的(DigestMismatch) => res.failed_cksum += 1,
+            坏的(ImproperlyFormatted) => {
+                res.bad_format += 1;
+
+                如果 opts.verbose.at_least_warning() {
+                    设 algo = 如果 设 一些(algo_name_input) = cli_algo_kind {
+                        algo_name_input.to_uppercase()
+                    } 否则 如果 设 一些(algo) = &last_algo {
+                        algo.as_str()
+                    } 否则 {
+                        "Unknown algorithm"
+                    };
+                    设 _ = writeln!(
+                        stderr(),
+                        "{}: {}",
+                        util_name(),
+                        translate!("checksum-error-algo-bad-format", "file" => filename_input.maybe_quote(), "line" => i + 1, "algo" => algo)
+                    );
+                }
+            }
+            坏的(CantOpenFile | FileIsDirectory) => res.failed_open_file += 1,
+            坏的(FileNotFound) 如果 !opts.ignore_missing => res.failed_open_file += 1,
+            _ => (),
+        }
+    }
+
+    设 filename_display = || {
+        如果 input_is_stdin {
+            "standard input".maybe_quote()
+        } 否则 {
+            filename_input.maybe_quote()
+        }
+    };
+
+    // not a single line correctly formatted found
+    // return an error
+    如果 res.total_properly_formatted() == 0 {
+        如果 opts.verbose.over_status() {
+            log_no_properly_formatted(filename_display());
+        }
+        返回 坏的(FileCheckError::Failed);
+    }
+
+    // if any incorrectly formatted line, show it
+    如果 opts.verbose.over_status() {
+        print_cksum_report(&res);
+    }
+
+    如果 opts.ignore_missing && res.correct == 0 {
+        // we have only bad format
+        // and we had ignore-missing
+        如果 opts.verbose.over_status() {
+            log_no_file_verified(filename_display());
+        }
+        返回 坏的(FileCheckError::Failed);
+    }
+
+    // strict means that we should have an exit code.
+    如果 opts.strict && res.bad_format > 0 {
+        返回 坏的(FileCheckError::Failed);
+    }
+
+    // If a file was missing, return an error unless we explicitly ignore it.
+    如果 res.failed_open_file > 0 && !opts.ignore_missing {
+        返回 坏的(FileCheckError::Failed);
+    }
+
+    // Obviously, if a checksum failed at some point, report the error.
+    如果 res.failed_cksum > 0 {
+        返回 坏的(FileCheckError::Failed);
+    }
+
+    好的(())
+}
+
+/// Do the checksum validation (can be strict or not)
+公有 方法 perform_checksum_validation<'a, I>(
+    files: I,
+    algo_kind: 选项<AlgoKind>,
+    length_input: 选项<正整数大小>,
+    opts: ChecksumValidateOptions,
+) -> UResult<()>
+何处
+    I: 迭代器协议<Item = &'a OsStr>,
+{
+    设 可变 failed = 假;
+
+    // if cksum has several input files, it will print the result for each file
+    循环 filename_input 在 files {
+        使用 FileCheckError::*;
+        匹配 process_checksum_file(filename_input, algo_kind, length_input, opts) {
+            坏的(UError(e)) => 返回 坏的(e),
+            坏的(Failed | CantOpenChecksumFile) => failed = 真,
+            好的(_) => (),
+        }
+    }
+
+    如果 failed {
+        坏的(USimpleError::新建(1, ""))
+    } 否则 {
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::ffi::OsString;
+
+    使用 超级::*;
+
+    #[test]
+    方法 test_algo_based_parser() {
+        #[allow(clippy::type_complexity)]
+        设 test_cases: &[(&[正8], 选项<(&[正8], 选项<&[正8]>, &[正8], &[正8])>)] = &[
+            (b"SHA256 (example.txt) = d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2", 一些((b"SHA256", 无, b"example.txt", b"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"))),
+            // cspell:disable
+            (b"BLAKE2b-512 (file) = abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef", 一些((b"BLAKE2b", 一些(b"512"), b"file", b"abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef"))),
+            (b" MD5 (test) = 9e107d9d372bb6826bd81d3542a419d6", 一些((b"MD5", 无, b"test", b"9e107d9d372bb6826bd81d3542a419d6"))),
+            (b"SHA-1 (anotherfile) = a9993e364706816aba3e25717850c26c9cd0d89d", 一些((b"SHA", 一些(b"1"), b"anotherfile", b"a9993e364706816aba3e25717850c26c9cd0d89d"))),
+            (b" MD5 (anothertest) = fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"anothertest", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5(anothertest2) = fds65dsf46as5df4d6f54asds5d7f7g9", 无),
+            (b" MD5(weirdfilename0)= stillfilename)= fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"weirdfilename0)= stillfilename", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5(weirdfilename1)= )= fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"weirdfilename1)= ", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5(weirdfilename2) = )= fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"weirdfilename2) = ", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5 (weirdfilename3)= ) = fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"weirdfilename3)= ", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5 (weirdfilename4) = ) = fds65dsf46as5df4d6f54asds5d7f7g9", 一些((b"MD5", 无, b"weirdfilename4) = ", b"fds65dsf46as5df4d6f54asds5d7f7g9"))),
+            (b" MD5(weirdfilename5)= ) = fds65dsf46as5df4d6f54asds5d7f7g9", 无),
+            (b" MD5(weirdfilename6) = ) = fds65dsf46as5df4d6f54asds5d7f7g9", 无),
+            (b" MD5 (weirdfilename7)= )= fds65dsf46as5df4d6f54asds5d7f7g9", 无),
+            (b" MD5 (weirdfilename8) = )= fds65dsf46as5df4d6f54asds5d7f7g9", 无),
+        ];
+
+        // cspell:enable
+        循环 (input, expected) 在 test_cases {
+            设 line_info = LineFormat::parse_algo_based(input);
+            匹配 expected {
+                一些((algo, bits, filename, checksum)) => {
+                    断言!(
+                        line_info.is_some(),
+                        "expected Some, got None for {}",
+                        字符串::from_utf8_lossy(filename)
+                    );
+                    设 line_info = line_info.解包();
+                    相等断言!(
+                        &line_info.algo_name.解包().as_bytes(),
+                        algo,
+                        "failed for {}",
+                        字符串::from_utf8_lossy(filename)
+                    );
+                    相等断言!(
+                        line_info
+                            .algo_bit_len
+                            .映射(|m| m.to_string().as_bytes().to_owned()),
+                        bits.映射(ToOwned::to_owned),
+                        "failed for {}",
+                        字符串::from_utf8_lossy(filename)
+                    );
+                    相等断言!(
+                        &line_info.filename,
+                        filename,
+                        "failed for {}",
+                        字符串::from_utf8_lossy(filename)
+                    );
+                    相等断言!(
+                        &line_info.checksum.as_bytes(),
+                        checksum,
+                        "failed for {}",
+                        字符串::from_utf8_lossy(filename)
+                    );
+                }
+                无 => {
+                    断言!(
+                        line_info.is_none(),
+                        "failed for {}",
+                        字符串::from_utf8_lossy(input)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    方法 test_double_space_parser() {
+        #[allow(clippy::type_complexity)]
+        设 test_cases: &[(&[正8], 选项<(&[正8], &[正8])>)] = &[
+            (
+                b"60b725f10c9c85c70d97880dfe8191b3  a",
+                一些((b"60b725f10c9c85c70d97880dfe8191b3", b"a")),
+            ),
+            (
+                b"bf35d7536c785cf06730d5a40301eba2   b",
+                一些((b"bf35d7536c785cf06730d5a40301eba2", b" b")),
+            ),
+            (
+                b"f5b61709718c1ecf8db1aea8547d4698  *c",
+                一些((b"f5b61709718c1ecf8db1aea8547d4698", b"*c")),
+            ),
+            (
+                b"b064a020db8018f18ff5ae367d01b212  dd",
+                一些((b"b064a020db8018f18ff5ae367d01b212", b"dd")),
+            ),
+            (
+                b"b064a020db8018f18ff5ae367d01b212   ",
+                一些((b"b064a020db8018f18ff5ae367d01b212", b" ")),
+            ),
+            // base64 checksums are accepted
+            (
+                b"b21lbGV0dGUgZHUgZnJvbWFnZQ==   ",
+                一些((b"b21lbGV0dGUgZHUgZnJvbWFnZQ==", b" ")),
+            ),
+            // Invalid checksums fail
+            (b"inva|idchecksum  test", 无),
+        ];
+
+        循环 (input, expected) 在 test_cases {
+            设 line_info = LineFormat::parse_untagged(input);
+            匹配 expected {
+                一些((checksum, filename)) => {
+                    断言!(line_info.is_some());
+                    设 line_info = line_info.解包();
+                    相等断言!(&line_info.filename, filename);
+                    相等断言!(&line_info.checksum.as_bytes(), checksum);
+                }
+                无 => {
+                    断言!(line_info.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    方法 test_single_space_parser() {
+        #[allow(clippy::type_complexity)]
+        设 test_cases: &[(&[正8], 选项<(&[正8], &[正8])>)] = &[
+            (
+                b"60b725f10c9c85c70d97880dfe8191b3 a",
+                一些((b"60b725f10c9c85c70d97880dfe8191b3", b"a")),
+            ),
+            (
+                b"bf35d7536c785cf06730d5a40301eba2 b",
+                一些((b"bf35d7536c785cf06730d5a40301eba2", b"b")),
+            ),
+            (
+                b"f5b61709718c1ecf8db1aea8547d4698 *c",
+                一些((b"f5b61709718c1ecf8db1aea8547d4698", b"*c")),
+            ),
+            (
+                b"b064a020db8018f18ff5ae367d01b212 dd",
+                一些((b"b064a020db8018f18ff5ae367d01b212", b"dd")),
+            ),
+            (b"invalidchecksum test", 无),
+        ];
+
+        循环 (input, expected) 在 test_cases {
+            设 line_info = LineFormat::parse_single_space(input);
+            匹配 expected {
+                一些((checksum, filename)) => {
+                    断言!(line_info.is_some());
+                    设 line_info = line_info.解包();
+                    相等断言!(&line_info.filename, filename);
+                    相等断言!(&line_info.checksum.as_bytes(), checksum);
+                }
+                无 => {
+                    断言!(line_info.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    方法 test_line_info() {
+        设 可变 cached_line_format = 无;
+
+        // Test algo-based parser
+        设 line_algo_based =
+            OsString::from("MD5 (example.txt) = d41d8cd98f00b204e9800998ecf8427e");
+        设 line_info = LineInfo::parse(&line_algo_based, &可变 cached_line_format).解包();
+        相等断言!(line_info.algo_name.as_deref(), 一些("MD5"));
+        断言!(line_info.algo_bit_len.is_none());
+        相等断言!(line_info.filename, b"example.txt");
+        相等断言!(line_info.checksum, "d41d8cd98f00b204e9800998ecf8427e");
+        相等断言!(line_info.format, LineFormat::AlgoBased);
+        断言!(cached_line_format.is_none());
+
+        // Test double-space parser
+        设 line_double_space = OsString::from("d41d8cd98f00b204e9800998ecf8427e  example.txt");
+        设 line_info = LineInfo::parse(&line_double_space, &可变 cached_line_format).解包();
+        断言!(line_info.algo_name.is_none());
+        断言!(line_info.algo_bit_len.is_none());
+        相等断言!(line_info.filename, b"example.txt");
+        相等断言!(line_info.checksum, "d41d8cd98f00b204e9800998ecf8427e");
+        相等断言!(line_info.format, LineFormat::Untagged);
+        断言!(cached_line_format.is_some());
+
+        cached_line_format = 无;
+
+        // Test single-space parser
+        设 line_single_space = OsString::from("d41d8cd98f00b204e9800998ecf8427e example.txt");
+        设 line_info = LineInfo::parse(&line_single_space, &可变 cached_line_format).解包();
+        断言!(line_info.algo_name.is_none());
+        断言!(line_info.algo_bit_len.is_none());
+        相等断言!(line_info.filename, b"example.txt");
+        相等断言!(line_info.checksum, "d41d8cd98f00b204e9800998ecf8427e");
+        相等断言!(line_info.format, LineFormat::SingleSpace);
+        断言!(cached_line_format.is_some());
+
+        cached_line_format = 无;
+
+        // Test invalid checksum line
+        设 line_invalid = OsString::from("invalid checksum line");
+        断言!(LineInfo::parse(&line_invalid, &可变 cached_line_format).is_none());
+        断言!(cached_line_format.is_none());
+
+        // Test leading space before checksum line
+        设 line_algo_based_leading_space =
+            OsString::from("   MD5 (example.txt) = d41d8cd98f00b204e9800998ecf8427e");
+        设 line_info =
+            LineInfo::parse(&line_algo_based_leading_space, &可变 cached_line_format).解包();
+        相等断言!(line_info.format, LineFormat::AlgoBased);
+        断言!(cached_line_format.is_none());
+
+        // Test trailing space after checksum line (should fail)
+        设 line_algo_based_leading_space =
+            OsString::from("MD5 (example.txt) = d41d8cd98f00b204e9800998ecf8427e ");
+        设 res = LineInfo::parse(&line_algo_based_leading_space, &可变 cached_line_format);
+        断言!(res.is_none());
+        断言!(cached_line_format.is_none());
+    }
+
+    #[test]
+    方法 test_get_expected_digest() {
+        设 ck = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_owned();
+
+        设 result = get_raw_expected_digest(&ck, 无);
+
+        相等断言!(
+            result.解包(),
+            hex::decode(b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+                .解包()
+        );
+    }
+
+    #[test]
+    方法 test_get_expected_checksum_invalid() {
+        // The line misses a '=' at the end to be valid base64
+        设 ck = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU".to_owned();
+
+        设 result = get_raw_expected_digest(&ck, 无);
+
+        断言!(result.is_none());
+    }
+
+    #[test]
+    方法 test_write_file_report() {
+        设 opts = ChecksumValidateOptions::默认();
+
+        设 cases: &[(&[正8], FileChecksumResult, &字符串切片, &[正8])] = &[
+            (b"filename", FileChecksumResult::好的, "", b"filename: OK\n"),
+            (
+                b"filename",
+                FileChecksumResult::Failed,
+                "",
+                b"filename: FAILED\n",
+            ),
+            (
+                b"filename",
+                FileChecksumResult::CantOpen,
+                "",
+                b"filename: FAILED open or read\n",
+            ),
+            (
+                b"filename",
+                FileChecksumResult::好的,
+                "prefix",
+                b"prefixfilename: OK\n",
+            ),
+            (
+                b"funky\xffname",
+                FileChecksumResult::好的,
+                "",
+                b"funky\xffname: OK\n",
+            ),
+        ];
+
+        循环 (filename, result, prefix, expected) 在 cases {
+            设 可变 buffer: 向量<正8> = 向量![];
+            write_file_report(&可变 buffer, filename, *result, prefix, opts.verbose);
+            相等断言!(&buffer, expected);
+        }
+    }
+}

@@ -1,0 +1,131 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 uu_numfmt::uumain;
+使用 uucore::benchmark::run_util_function;
+
+/// Benchmark SI formatting by passing numbers as command-line arguments
+#[divan::bench(args = [10_000])]
+方法 numfmt_to_si(bencher: Bencher, 计数: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| n.to_string()).收集();
+            设 可变 args: 向量<字符串> = 向量!["--to=si".to_string()];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark SI formatting with precision format
+#[divan::bench(args = [10_000])]
+方法 numfmt_to_si_precision(bencher: Bencher, 计数: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| n.to_string()).收集();
+            设 可变 args: 向量<字符串> = 向量!["--to=si".to_string(), "--format=%.6f".to_string()];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark IEC (binary) formatting
+#[divan::bench(args = [10_000])]
+方法 numfmt_to_iec(bencher: Bencher, 计数: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| n.to_string()).收集();
+            设 可变 args: 向量<字符串> = 向量!["--to=iec".to_string()];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark parsing from SI format back to raw numbers
+#[divan::bench(args = [10_000])]
+方法 numfmt_from_si(bencher: Bencher, 计数: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            // Generate SI formatted data (e.g., "1K", "2K", etc.)
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| 格式化!("{n}K")).收集();
+            设 可变 args: 向量<字符串> = 向量!["--from=si".to_string()];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark large numbers with SI formatting
+#[divan::bench(args = [10_000])]
+方法 numfmt_large_numbers_si(bencher: Bencher, 计数: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            // Generate numbers that all produce uniform SI output lengths (all in 1-9M range)
+            // This avoids variance from variable output string lengths
+            设 numbers: 向量<字符串> = (1..=计数)
+                .映射(|n| ((n % 9) + 1) * 1_000_000)
+                .映射(|n| n.to_string())
+                .收集();
+            设 可变 args: 向量<字符串> = 向量!["--to=si".to_string()];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark different padding widths
+#[divan::bench(args = [(10_000, 50)])]
+方法 numfmt_padding(bencher: Bencher, (计数, padding): (正整数大小, 正整数大小)) {
+    bencher
+        .with_inputs(|| {
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| n.to_string()).收集();
+            设 可变 args: 向量<字符串> = 向量!["--to=si".to_string(), 格式化!("--padding={padding}")];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+/// Benchmark round modes with SI formatting
+#[divan::bench(args = [("up", 10_000), ("down", 10_000), ("towards-zero", 10_000)])]
+方法 numfmt_round_modes(bencher: Bencher, (round_mode, 计数): (&字符串切片, 正整数大小)) {
+    bencher
+        .with_inputs(|| {
+            设 numbers: 向量<字符串> = (1..=计数).映射(|n| n.to_string()).收集();
+            设 可变 args: 向量<字符串> =
+                向量!["--to=si".to_string(), 格式化!("--round={round_mode}")];
+            args.extend(numbers);
+            args
+        })
+        .bench_values(|args| {
+            设 arg_refs: 向量<&字符串切片> = args.迭代().映射(字符串::as_str).收集();
+            black_box(run_util_function(uumain, &arg_refs));
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

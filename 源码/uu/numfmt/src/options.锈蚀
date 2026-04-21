@@ -1,0 +1,393 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::字符串切片::FromStr;
+
+使用 箱::units::Unit;
+使用 uucore::ranges::Range;
+使用 uucore::translate;
+
+公有 常量 DEBUG: &字符串切片 = "debug";
+公有 常量 DELIMITER: &字符串切片 = "delimiter";
+公有 常量 FIELD: &字符串切片 = "field";
+公有 常量 FIELD_DEFAULT: &字符串切片 = "1";
+公有 常量 FORMAT: &字符串切片 = "format";
+公有 常量 FROM: &字符串切片 = "from";
+公有 常量 FROM_DEFAULT: &字符串切片 = "none";
+公有 常量 FROM_UNIT: &字符串切片 = "from-unit";
+公有 常量 FROM_UNIT_DEFAULT: &字符串切片 = "1";
+公有 常量 GROUPING: &字符串切片 = "grouping";
+公有 常量 HEADER: &字符串切片 = "header";
+公有 常量 HEADER_DEFAULT: &字符串切片 = "1";
+公有 常量 INVALID: &字符串切片 = "invalid";
+公有 常量 NUMBER: &字符串切片 = "NUMBER";
+公有 常量 PADDING: &字符串切片 = "padding";
+公有 常量 ROUND: &字符串切片 = "round";
+公有 常量 SUFFIX: &字符串切片 = "suffix";
+公有 常量 TO: &字符串切片 = "to";
+公有 常量 TO_DEFAULT: &字符串切片 = "none";
+公有 常量 TO_UNIT: &字符串切片 = "to-unit";
+公有 常量 TO_UNIT_DEFAULT: &字符串切片 = "1";
+公有 常量 UNIT_SEPARATOR: &字符串切片 = "unit-separator";
+公有 常量 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+
+公有 结构 TransformOptions {
+    公有 from: Unit,
+    公有 from_unit: 正整数大小,
+    公有 to: Unit,
+    公有 to_unit: 正整数大小,
+}
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 InvalidModes {
+    Abort,
+    Fail,
+    Warn,
+    Ignore,
+}
+
+公有 结构 NumfmtOptions {
+    公有 transform: TransformOptions,
+    公有 padding: 整数大小,
+    公有 header: 正整数大小,
+    公有 fields: 向量<Range>,
+    公有 delimiter: 选项<向量<正8>>,
+    公有 round: RoundMethod,
+    公有 suffix: 选项<字符串>,
+    公有 unit_separator: 字符串,
+    公有 grouping: 布尔,
+    公有 explicit_unit_separator: 布尔,
+    公有 format: FormatOptions,
+    公有 invalid: InvalidModes,
+    公有 zero_terminated: 布尔,
+    公有 debug: 布尔,
+}
+
+#[derive(克隆协议, 复制协议)]
+公有 枚举 RoundMethod {
+    Up,
+    Down,
+    FromZero,
+    TowardsZero,
+    Nearest,
+}
+
+实现 RoundMethod {
+    公有 方法 round(自身, f: 点64) -> 点64 {
+        匹配 自身 {
+            自身类型::Up => f.ceil(),
+            自身类型::Down => f.floor(),
+            自身类型::FromZero => {
+                如果 f < 0.0 {
+                    f.floor()
+                } 否则 {
+                    f.ceil()
+                }
+            }
+            自身类型::TowardsZero => {
+                如果 f < 0.0 {
+                    f.ceil()
+                } 否则 {
+                    f.floor()
+                }
+            }
+            自身类型::Nearest => f.round(),
+        }
+    }
+}
+
+// Represents the options extracted from the --format argument provided by the user.
+#[derive(调试协议, 默认协议, 偏等比较协议, 相等比较协议)]
+公有 结构 FormatOptions {
+    公有 grouping: 布尔,
+    公有 padding: 选项<整数大小>,
+    公有 precision: 选项<正整数大小>,
+    公有 prefix: 字符串,
+    公有 suffix: 字符串,
+    公有 zero_padding: 布尔,
+}
+
+实现 FromStr 循环 FormatOptions {
+    类型 坏的 = 字符串;
+
+    // The recognized format is: [PREFIX]%[0]['][-][N][.][N]f[SUFFIX]
+    //
+    // The format defines the printing of a floating point argument '%f'.
+    // An optional quote (%'f) enables --grouping.
+    // An optional width value (%10f) will pad the number.
+    // An optional zero (%010f) will zero pad the number.
+    // An optional negative value (%-10f) will left align.
+    // An optional precision (%.1f) determines the precision of the number.
+    #[allow(clippy::cognitive_complexity)]
+    方法 from_str(s: &字符串切片) -> 结果<自身类型, 自身类型::坏的> {
+        设 可变 迭代 = s.chars().peekable();
+        设 可变 options = 自身类型::默认();
+
+        设 可变 padding = 字符串::新建();
+        设 可变 precision = 字符串::新建();
+        设 可变 double_percentage_counter = 0;
+
+        // '%' chars in the prefix, if any, must appear in blocks of even length, for example: "%%%%" and
+        // "%% %%" are ok, "%%% %" is not ok. A single '%' is treated as the beginning of the
+        // floating point argument.
+        当 设 一些(c) = 迭代.next() {
+            匹配 c {
+                '%' 如果 迭代.peek() == 一些(&'%') => {
+                    迭代.next();
+                    double_percentage_counter += 1;
+
+                    循环 _ 在 0..2 {
+                        options.prefix.压入('%');
+                    }
+                }
+                '%' => 中断,
+                _ => options.prefix.压入(c),
+            }
+        }
+
+        // GNU numfmt drops a char from the prefix for every '%%' in the prefix, so we do the same
+        循环 _ 在 0..double_percentage_counter {
+            options.prefix.弹出();
+        }
+
+        如果 迭代.peek().is_none() {
+            返回 如果 options.prefix == s {
+                坏的(translate!("numfmt-error-format-no-percent", "format" => s))
+            } 否则 {
+                坏的(translate!("numfmt-error-format-ends-in-percent", "format" => s))
+            };
+        }
+
+        // GNU numfmt allows to mix the characters " ", "'", and "0" in any way, so we do the same
+        当 matches!(迭代.peek(), 一些(' ' | '\'' | '0')) {
+            匹配 迭代.next().解包() {
+                ' ' => (),
+                '\'' => options.grouping = 真,
+                '0' => options.zero_padding = 真,
+                _ => 无法到达!(),
+            }
+        }
+
+        如果 设 一些('-') = 迭代.peek() {
+            迭代.next();
+
+            匹配 迭代.peek() {
+                一些(c) 如果 c.is_ascii_digit() => padding.压入('-'),
+                _ => {
+                    返回 坏的(translate!("numfmt-error-invalid-format-directive", "format" => s));
+                }
+            }
+        }
+
+        当 设 一些(c) = 迭代.peek() {
+            如果 c.is_ascii_digit() {
+                padding.压入(*c);
+                迭代.next();
+            } 否则 {
+                中断;
+            }
+        }
+
+        如果 !padding.为空() {
+            如果 设 好的(p) = padding.parse() {
+                options.padding = 一些(p);
+            } 否则 {
+                返回 坏的(
+                    translate!("numfmt-error-invalid-format-width-overflow", "format" => s),
+                );
+            }
+        }
+
+        如果 设 一些('.') = 迭代.peek() {
+            迭代.next();
+
+            如果 matches!(迭代.peek(), 一些(' ' | '+' | '-')) {
+                返回 坏的(translate!("numfmt-error-invalid-precision", "format" => s));
+            }
+
+            当 设 一些(c) = 迭代.peek() {
+                如果 c.is_ascii_digit() {
+                    precision.压入(*c);
+                    迭代.next();
+                } 否则 {
+                    中断;
+                }
+            }
+
+            如果 precision.为空() {
+                options.precision = 一些(0);
+            } 否则 如果 设 好的(p) = precision.parse() {
+                options.precision = 一些(p);
+            } 否则 {
+                返回 坏的(translate!("numfmt-error-invalid-precision", "format" => s));
+            }
+        }
+
+        如果 设 一些('f') = 迭代.peek() {
+            迭代.next();
+        } 否则 {
+            返回 坏的(translate!("numfmt-error-invalid-format-directive", "format" => s));
+        }
+
+        // '%' chars in the suffix, if any, must appear in blocks of even length, otherwise
+        // it is an error. For example: "%%%%" and "%% %%" are ok, "%%% %" is not ok.
+        当 设 一些(c) = 迭代.next() {
+            如果 c != '%' {
+                options.suffix.压入(c);
+            } 否则 如果 迭代.peek() == 一些(&'%') {
+                循环 _ 在 0..2 {
+                    options.suffix.压入('%');
+                }
+                迭代.next();
+            } 否则 {
+                返回 坏的(translate!("numfmt-error-format-too-many-percent", "format" => s));
+            }
+        }
+
+        好的(options)
+    }
+}
+
+实现 FromStr 循环 InvalidModes {
+    类型 坏的 = 字符串;
+
+    方法 from_str(s: &字符串切片) -> 结果<自身类型, 自身类型::坏的> {
+        匹配 s.to_lowercase().as_str() {
+            "abort" => 好的(自身类型::Abort),
+            "fail" => 好的(自身类型::Fail),
+            "warn" => 好的(自身类型::Warn),
+            "ignore" => 好的(自身类型::Ignore),
+            unknown => 坏的(translate!("numfmt-error-unknown-invalid-mode", "mode" => unknown)),
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_parse_format() {
+        相等断言!(FormatOptions::默认(), "%f".parse().解包());
+        相等断言!(FormatOptions::默认(), "%  f".parse().解包());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_parse_format_with_invalid_formats() {
+        断言!("".parse::<FormatOptions>().is_err());
+        断言!("hello".parse::<FormatOptions>().is_err());
+        断言!("hello%".parse::<FormatOptions>().is_err());
+        断言!("%-f".parse::<FormatOptions>().is_err());
+        断言!("%d".parse::<FormatOptions>().is_err());
+        断言!("%4 f".parse::<FormatOptions>().is_err());
+        断言!("%f%".parse::<FormatOptions>().is_err());
+        断言!("%f%%%".parse::<FormatOptions>().is_err());
+        断言!("%%f".parse::<FormatOptions>().is_err());
+        断言!("%%%%f".parse::<FormatOptions>().is_err());
+        断言!("%.-1f".parse::<FormatOptions>().is_err());
+        断言!("%. 1f".parse::<FormatOptions>().is_err());
+        断言!("%18446744073709551616f".parse::<FormatOptions>().is_err());
+        断言!("%.18446744073709551616f".parse::<FormatOptions>().is_err());
+    }
+
+    #[test]
+    方法 test_parse_format_with_prefix_and_suffix() {
+        设 formats = 向量![
+            ("--%f", "--", ""),
+            ("%f::", "", "::"),
+            ("--%f::", "--", "::"),
+            ("%f%%", "", "%%"),
+            ("%%%f", "%", ""),
+            ("%% %f", "%%", ""),
+        ];
+
+        循环 (format, expected_prefix, expected_suffix) 在 formats {
+            设 options: FormatOptions = format.parse().解包();
+            相等断言!(expected_prefix, options.prefix);
+            相等断言!(expected_suffix, options.suffix);
+        }
+    }
+
+    #[test]
+    方法 test_parse_format_with_padding() {
+        设 可变 expected_options = FormatOptions::默认();
+        设 formats = 向量![("%12f", 一些(12)), ("%-12f", 一些(-12))];
+
+        循环 (format, expected_padding) 在 formats {
+            expected_options.padding = expected_padding;
+            相等断言!(expected_options, format.parse().解包());
+        }
+    }
+
+    #[test]
+    方法 test_parse_format_with_precision() {
+        设 可变 expected_options = FormatOptions::默认();
+        设 formats = 向量![
+            ("%6.2f", 一些(6), 一些(2)),
+            ("%6.f", 一些(6), 一些(0)),
+            ("%.2f", 无, 一些(2)),
+            ("%.f", 无, 一些(0)),
+        ];
+
+        循环 (format, expected_padding, expected_precision) 在 formats {
+            expected_options.padding = expected_padding;
+            expected_options.precision = expected_precision;
+            相等断言!(expected_options, format.parse().解包());
+        }
+    }
+
+    #[test]
+    方法 test_parse_format_with_grouping() {
+        设 expected_options = FormatOptions {
+            grouping: 真,
+            ..默认协议::默认()
+        };
+        相等断言!(expected_options, "%'f".parse().解包());
+        相等断言!(expected_options, "% ' f".parse().解包());
+        相等断言!(expected_options, "%'''''''f".parse().解包());
+    }
+
+    #[test]
+    方法 test_parse_format_with_zero_padding() {
+        设 expected_options = FormatOptions {
+            padding: 一些(10),
+            zero_padding: 真,
+            ..默认协议::默认()
+        };
+        相等断言!(expected_options, "%010f".parse().解包());
+        相等断言!(expected_options, "% 0 10f".parse().解包());
+        相等断言!(expected_options, "%0000000010f".parse().解包());
+    }
+
+    #[test]
+    方法 test_parse_format_with_grouping_and_zero_padding() {
+        设 expected_options = FormatOptions {
+            grouping: 真,
+            zero_padding: 真,
+            ..默认协议::默认()
+        };
+        相等断言!(expected_options, "%0'f".parse().解包());
+        相等断言!(expected_options, "%'0f".parse().解包());
+        相等断言!(expected_options, "%0'0'0'f".parse().解包());
+        相等断言!(expected_options, "%'0'0'0f".parse().解包());
+    }
+
+    #[test]
+    方法 test_set_invalid_mode() {
+        相等断言!(好的(InvalidModes::Abort), InvalidModes::from_str("abort"));
+        相等断言!(好的(InvalidModes::Abort), InvalidModes::from_str("ABORT"));
+
+        相等断言!(好的(InvalidModes::Fail), InvalidModes::from_str("fail"));
+        相等断言!(好的(InvalidModes::Fail), InvalidModes::from_str("FAIL"));
+
+        相等断言!(好的(InvalidModes::Ignore), InvalidModes::from_str("ignore"));
+        相等断言!(好的(InvalidModes::Ignore), InvalidModes::from_str("IGNORE"));
+
+        相等断言!(好的(InvalidModes::Warn), InvalidModes::from_str("warn"));
+        相等断言!(好的(InvalidModes::Warn), InvalidModes::from_str("WARN"));
+
+        断言!(InvalidModes::from_str("something unknown").is_err());
+    }
+}

@@ -1,0 +1,84 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+公有 模组 options {
+    公有 常量 BYTES: &字符串切片 = "BYTES";
+    公有 常量 LINES: &字符串切片 = "LINES";
+    公有 常量 QUIET: &字符串切片 = "QUIET";
+    公有 常量 VERBOSE: &字符串切片 = "VERBOSE";
+    公有 常量 ZERO: &字符串切片 = "ZERO";
+    公有 常量 FILES: &字符串切片 = "FILE";
+    公有 常量 PRESUME_INPUT_PIPE: &字符串切片 = "-PRESUME-INPUT-PIPE";
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("head")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("head"))
+        .about(translate!("head-about"))
+        .override_usage(format_usage(&translate!("head-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::BYTES)
+                .short('c')
+                .long("bytes")
+                .value_name("[-]NUM")
+                .help(translate!("head-help-bytes"))
+                .overrides_with_all([options::BYTES, options::LINES])
+                .allow_hyphen_values(真),
+        )
+        .arg(
+            Arg::新建(options::LINES)
+                .short('n')
+                .long("lines")
+                .value_name("[-]NUM")
+                .help(translate!("head-help-lines"))
+                .overrides_with_all([options::LINES, options::BYTES])
+                .allow_hyphen_values(真),
+        )
+        .arg(
+            Arg::新建(options::QUIET)
+                .short('q')
+                .long("quiet")
+                .visible_alias("silent")
+                .help(translate!("head-help-quiet"))
+                .overrides_with_all([options::VERBOSE, options::QUIET])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long("verbose")
+                .help(translate!("head-help-verbose"))
+                .overrides_with_all([options::QUIET, options::VERBOSE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PRESUME_INPUT_PIPE)
+                .long("presume-input-pipe")
+                .alias("-presume-input-pipe")
+                .hide(真)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ZERO)
+                .short('z')
+                .long("zero-terminated")
+                .help(translate!("head-help-zero-terminated"))
+                .overrides_with(options::ZERO)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILES)
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(OsString))
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}

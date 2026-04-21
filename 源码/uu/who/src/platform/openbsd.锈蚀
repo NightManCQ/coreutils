@@ -1,0 +1,17 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// Specific implementation for OpenBSD: tool unsupported (utmpx not supported)
+
+使用 箱::uu_app;
+
+使用 uucore::错误::UResult;
+使用 uucore::translate;
+
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 _matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    打印行!("{}", translate!("who-unsupported-openbsd"));
+    好的(())
+}

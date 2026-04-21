@@ -1,0 +1,864 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) hdsf ghead gtail ACDBK hexdigit
+
+//! Parser for sizes in SI or IEC units (multiples of 1000 or 1024 bytes).
+
+/// The first eleven powers of 1000: `1, 10^3, 10^6, ..., 10^30`.
+///
+/// Index `n` is the SI base for the `n`-th suffix (0 → no suffix, 1 → K/kB,
+/// 2 → M/MB, ...).
+公有 常量 SI_BASES: [正128; 11] = [
+    1,
+    1_000,
+    1_000_000,
+    1_000_000_000,
+    1_000_000_000_000,
+    1_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+    1_000_000_000_000_000_000_000,
+    1_000_000_000_000_000_000_000_000,
+    1_000_000_000_000_000_000_000_000_000,
+    1_000_000_000_000_000_000_000_000_000_000,
+];
+
+/// The first eleven powers of 1024: `1, 1024, 1024^2, ..., 1024^10`.
+///
+/// Index `n` is the IEC base for the `n`-th suffix (0 → no suffix, 1 → Ki,
+/// 2 → Mi, ...).
+公有 常量 IEC_BASES: [正128; 11] = [
+    1,
+    1_024,
+    1_048_576,
+    1_073_741_824,
+    1_099_511_627_776,
+    1_125_899_906_842_624,
+    1_152_921_504_606_846_976,
+    1_180_591_620_717_411_303_424,
+    1_208_925_819_614_629_174_706_176,
+    1_237_940_039_285_380_274_899_124_224,
+    1_267_650_600_228_229_401_496_703_205_376,
+];
+
+使用 标准库::错误::错误协议;
+使用 标准库::格式化;
+使用 标准库::数字::{IntErrorKind, ParseIntError};
+
+使用 箱::display::Quotable;
+#[cfg(target_os = "linux")]
+使用 procfs::{Current, Meminfo};
+
+/// Error arising from trying to compute system memory.
+枚举 SystemError {
+    IOError,
+    ParseError,
+    #[cfg(not(target_os = "linux"))]
+    NotFound,
+}
+
+实现 转换协议<标准库::输入输出::错误协议> 循环 SystemError {
+    方法 from(_: 标准库::输入输出::错误协议) -> 自身类型 {
+        自身类型::IOError
+    }
+}
+
+实现 转换协议<ParseIntError> 循环 SystemError {
+    方法 from(_: ParseIntError) -> 自身类型 {
+        自身类型::ParseError
+    }
+}
+
+/// Get the total number of bytes of physical memory.
+///
+/// The information is read from the `/proc/meminfo` file.
+///
+/// # Errors
+///
+/// If there is a problem reading the file or finding the appropriate
+/// entry in the file.
+#[cfg(target_os = "linux")]
+方法 total_physical_memory() -> 结果<正128, SystemError> {
+    设 info = Meminfo::current().map_err(|_| SystemError::IOError)?;
+    好的((info.mem_total 转换 正128).saturating_mul(1024))
+}
+
+/// Return the number of bytes of memory that appear to be currently available.
+#[cfg(target_os = "linux")]
+公有 方法 available_memory_bytes() -> 选项<正128> {
+    设 info = Meminfo::current().ok()?;
+
+    如果 设 一些(available_kib) = info.mem_available {
+        设 available_bytes = (available_kib 转换 正128).saturating_mul(1024);
+        如果 available_bytes > 0 {
+            返回 一些(available_bytes);
+        }
+    }
+
+    设 fallback_kib = (info.mem_free 转换 正128)
+        .saturating_add(info.buffers 转换 正128)
+        .saturating_add(info.cached 转换 正128);
+
+    如果 fallback_kib > 0 {
+        一些(fallback_kib.saturating_mul(1024))
+    } 否则 {
+        total_physical_memory().ok()
+    }
+}
+
+/// Return `None` when the platform does not expose Linux-like `/proc/meminfo`.
+#[cfg(not(target_os = "linux"))]
+公有 方法 available_memory_bytes() -> 选项<正128> {
+    无
+}
+
+/// Get the total number of bytes of physical memory.
+///
+/// TODO Implement this for non-Linux systems.
+#[cfg(not(target_os = "linux"))]
+方法 total_physical_memory() -> 结果<正128, SystemError> {
+    坏的(SystemError::NotFound)
+}
+
+/// Parser for sizes in SI or IEC units (multiples of 1000 or 1024 bytes).
+///
+/// The [`Parser::parse`] function performs the parse.
+#[derive(默认协议)]
+公有 结构 Parser<'parser> {
+    /// Whether to allow empty numeric strings.
+    公有 no_empty_numeric: 布尔,
+    /// Whether to treat the suffix "B" as meaning "bytes".
+    公有 capital_b_bytes: 布尔,
+    /// Whether to treat "b" as a "byte count" instead of "block"
+    公有 b_byte_count: 布尔,
+    /// Whitelist for the suffix
+    公有 allow_list: 选项<&'parser [&'parser 字符串切片]>,
+    /// Default unit when no suffix is provided
+    公有 default_unit: 选项<&'parser 字符串切片>,
+}
+
+枚举 NumberSystem {
+    Decimal,
+    Octal,
+    Hexadecimal,
+    Binary,
+}
+
+实现<'parser> Parser<'parser> {
+    /// Change allow_list of the parser - whitelist for the suffix
+    公有 方法 with_allow_list(&可变 自身, allow_list: &'parser [&字符串切片]) -> &可变 自身类型 {
+        自身.allow_list = 一些(allow_list);
+        自身
+    }
+
+    /// Change default_unit of the parser - when no suffix is provided
+    公有 方法 with_default_unit(&可变 自身, default_unit: &'parser 字符串切片) -> &可变 自身类型 {
+        自身.default_unit = 一些(default_unit);
+        自身
+    }
+
+    /// Change b_byte_count of the parser - to treat "b" as a "byte count" instead of "block"
+    公有 方法 with_b_byte_count(&可变 自身, value: 布尔) -> &可变 自身类型 {
+        自身.b_byte_count = value;
+        自身
+    }
+
+    /// Change no_empty_numeric of the parser - to allow empty numeric strings
+    公有 方法 with_allow_empty_numeric(&可变 自身, value: 布尔) -> &可变 自身类型 {
+        自身.no_empty_numeric = value;
+        自身
+    }
+    /// Parse a size string into a number of bytes.
+    ///
+    /// A size string comprises an integer and an optional unit. The integer
+    /// may be in decimal, octal (0 prefix), hexadecimal (0x prefix), or
+    /// binary (0b prefix) notation. The unit may be K, M, G, T, P, E, Z, Y,
+    /// R or Q (powers of 1024), or KB, MB, etc. (powers of 1000), or b which
+    /// is 512. Binary prefixes can be used, too: KiB=K, MiB=M, and so on.
+    ///
+    /// # Errors
+    ///
+    /// Will return `ParseSizeError` if it's not possible to parse this
+    /// string into a number, e.g. if the string does not begin with a
+    /// numeral, or if the unit is not one of the supported units described
+    /// in the preceding section.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use uucore::parser::parse_size::Parser;
+    /// let parser = Parser {
+    ///     default_unit: Some("M"),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(Ok(123 * 1024 * 1024), parser.parse("123M")); // M is 1024^2
+    /// assert_eq!(Ok(123 * 1024 * 1024), parser.parse("123")); // default unit set to "M" on parser instance
+    /// assert_eq!(Ok(9 * 1000), parser.parse("9kB")); // kB is 1000
+    /// assert_eq!(Ok(2 * 1024), parser.parse("2K")); // K is 1024
+    /// assert_eq!(Ok(44251 * 1024), parser.parse("0xACDBK")); // 0xACDB is 44251 in decimal
+    /// assert_eq!(Ok(44251 * 1024 * 1024), parser.parse("0b1010110011011011")); // 0b1010110011011011 is 44251 in decimal, default M
+    /// ```
+    公有 方法 parse(&自身, size: &字符串切片) -> 结果<正128, ParseSizeError> {
+        如果 size.为空() {
+            返回 坏的(ParseSizeError::parse_failure(size));
+        }
+
+        设 number_system = 自身类型::determine_number_system(size);
+
+        // Split the size argument into numeric and unit parts
+        // For example, if the argument is "123K", the numeric part is "123", and
+        // the unit is "K"
+        设 numeric_string: 字符串 = 匹配 number_system {
+            NumberSystem::Hexadecimal => size
+                .chars()
+                .take(2)
+                .chain(size.chars().skip(2).take_while(字符::is_ascii_hexdigit))
+                .收集(),
+            NumberSystem::Binary => size
+                .chars()
+                .take(2)
+                .chain(size.chars().skip(2).take_while(|c| c.is_digit(2)))
+                .收集(),
+            _ => size.chars().take_while(字符::is_ascii_digit).收集(),
+        };
+        设 可变 unit: &字符串切片 = &size[numeric_string.长度()..];
+
+        如果 设 一些(default_unit) = 自身.default_unit {
+            // Check if `unit` is empty then assigns `default_unit` to `unit`
+            如果 unit.为空() {
+                unit = default_unit;
+            }
+        }
+
+        // Check if `b` is a byte count and remove `b`
+        如果 自身.b_byte_count && unit.ends_with('b') {
+            // If `unit` = 'b' then return error
+            如果 numeric_string.为空() {
+                返回 坏的(ParseSizeError::parse_failure(size));
+            }
+            unit = &unit[0..unit.长度() - 1];
+        }
+
+        如果 设 一些(allow_list) = 自身.allow_list {
+            // Check if `unit` appears in `allow_list`, if not return error
+            如果 !allow_list.包含(&unit) && !unit.为空() {
+                如果 numeric_string.为空() {
+                    返回 坏的(ParseSizeError::parse_failure(size));
+                }
+                返回 坏的(ParseSizeError::invalid_suffix(size));
+            }
+        }
+
+        // Special case: for percentage, just compute the given fraction
+        // of the total physical memory on the machine, if possible.
+        如果 unit == "%" {
+            设 number: 正128 = 自身类型::parse_number(&numeric_string, 10, size)?;
+            返回 匹配 total_physical_memory() {
+                好的(total) => 好的((number / 100) * total),
+                坏的(_) => 坏的(ParseSizeError::PhysicalMem(size.to_string())),
+            };
+        }
+
+        // Compute the factor the unit represents.
+        // empty string means the factor is 1.
+        //
+        // The lowercase "b" (used by `od`, `head`, `tail`, etc.) means
+        // "block" and the Posix block size is 512. The uppercase "B"
+        // means "byte".
+        设 (base, exponent): (正128, 正32) = 匹配 unit {
+            "" => (1, 0),
+            "B" 如果 自身.capital_b_bytes => (1, 0),
+            "b" => (512, 1),
+            "KiB" | "kiB" | "K" | "k" => (1024, 1),
+            "MiB" | "miB" | "M" | "m" => (1024, 2),
+            "GiB" | "giB" | "G" | "g" => (1024, 3),
+            "TiB" | "tiB" | "T" | "t" => (1024, 4),
+            "PiB" | "piB" | "P" | "p" => (1024, 5),
+            "EiB" | "eiB" | "E" | "e" => (1024, 6),
+            "ZiB" | "ziB" | "Z" | "z" => (1024, 7),
+            "YiB" | "yiB" | "Y" | "y" => (1024, 8),
+            "RiB" | "riB" | "R" | "r" => (1024, 9),
+            "QiB" | "qiB" | "Q" | "q" => (1024, 10),
+            "KB" | "kB" | "KD" | "kD" => (1000, 1),
+            "MB" | "mB" | "MD" | "mD" => (1000, 2),
+            "GB" | "gB" | "GD" | "gD" => (1000, 3),
+            "TB" | "tB" | "TD" | "tD" => (1000, 4),
+            "PB" | "pB" | "PD" | "pD" => (1000, 5),
+            "EB" | "eB" | "ED" | "eD" => (1000, 6),
+            "ZB" | "zB" | "ZD" | "zD" => (1000, 7),
+            "YB" | "yB" | "YD" | "yD" => (1000, 8),
+            "RB" | "rB" | "RD" | "rD" => (1000, 9),
+            "QB" | "qB" | "QD" | "qD" => (1000, 10),
+            _ 如果 numeric_string.为空() => 返回 坏的(ParseSizeError::parse_failure(size)),
+            _ => 返回 坏的(ParseSizeError::invalid_suffix(size)),
+        };
+        设 factor = base.pow(exponent);
+
+        // parse string into u128
+        设 number: 正128 = 匹配 number_system {
+            NumberSystem::Decimal => {
+                如果 numeric_string.为空() && !自身.no_empty_numeric {
+                    1
+                } 否则 {
+                    自身类型::parse_number(&numeric_string, 10, size)?
+                }
+            }
+            NumberSystem::Octal => {
+                设 trimmed_string = numeric_string.trim_start_matches('0');
+                自身类型::parse_number(trimmed_string, 8, size)?
+            }
+            NumberSystem::Hexadecimal => {
+                设 trimmed_string = numeric_string.trim_start_matches("0x");
+                自身类型::parse_number(trimmed_string, 16, size)?
+            }
+            NumberSystem::Binary => {
+                设 trimmed_string = numeric_string.trim_start_matches("0b");
+                自身类型::parse_number(trimmed_string, 2, size)?
+            }
+        };
+
+        number
+            .checked_mul(factor)
+            .ok_or_else(|| ParseSizeError::size_too_big(size))
+    }
+
+    /// Explicit u128 alias for `parse()`
+    公有 方法 parse_u128(&自身, size: &字符串切片) -> 结果<正128, ParseSizeError> {
+        自身.parse(size)
+    }
+
+    /// Same as `parse()` but tries to return u64
+    公有 方法 parse_u64(&自身, size: &字符串切片) -> 结果<正64, ParseSizeError> {
+        自身.parse(size).and_then(|num_u128| {
+            正64::try_from(num_u128).map_err(|_| ParseSizeError::size_too_big(size))
+        })
+    }
+
+    /// Same as `parse_u64()`, except returns `u64::MAX` on overflow
+    /// GNU lib/coreutils include similar functionality
+    /// and GNU test suite checks this behavior for some utils (`split` for example)
+    公有 方法 parse_u64_max(&自身, size: &字符串切片) -> 结果<正64, ParseSizeError> {
+        设 result = 自身.parse_u64(size);
+        匹配 result {
+            好的(_) => result,
+            坏的(错误) => {
+                如果 设 ParseSizeError::SizeTooBig(_) = 错误 {
+                    好的(正64::MAX)
+                } 否则 {
+                    坏的(错误)
+                }
+            }
+        }
+    }
+
+    /// Same as `parse_u64_max()`, except for u128, i.e. returns `u128::MAX` on overflow
+    公有 方法 parse_u128_max(&自身, size: &字符串切片) -> 结果<正128, ParseSizeError> {
+        设 result = 自身.parse_u128(size);
+        匹配 result {
+            好的(_) => result,
+            坏的(错误) => {
+                如果 设 ParseSizeError::SizeTooBig(_) = 错误 {
+                    好的(正128::MAX)
+                } 否则 {
+                    坏的(错误)
+                }
+            }
+        }
+    }
+
+    方法 determine_number_system(size: &字符串切片) -> NumberSystem {
+        如果 size.长度() <= 1 {
+            返回 NumberSystem::Decimal;
+        }
+
+        如果 size.starts_with("0x") {
+            返回 NumberSystem::Hexadecimal;
+        }
+
+        // Binary prefix: "0b" followed by at least one binary digit (0 or 1)
+        // Note: "0b" alone is treated as decimal 0 with suffix "b"
+        如果 设 一些(prefix) = size.strip_prefix("0b") {
+            如果 !prefix.为空() {
+                返回 NumberSystem::Binary;
+            }
+        }
+
+        设 num_digits: 正整数大小 = size
+            .chars()
+            .take_while(字符::is_ascii_digit)
+            .收集::<字符串>()
+            .长度();
+        设 all_zeros = size.chars().全部(|c| c == '0');
+        如果 size.starts_with('0') && num_digits > 1 && !all_zeros {
+            返回 NumberSystem::Octal;
+        }
+
+        NumberSystem::Decimal
+    }
+
+    方法 parse_number(
+        numeric_string: &字符串切片,
+        radix: 正32,
+        original_size: &字符串切片,
+    ) -> 结果<正128, ParseSizeError> {
+        正128::from_str_radix(numeric_string, radix).map_err(|e| 匹配 e.kind() {
+            IntErrorKind::PosOverflow => ParseSizeError::size_too_big(original_size),
+            _ => ParseSizeError::ParseFailure(original_size.to_string()),
+        })
+    }
+}
+
+公有 方法 allow_list_with_all_suffixes(units: &字符串切片) -> 向量<字符串> {
+    设 可变 allow_list = 向量::with_capacity(4 * units.长度());
+    循环 unit 在 units.chars() {
+        循环 suffix 在 &["", "iB", "B", "D"] {
+            allow_list.压入(格式化!("{unit}{suffix}"));
+        }
+    }
+    allow_list
+}
+
+/// Parse a size string into a number of bytes
+/// using Default Parser (no custom settings)
+///
+/// # Examples
+///
+/// ```rust
+/// use uucore::parser::parse_size::parse_size_u128;
+/// assert_eq!(Ok(123), parse_size_u128("123"));
+/// assert_eq!(Ok(9 * 1000), parse_size_u128("9kB")); // kB is 1000
+/// assert_eq!(Ok(2 * 1024), parse_size_u128("2K")); // K is 1024
+/// assert_eq!(Ok(44251 * 1024), parse_size_u128("0xACDBK")); // hexadecimal
+/// assert_eq!(Ok(10), parse_size_u128("0b1010")); // binary
+/// assert_eq!(Ok(10 * 1024), parse_size_u128("0b1010K")); // binary with suffix
+/// ```
+公有 方法 parse_size_u128(size: &字符串切片) -> 结果<正128, ParseSizeError> {
+    Parser::默认().parse(size)
+}
+
+/// Same as `parse_size_u128()`, but for u64
+公有 方法 parse_size_u64(size: &字符串切片) -> 结果<正64, ParseSizeError> {
+    Parser::默认().parse_u64(size)
+}
+
+/// Same as `parse_size_u64()`, except 0 fails to parse
+公有 方法 parse_size_non_zero_u64(size: &字符串切片) -> 结果<正64, ParseSizeError> {
+    设 v = Parser::默认().parse_u64(size)?;
+    如果 v == 0 {
+        返回 坏的(ParseSizeError::ParseFailure("0".to_string()));
+    }
+    好的(v)
+}
+
+/// Same as `parse_size_u64()` - deprecated
+#[deprecated = "Please use parse_size_u64(size: &str) -> Result<u64, ParseSizeError> OR parse_size_u128(size: &str) -> Result<u128, ParseSizeError> instead."]
+公有 方法 parse_size(size: &字符串切片) -> 结果<正64, ParseSizeError> {
+    parse_size_u64(size)
+}
+
+/// Same as `parse_size_u64()`, except returns `u64::MAX` on overflow
+/// GNU lib/coreutils include similar functionality
+/// and GNU test suite checks this behavior for some utils
+公有 方法 parse_size_u64_max(size: &字符串切片) -> 结果<正64, ParseSizeError> {
+    Parser::默认().parse_u64_max(size)
+}
+
+/// Same as `parse_size_u128()`, except returns `u128::MAX` on overflow
+公有 方法 parse_size_u128_max(size: &字符串切片) -> 结果<正128, ParseSizeError> {
+    Parser::默认().parse_u128_max(size)
+}
+
+/// Error type for parse_size
+#[derive(调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 ParseSizeError {
+    /// Suffix
+    InvalidSuffix(字符串),
+
+    /// Syntax
+    ParseFailure(字符串),
+
+    /// Overflow
+    SizeTooBig(字符串),
+
+    /// Could not determine total physical memory size.
+    PhysicalMem(字符串),
+}
+
+实现 错误协议 循环 ParseSizeError {
+    方法 description(&自身) -> &字符串切片 {
+        匹配 *自身 {
+            自身类型::InvalidSuffix(引用 s) => s,
+            自身类型::ParseFailure(引用 s) => s,
+            自身类型::SizeTooBig(引用 s) => s,
+            自身类型::PhysicalMem(引用 s) => s,
+        }
+    }
+}
+
+实现 格式化::显示协议 循环 ParseSizeError {
+    方法 格式化(&自身, f: &可变 格式化::Formatter) -> 结果<(), 格式化::错误协议> {
+        设 s = 匹配 自身 {
+            自身类型::InvalidSuffix(s)
+            | 自身类型::ParseFailure(s)
+            | 自身类型::SizeTooBig(s)
+            | 自身类型::PhysicalMem(s) => s,
+        };
+        write!(f, "{s}")
+    }
+}
+
+// FIXME: It's more idiomatic to move the formatting into the Display impl,
+// but there's a lot of downstream code that constructs these errors manually
+// that would be affected
+实现 ParseSizeError {
+    方法 invalid_suffix(s: &字符串切片) -> 自身类型 {
+        自身类型::InvalidSuffix(格式化!("{}", s.quote()))
+    }
+
+    方法 parse_failure(s: &字符串切片) -> 自身类型 {
+        // stderr on linux (GNU coreutils 8.32) (LC_ALL=C)
+        // has to be handled in the respective uutils because strings differ, e.g.:
+        //
+        // `NUM`
+        // head:     invalid number of bytes: '1fb'
+        // tail:     invalid number of bytes: '1fb'
+        //
+        // `SIZE`
+        // split:    invalid number of bytes: '1fb'
+        // truncate: Invalid number: '1fb'
+        //
+        // `MODE`
+        // stdbuf:   invalid mode '1fb'
+        //
+        // `SIZE`
+        // sort:     invalid suffix in --buffer-size argument '1fb'
+        // sort:     invalid --buffer-size argument 'fb'
+        //
+        // `SIZE`
+        // du:       invalid suffix in --buffer-size argument '1fb'
+        // du:       invalid suffix in --threshold argument '1fb'
+        // du:       invalid --buffer-size argument 'fb'
+        // du:       invalid --threshold argument 'fb'
+        //
+        // `BYTES`
+        // od:       invalid suffix in --read-bytes argument '1fb'
+        // od:       invalid --read-bytes argument  argument 'fb'
+        //                   --skip-bytes
+        //                   --width
+        //                   --strings
+        // etc.
+        自身类型::ParseFailure(格式化!("{}", s.quote()))
+    }
+
+    方法 size_too_big(s: &字符串切片) -> 自身类型 {
+        // stderr on linux (GNU coreutils 8.32) (LC_ALL=C)
+        // has to be handled in the respective uutils because strings differ, e.g.:
+        //
+        // head:     invalid number of bytes: '1Y': Value too large for defined data type
+        // tail:     invalid number of bytes: '1Y': Value too large for defined data type
+        // split:    invalid number of bytes: '1Y': Value too large for defined data type
+        // truncate:          Invalid number: '1Y': Value too large for defined data type
+        // stdbuf:               invalid mode '1Y': Value too large for defined data type
+        // sort:     -S argument '1Y' too large
+        // du:       -B argument '1Y' too large
+        // od:       -N argument '1Y' too large
+        // etc.
+        //
+        // stderr on macos (brew - GNU coreutils 8.32) also differs for the same version, e.g.:
+        // ghead:   invalid number of bytes: '1Y': Value too large to be stored in data type
+        // gtail:   invalid number of bytes: '1Y': Value too large to be stored in data type
+        自身类型::SizeTooBig(格式化!(
+            "{}: Value too large for defined data type",
+            s.quote()
+        ))
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    方法 variant_eq(a: &ParseSizeError, b: &ParseSizeError) -> 布尔 {
+        标准库::内存::discriminant(a) == 标准库::内存::discriminant(b)
+    }
+
+    #[test]
+    方法 all_suffixes() {
+        // Units  are  K,M,G,T,P,E,Z,Y,R,Q (powers of 1024) or KB,MB,... (powers of 1000).
+        // Binary prefixes can be used, too: KiB=K, MiB=M, and so on.
+        设 suffixes = [
+            ('K', 1正32),
+            ('M', 2正32),
+            ('G', 3正32),
+            ('T', 4正32),
+            ('P', 5正32),
+            ('E', 6正32),
+            ('Z', 7正32),
+            ('Y', 8正32),
+            ('R', 9正32),
+            ('Q', 10正32),
+        ];
+
+        循环 &(c, exp) 在 &suffixes {
+            设 s = 格式化!("2{c}B"); // KB
+            相等断言!(好的(2 * 1000_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("2{c}"); // K
+            相等断言!(好的(2 * 1024_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("2{c}iB"); // KiB
+            相等断言!(好的(2 * 1024_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("2{}iB", c.to_lowercase()); // kiB
+            相等断言!(好的(2 * 1024_u128.pow(exp)), parse_size_u128(&s));
+
+            // suffix only
+            设 s = 格式化!("{c}B"); // KB
+            相等断言!(好的(1000_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("{c}"); // K
+            相等断言!(好的(1024_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("{c}iB"); // KiB
+            相等断言!(好的(1024_u128.pow(exp)), parse_size_u128(&s));
+            设 s = 格式化!("{}iB", c.to_lowercase()); // kiB
+            相等断言!(好的(1024_u128.pow(exp)), parse_size_u128(&s));
+        }
+    }
+
+    #[test]
+    方法 overflow_x64() {
+        断言!(parse_size_u64("10000000000000000000000").is_err());
+        断言!(parse_size_u64("1000000000T").is_err());
+        断言!(parse_size_u64("100000P").is_err());
+        断言!(parse_size_u64("100E").is_err());
+        断言!(parse_size_u64("1Z").is_err());
+        断言!(parse_size_u64("1Y").is_err());
+        断言!(parse_size_u64("1R").is_err());
+        断言!(parse_size_u64("1Q").is_err());
+        断言!(parse_size_u64("0b1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111").is_err());
+
+        断言!(variant_eq(
+            &parse_size_u64("1Z").unwrap_err(),
+            &ParseSizeError::SizeTooBig(字符串::新建())
+        ));
+
+        相等断言!(
+            ParseSizeError::SizeTooBig("'1Y': Value too large for defined data type".to_string()),
+            parse_size_u64("1Y").unwrap_err()
+        );
+        相等断言!(
+            ParseSizeError::SizeTooBig("'1R': Value too large for defined data type".to_string()),
+            parse_size_u64("1R").unwrap_err()
+        );
+        相等断言!(
+            ParseSizeError::SizeTooBig("'1Q': Value too large for defined data type".to_string()),
+            parse_size_u64("1Q").unwrap_err()
+        );
+    }
+
+    #[test]
+    方法 overflow_to_max_u64() {
+        相等断言!(好的(1_099_511_627_776), parse_size_u64_max("1T"));
+        相等断言!(好的(1_125_899_906_842_624), parse_size_u64_max("1P"));
+        相等断言!(好的(正64::MAX), parse_size_u64_max("18446744073709551616"));
+        相等断言!(好的(正64::MAX), parse_size_u64_max("10000000000000000000000"));
+        相等断言!(好的(正64::MAX), parse_size_u64_max("1Y"));
+        相等断言!(好的(正64::MAX), parse_size_u64_max("1R"));
+        相等断言!(好的(正64::MAX), parse_size_u64_max("1Q"));
+    }
+
+    #[test]
+    方法 overflow_to_max_u128() {
+        相等断言!(
+            好的(12_379_400_392_853_802_748_991_242_240),
+            parse_size_u128_max("10R")
+        );
+        相等断言!(
+            好的(12_676_506_002_282_294_014_967_032_053_760),
+            parse_size_u128_max("10Q")
+        );
+        相等断言!(好的(正128::MAX), parse_size_u128_max("1000000000000R"));
+        相等断言!(好的(正128::MAX), parse_size_u128_max("1000000000Q"));
+    }
+
+    #[test]
+    方法 invalid_suffix() {
+        设 test_strings = ["5mib", "1eb", "1H"];
+        循环 &test_string 在 &test_strings {
+            相等断言!(
+                parse_size_u64(test_string).unwrap_err(),
+                ParseSizeError::InvalidSuffix(格式化!("{}", test_string.quote()))
+            );
+        }
+    }
+
+    #[test]
+    方法 invalid_syntax() {
+        设 test_strings = ["biB", "-", "+", "", "-1", "∞"];
+        循环 &test_string 在 &test_strings {
+            相等断言!(
+                parse_size_u64(test_string).unwrap_err(),
+                ParseSizeError::ParseFailure(格式化!("{}", test_string.quote()))
+            );
+        }
+    }
+
+    #[test]
+    方法 b_suffix() {
+        相等断言!(好的(3 * 512), parse_size_u64("3b")); // b is 512
+        相等断言!(好的(0), parse_size_u64("0b")); // b should be used as a suffix in this case instead of signifying binary
+    }
+
+    #[test]
+    方法 no_suffix() {
+        相等断言!(好的(1234), parse_size_u64("1234"));
+        相等断言!(好的(0), parse_size_u64("0"));
+        相等断言!(好的(5), parse_size_u64("5"));
+        相等断言!(好的(999), parse_size_u64("999"));
+    }
+
+    #[test]
+    方法 kilobytes_suffix() {
+        相等断言!(好的(123 * 1000), parse_size_u64("123KB")); // KB is 1000
+        相等断言!(好的(9 * 1000), parse_size_u64("9kB")); // kB is 1000
+        相等断言!(好的(2 * 1024), parse_size_u64("2K")); // K is 1024
+        相等断言!(好的(0), parse_size_u64("0K"));
+        相等断言!(好的(0), parse_size_u64("0KB"));
+        相等断言!(好的(1000), parse_size_u64("KB"));
+        相等断言!(好的(1024), parse_size_u64("K"));
+        相等断言!(好的(2000), parse_size_u64("2kB"));
+        相等断言!(好的(4000), parse_size_u64("4KB"));
+    }
+
+    #[test]
+    方法 megabytes_suffix() {
+        相等断言!(好的(123 * 1024 * 1024), parse_size_u64("123M"));
+        相等断言!(好的(123 * 1000 * 1000), parse_size_u64("123MB"));
+        相等断言!(好的(1024 * 1024), parse_size_u64("M"));
+        相等断言!(好的(1000 * 1000), parse_size_u64("MB"));
+        相等断言!(好的(2 * 1_048_576), parse_size_u64("2m"));
+        相等断言!(好的(4 * 1_048_576), parse_size_u64("4M"));
+        相等断言!(好的(2_000_000), parse_size_u64("2mB"));
+        相等断言!(好的(4_000_000), parse_size_u64("4MB"));
+    }
+
+    #[test]
+    方法 gigabytes_suffix() {
+        相等断言!(好的(1_073_741_824), parse_size_u64("1G"));
+        相等断言!(好的(2_000_000_000), parse_size_u64("2GB"));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    方法 x64() {
+        相等断言!(好的(1_099_511_627_776), parse_size_u64("1T"));
+        相等断言!(好的(1_125_899_906_842_624), parse_size_u64("1P"));
+        相等断言!(好的(1_152_921_504_606_846_976), parse_size_u64("1E"));
+
+        相等断言!(好的(1_180_591_620_717_411_303_424), parse_size_u128("1Z"));
+        相等断言!(好的(1_208_925_819_614_629_174_706_176), parse_size_u128("1Y"));
+        相等断言!(
+            好的(1_237_940_039_285_380_274_899_124_224),
+            parse_size_u128("1R")
+        );
+        相等断言!(
+            好的(1_267_650_600_228_229_401_496_703_205_376),
+            parse_size_u128("1Q")
+        );
+
+        相等断言!(好的(2_000_000_000_000), parse_size_u64("2TB"));
+        相等断言!(好的(2_000_000_000_000_000), parse_size_u64("2PB"));
+        相等断言!(好的(2_000_000_000_000_000_000), parse_size_u64("2EB"));
+
+        相等断言!(好的(2_000_000_000_000_000_000_000), parse_size_u128("2ZB"));
+        相等断言!(
+            好的(2_000_000_000_000_000_000_000_000),
+            parse_size_u128("2YB")
+        );
+        相等断言!(
+            好的(2_000_000_000_000_000_000_000_000_000),
+            parse_size_u128("2RB")
+        );
+        相等断言!(
+            好的(2_000_000_000_000_000_000_000_000_000_000),
+            parse_size_u128("2QB")
+        );
+    }
+
+    #[test]
+    方法 parse_size_options() {
+        设 可变 parser = Parser::默认();
+
+        parser
+            .with_allow_list(&["k", "K", "G", "MB", "M"])
+            .with_default_unit("K");
+
+        相等断言!(好的(1024), parser.parse("1"));
+        相等断言!(好的(2 * 1024), parser.parse("2"));
+        相等断言!(好的(1000 * 1000), parser.parse("1MB"));
+        相等断言!(好的(1024 * 1024), parser.parse("1M"));
+        相等断言!(好的(1024 * 1024 * 1024), parser.parse("1G"));
+
+        断言!(parser.parse("1T").is_err());
+        断言!(parser.parse("1P").is_err());
+        断言!(parser.parse("1E").is_err());
+
+        parser
+            .with_allow_list(&[
+                "b", "k", "K", "m", "M", "MB", "g", "G", "t", "T", "P", "E", "Z", "Y", "R", "Q",
+            ])
+            .with_default_unit("K")
+            .with_b_byte_count(真);
+
+        相等断言!(好的(1024), parser.parse("1"));
+        相等断言!(好的(2 * 1024), parser.parse("2"));
+        相等断言!(好的(1000 * 1000), parser.parse("1MB"));
+        相等断言!(好的(1024 * 1024), parser.parse("1M"));
+        相等断言!(好的(1024 * 1024 * 1024), parser.parse("1G"));
+        相等断言!(
+            好的(1_237_940_039_285_380_274_899_124_224),
+            parser.parse_u128("1R")
+        );
+        相等断言!(
+            好的(1_267_650_600_228_229_401_496_703_205_376),
+            parser.parse_u128("1Q")
+        );
+
+        相等断言!(好的(1), parser.parse("1b"));
+        相等断言!(好的(1024), parser.parse("1024b"));
+        相等断言!(好的(1024 * 1024 * 1024), parser.parse("1024Mb"));
+
+        断言!(parser.parse("b").is_err());
+        断言!(parser.parse("1B").is_err());
+        断言!(parser.parse("B").is_err());
+    }
+
+    #[test]
+    方法 parse_octal_size() {
+        相等断言!(好的(63), parse_size_u64("077"));
+        相等断言!(好的(528), parse_size_u64("01020"));
+        相等断言!(好的(668 * 1024), parse_size_u128("01234K"));
+    }
+
+    #[test]
+    方法 parse_hex_size() {
+        相等断言!(好的(10), parse_size_u64("0xA"));
+        相等断言!(好的(94722), parse_size_u64("0x17202"));
+        相等断言!(好的(44251 * 1024), parse_size_u128("0xACDBK"));
+    }
+
+    #[test]
+    方法 parse_binary_size() {
+        相等断言!(好的(44251), parse_size_u64("0b1010110011011011"));
+        相等断言!(好的(44251 * 1024), parse_size_u64("0b1010110011011011K"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    方法 parse_percent() {
+        断言!(parse_size_u64("0%").is_ok());
+        断言!(parse_size_u64("50%").is_ok());
+        断言!(parse_size_u64("100%").is_ok());
+        断言!(parse_size_u64("100000%").is_ok());
+        断言!(parse_size_u64("-1%").is_err());
+        断言!(parse_size_u64("1.0%").is_err());
+        断言!(parse_size_u64("0x1%").is_err());
+    }
+}

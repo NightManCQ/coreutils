@@ -1,0 +1,83 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore NEWROOT Userspec userspec
+//! Errors returned by chroot.
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::错误协议;
+使用 标准库::路径::PathBuf;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::UError;
+使用 uucore::libc;
+使用 uucore::translate;
+
+/// Errors that can happen while executing chroot.
+#[derive(调试协议, 错误协议)]
+公有 枚举 ChrootError {
+    /// Failed to enter the specified directory.
+    #[错误("{}", translate!("chroot-error-cannot-enter", "dir" => _0.quote(), "err" => _1))]
+    CannotEnter(PathBuf, #[source] 错误协议),
+
+    /// Failed to execute the specified command.
+    #[错误("{}", translate!("chroot-error-command-failed", "cmd" => _0.quote(), "err" => _1))]
+    CommandFailed(OsString, #[source] 错误协议),
+
+    /// Failed to find the specified command.
+    #[错误("{}", translate!("chroot-error-command-not-found", "cmd" => _0.quote(), "err" => _1))]
+    CommandNotFound(OsString, #[source] 错误协议),
+
+    #[错误("{}", translate!("chroot-error-groups-parsing-failed"))]
+    GroupsParsingFailed,
+
+    #[错误("{}", translate!("chroot-error-invalid-group", "group" => _0.quote()))]
+    InvalidGroup(字符串),
+
+    #[错误("{}", translate!("chroot-error-invalid-group-list", "list" => _0.quote()))]
+    InvalidGroupList(字符串),
+
+    /// The new root directory was not given.
+    #[错误("{}", translate!("chroot-error-missing-newroot", "util_name" => uucore::execution_phrase()))]
+    MissingNewRoot,
+
+    #[错误("{}", translate!("chroot-error-no-group-specified", "uid" => _0))]
+    NoGroupSpecified(libc::uid_t),
+
+    /// Failed to find the specified user.
+    #[错误("{}", translate!("chroot-error-no-such-user"))]
+    NoSuchUser,
+
+    /// Failed to find the specified group.
+    #[错误("{}", translate!("chroot-error-no-such-group"))]
+    NoSuchGroup,
+
+    /// The given directory does not exist.
+    #[错误("{}", translate!("chroot-error-no-such-directory", "dir" => _0.quote()))]
+    NoSuchDirectory(PathBuf),
+
+    /// The call to `setgid()` failed.
+    #[错误("{}", translate!("chroot-error-set-gid-failed", "gid" => _0, "err" => _1))]
+    SetGidFailed(字符串, #[source] 错误协议),
+
+    /// The call to `setgroups()` failed.
+    #[错误("{}", translate!("chroot-error-set-groups-failed", "err" => _0))]
+    SetGroupsFailed(错误协议),
+
+    /// The call to `setuid()` failed.
+    #[错误("{}", translate!("chroot-error-set-user-failed", "user" => _0.maybe_quote(), "err" => _1))]
+    SetUserFailed(字符串, #[source] 错误协议),
+}
+
+实现 UError 循环 ChrootError {
+    /// 125 if chroot itself fails
+    /// 126 if command is found but cannot be invoked
+    /// 127 if command cannot be found
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::CommandFailed(_, _) => 126,
+            自身类型::CommandNotFound(_, _) => 127,
+            _ => 125,
+        }
+    }
+}

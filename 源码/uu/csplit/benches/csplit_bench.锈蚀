@@ -1,0 +1,76 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::TempDir;
+使用 uu_csplit::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file, text_data};
+
+/// Benchmark splitting by line number
+#[divan::bench]
+方法 csplit_line_number(bencher: Bencher) {
+    设 data = text_data::generate_by_lines(100_000, 80);
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("xx");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &[
+                    "-f",
+                    &prefix,
+                    file_path.to_str().解包(),
+                    "10000",
+                    "50000",
+                    "90000",
+                ],
+            ));
+            drop(output_dir);
+        });
+}
+
+/// Benchmark splitting by regex pattern
+#[divan::bench]
+方法 csplit_regex_pattern(bencher: Bencher) {
+    // Generate data with periodic marker lines that we can split on
+    设 可变 data = 向量::新建();
+    循环 i 在 0..100_000 {
+        如果 i % 10_000 == 0 && i > 0 {
+            data.extend_from_slice(格式化!("SECTION {i}\n").as_bytes());
+        } 否则 {
+            data.extend_from_slice(格式化!("line {i} with some content to process\n").as_bytes());
+        }
+    }
+    设 file_path = setup_test_file(&data);
+
+    bencher
+        .with_inputs(|| {
+            设 output_dir = TempDir::新建().解包();
+            设 prefix = output_dir.路径().加入("xx");
+            (output_dir, prefix.to_str().解包().to_string())
+        })
+        .bench_values(|(output_dir, prefix)| {
+            black_box(run_util_function(
+                uumain,
+                &[
+                    "-f",
+                    &prefix,
+                    file_path.to_str().解包(),
+                    "/^SECTION/",
+                    "{*}",
+                ],
+            ));
+            drop(output_dir);
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

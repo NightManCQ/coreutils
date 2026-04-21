@@ -1,0 +1,331 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore hardlinked
+
+//! Hardlink preservation utilities for mv operations
+//!
+//! This module provides functionality to preserve hardlink relationships
+//! when moving files across different filesystems/partitions.
+
+使用 rustc_hash::FxHashMap;
+使用 标准库::输入输出;
+使用 标准库::路径::{Path, PathBuf};
+
+使用 uucore::display::Quotable;
+
+/// Tracks hardlinks during cross-partition moves to preserve them
+#[derive(调试协议, 默认协议)]
+公有 结构 HardlinkTracker {
+    /// Maps (device, inode) -> destination path for the first occurrence
+    inode_map: FxHashMap<(正64, 正64), PathBuf>,
+}
+
+/// Pre-scans files to identify hardlink groups with optimized memory usage
+#[derive(调试协议, 默认协议)]
+公有 结构 HardlinkGroupScanner {
+    /// Maps (device, inode) -> list of source paths that are hardlinked together
+    hardlink_groups: FxHashMap<(正64, 正64), 向量<PathBuf>>,
+    /// List of source files/directories being moved (for destination mapping)
+    source_files: 向量<PathBuf>,
+    /// Whether scanning has been performed
+    scanned: 布尔,
+}
+
+/// Configuration options for hardlink preservation
+#[derive(调试协议, 克隆协议, 默认协议)]
+公有 结构 HardlinkOptions {
+    /// Whether to show verbose output about hardlink operations
+    公有 verbose: 布尔,
+}
+
+/// Errors that can occur during hardlink operations
+#[derive(调试协议)]
+公有 枚举 HardlinkError {
+    Io(输入输出::错误协议),
+    Scan(字符串),
+    Preservation { source: PathBuf, target: PathBuf },
+    Metadata { 路径: PathBuf, 错误: 输入输出::错误协议 },
+}
+
+实现 标准库::格式化::显示协议 循环 HardlinkError {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::Io(e) => write!(f, "I/O error during hardlink operation: {e}"),
+            自身类型::Scan(msg) => {
+                write!(f, "Failed to scan files for hardlinks: {msg}")
+            }
+            自身类型::Preservation { source, target } => {
+                write!(
+                    f,
+                    "Failed to preserve hardlink: {} -> {}",
+                    source.quote(),
+                    target.quote()
+                )
+            }
+            自身类型::Metadata { 路径, 错误 } => {
+                write!(f, "Metadata access error for {}: {error}", 路径.quote())
+            }
+        }
+    }
+}
+
+实现 标准库::错误::错误协议 循环 HardlinkError {
+    方法 source(&自身) -> 选项<&(动态 标准库::错误::错误协议 + '静态)> {
+        匹配 自身 {
+            自身类型::Io(e) => 一些(e),
+            自身类型::Metadata { 错误, .. } => 一些(错误),
+            _ => 无,
+        }
+    }
+}
+
+实现 转换协议<输入输出::错误协议> 循环 HardlinkError {
+    方法 from(错误: 输入输出::错误协议) -> 自身类型 {
+        自身类型::Io(错误)
+    }
+}
+
+实现 转换协议<HardlinkError> 循环 输入输出::错误协议 {
+    方法 from(错误: HardlinkError) -> 自身类型 {
+        匹配 错误 {
+            HardlinkError::Io(e) => e,
+            HardlinkError::Scan(msg) => 自身类型::other(msg),
+            HardlinkError::Preservation { source, target } => 自身类型::other(格式化!(
+                "Failed to preserve hardlink: {} -> {}",
+                source.quote(),
+                target.quote()
+            )),
+
+            HardlinkError::Metadata { 路径, 错误 } => 自身类型::other(格式化!(
+                "Metadata access error for {}: {error}",
+                路径.quote(),
+            )),
+        }
+    }
+}
+
+实现 HardlinkTracker {
+    公有 方法 新建() -> 自身类型 {
+        自身类型::默认()
+    }
+
+    /// Check if a file is a hardlink we've seen before, and return the target path if so
+    公有 方法 check_hardlink(
+        &可变 自身,
+        source: &Path,
+        dest: &Path,
+        scanner: &HardlinkGroupScanner,
+        options: &HardlinkOptions,
+    ) -> 选项<PathBuf> {
+        使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+        设 metadata = 匹配 source.metadata() {
+            好的(meta) => meta,
+            坏的(e) => {
+                // Gracefully handle metadata errors by logging and continuing without hardlink tracking
+                如果 options.verbose {
+                    错误打印行!("warning: cannot get metadata for {}: {e}", source.quote());
+                }
+                返回 无;
+            }
+        };
+
+        设 key = (metadata.dev(), metadata.ino());
+
+        // Check if we've already processed a file with this inode
+        如果 设 一些(existing_path) = 自身.inode_map.获取(&key) {
+            // Check if this file is part of a hardlink group from the scanner
+            设 has_hardlinks = scanner
+                .hardlink_groups
+                .获取(&key)
+                .is_some_and(|group| group.长度() > 1);
+
+            如果 has_hardlinks {
+                如果 options.verbose {
+                    错误打印行!(
+                        "preserving hardlink {} -> {} (hardlinked)",
+                        source.quote(),
+                        existing_path.quote()
+                    );
+                }
+                返回 一些(existing_path.克隆());
+            }
+        }
+
+        // This is the first time we see this file, record its destination
+        自身.inode_map.插入(key, dest.to_path_buf());
+
+        无
+    }
+}
+
+实现 HardlinkGroupScanner {
+    公有 方法 新建() -> 自身类型 {
+        自身类型::默认()
+    }
+
+    /// Scan files and group them by hardlinks, including recursive directory scanning
+    公有 方法 scan_files(&可变 自身, files: &[PathBuf], options: &HardlinkOptions) {
+        如果 自身.scanned {
+            返回;
+        }
+
+        // Store the source files for destination mapping
+        自身.source_files = files.to_vec();
+
+        循环 file 在 files {
+            如果 设 坏的(e) = 自身.scan_single_path(file) {
+                如果 options.verbose {
+                    // Only show warnings for verbose mode
+                    错误打印行!("warning: failed to scan {}: {e}", file.quote());
+                }
+                // For non-verbose mode, silently continue for missing files
+                // This provides graceful degradation - we'll lose hardlink info for this file
+                // but can still preserve hardlinks for other files
+            }
+        }
+
+        自身.scanned = 真;
+
+        如果 options.verbose {
+            设 stats = 自身.stats();
+            如果 stats.total_groups > 0 {
+                错误打印行!(
+                    "found {} hardlink groups with {} total files",
+                    stats.total_groups, stats.total_files
+                );
+            }
+        }
+    }
+
+    /// Scan a single path (file or directory)
+    方法 scan_single_path(&可变 自身, 路径: &Path) -> 输入输出::结果<()> {
+        使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+        如果 路径.is_dir() {
+            // Recursively scan directory contents
+            自身.scan_directory_recursive(路径)?;
+        } 否则 {
+            设 metadata = 路径.metadata()?;
+            如果 metadata.nlink() > 1 {
+                设 key = (metadata.dev(), metadata.ino());
+                自身.hardlink_groups
+                    .entry(key)
+                    .or_default()
+                    .压入(路径.to_path_buf());
+            }
+        }
+        好的(())
+    }
+
+    /// Recursively scan a directory for hardlinked files
+    方法 scan_directory_recursive(&可变 自身, dir: &Path) -> 输入输出::结果<()> {
+        使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+        设 entries = 标准库::文件系统::read_dir(dir)?;
+        循环 entry 在 entries {
+            设 entry = entry?;
+            设 路径 = entry.路径();
+
+            如果 路径.is_dir() {
+                自身.scan_directory_recursive(&路径)?;
+            } 否则 {
+                设 metadata = 路径.metadata()?;
+                如果 metadata.nlink() > 1 {
+                    设 key = (metadata.dev(), metadata.ino());
+                    自身.hardlink_groups.entry(key).or_default().压入(路径);
+                }
+            }
+        }
+        好的(())
+    }
+
+    #[cfg(not(unix))]
+    公有 方法 scan_files(
+        &可变 自身,
+        files: &[PathBuf],
+        _options: &HardlinkOptions,
+    ) -> HardlinkResult<()> {
+        自身.source_files = files.to_vec();
+        自身.scanned = 真;
+        好的(())
+    }
+
+    #[cfg(not(unix))]
+    公有 方法 stats(&自身) -> ScannerStats {
+        ScannerStats {
+            total_groups: 0,
+            total_files: 0,
+        }
+    }
+
+    /// Get statistics about scanned hardlinks
+    #[cfg(unix)]
+    公有 方法 stats(&自身) -> ScannerStats {
+        设 total_groups = 自身.hardlink_groups.长度();
+        设 total_files = 自身.hardlink_groups.values().映射(向量::长度).求和();
+
+        ScannerStats {
+            total_groups,
+            total_files,
+        }
+    }
+}
+
+/// Statistics about hardlink scanning
+#[derive(调试协议, 克隆协议)]
+公有 结构 ScannerStats {
+    公有 total_groups: 正整数大小,
+    公有 total_files: 正整数大小,
+}
+
+/// Create a new hardlink tracker and scanner pair
+公有 方法 create_hardlink_context() -> (HardlinkTracker, HardlinkGroupScanner) {
+    (HardlinkTracker::新建(), HardlinkGroupScanner::新建())
+}
+
+/// Convenient function to execute operations with proper hardlink context handling
+公有 方法 with_optional_hardlink_context<F, R>(
+    tracker: 选项<&可变 HardlinkTracker>,
+    scanner: 选项<&HardlinkGroupScanner>,
+    operation: F,
+) -> R
+何处
+    F: FnOnce(&可变 HardlinkTracker, &HardlinkGroupScanner) -> R,
+{
+    如果 设 (一些(tracker), 一些(scanner)) = (tracker, scanner) {
+        operation(tracker, scanner)
+    } 否则 {
+        设 (可变 dummy_tracker, dummy_scanner) = create_hardlink_context();
+        operation(&可变 dummy_tracker, &dummy_scanner)
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_hardlink_tracker_creation() {
+        设 _tracker = HardlinkTracker::新建();
+        // Just test that creation works
+    }
+
+    #[test]
+    方法 test_scanner_creation() {
+        设 scanner = HardlinkGroupScanner::新建();
+        设 stats = scanner.stats();
+        相等断言!(stats.total_groups, 0);
+        相等断言!(stats.total_files, 0);
+    }
+
+    #[test]
+    方法 test_create_hardlink_context() {
+        设 (_tracker, scanner) = create_hardlink_context();
+        设 stats = scanner.stats();
+        相等断言!(stats.total_groups, 0);
+        相等断言!(stats.total_files, 0);
+    }
+}

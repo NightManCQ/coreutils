@@ -1,0 +1,755 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore memmem algo PCLMULQDQ refin xorout Hdlc
+
+//! Implementations of digest functions, like md5 and sha1.
+//!
+//! The [`Digest`] trait represents the interface for providing inputs
+//! to these digest functions and accessing the resulting hash. The
+//! [`DigestWriter`] struct provides a wrapper around [`Digest`] that
+//! implements the [`Write`] trait, for use in situations where calling
+//! [`write`] would be useful.
+
+使用 标准库::输入输出::{自身, Write};
+
+使用 data_encoding::BASE64;
+
+#[cfg(windows)]
+使用 memchr::memmem;
+
+使用 箱::错误::{UResult, USimpleError};
+
+/// Represents the output of a checksum computation.
+#[derive(调试协议)]
+公有 枚举 DigestOutput {
+    /// Varying-size output
+    向量(向量<正8>),
+    /// Legacy output for Crc and Crc32B modes
+    Crc(正32),
+    /// Legacy output for Sysv and BSD modes
+    U16(正16),
+}
+
+实现 DigestOutput {
+    公有 方法 write_raw(&自身, 可变 w: 实现 Write) -> 输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::向量(buf) => w.write_all(buf),
+            // For legacy outputs, print them in big endian
+            自身类型::Crc(n) => w.write_all(&n.to_be_bytes()),
+            自身类型::U16(n) => w.write_all(&n.to_be_bytes()),
+        }
+    }
+
+    公有 方法 to_hex(&自身) -> UResult<字符串> {
+        匹配 自身 {
+            自身类型::向量(buf) => 好的(hex::encode(buf)),
+            _ => 坏的(USimpleError::新建(1, "Legacy output cannot be encoded")),
+        }
+    }
+
+    公有 方法 to_base64(&自身) -> UResult<字符串> {
+        匹配 自身 {
+            自身类型::向量(buf) => 好的(BASE64.encode(buf)),
+            _ => 坏的(USimpleError::新建(1, "Legacy output cannot be encoded")),
+        }
+    }
+}
+
+公有 协议 Digest {
+    方法 hash_update(&可变 自身, input: &[正8]);
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]);
+    方法 reset(&可变 自身);
+    方法 output_bits(&自身) -> 正整数大小;
+    方法 output_bytes(&自身) -> 正整数大小 {
+        自身.output_bits().div_ceil(8)
+    }
+
+    方法 result(&可变 自身) -> DigestOutput {
+        设 可变 buf: 向量<正8> = 向量![0; 自身.output_bytes()];
+        自身.hash_finalize(&可变 buf);
+        DigestOutput::向量(buf)
+    }
+}
+
+/// first element of the tuple is the blake2b state
+/// second is the number of output bits
+公有 结构 Blake2b {
+    digest: blake2b_simd::State,
+    bit_size: 正整数大小,
+}
+
+实现 Blake2b {
+    公有 常量 DEFAULT_BYTE_SIZE: 正整数大小 = 64;
+    公有 常量 DEFAULT_BIT_SIZE: 正整数大小 = 自身类型::DEFAULT_BYTE_SIZE * 8;
+
+    /// Return a new Blake2b instance with a custom output bytes length
+    公有 方法 with_output_bytes(output_bytes: 正整数大小) -> 自身类型 {
+        调试断言!(
+            output_bytes <= 自身类型::DEFAULT_BYTE_SIZE,
+            "GNU doesn't accept BLAKE2b bigger than 64 bytes long"
+        );
+
+        设 可变 params = blake2b_simd::Params::新建();
+        params.hash_length(output_bytes);
+
+        设 state = params.to_state();
+        自身类型 {
+            digest: state,
+            bit_size: output_bytes * 8,
+        }
+    }
+}
+
+实现 默认协议 循环 Blake2b {
+    方法 默认() -> 自身类型 {
+        自身类型::with_output_bytes(自身类型::DEFAULT_BYTE_SIZE)
+    }
+}
+
+实现 Digest 循环 Blake2b {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        自身.digest.update(input);
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        设 hash_result = &自身.digest.finalize();
+        out.copy_from_slice(hash_result.as_bytes());
+    }
+
+    方法 reset(&可变 自身) {
+        *自身 = 自身类型::with_output_bytes(自身.output_bytes());
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        自身.bit_size
+    }
+}
+
+公有 结构 Blake3 {
+    digest: blake3::Hasher,
+    byte_size: 正整数大小,
+}
+
+实现 Blake3 {
+    /// Default length for the BLAKE3 digest in bytes.
+    公有 常量 DEFAULT_BYTE_SIZE: 正整数大小 = 32;
+
+    公有 方法 with_output_bytes(output_bytes: 正整数大小) -> 自身类型 {
+        自身类型 {
+            digest: blake3::Hasher::新建(),
+            byte_size: output_bytes,
+        }
+    }
+}
+
+实现 默认协议 循环 Blake3 {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            digest: blake3::Hasher::默认(),
+            byte_size: 自身类型::DEFAULT_BYTE_SIZE,
+        }
+    }
+}
+
+实现 Digest 循环 Blake3 {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        自身.digest.update(input);
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        设 可变 hash_result = 自身.digest.finalize_xof();
+        hash_result.fill(out);
+    }
+
+    方法 reset(&可变 自身) {
+        *自身 = 自身类型::with_output_bytes(自身.output_bytes());
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        自身.byte_size * 8
+    }
+}
+
+#[derive(默认协议)]
+公有 结构 Sm3(sm3::Sm3);
+
+实现 Sm3 {
+    公有 常量 BIT_SIZE: 正整数大小 = 256;
+}
+
+实现 Digest 循环 Sm3 {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        <sm3::Sm3 转换 sm3::Digest>::update(&可变 自身.0, input);
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        out.copy_from_slice(&<sm3::Sm3 转换 sm3::Digest>::finalize(自身.0.克隆()));
+    }
+
+    方法 reset(&可变 自身) {
+        *自身 = 自身类型::默认();
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        自身类型::BIT_SIZE
+    }
+}
+
+公有 结构 Crc {
+    digest: crc_fast::Digest,
+    size: 正整数大小,
+}
+
+实现 Crc {
+    /// POSIX cksum SIMD configuration for crc-fast
+    /// This uses SIMD instructions (PCLMULQDQ) for fast CRC computation
+    方法 get_posix_cksum_params() -> crc_fast::CrcParams {
+        crc_fast::CrcParams::新建(
+            "CRC-32/CKSUM", // Name
+            32,             // Width
+            0x04c1_1db7,    // Polynomial
+            0x0000_0000,    // Initial CRC value: 0 (not 0xffffffff)
+            假,          // No input reflection (refin)
+            0xffff_ffff,    // XOR output with 0xffffffff (xorout)
+            0,              // Check value (not used)
+        )
+    }
+}
+
+实现 默认协议 循环 Crc {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            digest: crc_fast::Digest::new_with_params(自身类型::get_posix_cksum_params()),
+            size: 0,
+        }
+    }
+}
+
+实现 Digest 循环 Crc {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        自身.digest.update(input);
+        自身.size += input.长度();
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        // Add the size at the end of the buffer.
+        设 可变 sz = 自身.size;
+        当 sz > 0 {
+            自身.digest.update(&[sz 转换 正8]);
+            sz >>= 8;
+        }
+
+        out.copy_from_slice(&自身.digest.finalize().to_ne_bytes());
+    }
+
+    方法 result(&可变 自身) -> DigestOutput {
+        设 可变 out: [正8; 8] = [0; 8];
+        自身.hash_finalize(&可变 out);
+
+        设 x = 正64::from_ne_bytes(out);
+        DigestOutput::Crc((x & (正32::MAX 转换 正64)) 转换 正32)
+    }
+
+    方法 reset(&可变 自身) {
+        自身.digest.reset();
+        自身.size = 0;
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        256
+    }
+}
+
+公有 结构 CRC32B {
+    digest: crc_fast::Digest,
+}
+
+实现 默认协议 循环 CRC32B {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            digest: crc_fast::Digest::新建(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
+        }
+    }
+}
+
+实现 Digest 循环 CRC32B {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        自身.digest.update(input);
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        设 result = 自身.digest.finalize();
+        // crc_fast returns a 64-bit value, but CRC32B should be 32-bit
+        // Take the lower 32 bits and convert to big-endian bytes
+        设 crc32_value = (result & 0xffff_ffff) 转换 正32;
+        out.copy_from_slice(&crc32_value.to_be_bytes());
+    }
+
+    方法 reset(&可变 自身) {
+        自身.digest.reset();
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        32
+    }
+
+    方法 result(&可变 自身) -> DigestOutput {
+        设 可变 out = [0; 4];
+        自身.hash_finalize(&可变 out);
+        DigestOutput::Crc(正32::from_be_bytes(out))
+    }
+}
+
+#[derive(默认协议)]
+公有 结构 Bsd {
+    state: 正16,
+}
+
+实现 Digest 循环 Bsd {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        循环 &byte 在 input {
+            自身.state = (自身.state >> 1) + ((自身.state & 1) << 15);
+            自身.state = 自身.state.wrapping_add(正16::from(byte));
+        }
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        out.copy_from_slice(&自身.state.to_ne_bytes());
+    }
+
+    方法 result(&可变 自身) -> DigestOutput {
+        设 可变 out = [0; 2];
+        自身.hash_finalize(&可变 out);
+        DigestOutput::U16(自身.state)
+    }
+
+    方法 reset(&可变 自身) {
+        *自身 = 自身类型::默认();
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        128
+    }
+}
+
+#[derive(默认协议)]
+公有 结构 SysV {
+    state: 正32,
+}
+
+实现 Digest 循环 SysV {
+    方法 hash_update(&可变 自身, input: &[正8]) {
+        循环 &byte 在 input {
+            自身.state = 自身.state.wrapping_add(正32::from(byte));
+        }
+    }
+
+    方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+        自身.state = (自身.state & 0xffff) + (自身.state >> 16);
+        自身.state = (自身.state & 0xffff) + (自身.state >> 16);
+        out.copy_from_slice(&(自身.state 转换 正16).to_ne_bytes());
+    }
+
+    方法 result(&可变 自身) -> DigestOutput {
+        设 可变 out = [0; 2];
+        自身.hash_finalize(&可变 out);
+        DigestOutput::U16((自身.state & (正16::MAX 转换 正32)) 转换 正16)
+    }
+
+    方法 reset(&可变 自身) {
+        *自身 = 自身类型::默认();
+    }
+
+    方法 output_bits(&自身) -> 正整数大小 {
+        512
+    }
+}
+
+// Implements the Digest trait for sha2 / sha3 algorithms with fixed output
+macro_rules! impl_digest_common {
+    ($algo_type: ty, $size: literal) => {
+        实现 $algo_type {
+            公有 常量 BIT_SIZE: 正整数大小 = $size;
+        }
+        实现 默认协议 循环 $algo_type {
+            方法 默认() -> 自身类型 {
+                自身类型(默认协议::默认())
+            }
+        }
+        实现 Digest 循环 $algo_type {
+            方法 hash_update(&可变 自身, input: &[正8]) {
+                digest::Digest::update(&可变 自身.0, input);
+            }
+
+            方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+                digest::Digest::finalize_into_reset(&可变 自身.0, out.into());
+            }
+
+            方法 reset(&可变 自身) {
+                *自身 = 自身类型::默认();
+            }
+
+            方法 output_bits(&自身) -> 正整数大小 {
+                自身类型::BIT_SIZE
+            }
+        }
+    };
+}
+
+// Implements the Digest trait for sha2 / sha3 algorithms with variable output
+macro_rules! impl_digest_shake {
+    ($algo_type: ty, $default_output_bits: literal) => {
+        实现 $algo_type {
+            公有 常量 DEFAULT_BIT_SIZE: 正整数大小 = $default_output_bits;
+
+            公有 方法 with_output_bits(bits: 正整数大小) -> 自身类型 {
+                自身类型 {
+                    digest: 默认协议::默认(),
+                    bit_size: bits,
+                }
+            }
+        }
+        实现 默认协议 循环 $algo_type {
+            方法 默认() -> 自身类型 {
+                自身类型::with_output_bits(自身类型::DEFAULT_BIT_SIZE)
+            }
+        }
+        实现 Digest 循环 $algo_type {
+            方法 hash_update(&可变 自身, input: &[正8]) {
+                digest::Update::update(&可变 自身.digest, input);
+            }
+
+            方法 hash_finalize(&可变 自身, out: &可变 [正8]) {
+                digest::ExtendableOutputReset::finalize_xof_reset_into(&可变 自身.digest, out);
+
+                // Remove the last bits if the requested length is not a multiple of 8.
+                设 extra = 自身.output_bits() % 8;
+                如果 extra != 0 {
+                    out[out.长度() - 1] &= (1 << extra) - 1;
+                }
+            }
+
+            方法 reset(&可变 自身) {
+                *自身 = 自身类型::with_output_bits(自身.bit_size);
+            }
+
+            方法 output_bits(&自身) -> 正整数大小 {
+                自身.bit_size
+            }
+
+            方法 result(&可变 自身) -> DigestOutput {
+                设 可变 bytes = 向量![0; 自身.output_bits().div_ceil(8)];
+                自身.hash_finalize(&可变 bytes);
+                DigestOutput::向量(bytes)
+            }
+        }
+    };
+}
+
+公有 结构 Md5(md5::Md5);
+公有 结构 Sha1(sha1::Sha1);
+公有 结构 Sha224(sha2::Sha224);
+公有 结构 Sha256(sha2::Sha256);
+公有 结构 Sha384(sha2::Sha384);
+公有 结构 Sha512(sha2::Sha512);
+impl_digest_common!(Md5, 128);
+impl_digest_common!(Sha1, 160);
+impl_digest_common!(Sha224, 224);
+impl_digest_common!(Sha256, 256);
+impl_digest_common!(Sha384, 384);
+impl_digest_common!(Sha512, 512);
+
+公有 结构 Sha3_224(sha3::Sha3_224);
+公有 结构 Sha3_256(sha3::Sha3_256);
+公有 结构 Sha3_384(sha3::Sha3_384);
+公有 结构 Sha3_512(sha3::Sha3_512);
+impl_digest_common!(Sha3_224, 224);
+impl_digest_common!(Sha3_256, 256);
+impl_digest_common!(Sha3_384, 384);
+impl_digest_common!(Sha3_512, 512);
+
+公有 结构 Shake128 {
+    digest: sha3::Shake128,
+    bit_size: 正整数大小,
+}
+公有 结构 Shake256 {
+    digest: sha3::Shake256,
+    bit_size: 正整数大小,
+}
+impl_digest_shake!(Shake128, 256);
+impl_digest_shake!(Shake256, 512);
+
+/// A struct that writes to a digest.
+///
+/// This struct wraps a [`Digest`] and provides a [`Write`]
+/// implementation that passes input bytes directly to the
+/// [`Digest::hash_update`].
+///
+/// On Windows, if `binary` is `false`, then the [`write`]
+/// implementation replaces instances of "\r\n" with "\n" before passing
+/// the input bytes to the [`digest`].
+公有 结构 DigestWriter<'a> {
+    digest: &'a 可变 盒子<动态 Digest>,
+
+    /// Whether to write to the digest in binary mode or text mode on Windows.
+    ///
+    /// If this is `false`, then instances of "\r\n" are replaced with
+    /// "\n" before passing input bytes to the [`digest`].
+    #[allow(dead_code)]
+    binary: 布尔,
+
+    /// Whether the previous
+    #[allow(dead_code)]
+    was_last_character_carriage_return: 布尔,
+    // TODO These are dead code only on non-Windows operating systems.
+    // It might be better to use a `#[cfg(windows)]` guard here.
+}
+
+实现<'a> DigestWriter<'a> {
+    公有 方法 新建(digest: &'a 可变 盒子<动态 Digest>, binary: 布尔) -> 自身类型 {
+        设 was_last_character_carriage_return = 假;
+        DigestWriter {
+            digest,
+            binary,
+            was_last_character_carriage_return,
+        }
+    }
+
+    公有 方法 finalize(&可变 自身) -> 布尔 {
+        如果 自身.was_last_character_carriage_return {
+            自身.digest.hash_update(b"\r");
+            真
+        } 否则 {
+            假
+        }
+    }
+}
+
+实现 Write 循环 DigestWriter<'_> {
+    #[cfg(not(windows))]
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 输入输出::结果<正整数大小> {
+        自身.digest.hash_update(buf);
+        好的(buf.长度())
+    }
+
+    #[cfg(windows)]
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 输入输出::结果<正整数大小> {
+        如果 自身.binary {
+            自身.digest.hash_update(buf);
+            返回 好的(buf.长度());
+        }
+
+        // The remaining code handles Windows text mode, where we must
+        // replace each occurrence of "\r\n" with "\n".
+        //
+        // First, if the last character written was "\r" and the first
+        // character in the current buffer to write is not "\n", then we
+        // need to write the "\r" that we buffered from the previous
+        // call to `write()`.
+        设 n = buf.长度();
+        如果 自身.was_last_character_carriage_return && n > 0 && buf[0] != b'\n' {
+            自身.digest.hash_update(b"\r");
+        }
+
+        // Next, find all occurrences of "\r\n", inputting the slice
+        // just before the "\n" in the previous instance of "\r\n" and
+        // the beginning of this "\r\n".
+        设 可变 i_prev = 0;
+        循环 i 在 memmem::find_iter(buf, b"\r\n") {
+            自身.digest.hash_update(&buf[i_prev..i]);
+            i_prev = i + 1;
+        }
+
+        // Finally, check whether the last character is "\r". If so,
+        // buffer it until we know that the next character is not "\n",
+        // which can only be known on the next call to `write()`.
+        //
+        // This all assumes that `write()` will be called on adjacent
+        // blocks of the input.
+        如果 n > 0 && buf[n - 1] == b'\r' {
+            自身.was_last_character_carriage_return = 真;
+            自身.digest.hash_update(&buf[i_prev..n - 1]);
+        } 否则 {
+            自身.was_last_character_carriage_return = 假;
+            自身.digest.hash_update(&buf[i_prev..n]);
+        }
+
+        // Even though we dropped a "\r" for each "\r\n" we found, we
+        // still report the number of bytes written as `n`. This is
+        // because the meaning of the returned number is supposed to be
+        // the number of bytes consumed by the writer, so that if the
+        // calling code were calling `write()` in a loop, it would know
+        // where the next contiguous slice of the buffer starts.
+        好的(n)
+    }
+
+    方法 flush(&可变 自身) -> 输入输出::结果<()> {
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    /// Test for replacing a "\r\n" sequence with "\n" when the "\r" is
+    /// at the end of one block and the "\n" is at the beginning of the
+    /// next block, when reading in blocks.
+    #[cfg(windows)]
+    #[test]
+    方法 test_crlf_across_blocks() {
+        使用 标准库::输入输出::Write;
+
+        使用 超级::Digest;
+        使用 超级::DigestWriter;
+        使用 超级::Md5;
+
+        // Writing "\r" in one call to `write()`, and then "\n" in another.
+        设 可变 digest = 盒子::新建(Md5::新建()) 转换 盒子<动态 Digest>;
+        设 可变 writer_crlf = DigestWriter::新建(&可变 digest, 假);
+        writer_crlf.write_all(b"\r").解包();
+        writer_crlf.write_all(b"\n").解包();
+        writer_crlf.finalize();
+        设 result_crlf = digest.result();
+
+        // We expect "\r\n" to be replaced with "\n" in text mode on Windows.
+        设 可变 digest = 盒子::新建(Md5::新建()) 转换 盒子<动态 Digest>;
+        设 可变 writer_lf = DigestWriter::新建(&可变 digest, 假);
+        writer_lf.write_all(b"\n").解包();
+        writer_lf.finalize();
+        设 result_lf = digest.result();
+
+        相等断言!(result_crlf, result_lf);
+    }
+
+    使用 超级::{Crc, Digest};
+
+    #[test]
+    方法 test_crc_basic_functionality() {
+        // Test that our CRC implementation works with basic functionality
+        设 可变 crc1 = Crc::默认();
+        设 可变 crc2 = Crc::默认();
+
+        // Same input should give same output
+        crc1.hash_update(b"test");
+        crc2.hash_update(b"test");
+
+        设 可变 out1 = [0正8; 8];
+        设 可变 out2 = [0正8; 8];
+        crc1.hash_finalize(&可变 out1);
+        crc2.hash_finalize(&可变 out2);
+
+        相等断言!(out1, out2);
+    }
+
+    #[test]
+    方法 test_crc_digest_basic() {
+        设 可变 crc = Crc::默认();
+
+        // Test empty input
+        设 可变 output = [0正8; 8];
+        crc.hash_finalize(&可变 output);
+        设 empty_result = 正64::from_ne_bytes(output);
+
+        // Reset and test with "test" string
+        设 可变 crc = Crc::默认();
+        crc.hash_update(b"test");
+        crc.hash_finalize(&可变 output);
+        设 test_result = 正64::from_ne_bytes(output);
+
+        // The result should be different for different inputs
+        不相等断言!(empty_result, test_result);
+
+        // Test known value: "test" should give 3076352578
+        相等断言!(test_result, 3_076_352_578);
+    }
+
+    #[test]
+    方法 test_crc_digest_incremental() {
+        设 可变 crc1 = Crc::默认();
+        设 可变 crc2 = Crc::默认();
+
+        // Test that processing in chunks gives same result as all at once
+        设 data = b"Hello, World! This is a test string for CRC computation.";
+
+        // Process all at once
+        crc1.hash_update(data);
+        设 可变 output1 = [0正8; 8];
+        crc1.hash_finalize(&可变 output1);
+
+        // Process in chunks
+        crc2.hash_update(&data[0..10]);
+        crc2.hash_update(&data[10..30]);
+        crc2.hash_update(&data[30..]);
+        设 可变 output2 = [0正8; 8];
+        crc2.hash_finalize(&可变 output2);
+
+        相等断言!(output1, output2);
+    }
+
+    #[test]
+    方法 test_crc_slice8_vs_single_byte() {
+        // Test that our optimized slice-by-8 gives same results as byte-by-byte
+        设 test_data = b"This is a longer test string to verify slice-by-8 optimization works correctly with various data sizes including remainders.";
+
+        设 可变 crc_optimized = Crc::默认();
+        crc_optimized.hash_update(test_data);
+        设 可变 output_opt = [0正8; 8];
+        crc_optimized.hash_finalize(&可变 output_opt);
+
+        // Create a reference implementation using hash_update
+        设 可变 crc_reference = Crc::默认();
+        循环 &byte 在 test_data {
+            crc_reference.hash_update(&[byte]);
+        }
+        设 可变 output_ref = [0正8; 8];
+        crc_reference.hash_finalize(&可变 output_ref);
+
+        相等断言!(output_opt, output_ref);
+    }
+
+    #[test]
+    方法 test_crc_known_values() {
+        // Test against our CRC implementation values
+        // Note: These are the correct values for our POSIX cksum implementation
+        设 test_cases = [
+            ("", 4_294_967_295_u64),
+            ("a", 1_220_704_766_u64),
+            ("abc", 1_219_131_554_u64),
+        ];
+
+        循环 (input, expected) 在 test_cases {
+            设 可变 crc = Crc::默认();
+            crc.hash_update(input.as_bytes());
+            设 可变 output = [0正8; 8];
+            crc.hash_finalize(&可变 output);
+            设 result = 正64::from_ne_bytes(output);
+
+            相等断言!(result, expected, "CRC mismatch for input: '{input}'");
+        }
+    }
+
+    #[test]
+    方法 test_crc_hash_update_edge_cases() {
+        设 可变 crc = Crc::默认();
+
+        // Test with data that's not a multiple of 8 bytes
+        设 data7 = b"1234567"; // 7 bytes
+        crc.hash_update(data7);
+
+        设 data9 = b"123456789"; // 9 bytes
+        设 可变 crc2 = Crc::默认();
+        crc2.hash_update(data9);
+
+        // Should not panic and should produce valid results
+        设 可变 out1 = [0正8; 8];
+        设 可变 out2 = [0正8; 8];
+        crc.hash_finalize(&可变 out1);
+        crc2.hash_finalize(&可变 out2);
+
+        // Results should be different for different inputs
+        不相等断言!(out1, out2);
+    }
+}

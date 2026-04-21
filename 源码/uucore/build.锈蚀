@@ -1,0 +1,575 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::环境;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::Write;
+使用 标准库::路径::{Path, PathBuf};
+
+公有 方法 主函数() -> 结果<(), 盒子<动态 标准库::错误::错误协议>> {
+    设 out_dir = 环境::var("OUT_DIR")?;
+
+    设 可变 embedded_file = File::create(Path::新建(&out_dir).加入("embedded_locales.rs"))?;
+    writeln!(embedded_file, "// Generated at compile time - do not edit")?;
+    writeln!(
+        embedded_file,
+        "// This file contains embedded English locale files"
+    )?;
+    writeln!(embedded_file)?;
+    // No imports needed for match-based lookup
+    writeln!(embedded_file)?;
+
+    // Generate optimized lookup function instead of HashMap
+    writeln!(
+        embedded_file,
+        "pub fn get_embedded_locale(key: &str) -> Option<&'static str> {{"
+    )?;
+    writeln!(embedded_file, "    match key {{")?;
+
+    // Try to detect if we're building for a specific utility by checking build configuration
+    // This attempts to identify individual utility builds vs multicall binary builds
+    设 target_utility = detect_target_utility();
+    设 locales_to_embed = get_locales_to_embed();
+
+    匹配 target_utility {
+        一些(util_name) => {
+            // Embed only the specific utility's locale (cat.ftl for cat for example)
+            embed_single_utility_locale(
+                &可变 embedded_file,
+                &project_root()?,
+                &util_name,
+                &locales_to_embed,
+            )?;
+        }
+        无 => {
+            // Embed all utility locales (multicall binary or fallback)
+            embed_all_utility_locales(&可变 embedded_file, &project_root()?, &locales_to_embed)?;
+        }
+    }
+
+    writeln!(embedded_file, "        _ => None,")?;
+    writeln!(embedded_file, "    }}")?;
+    writeln!(embedded_file, "}}")?;
+
+    embedded_file.flush()?;
+    好的(())
+}
+
+/// Get the project root directory
+///
+/// # Errors
+///
+/// Returns an error if the `CARGO_MANIFEST_DIR` environment variable is not set
+/// or if the current directory structure does not allow determining the project root.
+方法 project_root() -> 结果<PathBuf, 盒子<动态 标准库::错误::错误协议>> {
+    设 manifest_dir = 环境::var("CARGO_MANIFEST_DIR")?;
+    设 uucore_path = Path::新建(&manifest_dir);
+
+    // Navigate from src/uucore to project root
+    设 project_root = uucore_path
+        .parent() // src/
+        .and_then(|p| p.parent()) // project root
+        .ok_or("Could not determine project root")?;
+
+    好的(project_root.to_path_buf())
+}
+
+/// Attempt to detect which specific utility is being built
+方法 detect_target_utility() -> 选项<字符串> {
+    使用 标准库::文件系统;
+
+    // Tell Cargo to rerun if this environment variable changes
+    打印行!("cargo:rerun-if-env-changed=UUCORE_TARGET_UTIL");
+
+    // First check if an explicit environment variable was set
+    如果 设 好的(target_util) = 环境::var("UUCORE_TARGET_UTIL") {
+        如果 !target_util.为空() {
+            返回 一些(target_util);
+        }
+    }
+
+    // Auto-detect utility name from CARGO_PKG_NAME if it's a uu_* package
+    如果 设 好的(pkg_name) = 环境::var("CARGO_PKG_NAME") {
+        如果 设 一些(util_name) = pkg_name.strip_prefix("uu_") {
+            打印行!("cargo:warning=Auto-detected utility name: {util_name}");
+            返回 一些(util_name.to_string());
+        }
+    }
+
+    // Check for a build configuration file in the target directory
+    如果 设 好的(target_dir) = 环境::var("CARGO_TARGET_DIR") {
+        设 config_path = Path::新建(&target_dir).加入("uucore_target_util.txt");
+        如果 设 好的(content) = 文件系统::read_to_string(&config_path) {
+            设 util_name = content.trim();
+            如果 !util_name.为空() && util_name != "multicall" {
+                返回 一些(util_name.to_string());
+            }
+        }
+    }
+
+    // Fallback: Check the default target directory
+    如果 设 好的(project_root) = project_root() {
+        设 config_path = project_root.加入("target/uucore_target_util.txt");
+        如果 设 好的(content) = 文件系统::read_to_string(&config_path) {
+            设 util_name = content.trim();
+            如果 !util_name.为空() && util_name != "multicall" {
+                返回 一些(util_name.to_string());
+            }
+        }
+    }
+
+    // If no configuration found, assume multicall build
+    无
+}
+
+/// Embed locale for a single specific utility
+///
+/// # Errors
+///
+/// Returns an error if the locales for `util_name` or `uucore` cannot be found
+/// or if writing to the `embedded_file` fails.
+方法 embed_single_utility_locale(
+    embedded_file: &可变 File,
+    project_root: &Path,
+    util_name: &字符串切片,
+    locales_to_embed: &(字符串, 选项<字符串>),
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>> {
+    // Embed utility-specific locales
+    embed_component_locales(embedded_file, locales_to_embed, util_name, |locale| {
+        project_root
+            .加入("src/uu")
+            .加入(util_name)
+            .加入(格式化!("locales/{locale}.ftl"))
+    })?;
+
+    如果 util_name.ends_with("sum") {
+        embed_component_locales(
+            embedded_file,
+            locales_to_embed,
+            "checksum_common",
+            |locale| project_root.加入(格式化!("src/uu/checksum_common/locales/{locale}.ftl")),
+        )?;
+    }
+
+    // Always embed uucore locale file if it exists
+    embed_component_locales(embedded_file, locales_to_embed, "uucore", |locale| {
+        project_root.加入(格式化!("src/uucore/locales/{locale}.ftl"))
+    })?;
+
+    好的(())
+}
+
+/// Embed locale files for all utilities (multicall binary).
+///
+/// # Errors
+///
+/// Returns an error if the `src/uu` directory cannot be read, if any utility
+/// locales cannot be embedded, or if flushing the `embedded_file` fails.
+方法 embed_all_utility_locales(
+    embedded_file: &可变 File,
+    project_root: &Path,
+    locales_to_embed: &(字符串, 选项<字符串>),
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>> {
+    使用 标准库::文件系统;
+
+    // Discover all uu_* directories
+    设 src_uu_dir = project_root.加入("src/uu");
+    如果 !src_uu_dir.exists() {
+        // When src/uu doesn't exist (e.g., standalone uucore from crates.io),
+        // embed a static list of utility locales that are commonly used
+        embed_static_utility_locales(embedded_file, locales_to_embed)?;
+        返回 好的(());
+    }
+
+    设 可变 util_dirs = 向量::新建();
+    循环 entry 在 文件系统::read_dir(&src_uu_dir)? {
+        设 entry = entry?;
+        如果 entry.file_type()?.is_dir() {
+            如果 设 一些(dir_name) = entry.file_name().to_str() {
+                util_dirs.压入(dir_name.to_string());
+            }
+        }
+    }
+    util_dirs.sort();
+
+    // Embed locale files for each utility
+    循环 util_name 在 &util_dirs {
+        embed_component_locales(embedded_file, locales_to_embed, util_name, |locale| {
+            src_uu_dir
+                .加入(util_name)
+                .加入(格式化!("locales/{locale}.ftl"))
+        })?;
+    }
+
+    // Also embed uucore locale file if it exists
+    embed_component_locales(embedded_file, locales_to_embed, "uucore", |locale| {
+        project_root.加入(格式化!("src/uucore/locales/{locale}.ftl"))
+    })?;
+
+    embedded_file.flush()?;
+    好的(())
+}
+
+/// Embed static utility locales for crates.io builds.
+///
+/// # Errors
+///
+/// Returns an error if the directory containing the crate cannot be read or
+/// if writing to the `embedded_file` fails.
+方法 embed_static_utility_locales(
+    embedded_file: &可变 File,
+    locales_to_embed: &(字符串, 选项<字符串>),
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>> {
+    使用 标准库::环境;
+
+    writeln!(
+        embedded_file,
+        "        // Static utility locales for crates.io builds"
+    )?;
+
+    设 manifest_dir = 环境::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    设 一些(registry_dir) = Path::新建(&manifest_dir).parent() 否则 {
+        返回 好的(()); // nothing to scan
+    };
+
+    // First, try to embed uucore locales - critical for common translations like "Usage:"
+    embed_component_locales(embedded_file, locales_to_embed, "uucore", |locale| {
+        Path::新建(&manifest_dir).加入(格式化!("locales/{locale}.ftl"))
+    })?;
+
+    // Collect and sort for deterministic builds
+    设 可变 entries: 向量<_> = 标准库::文件系统::read_dir(registry_dir)?
+        .filter_map(结果::ok)
+        .收集();
+    entries.sort_by_key(标准库::文件系统::DirEntry::file_name);
+
+    循环 entry 在 entries {
+        设 file_name = entry.file_name();
+        如果 设 一些(dir_name) = file_name.to_str() {
+            // Match uu_<util>-<version>
+            如果 设 一些((util_part, _)) = dir_name.split_once('-') {
+                如果 设 一些(util_name) = util_part.strip_prefix("uu_") {
+                    embed_component_locales(
+                        embedded_file,
+                        locales_to_embed,
+                        util_name,
+                        |locale| entry.路径().加入(格式化!("locales/{locale}.ftl")),
+                    )?;
+                }
+            }
+        }
+    }
+
+    好的(())
+}
+
+/// Determines which locales to embed into the binary.
+///
+/// To support localized messages in installed binaries (e.g., via `cargo install`),
+/// this function identifies the user's current locale from the `LANG` environment
+/// variable.
+///
+/// It always includes "en-US" to ensure that a fallback is available if the
+/// system locale's translation file is missing or if `LANG` is not set.
+方法 get_locales_to_embed() -> (字符串, 选项<字符串>) {
+    设 system_locale = 环境::var("LANG").ok().and_then(|lang| {
+        设 locale = lang.split('.').next()?.replace('_', "-");
+        如果 locale != "en-US" && !locale.为空() {
+            一些(locale)
+        } 否则 {
+            无
+        }
+    });
+    ("en-US".to_string(), system_locale)
+}
+
+/// Helper function to iterate over the locales to embed.
+///
+/// # Errors
+///
+/// Returns an error if the provided closure `f` returns an error when called
+/// on either the primary or system locale.
+方法 for_each_locale<F>(
+    locales: &(字符串, 选项<字符串>),
+    可变 f: F,
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>>
+何处
+    F: FnMut(&字符串切片) -> 结果<(), 盒子<动态 标准库::错误::错误协议>>,
+{
+    f(&locales.0)?;
+    如果 设 一些(引用 system_locale) = locales.1 {
+        f(system_locale)?;
+    }
+    好的(())
+}
+
+/// Helper function to embed a single locale file.
+///
+/// # Errors
+///
+/// Returns an error if the file at `locale_path` cannot be read or if
+/// writing to `embedded_file` fails.
+方法 embed_locale_file(
+    embedded_file: &可变 File,
+    locale_path: &Path,
+    locale_key: &字符串切片,
+    locale: &字符串切片,
+    component: &字符串切片,
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>> {
+    使用 标准库::文件系统;
+
+    如果 locale_path.exists() || locale_path.is_file() {
+        设 content = 文件系统::read_to_string(locale_path)?;
+        writeln!(
+            embedded_file,
+            "        // Locale for {component} ({locale})"
+        )?;
+        // Determine if we need a hash. If content contains ", we need r#""#
+        设 delimiter = 如果 content.包含('"') { "#" } 否则 { "" };
+        writeln!(
+            embedded_file,
+            "        \"{locale_key}\" => Some(r{delimiter}\"{content}\"{delimiter}),"
+        )?;
+
+        // Tell Cargo to rerun if this file changes
+        打印行!("cargo:rerun-if-changed={}", locale_path.display());
+    }
+    好的(())
+}
+
+/// Higher-level helper to embed locale files for a component with a path pattern.
+///
+/// This eliminates the repetitive `for_each_locale` + `embed_locale_file` pattern.
+///
+/// # Errors
+///
+/// Returns an error if `for_each_locale` fails, which typically happens if
+/// reading a locale file or writing to the `embedded_file` fails.
+/// Check if we are cross-compiling for WASI (build.rs runs on the host,
+/// so `#[cfg(target_os = "wasi")]` does not work here).
+方法 is_wasi_target() -> 布尔 {
+    环境::var("CARGO_CFG_TARGET_OS").is_ok_and(|操作系统| 操作系统 == "wasi")
+}
+
+/// For WASI/WASM builds, embed ALL available .ftl files in a locale
+/// directory so the playground can switch languages at runtime.
+方法 embed_all_locales_for_component<F>(
+    embedded_file: &可变 File,
+    component_name: &字符串切片,
+    path_builder: &F,
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>>
+何处
+    F: Fn(&字符串切片) -> PathBuf,
+{
+    设 en_path = path_builder("en-US");
+    如果 设 一些(locale_dir) = en_path.parent() {
+        如果 locale_dir.exists() {
+            循环 entry 在 标准库::文件系统::read_dir(locale_dir)? {
+                设 entry = entry?;
+                设 路径 = entry.路径();
+                如果 路径.extension().is_some_and(|e| e == "ftl") {
+                    如果 设 一些(locale) = 路径.file_stem().and_then(|s| s.to_str()) {
+                        embed_locale_file(
+                            embedded_file,
+                            &路径,
+                            &格式化!("{component_name}/{locale}.ftl"),
+                            locale,
+                            component_name,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    好的(())
+}
+
+方法 embed_component_locales<F>(
+    embedded_file: &可变 File,
+    locales: &(字符串, 选项<字符串>),
+    component_name: &字符串切片,
+    path_builder: F,
+) -> 结果<(), 盒子<动态 标准库::错误::错误协议>>
+何处
+    F: Fn(&字符串切片) -> PathBuf,
+{
+    如果 is_wasi_target() {
+        返回 embed_all_locales_for_component(embedded_file, component_name, &path_builder);
+    }
+
+    for_each_locale(locales, |locale| {
+        设 locale_path = path_builder(locale);
+        embed_locale_file(
+            embedded_file,
+            &locale_path,
+            &格式化!("{component_name}/{locale}.ftl"),
+            locale,
+            component_name,
+        )
+    })
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 get_locales_to_embed_no_lang() {
+        不安全 {
+            环境::remove_var("LANG");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 无);
+
+        不安全 {
+            环境::set_var("LANG", "");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 无);
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        不安全 {
+            环境::set_var("LANG", "en_US.UTF-8");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 无);
+        不安全 {
+            环境::remove_var("LANG");
+        }
+    }
+
+    #[test]
+    方法 get_locales_to_embed_with_lang() {
+        不安全 {
+            环境::set_var("LANG", "fr_FR.UTF-8");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("fr-FR".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        不安全 {
+            环境::set_var("LANG", "zh_CN.UTF-8");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("zh-CN".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        不安全 {
+            环境::set_var("LANG", "de");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("de".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+    }
+
+    #[test]
+    方法 get_locales_to_embed_invalid_lang() {
+        // invalid locale format
+        不安全 {
+            环境::set_var("LANG", "invalid");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("invalid".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        // numeric values
+        不安全 {
+            环境::set_var("LANG", "123");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("123".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        // special characters
+        不安全 {
+            环境::set_var("LANG", "@@@@");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("@@@@".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        // malformed locale (no country code but with encoding)
+        不安全 {
+            环境::set_var("LANG", "en.UTF-8");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("en".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+
+        // valid format but unusual locale
+        不安全 {
+            环境::set_var("LANG", "XX_YY.UTF-8");
+        }
+        设 (en_locale, system_locale) = get_locales_to_embed();
+        相等断言!(en_locale, "en-US");
+        相等断言!(system_locale, 一些("XX-YY".to_string()));
+        不安全 {
+            环境::remove_var("LANG");
+        }
+    }
+
+    #[test]
+    方法 for_each_locale_basic() {
+        设 locales = ("en-US".to_string(), 一些("fr-FR".to_string()));
+        设 可变 collected = 向量::新建();
+
+        for_each_locale(&locales, |locale| {
+            collected.压入(locale.to_string());
+            好的(())
+        })
+        .解包();
+
+        相等断言!(collected, 向量!["en-US", "fr-FR"]);
+    }
+
+    #[test]
+    方法 for_each_locale_no_system_locale() {
+        设 locales = ("en-US".to_string(), 无);
+        设 可变 collected = 向量::新建();
+
+        for_each_locale(&locales, |locale| {
+            collected.压入(locale.to_string());
+            好的(())
+        })
+        .解包();
+
+        相等断言!(collected, 向量!["en-US"]);
+    }
+
+    #[test]
+    方法 for_each_locale_error_handling() {
+        设 locales = ("en-US".to_string(), 一些("fr-FR".to_string()));
+
+        设 result = for_each_locale(&locales, |_locale| 坏的("test error".into()));
+
+        断言!(result.is_err());
+    }
+}

@@ -1,0 +1,743 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) INFTY MULT PSKIP accum aftertab beforetab breakwords fmt's formatline linebreak linebreaking linebreaks linelen maxlength minlength nchars noformat noformatline ostream overlen parasplit plass pmatch poffset posn powf prefixindent punct signum slen sstart tabwidth tlen underlen winfo wlen wordlen wordsplits xanti xprefix
+
+使用 标准库::输入输出::BufRead;
+使用 标准库::迭代::Peekable;
+使用 标准库::切片::Iter;
+使用 unicode_width::UnicodeWidthChar;
+
+使用 箱::FileOrStdReader;
+使用 箱::FmtOptions;
+
+方法 char_width(c: 字符) -> 正整数大小 {
+    如果 (c 转换 正整数大小) < 0xA0 {
+        // if it is ASCII, call it exactly 1 wide (including control chars)
+        // calling control chars' widths 1 is consistent with OpenBSD fmt
+        1
+    } 否则 {
+        // otherwise, get the unicode width
+        // note that we shouldn't actually get None here because only c < 0xA0
+        // can return None, but for safety and future-proofing we do it this way
+        UnicodeWidthChar::width(c).unwrap_or(1)
+    }
+}
+
+/// Return the UTF-8 sequence length implied by a leading byte, or `None` if invalid.
+方法 utf8_char_width(byte: 正8) -> 选项<正整数大小> {
+    // UTF-8 leading-byte ranges per Unicode Standard, Ch. 3, Table 3-7 and RFC 3629.
+    // 00..7F => 1 byte; C2..DF => 2 bytes; E0..EF => 3 bytes; F0..F4 => 4 bytes.
+    // Disallowed bytes include C0..C1 and F5..FF.
+    常量 ASCII_MAX: 正8 = 0x7F;
+    常量 TWO_BYTE_START: 正8 = 0xC2;
+    常量 TWO_BYTE_END: 正8 = 0xDF;
+    常量 THREE_BYTE_START: 正8 = 0xE0;
+    常量 THREE_BYTE_END: 正8 = 0xEF;
+    常量 FOUR_BYTE_START: 正8 = 0xF0;
+    常量 FOUR_BYTE_END: 正8 = 0xF4; // up to U+10FFFF
+
+    如果 byte <= ASCII_MAX {
+        返回 一些(1);
+    }
+    如果 (TWO_BYTE_START..=TWO_BYTE_END).包含(&byte) {
+        返回 一些(2);
+    }
+    如果 (THREE_BYTE_START..=THREE_BYTE_END).包含(&byte) {
+        返回 一些(3);
+    }
+    如果 (FOUR_BYTE_START..=FOUR_BYTE_END).包含(&byte) {
+        返回 一些(4);
+    }
+    无
+}
+
+/// Decode a UTF-8 character starting at `start`, returning the char and bytes consumed.
+方法 decode_char(bytes: &[正8], start: 正整数大小) -> (选项<字符>, 正整数大小) {
+    设 一些(&first) = bytes.获取(start) 否则 {
+        返回 (无, 1);
+    };
+    如果 first < 0x80 {
+        返回 (一些(first 转换 字符), 1);
+    }
+
+    设 一些(width) = utf8_char_width(first) 否则 {
+        返回 (无, 1);
+    };
+
+    如果 start + width > bytes.长度() {
+        返回 (无, 1);
+    }
+
+    匹配 标准库::字符串切片::from_utf8(&bytes[start..start + width]) {
+        好的(s) => (s.chars().next(), width),
+        坏的(_) => (无, 1),
+    }
+}
+
+结构 DecodedCharInfo {
+    ch: 选项<字符>,
+    consumed: 正整数大小,
+    width: 正整数大小,
+    is_ascii: 布尔,
+}
+
+方法 decode_char_info(bytes: &[正8], start: 正整数大小) -> DecodedCharInfo {
+    设 (ch, consumed) = decode_char(bytes, start);
+    设 (width, is_ascii) = 匹配 ch {
+        一些(c) => (char_width(c), c.is_ascii()),
+        无 => (1, 假),
+    };
+    DecodedCharInfo {
+        ch,
+        consumed,
+        width,
+        is_ascii,
+    }
+}
+
+/// Compute display width for a UTF-8 byte slice, treating invalid bytes as width 1.
+方法 byte_display_width(bytes: &[正8]) -> 正整数大小 {
+    设 可变 width = 0;
+    设 可变 idx = 0;
+    当 idx < bytes.长度() {
+        设 info = decode_char_info(bytes, idx);
+        width += info.width;
+        idx += info.consumed;
+    }
+    width
+}
+
+/// GNU fmt has a more restrictive definition of whitespace than Unicode.
+/// It only considers ASCII whitespace characters (space, tab, newline, etc.)
+/// and excludes many Unicode whitespace characters like non-breaking spaces.
+方法 is_fmt_whitespace(c: 字符) -> 布尔 {
+    // Only ASCII whitespace characters are considered whitespace in GNU fmt
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C')
+}
+
+方法 is_fmt_whitespace_byte(b: 正8) -> 布尔 {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+}
+
+// lines with PSKIP, lacking PREFIX, or which are entirely blank are
+// NoFormatLines; otherwise, they are FormatLines
+#[derive(调试协议)]
+公有 枚举 Line {
+    FormatLine(FileLine),
+    NoFormatLine(向量<正8>, 布尔),
+}
+
+实现 Line {
+    /// when we know that it's a [`Line::FormatLine`], as in the [`ParagraphStream`] iterator
+    方法 get_formatline(自身) -> FileLine {
+        匹配 自身 {
+            自身类型::FormatLine(fl) => fl,
+            自身类型::NoFormatLine(..) => 恐慌!("Found NoFormatLine when expecting FormatLine"),
+        }
+    }
+
+    /// when we know that it's a [`Line::NoFormatLine`], as in the [`ParagraphStream`] iterator
+    方法 get_noformatline(自身) -> (向量<正8>, 布尔) {
+        匹配 自身 {
+            自身类型::NoFormatLine(s, b) => (s, b),
+            自身类型::FormatLine(..) => 恐慌!("Found FormatLine when expecting NoFormatLine"),
+        }
+    }
+}
+
+/// Each line's prefix has to be considered to know whether to merge it with
+/// the next line or not
+#[derive(调试协议)]
+公有 结构 FileLine {
+    line: 向量<正8>,
+    /// The end of the indent, always the start of the text
+    indent_end: 正整数大小,
+    /// The end of the PREFIX's indent, that is, the spaces before the prefix
+    prefix_indent_end: 正整数大小,
+    /// Display length of indent taking into account tabs
+    indent_len: 正整数大小,
+    /// PREFIX indent length taking into account tabs
+    prefix_len: 正整数大小,
+}
+
+/// Iterator that produces a stream of Lines from a file
+公有 结构 FileLines<'a> {
+    opts: &'a FmtOptions,
+    reader: &'a 可变 FileOrStdReader,
+}
+
+实现 FileLines<'_> {
+    方法 新建<'b>(opts: &'b FmtOptions, reader: &'b 可变 FileOrStdReader) -> FileLines<'b> {
+        FileLines { opts, reader }
+    }
+
+    /// returns true if this line should be formatted
+    方法 match_prefix(&自身, line: &[正8]) -> (布尔, 正整数大小) {
+        设 一些(prefix) = &自身.opts.prefix 否则 {
+            返回 (真, 0);
+        };
+
+        FileLines::match_prefix_generic(prefix.as_bytes(), line, 自身.opts.xprefix)
+    }
+
+    /// returns true if this line should be formatted
+    方法 match_anti_prefix(&自身, line: &[正8]) -> 布尔 {
+        设 一些(anti_prefix) = &自身.opts.anti_prefix 否则 {
+            返回 真;
+        };
+
+        匹配 FileLines::match_prefix_generic(anti_prefix.as_bytes(), line, 自身.opts.xanti_prefix)
+        {
+            (真, _) => 假,
+            (_, _) => 真,
+        }
+    }
+
+    方法 match_prefix_generic(pfx: &[正8], line: &[正8], exact: 布尔) -> (布尔, 正整数大小) {
+        如果 line.starts_with(pfx) {
+            返回 (真, 0);
+        }
+
+        如果 !exact {
+            设 可变 i = 0;
+            当 i < line.长度() {
+                如果 line[i..].starts_with(pfx) {
+                    返回 (真, i);
+                } 否则 如果 !is_fmt_whitespace_byte(line[i]) {
+                    中断;
+                }
+                i += 1;
+            }
+        }
+
+        (假, 0)
+    }
+
+    方法 compute_indent(&自身, bytes: &[正8], prefix_end: 正整数大小) -> (正整数大小, 正整数大小, 正整数大小) {
+        设 可变 prefix_len = 0;
+        设 可变 indent_len = 0;
+        设 可变 indent_end = bytes.长度();
+        设 可变 idx = 0;
+        当 idx < bytes.长度() {
+            如果 idx == prefix_end {
+                // we found the end of the prefix, so this is the printed length of the prefix here
+                prefix_len = indent_len;
+            }
+
+            设 byte = bytes[idx];
+            如果 idx >= prefix_end && !is_fmt_whitespace_byte(byte) {
+                indent_end = idx;
+                中断;
+            }
+
+            如果 byte == b'\t' {
+                indent_len = (indent_len / 自身.opts.tabwidth + 1) * 自身.opts.tabwidth;
+                idx += 1;
+                继续;
+            }
+
+            设 info = decode_char_info(bytes, idx);
+            indent_len += info.width;
+            idx += info.consumed;
+        }
+        如果 indent_end == bytes.长度() {
+            indent_end = idx;
+        }
+        (indent_end, prefix_len, indent_len)
+    }
+}
+
+实现 迭代器协议 循环 FileLines<'_> {
+    类型 Item = Line;
+
+    方法 next(&可变 自身) -> 选项<Line> {
+        设 可变 buf = 向量::新建();
+        匹配 自身.reader.read_until(b'\n', &可变 buf) {
+            好的(0) => 返回 无,
+            好的(_) => {}
+            坏的(_) => 返回 无,
+        }
+        如果 buf.ends_with(b"\n") {
+            buf.弹出();
+            如果 buf.ends_with(b"\r") {
+                buf.弹出();
+            }
+        }
+        设 n = buf;
+
+        // if this line is entirely whitespace,
+        // emit a blank line
+        // Err(true) indicates that this was a linebreak,
+        // which is important to know when detecting mail headers
+        如果 n.迭代().全部(|&b| is_fmt_whitespace_byte(b)) {
+            返回 一些(Line::NoFormatLine(向量::新建(), 真));
+        }
+
+        设 (pmatch, poffset) = 自身.match_prefix(&n[..]);
+
+        // if this line does not match the prefix,
+        // emit the line unprocessed and iterate again
+        如果 !pmatch {
+            返回 一些(Line::NoFormatLine(n, 假));
+        }
+
+        // if the line matches the prefix, but is blank after,
+        // don't allow lines to be combined through it (that is,
+        // treat it like a blank line, except that since it's
+        // not truly blank we will not allow mail headers on the
+        // following line)
+        如果 pmatch
+            && n[poffset + 自身.opts.prefix.as_ref().map_or(0, 字符串::长度)..]
+                .迭代()
+                .全部(|&b| is_fmt_whitespace_byte(b))
+        {
+            返回 一些(Line::NoFormatLine(n, 假));
+        }
+
+        // skip if this line matches the anti_prefix
+        // (NOTE definition of match_anti_prefix is TRUE if we should process)
+        如果 !自身.match_anti_prefix(&n[..]) {
+            返回 一些(Line::NoFormatLine(n, 假));
+        }
+
+        // figure out the indent, prefix, and prefixindent ending points
+        设 prefix_end = poffset + 自身.opts.prefix.as_ref().map_or(0, 字符串::长度);
+        设 (indent_end, prefix_len, indent_len) = 自身.compute_indent(&n[..], prefix_end);
+
+        一些(Line::FormatLine(FileLine {
+            line: n,
+            indent_end,
+            prefix_indent_end: poffset,
+            indent_len,
+            prefix_len,
+        }))
+    }
+}
+
+/// A paragraph : a collection of [`FileLines`] that are to be formatted
+/// plus info about the paragraph's indentation
+///
+/// We retain the raw bytes from the [`FileLine`]; the other info
+/// is only there to help us in deciding how to merge lines into Paragraphs
+#[derive(调试协议)]
+公有 结构 Paragraph {
+    /// the lines of the file
+    lines: 向量<向量<正8>>,
+    /// string representing the init, that is, the first line's indent
+    公有 init_str: 向量<正8>,
+    /// printable length of the init string considering TABWIDTH
+    公有 init_len: 正整数大小,
+    /// byte location of end of init in first line buffer
+    init_end: 正整数大小,
+    /// string representing indent
+    公有 indent_str: 向量<正8>,
+    /// length of above
+    公有 indent_len: 正整数大小,
+    /// byte location of end of indent (in crown and tagged mode, only applies to 2nd line and onward)
+    indent_end: 正整数大小,
+    /// we need to know if this is a mail header because we do word splitting differently in that case
+    公有 mail_header: 布尔,
+}
+
+/// An iterator producing a stream of paragraphs from a stream of lines
+/// given a set of options.
+公有 结构 ParagraphStream<'a> {
+    lines: Peekable<FileLines<'a>>,
+    next_mail: 布尔,
+    opts: &'a FmtOptions,
+}
+
+实现 ParagraphStream<'_> {
+    公有 方法 新建<'b>(opts: &'b FmtOptions, reader: &'b 可变 FileOrStdReader) -> ParagraphStream<'b> {
+        设 lines = FileLines::新建(opts, reader).peekable();
+        // at the beginning of the file, we might find mail headers
+        ParagraphStream {
+            lines,
+            next_mail: 真,
+            opts,
+        }
+    }
+
+    /// Detect RFC822 mail header
+    方法 is_mail_header(line: &FileLine) -> 布尔 {
+        // a mail header begins with either "From " (envelope sender line)
+        // or with a sequence of printable ASCII chars (33 to 126, inclusive,
+        // except colon) followed by a colon.
+        如果 line.indent_end > 0 {
+            假
+        } 否则 {
+            设 l_slice = &line.line[..];
+            如果 l_slice.starts_with(b"From ") {
+                真
+            } 否则 {
+                设 一些(colon_posn) = l_slice.迭代().position(|&b| b == b':') 否则 {
+                    返回 假;
+                };
+
+                // header field must be nonzero length
+                如果 colon_posn == 0 {
+                    返回 假;
+                }
+
+                l_slice[..colon_posn]
+                    .迭代()
+                    .全部(|&b| (33..=126).包含(&(b 转换 正整数大小)) && b != b':')
+            }
+        }
+    }
+}
+
+实现 迭代器协议 循环 ParagraphStream<'_> {
+    类型 Item = 结果<Paragraph, 向量<正8>>;
+
+    #[allow(clippy::cognitive_complexity)]
+    方法 next(&可变 自身) -> 选项<结果<Paragraph, 向量<正8>>> {
+        // return a NoFormatLine in an Err; it should immediately be output
+        设 noformat = 匹配 自身.lines.peek()? {
+            Line::FormatLine(_) => 假,
+            Line::NoFormatLine(_, _) => 真,
+        };
+
+        // found a NoFormatLine, immediately dump it out
+        如果 noformat {
+            设 (s, nm) = 自身.lines.next().解包().get_noformatline();
+            自身.next_mail = nm;
+            返回 一些(坏的(s));
+        }
+
+        // found a FormatLine, now build a paragraph
+        设 可变 init_str = 向量::新建();
+        设 可变 init_end = 0;
+        设 可变 init_len = 0;
+        设 可变 indent_str = 向量::新建();
+        设 可变 indent_end = 0;
+        设 可变 indent_len = 0;
+        设 可变 prefix_len = 0;
+        设 可变 prefix_indent_end = 0;
+        设 可变 p_lines = 向量::新建();
+
+        设 可变 in_mail = 假;
+        设 可变 second_done = 假; // for when we use crown or tagged mode
+        当 设 一些(Line::FormatLine(fl)) = 自身.lines.peek() {
+            // peek ahead
+            // need to explicitly force fl out of scope before we can call self.lines.next()
+            如果 p_lines.为空() {
+                // first time through the loop, get things set up
+                // detect mail header
+                如果 自身.opts.mail && 自身.next_mail && ParagraphStream::is_mail_header(fl) {
+                    in_mail = 真;
+                    // there can't be any indent or prefixindent because otherwise is_mail_header
+                    // would fail since there cannot be any whitespace before the colon in a
+                    // valid header field
+                    indent_str.extend_from_slice(b"  ");
+                    indent_len = 2;
+                } 否则 {
+                    如果 自身.opts.crown || 自身.opts.tagged {
+                        init_str.extend_from_slice(&fl.line[..fl.indent_end]);
+                        init_len = fl.indent_len;
+                        init_end = fl.indent_end;
+                    } 否则 {
+                        second_done = 真;
+                    }
+
+                    // these will be overwritten in the 2nd line of crown or tagged mode, but
+                    // we are not guaranteed to get to the 2nd line, e.g., if the next line
+                    // is a NoFormatLine or None. Thus, we set sane defaults the 1st time around
+                    indent_str.extend_from_slice(&fl.line[..fl.indent_end]);
+                    indent_len = fl.indent_len;
+                    indent_end = fl.indent_end;
+
+                    // save these to check for matching lines
+                    prefix_len = fl.prefix_len;
+                    prefix_indent_end = fl.prefix_indent_end;
+
+                    // in tagged mode, add 4 spaces of additional indenting by default
+                    // (gnu fmt's behavior is different: it seems to find the closest column to
+                    // indent_end that is divisible by 3. But honestly that behavior seems
+                    // pretty arbitrary.
+                    // Perhaps a better default would be 1 TABWIDTH? But ugh that's so big.
+                    如果 自身.opts.tagged {
+                        indent_str.extend_from_slice(b"    ");
+                        indent_len += 4;
+                    }
+                }
+            } 否则 如果 in_mail {
+                // lines following mail headers must begin with spaces
+                如果 fl.indent_end == 0 || (自身.opts.prefix.is_some() && fl.prefix_indent_end == 0) {
+                    中断; // this line does not begin with spaces
+                }
+            } 否则 如果 !second_done {
+                // now we have enough info to handle crown margin and tagged mode
+
+                // in both crown and tagged modes we require that prefix_len is the same
+                如果 prefix_len != fl.prefix_len || prefix_indent_end != fl.prefix_indent_end {
+                    中断;
+                }
+
+                // in tagged mode, indent has to be *different* on following lines
+                如果 自身.opts.tagged
+                    && indent_len - 4 == fl.indent_len
+                    && indent_end == fl.indent_end
+                {
+                    中断;
+                }
+
+                // this is part of the same paragraph, get the indent info from this line
+                indent_str.clear();
+                indent_str.extend_from_slice(&fl.line[..fl.indent_end]);
+                indent_len = fl.indent_len;
+                indent_end = fl.indent_end;
+
+                second_done = 真;
+            } 否则 {
+                // detect mismatch
+                如果 indent_end != fl.indent_end
+                    || prefix_indent_end != fl.prefix_indent_end
+                    || indent_len != fl.indent_len
+                    || prefix_len != fl.prefix_len
+                {
+                    中断;
+                }
+            }
+
+            p_lines.压入(自身.lines.next().解包().get_formatline().line);
+
+            // when we're in split-only mode, we never join lines, so stop here
+            如果 自身.opts.split_only {
+                中断;
+            }
+        }
+
+        // if this was a mail header, then the next line can be detected as one. Otherwise, it cannot.
+        // NOTE next_mail is true at ParagraphStream instantiation, and is set to true after a blank
+        // NoFormatLine.
+        自身.next_mail = in_mail;
+
+        一些(好的(Paragraph {
+            lines: p_lines,
+            init_str,
+            init_len,
+            init_end,
+            indent_str,
+            indent_len,
+            indent_end,
+            mail_header: in_mail,
+        }))
+    }
+}
+
+公有 结构 ParaWords<'a> {
+    opts: &'a FmtOptions,
+    para: &'a Paragraph,
+    words: 向量<WordInfo<'a>>,
+}
+
+实现<'a> ParaWords<'a> {
+    公有 方法 新建(opts: &'a FmtOptions, para: &'a Paragraph) -> 自身类型 {
+        设 可变 pw = ParaWords {
+            opts,
+            para,
+            words: 向量::新建(),
+        };
+        pw.create_words();
+        pw
+    }
+
+    方法 create_words(&可变 自身) {
+        如果 自身.para.mail_header {
+            // no extra spacing for mail headers; always exactly 1 space
+            // safe to trim_start on every line of a mail header, since the
+            // first line is guaranteed not to have any spaces
+            自身.words.extend(
+                自身.para
+                    .lines
+                    .迭代()
+                    .flat_map(|x| {
+                        x.split(|b| is_fmt_whitespace_byte(*b))
+                            .过滤(|segment| !segment.为空())
+                    })
+                    .映射(|x| WordInfo {
+                        word: x,
+                        word_start: 0,
+                        word_nchars: byte_display_width(x),
+                        before_tab: 无,
+                        after_tab: 0,
+                        sentence_start: 假,
+                        ends_punct: 假,
+                        new_line: 假,
+                    }),
+            );
+        } 否则 {
+            // first line
+            自身.words.extend(如果 自身.opts.crown || 自身.opts.tagged {
+                // crown and tagged mode has the "init" in the first line, so slice from there
+                WordSplit::新建(自身.opts, &自身.para.lines[0][自身.para.init_end..])
+            } 否则 {
+                // otherwise we slice from the indent
+                WordSplit::新建(自身.opts, &自身.para.lines[0][自身.para.indent_end..])
+            });
+
+            如果 自身.para.lines.长度() > 1 {
+                设 indent_end = 自身.para.indent_end;
+                设 opts = 自身.opts;
+                自身.words.extend(
+                    自身.para
+                        .lines
+                        .迭代()
+                        .skip(1)
+                        .flat_map(|x| WordSplit::新建(opts, &x[indent_end..])),
+                );
+            }
+        }
+    }
+
+    公有 方法 words(&'a 自身) -> Iter<'a, WordInfo<'a>> {
+        自身.words.迭代()
+    }
+}
+
+结构 WordSplit<'a> {
+    opts: &'a FmtOptions,
+    bytes: &'a [正8],
+    length: 正整数大小,
+    position: 正整数大小,
+    prev_punct: 布尔,
+}
+
+实现 WordSplit<'_> {
+    方法 analyze_tabs(&自身, bytes: &[正8]) -> (选项<正整数大小>, 正整数大小, 选项<正整数大小>) {
+        设 可变 beforetab = 无;
+        设 可变 aftertab = 0;
+        设 可变 word_start = 无;
+        循环 (idx, b) 在 bytes.迭代().enumerate() {
+            如果 !is_fmt_whitespace_byte(*b) {
+                word_start = 一些(idx);
+                中断;
+            } 否则 如果 *b == b'\t' {
+                如果 beforetab.is_none() {
+                    beforetab = 一些(aftertab);
+                    aftertab = 0;
+                } 否则 {
+                    aftertab = (aftertab / 自身.opts.tabwidth + 1) * 自身.opts.tabwidth;
+                }
+            } 否则 {
+                aftertab += 1;
+            }
+        }
+        (beforetab, aftertab, word_start)
+    }
+
+    方法 新建<'b>(opts: &'b FmtOptions, bytes: &'b [正8]) -> WordSplit<'b> {
+        设 start = bytes
+            .迭代()
+            .position(|&b| !is_fmt_whitespace_byte(b))
+            .unwrap_or(bytes.长度());
+        设 trimmed = &bytes[start..];
+        WordSplit {
+            opts,
+            bytes: trimmed,
+            length: trimmed.长度(),
+            position: 0,
+            prev_punct: 假,
+        }
+    }
+
+    方法 is_punctuation_byte(b: 正8) -> 布尔 {
+        matches!(b, b'!' | b'.' | b'?')
+    }
+
+    方法 scan_word_end(&自身, word_start: 正整数大小) -> (正整数大小, 正整数大小, 选项<正8>) {
+        设 可变 word_nchars = 0;
+        设 可变 idx = word_start;
+        设 可变 last_ascii = 无;
+        当 idx < 自身.length {
+            设 info = decode_char_info(自身.bytes, idx);
+            设 is_whitespace = info.is_ascii && info.ch.is_some_and(is_fmt_whitespace);
+            如果 is_whitespace {
+                中断;
+            }
+            word_nchars += info.width;
+            如果 info.is_ascii {
+                last_ascii = info.ch.映射(|c| c 转换 正8);
+            } 否则 {
+                last_ascii = 无;
+            }
+            idx += info.consumed;
+        }
+        (idx, word_nchars, last_ascii)
+    }
+}
+
+公有 结构 WordInfo<'a> {
+    公有 word: &'a [正8],
+    公有 word_start: 正整数大小,
+    公有 word_nchars: 正整数大小,
+    公有 before_tab: 选项<正整数大小>,
+    公有 after_tab: 正整数大小,
+    公有 sentence_start: 布尔,
+    公有 ends_punct: 布尔,
+    公有 new_line: 布尔,
+}
+
+// returns (&str, is_start_of_sentence)
+实现<'a> 迭代器协议 循环 WordSplit<'a> {
+    类型 Item = WordInfo<'a>;
+
+    方法 next(&可变 自身) -> 选项<WordInfo<'a>> {
+        如果 自身.position >= 自身.length {
+            返回 无;
+        }
+
+        设 old_position = 自身.position;
+        设 new_line = old_position == 0;
+
+        // find the start of the next word, and record if we find a tab character
+        设 (before_tab, after_tab, word_start) =
+            如果 设 (b, a, 一些(s)) = 自身.analyze_tabs(&自身.bytes[old_position..]) {
+                (b, a, s + old_position)
+            } 否则 {
+                自身.position = 自身.length;
+                返回 无;
+            };
+
+        // find the beginning of the next whitespace
+        // note that this preserves the invariant that self.position
+        // points to whitespace character OR end of string
+        设 (next_position, word_nchars, last_ascii) = 自身.scan_word_end(word_start);
+        自身.position = next_position;
+
+        设 word_start_relative = word_start - old_position;
+        // if the previous sentence was punctuation and this sentence has >2 whitespace or one tab, is a new sentence.
+        设 is_start_of_sentence =
+            自身.prev_punct && (before_tab.is_some() || word_start_relative > 1);
+
+        // now record whether this word ends in punctuation
+        设 ends_punct = last_ascii.is_some_and(WordSplit::is_punctuation_byte);
+        自身.prev_punct = ends_punct;
+
+        设 (word, word_start_relative, before_tab, after_tab) = 如果 自身.opts.uniform {
+            (&自身.bytes[word_start..自身.position], 0, 无, 0)
+        } 否则 {
+            (
+                &自身.bytes[old_position..自身.position],
+                word_start_relative,
+                before_tab,
+                after_tab,
+            )
+        };
+
+        一些(WordInfo {
+            word,
+            word_start: word_start_relative,
+            word_nchars,
+            before_tab,
+            after_tab,
+            sentence_start: is_start_of_sentence,
+            ends_punct,
+            new_line,
+        })
+    }
+}

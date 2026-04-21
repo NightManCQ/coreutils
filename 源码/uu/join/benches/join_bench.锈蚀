@@ -1,0 +1,172 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::{文件系统::File, 输入输出::Write};
+使用 tempfile::TempDir;
+使用 uu_join::uumain;
+使用 uucore::benchmark::run_util_function;
+
+/// Create two sorted files with matching keys for join benchmarking
+方法 create_join_files(temp_dir: &TempDir, num_lines: 正整数大小) -> (字符串, 字符串) {
+    设 file1_path = temp_dir.路径().加入("file1.txt");
+    设 file2_path = temp_dir.路径().加入("file2.txt");
+
+    设 可变 file1 = File::create(&file1_path).解包();
+    设 可变 file2 = File::create(&file2_path).解包();
+
+    循环 i 在 0..num_lines {
+        writeln!(file1, "{i:08} field1_{i} field2_{i}").解包();
+        writeln!(file2, "{i:08} data1_{i} data2_{i}").解包();
+    }
+
+    (
+        file1_path.to_str().解包().to_string(),
+        file2_path.to_str().解包().to_string(),
+    )
+}
+
+/// Create two files with partial overlap for join benchmarking
+方法 create_partial_overlap_files(
+    temp_dir: &TempDir,
+    num_lines: 正整数大小,
+    overlap_ratio: 点64,
+) -> (字符串, 字符串) {
+    设 file1_path = temp_dir.路径().加入("file1.txt");
+    设 file2_path = temp_dir.路径().加入("file2.txt");
+
+    设 可变 file1 = File::create(&file1_path).解包();
+    设 可变 file2 = File::create(&file2_path).解包();
+
+    设 overlap_count = (num_lines 转换 点64 * overlap_ratio) 转换 正整数大小;
+
+    // File 1: keys 0 to num_lines-1
+    循环 i 在 0..num_lines {
+        writeln!(file1, "{i:08} f1_data_{i}").解包();
+    }
+
+    // File 2: keys (num_lines - overlap_count) to (2*num_lines - overlap_count - 1)
+    设 start = num_lines - overlap_count;
+    循环 i 在 0..num_lines {
+        writeln!(file2, "{:08} f2_data_{i}", start + i).解包();
+    }
+
+    (
+        file1_path.to_str().解包().to_string(),
+        file2_path.to_str().解包().to_string(),
+    )
+}
+
+/// Benchmark basic join with fully matching keys
+#[divan::bench]
+方法 join_full_match(bencher: Bencher) {
+    设 num_lines = 10000;
+    设 temp_dir = TempDir::新建().解包();
+    设 (file1, file2) = create_join_files(&temp_dir, num_lines);
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[&file1, &file2]));
+    });
+}
+
+/// Benchmark join with partial overlap (50%)
+#[divan::bench]
+方法 join_partial_overlap(bencher: Bencher) {
+    设 num_lines = 10000;
+    设 temp_dir = TempDir::新建().解包();
+    设 (file1, file2) = create_partial_overlap_files(&temp_dir, num_lines, 0.5);
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[&file1, &file2]));
+    });
+}
+
+/// Benchmark join with custom field separator
+#[divan::bench]
+方法 join_custom_separator(bencher: Bencher) {
+    设 num_lines = 10000;
+    设 temp_dir = TempDir::新建().解包();
+    设 file1_path = temp_dir.路径().加入("file1.txt");
+    设 file2_path = temp_dir.路径().加入("file2.txt");
+
+    设 可变 file1 = File::create(&file1_path).解包();
+    设 可变 file2 = File::create(&file2_path).解包();
+
+    循环 i 在 0..num_lines {
+        writeln!(file1, "{i:08}\tfield1_{i}\tfield2_{i}").解包();
+        writeln!(file2, "{i:08}\tdata1_{i}\tdata2_{i}").解包();
+    }
+
+    设 file1_str = file1_path.to_str().解包();
+    设 file2_str = file2_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-t", "\t", file1_str, file2_str],
+        ));
+    });
+}
+
+/// Benchmark join with French locale (fr_FR.UTF-8) - ASCII data (fast path)
+#[divan::bench]
+方法 join_french_locale(bencher: Bencher) {
+    设 num_lines = 10000;
+    设 temp_dir = TempDir::新建().解包();
+    设 (file1, file2) = create_join_files(&temp_dir, num_lines);
+
+    bencher
+        .with_inputs(|| 不安全 {
+            标准库::环境::set_var("LC_ALL", "fr_FR.UTF-8");
+        })
+        .bench_values(|_| {
+            black_box(run_util_function(uumain, &[&file1, &file2]));
+        });
+}
+
+/// Create files with Unicode data that requires locale collation
+方法 create_unicode_join_files(temp_dir: &TempDir, num_lines: 正整数大小) -> (字符串, 字符串) {
+    设 file1_path = temp_dir.路径().加入("file1.txt");
+    设 file2_path = temp_dir.路径().加入("file2.txt");
+
+    设 可变 file1 = File::create(&file1_path).解包();
+    设 可变 file2 = File::create(&file2_path).解包();
+
+    // Create data with accented characters that require locale collation
+    设 accented_chars = [
+        "àbc", "àbd", "abc", "abd", "èfg", "efg", "çar", "car", "öst", "ost",
+    ];
+
+    循环 i 在 0..num_lines {
+        设 key = &accented_chars[i % accented_chars.长度()];
+        writeln!(file1, "{key}:{i:06} field1_{i}").解包();
+        writeln!(file2, "{key}:{i:06} data1_{i}").解包();
+    }
+
+    (
+        file1_path.to_str().解包().to_string(),
+        file2_path.to_str().解包().to_string(),
+    )
+}
+
+/// Benchmark join with actual Unicode data requiring locale collation
+#[divan::bench]
+方法 join_unicode_locale(bencher: Bencher) {
+    设 num_lines = 1000; // Smaller due to complexity
+    设 temp_dir = TempDir::新建().解包();
+    设 (file1, file2) = create_unicode_join_files(&temp_dir, num_lines);
+
+    bencher
+        .with_inputs(|| 不安全 {
+            标准库::环境::set_var("LC_ALL", "fr_FR.UTF-8");
+        })
+        .bench_values(|_| {
+            black_box(run_util_function(uumain, &[&file1, &file2]));
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

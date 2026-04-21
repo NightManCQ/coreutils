@@ -1,0 +1,262 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) signalname pids killpg
+
+使用 clap::{Arg, ArgAction, Command};
+使用 nix::sys::signal::{自身, Signal};
+使用 nix::unistd::Pid;
+使用 标准库::输入输出::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::translate;
+
+使用 uucore::signals::{
+    signal_by_name_or_value, signal_list_name_by_value, signal_list_value_by_name_or_number,
+    signal_name_by_value, signal_number_upper_bound,
+};
+使用 uucore::{format_usage, show};
+
+// When the -l option is selected, the program displays the type of signal related to a certain
+// value or string. In case of a value, the program should control the lower 8 bits, but there is
+// a particular case in which if the value is in range [128, 159], it is translated to a signal
+常量 OFFSET: 正整数大小 = 128;
+
+公有 模组 options {
+    公有 静态 PIDS_OR_SIGNALS: &字符串切片 = "pids_or_signals";
+    公有 静态 LIST: &字符串切片 = "list";
+    公有 静态 TABLE: &字符串切片 = "table";
+    公有 静态 SIGNAL: &字符串切片 = "signal";
+}
+
+#[derive(克隆协议, 复制协议)]
+公有 枚举 Mode {
+    Kill,
+    Table,
+    List,
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 可变 args = args.collect_ignore();
+    设 obs_signal = handle_obsolete(&可变 args);
+
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 mode = 如果 matches.get_flag(options::TABLE) {
+        Mode::Table
+    } 否则 如果 matches.get_flag(options::LIST) {
+        Mode::List
+    } 否则 {
+        Mode::Kill
+    };
+
+    设 pids_or_signals: 向量<字符串> = matches
+        .get_many::<字符串>(options::PIDS_OR_SIGNALS)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    匹配 mode {
+        Mode::Kill => {
+            设 sig = 如果 设 一些(signal) = obs_signal {
+                signal
+            } 否则 如果 设 一些(signal) = matches.get_one::<字符串>(options::SIGNAL) {
+                parse_signal_value(signal)?
+            } 否则 {
+                15_usize //SIGTERM
+            };
+
+            设 sig_name = signal_name_by_value(sig);
+            // Signal does not support converting from EXIT
+            // Instead, nix::signal::kill expects Option::None to properly handle EXIT
+            设 sig: 选项<Signal> = 如果 sig_name.is_some_and(|name| name == "EXIT") {
+                无
+            } 否则 {
+                设 sig = (sig 转换 整32)
+                    .try_into()
+                    .map_err(|e| 错误协议::from_raw_os_error(e 转换 整32))?;
+                一些(sig)
+            };
+
+            设 pids = parse_pids(&pids_or_signals)?;
+            如果 pids.为空() {
+                坏的(USimpleError::新建(1, translate!("kill-error-no-process-id")))
+            } 否则 {
+                kill(sig, &pids);
+                好的(())
+            }
+        }
+        Mode::Table => {
+            table();
+            好的(())
+        }
+        Mode::List => {
+            list(&pids_or_signals);
+            好的(())
+        }
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("kill")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("kill"))
+        .about(translate!("kill-about"))
+        .override_usage(format_usage(&translate!("kill-usage")))
+        .infer_long_args(真)
+        .allow_negative_numbers(真)
+        .arg(
+            Arg::新建(options::LIST)
+                .short('l')
+                .long(options::LIST)
+                .help(translate!("kill-help-list"))
+                .conflicts_with(options::TABLE)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TABLE)
+                .short('t')
+                .short_alias('L')
+                .long(options::TABLE)
+                .help(translate!("kill-help-table"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SIGNAL)
+                .short('s')
+                .short_alias('n') // For bash compatibility, like in GNU coreutils
+                .long(options::SIGNAL)
+                .value_name("signal")
+                .help(translate!("kill-help-signal"))
+                .conflicts_with_all([options::LIST, options::TABLE]),
+        )
+        .arg(
+            Arg::新建(options::PIDS_OR_SIGNALS)
+                .hide(真)
+                .action(ArgAction::Append),
+        )
+}
+
+方法 handle_obsolete(args: &可变 向量<字符串>) -> 选项<正整数大小> {
+    // Sanity check - need at least the program name and one argument
+    如果 args.长度() >= 2 {
+        // Old signal can only be in the first argument position
+        设 切片 = args[1].as_str();
+        如果 设 一些(signal) = 切片.strip_prefix('-') {
+            // With '-', a signal name must start with an uppercase char
+            如果 signal.chars().next().is_some_and(字符::is_lowercase) {
+                返回 无;
+            }
+            // Check if it is a valid signal
+            设 opt_signal = signal_by_name_or_value(signal);
+            如果 opt_signal.is_some() {
+                // remove the signal before return
+                args.移除(1);
+                返回 opt_signal;
+            }
+        }
+    }
+    无
+}
+
+方法 table() {
+    循环 signal_value 在 0..=signal_number_upper_bound() {
+        如果 设 一些(signal_name) = signal_list_name_by_value(signal_value) {
+            打印行!("{signal_value: >#2} {signal_name}");
+        }
+    }
+}
+
+方法 normalize_list_signal_value(signal_value: 正整数大小) -> 选项<正整数大小> {
+    // `kill -l` also accepts wait-status-like values and decodes the signal
+    // number from the low 8 bits.
+    设 lower_8_bits = signal_value & 0xff;
+    如果 lower_8_bits <= signal_number_upper_bound() {
+        返回 一些(lower_8_bits);
+    }
+
+    signal_value
+        .checked_sub(OFFSET)
+        .过滤(|value| *value <= signal_number_upper_bound())
+}
+
+方法 print_signal(signal_name_or_value: &字符串切片) -> UResult<()> {
+    如果 设 好的(signal_value) = signal_name_or_value.parse::<正整数大小>() {
+        // GNU kill accepts plain signal numbers, values masked to the low 8 bits,
+        // and exit statuses that encode `128 + signal`.
+        如果 设 一些(signal_value) = normalize_list_signal_value(signal_value) {
+            打印行!(
+                "{}",
+                signal_list_name_by_value(signal_value).unwrap_or_else(|| signal_value.to_string())
+            );
+            返回 好的(());
+        }
+    }
+
+    如果 设 一些(signal_value) = signal_list_value_by_name_or_number(signal_name_or_value) {
+        打印行!("{signal_value}");
+        返回 好的(());
+    }
+
+    坏的(USimpleError::新建(
+        1,
+        translate!("kill-error-invalid-signal", "signal" => signal_name_or_value.quote()),
+    ))
+}
+
+方法 print_signals() {
+    循环 signal_value 在 0..=signal_number_upper_bound() {
+        如果 设 一些(signal_name) = signal_list_name_by_value(signal_value) {
+            打印行!("{signal_name}");
+        }
+    }
+}
+
+方法 list(signals: &向量<字符串>) {
+    如果 signals.为空() {
+        print_signals();
+    } 否则 {
+        循环 signal 在 signals {
+            如果 设 坏的(e) = print_signal(signal) {
+                uucore::show!(e);
+            }
+        }
+    }
+}
+
+方法 parse_signal_value(signal_name: &字符串切片) -> UResult<正整数大小> {
+    设 optional_signal_value = signal_by_name_or_value(signal_name);
+    匹配 optional_signal_value {
+        一些(x) => 好的(x),
+        无 => 坏的(USimpleError::新建(
+            1,
+            translate!("kill-error-invalid-signal", "signal" => signal_name.quote()),
+        )),
+    }
+}
+
+方法 parse_pids(pids: &[字符串]) -> UResult<向量<整32>> {
+    pids.迭代()
+        .映射(|x| {
+            x.parse::<整32>().map_err(|e| {
+                USimpleError::新建(
+                    1,
+                    translate!("kill-error-parse-argument", "argument" => x.quote(), "error" => e),
+                )
+            })
+        })
+        .收集()
+}
+
+方法 kill(sig: 选项<Signal>, pids: &[整32]) {
+    循环 &pid 在 pids {
+        如果 设 坏的(e) = signal::kill(Pid::from_raw(pid), sig) {
+            show!(
+                错误协议::from_raw_os_error(e 转换 整32)
+                    .map_err_context(|| { translate!("kill-error-sending-signal", "pid" => pid) })
+            );
+        }
+    }
+}

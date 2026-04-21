@@ -1,0 +1,204 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::OsString;
+使用 uucore::parser::parse_signed_num::{SignPrefix, parse_signed_num_max};
+使用 uucore::parser::parse_size::ParseSizeError;
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+公有 结构 ParseError;
+
+/// Parses obsolete syntax
+/// head -NUM\[kmzv\] // spell-checker:disable-line
+公有 方法 parse_obsolete(src: &字符串切片) -> 选项<结果<向量<OsString>, ParseError>> {
+    设 可变 chars = src.char_indices();
+    如果 设 一些((可变 num_start, '-')) = chars.next() {
+        num_start += 1;
+        设 可变 num_end = src.长度();
+        设 可变 has_num = 假;
+        设 可变 plus_possible = 假;
+        设 可变 last_char = 0 转换 字符;
+        循环 (n, c) 在 &可变 chars {
+            如果 c.is_ascii_digit() {
+                has_num = 真;
+                plus_possible = 假;
+            } 否则 如果 c == '+' && plus_possible {
+                plus_possible = 假;
+                num_start += 1;
+            } 否则 {
+                num_end = n;
+                last_char = c;
+                中断;
+            }
+        }
+        如果 has_num {
+            一些(process_num_block(
+                &src[num_start..num_end],
+                last_char,
+                &可变 chars,
+            ))
+        } 否则 {
+            无
+        }
+    } 否则 {
+        无
+    }
+}
+
+/// Processes the numeric block of the input string to generate the appropriate options.
+方法 process_num_block(
+    src: &字符串切片,
+    last_char: 字符,
+    chars: &可变 标准库::字符串切片::CharIndices,
+) -> 结果<向量<OsString>, ParseError> {
+    设 数字 = 匹配 src.parse::<正整数大小>() {
+        好的(n) => n,
+        坏的(e) 如果 *e.kind() == 标准库::数字::IntErrorKind::PosOverflow => 正整数大小::MAX,
+        _ => 返回 坏的(ParseError),
+    };
+    设 可变 quiet = 假;
+    设 可变 verbose = 假;
+    设 可变 zero_terminated = 假;
+    设 可变 multiplier = 无;
+    设 可变 c = last_char;
+    无限循环 {
+        // note that here, we only match lower case 'k', 'c', and 'm'
+        匹配 c {
+            // we want to preserve order
+            // this also saves us 1 heap allocation
+            'q' => {
+                quiet = 真;
+                verbose = 假;
+            }
+            'v' => {
+                verbose = 真;
+                quiet = 假;
+            }
+            'z' => zero_terminated = 真,
+            'c' => multiplier = 一些(1),
+            'b' => multiplier = 一些(512),
+            'k' => multiplier = 一些(1024),
+            'm' => multiplier = 一些(1024 * 1024),
+            '\0' => {}
+            _ => 返回 坏的(ParseError),
+        }
+        如果 设 一些((_, next)) = chars.next() {
+            c = next;
+        } 否则 {
+            中断;
+        }
+    }
+    设 可变 options = 向量::新建();
+    如果 quiet {
+        options.压入(OsString::from("-q"));
+    }
+    如果 verbose {
+        options.压入(OsString::from("-v"));
+    }
+    如果 zero_terminated {
+        options.压入(OsString::from("-z"));
+    }
+    如果 设 一些(n) = multiplier {
+        options.压入(OsString::from("-c"));
+        设 数字 = 数字.saturating_mul(n);
+        options.压入(OsString::from(格式化!("{num}")));
+    } 否则 {
+        options.压入(OsString::from("-n"));
+        options.压入(OsString::from(格式化!("{num}")));
+    }
+    好的(options)
+}
+
+/// Parses an -c or -n argument,
+/// the bool specifies whether to read from the end (all but last N)
+公有 方法 parse_num(src: &字符串切片) -> 结果<(正64, 布尔), ParseSizeError> {
+    设 result = parse_signed_num_max(src)?;
+    // head: '-' means "all but last N"
+    设 all_but_last = result.sign == 一些(SignPrefix::Minus);
+    好的((result.value, all_but_last))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    方法 obsolete(src: &字符串切片) -> 选项<结果<向量<字符串>, ParseError>> {
+        设 r = parse_obsolete(src);
+        匹配 r {
+            一些(s) => 匹配 s {
+                好的(v) => 一些(好的(v
+                    .into_iter()
+                    .映射(|s| s.to_str().解包().to_owned())
+                    .收集())),
+                坏的(e) => 一些(坏的(e)),
+            },
+            无 => 无,
+        }
+    }
+
+    #[期望(clippy::unnecessary_wraps, reason = "test helper")]
+    方法 obsolete_result(src: &[&字符串切片]) -> 选项<结果<向量<字符串>, ParseError>> {
+        一些(好的(src.迭代().映射(|&s| s.to_string()).收集()))
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_parse_numbers_obsolete() {
+        相等断言!(obsolete("-5"), obsolete_result(&["-n", "5"]));
+        相等断言!(obsolete("-100"), obsolete_result(&["-n", "100"]));
+        相等断言!(obsolete("-5m"), obsolete_result(&["-c", "5242880"]));
+        相等断言!(obsolete("-1k"), obsolete_result(&["-c", "1024"]));
+        相等断言!(obsolete("-2b"), obsolete_result(&["-c", "1024"]));
+        相等断言!(obsolete("-1mmk"), obsolete_result(&["-c", "1024"]));
+        相等断言!(obsolete("-1vz"), obsolete_result(&["-v", "-z", "-n", "1"]));
+        相等断言!(
+            obsolete("-1vzqvq"), // spell-checker:disable-line
+            obsolete_result(&["-q", "-z", "-n", "1"])
+        );
+        相等断言!(obsolete("-1vzc"), obsolete_result(&["-v", "-z", "-c", "1"]));
+        相等断言!(
+            obsolete("-105kzm"),
+            obsolete_result(&["-z", "-c", "110100480"])
+        );
+    }
+
+    #[test]
+    方法 test_parse_errors_obsolete() {
+        相等断言!(obsolete("-5n"), 一些(坏的(ParseError)));
+        相等断言!(obsolete("-5c5"), 一些(坏的(ParseError)));
+    }
+
+    #[test]
+    方法 test_parse_obsolete_no_match() {
+        相等断言!(obsolete("-k"), 无);
+        相等断言!(obsolete("asd"), 无);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    方法 test_parse_obsolete_overflow_x64() {
+        相等断言!(
+            obsolete("-1000000000000000m"),
+            obsolete_result(&["-c", "18446744073709551615"])
+        );
+        相等断言!(
+            obsolete("-10000000000000000000000"),
+            obsolete_result(&["-n", "18446744073709551615"])
+        );
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    方法 test_parse_obsolete_overflow_x32() {
+        相等断言!(
+            obsolete("-42949672960"),
+            obsolete_result(&["-n", "4294967295"])
+        );
+        相等断言!(
+            obsolete("-42949672k"),
+            obsolete_result(&["-c", "4294967295"])
+        );
+    }
+}

@@ -1,0 +1,125 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Check if a file is ordered
+
+使用 箱::{
+    GlobalSettings, SortError,
+    chunks::{自身, Chunk, RecycledChunk},
+    compare_by, open,
+};
+使用 itertools::Itertools;
+使用 标准库::{
+    比较::排序顺序,
+    ffi::OsStr,
+    输入输出::Read,
+    迭代,
+    同步::mpsc::{接收器, SyncSender, sync_channel},
+    线程,
+};
+使用 uucore::错误::UResult;
+
+/// Check if the file at `path` is ordered.
+///
+/// # Returns
+///
+/// The code we should exit with.
+公有 方法 check(路径: &OsStr, settings: &GlobalSettings) -> UResult<()> {
+    设 max_allowed_cmp = 如果 settings.unique {
+        // If `unique` is enabled, the previous line must compare _less_ to the next one.
+        排序顺序::Less
+    } 否则 {
+        // Otherwise, the line previous line must compare _less or equal_ to the next one.
+        排序顺序::Equal
+    };
+    设 file = open(路径)?;
+    设 (recycled_sender, recycled_receiver) = sync_channel(2);
+    设 (loaded_sender, loaded_receiver) = sync_channel(2);
+    线程::生成({
+        设 settings = settings.克隆();
+        移动 || reader(file, &recycled_receiver, &loaded_sender, &settings)
+    });
+    循环 _ 在 0..2 {
+        设 _ = recycled_sender.发送(RecycledChunk::新建(如果 settings.buffer_size < 100 * 1024 {
+            // when the buffer size is smaller than 100KiB we choose it instead of the default.
+            // this improves testability.
+            settings.buffer_size
+        } 否则 {
+            100 * 1024
+        }));
+    }
+
+    设 可变 prev_chunk: 选项<Chunk> = 无;
+    设 可变 line_idx = 0;
+    循环 chunk 在 loaded_receiver {
+        line_idx += 1;
+        如果 设 一些(prev_chunk) = prev_chunk.take() {
+            // Check if the first element of the new chunk is greater than the last
+            // element from the previous chunk
+            设 prev_last = prev_chunk.lines().最后().解包();
+            设 new_first = chunk.lines().first().解包();
+
+            如果 compare_by(
+                prev_last,
+                new_first,
+                settings,
+                prev_chunk.line_data(),
+                chunk.line_data(),
+            ) > max_allowed_cmp
+            {
+                返回 坏的(SortError::Disorder {
+                    file: 路径.to_owned(),
+                    line_number: line_idx,
+                    line: 字符串::from_utf8_lossy(new_first.line).into_owned(),
+                    silent: settings.check_silent,
+                }
+                .into());
+            }
+            设 _ = recycled_sender.发送(prev_chunk.recycle());
+        }
+
+        循环 (a, b) 在 chunk.lines().迭代().tuple_windows() {
+            line_idx += 1;
+            如果 compare_by(a, b, settings, chunk.line_data(), chunk.line_data()) > max_allowed_cmp {
+                返回 坏的(SortError::Disorder {
+                    file: 路径.to_owned(),
+                    line_number: line_idx,
+                    line: 字符串::from_utf8_lossy(b.line).into_owned(),
+                    silent: settings.check_silent,
+                }
+                .into());
+            }
+        }
+
+        prev_chunk = 一些(chunk);
+    }
+    好的(())
+}
+
+/// The function running on the reader thread.
+方法 reader(
+    可变 file: 盒子<动态 Read + Send>,
+    receiver: &接收器<RecycledChunk>,
+    sender: &SyncSender<Chunk>,
+    settings: &GlobalSettings,
+) -> UResult<()> {
+    设 可变 carry_over = 向量![];
+    循环 recycled_chunk 在 receiver {
+        设 should_continue = chunks::读锁定(
+            sender,
+            recycled_chunk,
+            无,
+            &可变 carry_over,
+            &可变 file,
+            &可变 迭代::empty(),
+            settings.line_ending.into(),
+            settings,
+        )?;
+        如果 !should_continue {
+            中断;
+        }
+    }
+    好的(())
+}

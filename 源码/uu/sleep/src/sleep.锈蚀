@@ -1,0 +1,75 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::线程;
+使用 标准库::时间::持续时间;
+使用 uucore::translate;
+使用 uucore::{
+    错误::{UResult, USimpleError, UUsageError},
+    format_usage,
+    parser::parse_time,
+    show_error,
+};
+
+模组 options {
+    公有 常量 NUMBER: &字符串切片 = "NUMBER";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 numbers = matches
+        .get_many::<字符串>(options::NUMBER)
+        .ok_or_else(|| {
+            USimpleError::新建(
+                1,
+                translate!("sleep-error-missing-operand", "program" => uucore::execution_phrase()),
+            )
+        })?
+        .映射(字符串::as_str)
+        .收集::<向量<_>>();
+
+    休眠(&numbers)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("sleep")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("sleep"))
+        .about(translate!("sleep-about"))
+        .after_help(translate!("sleep-after-help"))
+        .override_usage(format_usage(&translate!("sleep-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::NUMBER)
+                .help(translate!("sleep-help-number"))
+                .value_name(options::NUMBER)
+                .action(ArgAction::Append),
+        )
+}
+
+方法 休眠(args: &[&字符串切片]) -> UResult<()> {
+    设 可变 arg_error = 假;
+
+    设 sleep_dur = args
+        .迭代()
+        .filter_map(|input| 匹配 parse_time::from_str(input, 真) {
+            好的(duration) => 一些(duration),
+            坏的(错误) => {
+                arg_error = 真;
+                show_error!("{error}");
+                无
+            }
+        })
+        .折叠(持续时间::ZERO, 持续时间::saturating_add);
+
+    如果 arg_error {
+        返回 坏的(UUsageError::新建(1, ""));
+    }
+    线程::休眠(sleep_dur);
+    好的(())
+}

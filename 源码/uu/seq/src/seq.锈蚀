@@ -1,0 +1,402 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) bigdecimal extendedbigdecimal numberparse hexadecimalfloat biguint
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::输入输出::{BufWriter, Write, stdout};
+
+使用 clap::{Arg, ArgAction, Command};
+使用 num_bigint::BigUint;
+使用 num_traits::ToPrimitive;
+使用 num_traits::Zero;
+
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::extendedbigdecimal::ExtendedBigDecimal;
+使用 uucore::format::num_format::FloatVariant;
+使用 uucore::format::{Format, num_format};
+使用 uucore::{fast_inc::fast_inc, format_usage};
+
+模组 错误;
+
+// public to allow fuzzing
+#[cfg(fuzzing)]
+公有 模组 number;
+#[cfg(not(fuzzing))]
+模组 number;
+模组 numberparse;
+使用 箱::错误::SeqError;
+使用 箱::number::PreciseNumber;
+
+#[cfg(unix)]
+使用 uucore::signals;
+使用 uucore::translate;
+
+常量 OPT_SEPARATOR: &字符串切片 = "separator";
+常量 OPT_TERMINATOR: &字符串切片 = "terminator";
+常量 OPT_EQUAL_WIDTH: &字符串切片 = "equal-width";
+常量 OPT_FORMAT: &字符串切片 = "format";
+
+常量 ARG_NUMBERS: &字符串切片 = "numbers";
+
+#[derive(克隆协议)]
+结构 SeqOptions<'a> {
+    separator: OsString,
+    terminator: OsString,
+    equal_width: 布尔,
+    format: 选项<&'a 字符串切片>,
+}
+
+/// A range of floats.
+///
+/// The elements are (first, increment, last).
+类型 RangeFloat = (ExtendedBigDecimal, ExtendedBigDecimal, ExtendedBigDecimal);
+
+/// Turn short args with attached value, for example "-s,", into two args "-s" and "," to make
+/// them work with clap.
+方法 split_short_args_with_value(args: 实现 uucore::Args) -> 实现 uucore::Args {
+    设 可变 v: 向量<OsString> = 向量::新建();
+
+    循环 arg 在 args {
+        设 bytes = arg.as_encoded_bytes();
+
+        如果 bytes.长度() > 2
+            && (bytes.starts_with(b"-f") || bytes.starts_with(b"-s") || bytes.starts_with(b"-t"))
+        {
+            设 (short_arg, value) = bytes.split_at(2);
+            // SAFETY:
+            // Both `short_arg` and `value` only contain content that originated from `OsStr::as_encoded_bytes`
+            v.压入(不安全 { OsString::from_encoded_bytes_unchecked(short_arg.to_vec()) });
+            v.压入(不安全 { OsString::from_encoded_bytes_unchecked(value.to_vec()) });
+        } 否则 {
+            v.压入(arg);
+        }
+    }
+
+    v.into_iter()
+}
+
+方法 select_precision(
+    first: &PreciseNumber,
+    increment: &PreciseNumber,
+    最后: &PreciseNumber,
+) -> 选项<正整数大小> {
+    匹配 (
+        first.num_fractional_digits,
+        increment.num_fractional_digits,
+        最后.num_fractional_digits,
+    ) {
+        (一些(0), 一些(0), 一些(0)) => 一些(0),
+        (一些(f), 一些(i), 一些(_)) => 一些(f.max(i)),
+        _ => 无,
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result(uu_app(), split_short_args_with_value(args))?;
+
+    设 numbers_option = matches.get_many::<字符串>(ARG_NUMBERS);
+
+    如果 numbers_option.is_none() {
+        返回 坏的(SeqError::NoArguments.into());
+    }
+
+    设 numbers = numbers_option.解包().收集::<向量<_>>();
+
+    设 options = SeqOptions {
+        separator: matches
+            .get_one::<OsString>(OPT_SEPARATOR)
+            .cloned()
+            .unwrap_or_else(|| OsString::from("\n")),
+        terminator: matches
+            .get_one::<OsString>(OPT_TERMINATOR)
+            .cloned()
+            .unwrap_or_else(|| OsString::from("\n")),
+        equal_width: matches.get_flag(OPT_EQUAL_WIDTH),
+        format: matches.get_one::<字符串>(OPT_FORMAT).映射(字符串::as_str),
+    };
+
+    如果 options.equal_width && options.format.is_some() {
+        返回 坏的(SeqError::FormatAndEqualWidth.into());
+    }
+
+    设 first = 如果 numbers.长度() > 1 {
+        匹配 numbers[0].parse() {
+            好的(数字) => 数字,
+            坏的(e) => 返回 坏的(SeqError::ParseError(numbers[0].to_owned(), e).into()),
+        }
+    } 否则 {
+        PreciseNumber::one()
+    };
+    设 increment = 如果 numbers.长度() > 2 {
+        匹配 numbers[1].parse() {
+            好的(数字) => 数字,
+            坏的(e) => 返回 坏的(SeqError::ParseError(numbers[1].to_owned(), e).into()),
+        }
+    } 否则 {
+        PreciseNumber::one()
+    };
+    如果 increment.is_zero() {
+        返回 坏的(SeqError::ZeroIncrement(numbers[1].to_owned()).into());
+    }
+    设 最后: PreciseNumber = {
+        // We are guaranteed that `numbers.len()` is greater than zero
+        // and at most three because of the argument specification in
+        // `uu_app()`.
+        设 n: 正整数大小 = numbers.长度();
+        匹配 numbers[n - 1].parse() {
+            好的(数字) => 数字,
+            坏的(e) => 返回 坏的(SeqError::ParseError(numbers[n - 1].to_owned(), e).into()),
+        }
+    };
+
+    // If a format was passed on the command line, use that.
+    // If not, use some default format based on parameters precision.
+    设 (format, padding, fast_allowed) = 如果 设 一些(字符串切片) = options.format {
+        (
+            Format::<num_format::Float, &ExtendedBigDecimal>::parse(字符串切片)?,
+            0,
+            假,
+        )
+    } 否则 {
+        设 precision = select_precision(&first, &increment, &最后);
+
+        设 padding = 如果 options.equal_width {
+            设 precision_value = precision.unwrap_or(0);
+            first
+                .num_integral_digits
+                .max(increment.num_integral_digits)
+                .max(最后.num_integral_digits)
+                + 如果 precision_value > 0 {
+                    precision_value + 1
+                } 否则 {
+                    0
+                }
+        } 否则 {
+            0
+        };
+
+        设 formatter = 匹配 precision {
+            // format with precision: decimal floats and integers
+            一些(precision) => num_format::Float {
+                variant: FloatVariant::Decimal,
+                width: padding,
+                alignment: num_format::NumberAlignment::RightZero,
+                precision: 一些(precision),
+                ..默认协议::默认()
+            },
+            // format without precision: hexadecimal floats
+            无 => num_format::Float {
+                variant: FloatVariant::Shortest,
+                ..默认协议::默认()
+            },
+        };
+        // Allow fast printing if precision is 0 (integer inputs), `print_seq` will do further checks.
+        (
+            Format::from_formatter(formatter),
+            padding,
+            precision == 一些(0),
+        )
+    };
+
+    设 result = print_seq(
+        (first.number, increment.number, 最后.number),
+        &options.separator,
+        &options.terminator,
+        &format,
+        fast_allowed,
+        padding,
+    );
+
+    匹配 result {
+        好的(()) => 好的(()),
+        坏的(err) 如果 err.kind() == 标准库::输入输出::ErrorKind::BrokenPipe => {
+            // GNU seq prints the Broken pipe message but still exits with status 0
+            // unless SIGPIPE was explicitly ignored, in which case it should fail.
+            设 err = err.map_err_context(|| "write error".into());
+            uucore::show_error!("{err}");
+            #[cfg(unix)]
+            如果 signals::sigpipe_was_ignored() {
+                uucore::错误::set_exit_code(1);
+            }
+            好的(())
+        }
+        坏的(err) => 坏的(err.map_err_context(|| "write error".into())),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("seq")
+        .trailing_var_arg(真)
+        .infer_long_args(真)
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("seq-about"))
+        .override_usage(format_usage(&translate!("seq-usage")))
+        .arg(
+            Arg::新建(OPT_SEPARATOR)
+                .short('s')
+                .long("separator")
+                .help(translate!("seq-help-separator"))
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(OPT_TERMINATOR)
+                .short('t')
+                .long("terminator")
+                .help(translate!("seq-help-terminator"))
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(OPT_EQUAL_WIDTH)
+                .short('w')
+                .long("equal-width")
+                .help(translate!("seq-help-equal-width"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_FORMAT)
+                .short('f')
+                .long(OPT_FORMAT)
+                .help(translate!("seq-help-format")),
+        )
+        .arg(
+            // we use allow_hyphen_values instead of allow_negative_numbers because clap removed
+            // the support for "exotic" negative numbers like -.1 (see https://github.com/clap-rs/clap/discussions/5837)
+            Arg::新建(ARG_NUMBERS)
+                .allow_hyphen_values(真)
+                .action(ArgAction::Append)
+                .num_args(1..=3),
+        )
+}
+
+/// Integer print, default format, positive increment: fast code path
+/// that avoids reformatting digit at all iterations.
+方法 fast_print_seq(
+    可变 stdout: 实现 Write,
+    first: &BigUint,
+    increment: 正64,
+    最后: &BigUint,
+    separator: &OsStr,
+    terminator: &OsStr,
+    padding: 正整数大小,
+) -> 标准库::输入输出::结果<()> {
+    // Nothing to do, just return.
+    如果 最后 < first {
+        返回 好的(());
+    }
+
+    // Do at most u64::MAX loops. We can print in the order of 1e8 digits per second,
+    // u64::MAX is 1e19, so it'd take hundreds of years for this to complete anyway.
+    // TODO: we can move this test to `print_seq` if we care about this case.
+    设 loop_cnt = ((最后 - first) / increment).to_u64().unwrap_or(正64::MAX);
+
+    // Format the first number.
+    设 first_str = first.to_string();
+
+    // Makeshift log10.ceil
+    设 last_length = 最后.to_string().长度();
+
+    // Allocate a large u8 buffer, that contains a preformatted string
+    // of the number followed by the `separator`.
+    //
+    // | ... head space ... | number | separator |
+    // ^0                   ^ start  ^ num_end   ^ size (==buf.len())
+    //
+    // We keep track of start in this buffer, as the number grows.
+    // When printing, we take a slice between start and end.
+    设 size = last_length.max(padding) + separator.长度();
+    // Fill with '0', this is needed for equal_width, and harmless otherwise.
+    设 可变 buf = 向量![b'0'; size];
+    设 buf = buf.as_mut_slice();
+
+    设 num_end = buf.长度() - separator.长度();
+    设 可变 start = num_end - first_str.长度();
+
+    // Initialize buf with first and separator.
+    buf[start..num_end].copy_from_slice(first_str.as_bytes());
+    buf[num_end..].copy_from_slice(separator.as_encoded_bytes());
+
+    // Normally, if padding is > 0, it should be equal to last_length,
+    // so start would be == 0, but there are corner cases.
+    start = start.min(num_end - padding);
+
+    // Prepare the number to increment with as a string
+    设 inc_str = increment.to_string();
+    设 inc_str = inc_str.as_bytes();
+
+    循环 _ 在 0..loop_cnt {
+        stdout.write_all(&buf[start..])?;
+        fast_inc(buf, &可变 start, num_end, inc_str);
+    }
+    // Write the last number without separator, but with terminator.
+    stdout.write_all(&buf[start..num_end])?;
+    stdout.write_all(terminator.as_encoded_bytes())?;
+    stdout.flush()?;
+    好的(())
+}
+
+方法 done_printing<T: Zero + 偏序比较协议>(next: &T, increment: &T, 最后: &T) -> 布尔 {
+    如果 increment >= &T::zero() {
+        next > 最后
+    } 否则 {
+        next < 最后
+    }
+}
+
+/// Arbitrary precision decimal number code path ("slow" path)
+方法 print_seq(
+    range: RangeFloat,
+    separator: &OsStr,
+    terminator: &OsStr,
+    format: &Format<num_format::Float, &ExtendedBigDecimal>,
+    fast_allowed: 布尔,
+    padding: 正整数大小, // Used by fast path only
+) -> 标准库::输入输出::结果<()> {
+    设 stdout = stdout().锁定();
+    设 可变 stdout = BufWriter::新建(stdout);
+    设 (first, increment, 最后) = range;
+
+    如果 fast_allowed {
+        // Test if we can use fast code path.
+        // First try to convert the range to BigUint (u64 for the increment).
+        设 (first_bui, increment_u64, last_bui) = (
+            first.to_biguint(),
+            increment.to_biguint().and_then(|x| x.to_u64()),
+            最后.to_biguint(),
+        );
+        如果 设 (一些(first_bui), 一些(increment_u64), 一些(last_bui)) =
+            (first_bui, increment_u64, last_bui)
+        {
+            返回 fast_print_seq(
+                stdout,
+                &first_bui,
+                increment_u64,
+                &last_bui,
+                separator,
+                terminator,
+                padding,
+            );
+        }
+    }
+
+    设 可变 value = first;
+
+    设 可变 is_first_iteration = 真;
+    当 !done_printing(&value, &increment, &最后) {
+        如果 !is_first_iteration {
+            stdout.write_all(separator.as_encoded_bytes())?;
+        }
+        format.格式化(&可变 stdout, &value)?;
+        // TODO Implement augmenting addition.
+        value = value + increment.克隆();
+        is_first_iteration = 假;
+    }
+    如果 !is_first_iteration {
+        stdout.write_all(terminator.as_encoded_bytes())?;
+    }
+    stdout.flush()?;
+    好的(())
+}

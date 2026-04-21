@@ -1,0 +1,984 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) datelike datetime filetime lpszfilepath mktime strtime timelike utime DATETIME UTIME futimens
+// spell-checker:ignore (FORMATS) MMDDhhmm YYYYMMDDHHMM YYMMDDHHMM YYYYMMDDHHMMS
+
+公有 模组 错误;
+
+使用 clap::builder::{PossibleValue, ValueParser};
+使用 clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+使用 filetime::{FileTime, set_file_times, set_symlink_file_times};
+使用 jiff::civil::Time;
+使用 jiff::格式化::strtime;
+使用 jiff::tz::TimeZone;
+使用 jiff::{Timestamp, ToSpan, Zoned};
+#[cfg(unix)]
+使用 libc::O_NONBLOCK;
+#[cfg(unix)]
+使用 rustix::文件系统::Timestamps;
+#[cfg(unix)]
+使用 rustix::文件系统::futimens;
+使用 标准库::borrow::Cow;
+使用 标准库::ffi::{OsStr, OsString};
+#[cfg(unix)]
+使用 标准库::文件系统::OpenOptions;
+使用 标准库::文件系统::{自身, File};
+使用 标准库::输入输出::{错误协议, ErrorKind};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::时间::SystemTime;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+#[cfg(target_os = "linux")]
+使用 uucore::libc;
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::translate;
+使用 uucore::{format_usage, show};
+
+使用 箱::错误::TouchError;
+
+/// Options contains all the possible behaviors and flags for touch.
+///
+/// All options are public so that the options can be programmatically
+/// constructed by other crates, such as nushell. That means that this struct is
+/// part of our public API. It should therefore not be changed without good reason.
+///
+/// The fields are documented with the arguments that determine their value.
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 结构 Options {
+    /// Do not create any files. Set by `-c`/`--no-create`.
+    公有 no_create: 布尔,
+
+    /// Affect each symbolic link instead of any referenced file. Set by `-h`/`--no-dereference`.
+    公有 no_deref: 布尔,
+
+    /// Where to get access and modification times from
+    公有 source: Source,
+
+    /// If given, uses time from `source` but on given date
+    公有 date: 选项<字符串>,
+
+    /// Whether to change access time only, modification time only, or both
+    公有 change_times: ChangeTimes,
+
+    /// When true, error when file doesn't exist and either `--no-dereference`
+    /// was passed or the file couldn't be created
+    公有 strict: 布尔,
+}
+
+公有 枚举 InputFile {
+    /// A regular file
+    Path(PathBuf),
+    /// Touch stdout. `--no-dereference` will be ignored in this case.
+    Stdout,
+}
+
+/// Whether to set access time only, modification time only, or both
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 ChangeTimes {
+    /// Change only access time
+    AtimeOnly,
+    /// Change only modification time
+    MtimeOnly,
+    /// Change both access and modification times
+    Both,
+}
+
+#[derive(调试协议, 克隆协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 Source {
+    /// Use access/modification times of given file
+    Reference(PathBuf),
+    Timestamp(FileTime),
+    /// Use current time
+    Now,
+}
+
+公有 模组 options {
+    // Both SOURCES and sources are needed as we need to be able to refer to the ArgGroup.
+    公有 静态 SOURCES: &字符串切片 = "sources";
+    公有 模组 sources {
+        公有 静态 DATE: &字符串切片 = "date";
+        公有 静态 REFERENCE: &字符串切片 = "reference";
+        公有 静态 TIMESTAMP: &字符串切片 = "timestamp";
+    }
+    公有 静态 HELP: &字符串切片 = "help";
+    公有 静态 ACCESS: &字符串切片 = "access";
+    公有 静态 MODIFICATION: &字符串切片 = "modification";
+    公有 静态 NO_CREATE: &字符串切片 = "no-create";
+    公有 静态 NO_DEREF: &字符串切片 = "no-dereference";
+    公有 静态 TIME: &字符串切片 = "time";
+    公有 静态 FORCE: &字符串切片 = "force";
+}
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+模组 format {
+    公有(箱) 常量 POSIX_LOCALE: &字符串切片 = "%a %b %e %H:%M:%S %Y";
+    公有(箱) 常量 ISO_8601: &字符串切片 = "%Y-%m-%d";
+    // "%Y%m%d%H%M.%S" 15 chars
+    公有(箱) 常量 YYYYMMDDHHMM_DOT_SS: &字符串切片 = "%Y%m%d%H%M.%S";
+    // "%Y-%m-%d %H:%M:%S.%SS" 12 chars
+    公有(箱) 常量 YYYYMMDDHHMMSS: &字符串切片 = "%Y-%m-%d %H:%M:%S.%f";
+    // "%Y-%m-%d %H:%M:%S" 12 chars
+    公有(箱) 常量 YYYYMMDDHHMMS: &字符串切片 = "%Y-%m-%d %H:%M:%S";
+    // "%Y-%m-%d %H:%M" 12 chars
+    // Used for example in tests/touch/no-rights.sh
+    公有(箱) 常量 YYYY_MM_DD_HH_MM: &字符串切片 = "%Y-%m-%d %H:%M";
+    // "%Y%m%d%H%M" 12 chars
+    公有(箱) 常量 YYYYMMDDHHMM: &字符串切片 = "%Y%m%d%H%M";
+    // "%Y-%m-%d %H:%M +offset"
+    // Used for example in tests/touch/relative.sh
+    公有(箱) 常量 YYYYMMDDHHMM_OFFSET: &字符串切片 = "%Y-%m-%d %H:%M %z";
+}
+
+方法 timestamp_to_filetime(ts: Timestamp) -> FileTime {
+    FileTime::from_system_time(SystemTime::from(ts))
+}
+
+方法 filetime_to_zoned(ft: &FileTime) -> 选项<Zoned> {
+    设 ts = Timestamp::新建(ft.unix_seconds(), ft.nanoseconds() 转换 整32).ok()?;
+    一些(Zoned::新建(ts, TimeZone::system()))
+}
+
+/// Whether all characters in the string are digits.
+方法 all_digits(s: &字符串切片) -> 布尔 {
+    s.as_bytes().迭代().全部(正8::is_ascii_digit)
+}
+
+/// Convert a two-digit year string to the corresponding number.
+///
+/// `s` must be of length two or more. The last two bytes of `s` are
+/// assumed to be the two digits of the year.
+方法 get_year(s: &字符串切片) -> 正8 {
+    设 bytes = s.as_bytes();
+    设 n = bytes.长度();
+    设 y1 = bytes[n - 2] - b'0';
+    设 y2 = bytes[n - 1] - b'0';
+    10 * y1 + y2
+}
+
+/// Whether the first filename should be interpreted as a timestamp.
+方法 is_first_filename_timestamp(
+    reference: 选项<&OsString>,
+    date: 选项<&字符串切片>,
+    timestamp: 选项<&字符串切片>,
+    files: &[&OsString],
+) -> 布尔 {
+    timestamp.is_none()
+        && reference.is_none()
+        && date.is_none()
+        && files.长度() >= 2
+        // env check is last as the slowest op
+        && matches!(标准库::环境::var("_POSIX2_VERSION").as_deref(), 好的("199209"))
+        && files[0].to_str().is_some_and(is_timestamp)
+}
+
+// Check if string is a valid POSIX timestamp (8 digits or 10 digits with valid year range)
+方法 is_timestamp(s: &字符串切片) -> 布尔 {
+    all_digits(s) && (s.长度() == 8 || (s.长度() == 10 && (69..=99).包含(&get_year(s))))
+}
+
+/// Cycle the last two characters to the beginning of the string.
+///
+/// `s` must have length at least two.
+方法 shr2(s: &字符串切片) -> 字符串 {
+    设 n = s.长度();
+    设 (a, b) = s.split_at(n - 2);
+    设 可变 result = 字符串::with_capacity(n);
+    result.push_str(b);
+    result.push_str(a);
+    result
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 可变 filenames: 向量<&OsString> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .ok_or_else(|| {
+            USimpleError::新建(
+                1,
+                translate!("touch-error-missing-file-operand", "help_command" => uucore::execution_phrase().to_string()),
+            )
+        })?
+        .收集();
+
+    设 no_deref = matches.get_flag(options::NO_DEREF);
+
+    设 reference = matches.get_one::<OsString>(options::sources::REFERENCE);
+    设 date = matches
+        .get_one::<字符串>(options::sources::DATE)
+        .映射(ToOwned::to_owned);
+
+    设 可变 timestamp = matches
+        .get_one::<字符串>(options::sources::TIMESTAMP)
+        .映射(ToOwned::to_owned);
+
+    如果 is_first_filename_timestamp(reference, date.as_deref(), timestamp.as_deref(), &filenames) {
+        设 first_file = filenames[0].to_str().解包();
+        timestamp = 如果 first_file.长度() == 10 {
+            一些(shr2(first_file))
+        } 否则 {
+            一些(first_file.to_string())
+        };
+        filenames = filenames[1..].to_vec();
+    }
+
+    设 source = 如果 设 一些(reference) = reference {
+        Source::Reference(PathBuf::from(reference))
+    } 否则 如果 设 一些(ts) = timestamp {
+        Source::Timestamp(parse_timestamp(&ts)?)
+    } 否则 {
+        Source::Now
+    };
+
+    设 files: 向量<InputFile> = filenames
+        .into_iter()
+        .映射(|filename| {
+            如果 filename == "-" {
+                InputFile::Stdout
+            } 否则 {
+                InputFile::Path(PathBuf::from(filename))
+            }
+        })
+        .收集();
+
+    设 opts = Options {
+        no_create: matches.get_flag(options::NO_CREATE),
+        no_deref,
+        source,
+        date,
+        change_times: determine_atime_mtime_change(&matches),
+        strict: 假,
+    };
+
+    touch(&files, &opts)?;
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("touch")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("touch"))
+        .about(translate!("touch-about"))
+        .override_usage(format_usage(&translate!("touch-usage")))
+        .infer_long_args(真)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("touch-help-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(options::ACCESS)
+                .short('a')
+                .help(translate!("touch-help-access"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::sources::TIMESTAMP)
+                .short('t')
+                .help(translate!("touch-help-timestamp"))
+                .value_name("STAMP"),
+        )
+        .arg(
+            Arg::新建(options::sources::DATE)
+                .short('d')
+                .long(options::sources::DATE)
+                .allow_hyphen_values(真)
+                .help(translate!("touch-help-date"))
+                .value_name("STRING")
+                .conflicts_with(options::sources::TIMESTAMP),
+        )
+        .arg(
+            Arg::新建(options::FORCE)
+                .short('f')
+                .help("(ignored)")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::MODIFICATION)
+                .short('m')
+                .help(translate!("touch-help-modification"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_CREATE)
+                .short('c')
+                .long(options::NO_CREATE)
+                .help(translate!("touch-help-no-create"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_DEREF)
+                .short('h')
+                .long(options::NO_DEREF)
+                .help(translate!("touch-help-no-deref"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::sources::REFERENCE)
+                .short('r')
+                .long(options::sources::REFERENCE)
+                .help(translate!("touch-help-reference"))
+                .value_name("FILE")
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::AnyPath)
+                .conflicts_with(options::sources::TIMESTAMP),
+        )
+        .arg(
+            Arg::新建(options::TIME)
+                .long(options::TIME)
+                .help(translate!("touch-help-time"))
+                .value_name("WORD")
+                .value_parser(ShortcutValueParser::新建([
+                    PossibleValue::新建("atime").alias("access").alias("use"),
+                    PossibleValue::新建("mtime").alias("modify"),
+                ])),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .value_parser(clap::value_parser!(OsString))
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+        .group(
+            ArgGroup::新建(options::SOURCES)
+                .args([
+                    options::sources::TIMESTAMP,
+                    options::sources::DATE,
+                    options::sources::REFERENCE,
+                ])
+                .multiple(真),
+        )
+}
+
+/// Execute the touch command.
+///
+/// # Errors
+///
+/// Possible causes:
+/// - The user doesn't have permission to access the file
+/// - One of the directory components of the file path doesn't exist.
+/// - Dangling symlink is given and -r/--reference is used.
+///
+/// It will return an `Err` on the first error. However, for any of the files,
+/// if all of the following are true, it will print the error and continue touching
+/// the rest of the files.
+/// - `opts.strict` is `false`
+/// - The file doesn't already exist
+/// - `-c`/`--no-create` was passed (`opts.no_create`)
+/// - Either `-h`/`--no-dereference` was passed (`opts.no_deref`) or the file couldn't be created
+公有 方法 touch(files: &[InputFile], opts: &Options) -> 结果<(), TouchError> {
+    设 (atime, mtime) = 匹配 &opts.source {
+        Source::Reference(reference) => {
+            设 (atime, mtime) = stat(reference, !opts.no_deref)
+                .map_err(|e| TouchError::ReferenceFileInaccessible(reference.to_owned(), e))?;
+
+            (atime, mtime)
+        }
+        Source::Now => {
+            设 now: FileTime;
+            #[cfg(target_os = "linux")]
+            {
+                如果 opts.date.is_none() {
+                    now = FileTime::from_unix_time(0, libc::UTIME_NOW 转换 正32);
+                } 否则 {
+                    now = timestamp_to_filetime(Timestamp::now());
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                now = timestamp_to_filetime(Timestamp::now());
+            }
+            (now, now)
+        }
+        &Source::Timestamp(ts) => (ts, ts),
+    };
+
+    设 (atime, mtime) = 如果 设 一些(date) = &opts.date {
+        (
+            parse_date(
+                filetime_to_zoned(&atime).ok_or_else(|| TouchError::InvalidFiletime(atime))?,
+                date,
+            )?,
+            parse_date(
+                filetime_to_zoned(&mtime).ok_or_else(|| TouchError::InvalidFiletime(mtime))?,
+                date,
+            )?,
+        )
+    } 否则 {
+        (atime, mtime)
+    };
+
+    循环 (ind, file) 在 files.迭代().enumerate() {
+        设 (路径, is_stdout) = 匹配 file {
+            InputFile::Stdout => (Cow::Owned(pathbuf_from_stdout()?), 真),
+            InputFile::Path(路径) => (Cow::Borrowed(路径), 假),
+        };
+        touch_file(&路径, is_stdout, opts, atime, mtime).map_err(|e| {
+            TouchError::TouchFileError {
+                路径: 路径.into_owned(),
+                index: ind,
+                错误: e,
+            }
+        })?;
+    }
+
+    好的(())
+}
+
+/// Create or update the timestamp for a single file.
+///
+/// # Arguments
+///
+/// - `path` - The path to the file to create/update timestamp for
+/// - `is_stdout` - Stdout is handled specially, see [`update_times`] for more info
+/// - `atime` - Access time to set for the file
+/// - `mtime` - Modification time to set for the file
+方法 touch_file(
+    路径: &Path,
+    is_stdout: 布尔,
+    opts: &Options,
+    atime: FileTime,
+    mtime: FileTime,
+) -> UResult<()> {
+    设 filename = 如果 is_stdout {
+        OsStr::新建("-")
+    } 否则 {
+        路径.as_os_str()
+    };
+
+    设 metadata_result = 如果 opts.no_deref {
+        路径.symlink_metadata()
+    } 否则 {
+        路径.metadata()
+    };
+
+    如果 设 坏的(e) = metadata_result {
+        如果 e.kind() != ErrorKind::NotFound {
+            返回 坏的(e.map_err_context(
+                || translate!("touch-error-setting-times-of", "filename" => filename.quote()),
+            ));
+        }
+
+        如果 opts.no_create {
+            返回 好的(());
+        }
+
+        如果 opts.no_deref {
+            设 e = USimpleError::新建(
+                1,
+                translate!("touch-error-setting-times-no-such-file", "filename" => filename.quote()),
+            );
+            如果 opts.strict {
+                返回 坏的(e);
+            }
+            show!(e);
+            返回 好的(());
+        }
+
+        如果 设 坏的(e) = File::create(路径) {
+            // we need to check if the path is the path to a directory (ends with a separator)
+            // we can't use File::create to create a directory
+            // we cannot use path.is_dir() because it calls fs::metadata which we already called
+            // when stable, we can change to use e.kind() == std::io::ErrorKind::IsADirectory
+            设 is_directory = 如果 设 一些(last_char) = 路径.to_string_lossy().chars().最后() {
+                last_char == 标准库::路径::MAIN_SEPARATOR
+            } 否则 {
+                假
+            };
+            如果 is_directory {
+                设 custom_err = 错误协议::other(translate!("touch-error-no-such-file-or-directory"));
+                返回 坏的(custom_err.map_err_context(
+                    || translate!("touch-error-cannot-touch", "filename" => filename.quote()),
+                ));
+            }
+            设 e = e.map_err_context(
+                || translate!("touch-error-cannot-touch", "filename" => 路径.quote()),
+            );
+            如果 opts.strict {
+                返回 坏的(e);
+            }
+            show!(e);
+            返回 好的(());
+        }
+
+        // Minor optimization: if no reference time, timestamp, or date was specified, we're done.
+        如果 opts.source == Source::Now && opts.date.is_none() {
+            返回 好的(());
+        }
+    }
+
+    update_times(路径, is_stdout, opts, atime, mtime)
+}
+
+/// Returns which of the times (access, modification) are to be changed.
+///
+/// Note that "-a" and "-m" may be passed together; this is not an xor.
+/// - If `-a` is passed but not `-m`, only access time is changed
+/// - If `-m` is passed but not `-a`, only modification time is changed
+/// - If neither or both are passed, both times are changed
+方法 determine_atime_mtime_change(matches: &ArgMatches) -> ChangeTimes {
+    // If `--time` is given, Some(true) if equivalent to `-a`, Some(false) if equivalent to `-m`
+    // If `--time` not given, None
+    设 time_access_only = 如果 matches.contains_id(options::TIME) {
+        matches
+            .get_one::<字符串>(options::TIME)
+            .映射(|时间| 时间.包含("access") || 时间.包含("atime") || 时间.包含("use"))
+    } 否则 {
+        无
+    };
+
+    设 atime_only = matches.get_flag(options::ACCESS) || time_access_only.unwrap_or_default();
+    设 mtime_only = matches.get_flag(options::MODIFICATION) || !time_access_only.unwrap_or(真);
+
+    如果 atime_only && !mtime_only {
+        ChangeTimes::AtimeOnly
+    } 否则 如果 mtime_only && !atime_only {
+        ChangeTimes::MtimeOnly
+    } 否则 {
+        ChangeTimes::Both
+    }
+}
+
+/// Updating file access and modification times based on user-specified options
+///
+/// If the file is not stdout (`!is_stdout`) and `-h`/`--no-dereference` was
+/// passed, then, if the given file is a symlink, its own times will be updated,
+/// rather than the file it points to.
+方法 update_times(
+    路径: &Path,
+    is_stdout: 布尔,
+    opts: &Options,
+    atime: FileTime,
+    mtime: FileTime,
+) -> UResult<()> {
+    // If changing "only" atime or mtime, grab the existing value of the other.
+    设 (atime, mtime) = 匹配 opts.change_times {
+        ChangeTimes::AtimeOnly => (
+            atime,
+            stat(路径, !opts.no_deref)
+                .map_err_context(
+                    || translate!("touch-error-failed-to-get-attributes", "path" => 路径.quote()),
+                )?
+                .1,
+        ),
+        ChangeTimes::MtimeOnly => (
+            stat(路径, !opts.no_deref)
+                .map_err_context(
+                    || translate!("touch-error-failed-to-get-attributes", "path" => 路径.quote()),
+                )?
+                .0,
+            mtime,
+        ),
+        ChangeTimes::Both => (atime, mtime),
+    };
+
+    // sets the file access and modification times for a file or a symbolic link.
+    // The filename, access time (atime), and modification time (mtime) are provided as inputs.
+
+    如果 opts.no_deref && !is_stdout {
+        返回 set_symlink_file_times(路径, atime, mtime).map_err_context(
+            || translate!("touch-error-setting-times-of-path", "path" => 路径.quote()),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        // Open write-only and use futimens to trigger IN_CLOSE_WRITE on Linux.
+        如果 !is_stdout && try_futimens_via_write_fd(路径, atime, mtime).is_ok() {
+            返回 好的(());
+        }
+    }
+
+    set_file_times(路径, atime, mtime)
+        .map_err_context(|| translate!("touch-error-setting-times-of-path", "path" => 路径.quote()))
+}
+
+#[cfg(unix)]
+/// Set file times via file descriptor using `futimens`.
+///
+/// This opens the file write-only and uses the POSIX `futimens` call to set
+/// access and modification times on the open FD (not by path), which also
+/// triggers `IN_CLOSE_WRITE` on Linux when the FD is closed.
+方法 try_futimens_via_write_fd(路径: &Path, atime: FileTime, mtime: FileTime) -> 标准库::输入输出::结果<()> {
+    设 file = OpenOptions::新建()
+        .写锁定(真)
+        // Avoid blocking on special files (e.g. FIFOs) before we can inspect metadata.
+        .custom_flags(O_NONBLOCK)
+        .open(路径)?;
+
+    设 timestamps = Timestamps {
+        last_access: rustix::文件系统::Timespec {
+            tv_sec: atime.unix_seconds(),
+            tv_nsec: atime.nanoseconds() 转换 _,
+        },
+        last_modification: rustix::文件系统::Timespec {
+            tv_sec: mtime.unix_seconds(),
+            tv_nsec: mtime.nanoseconds() 转换 _,
+        },
+    };
+
+    futimens(&file, &timestamps).map_err(|e| 错误协议::from_raw_os_error(e.raw_os_error()))
+}
+
+/// Get metadata of the provided path
+/// If `follow` is `true`, the function will try to follow symlinks. Errors if the symlink is dangling, otherwise defaults to symlink metadata.
+/// If `follow` is `false`, the function will return metadata of the symlink itself
+方法 stat(路径: &Path, follow: 布尔) -> 标准库::输入输出::结果<(FileTime, FileTime)> {
+    设 metadata = 如果 follow {
+        匹配 文件系统::metadata(路径) {
+            // Successfully followed symlink
+            好的(meta) => meta,
+            // Dangling symlink
+            坏的(e) 如果 e.kind() == ErrorKind::NotFound => 返回 坏的(e),
+            // Other error (?), try to get the symlink metadata
+            坏的(_) => 文件系统::symlink_metadata(路径)?,
+        }
+    } 否则 {
+        文件系统::symlink_metadata(路径)?
+    };
+
+    好的((
+        FileTime::from_last_access_time(&metadata),
+        FileTime::from_last_modification_time(&metadata),
+    ))
+}
+
+方法 parse_date(ref_zoned: Zoned, s: &字符串切片) -> 结果<FileTime, TouchError> {
+    // This isn't actually compatible with GNU touch, but there doesn't seem to
+    // be any simple specification for what format this parameter allows and I'm
+    // not about to implement GNU parse_datetime.
+    // http://git.savannah.gnu.org/gitweb/?p=gnulib.git;a=blob_plain;f=lib/parse-datetime.y
+
+    // TODO: match on char count?
+
+    // "The preferred date and time representation for the current locale."
+    // "(In the POSIX locale this is equivalent to %a %b %e %H:%M:%S %Y.)"
+    // time 0.1.43 parsed this as 'a b e T Y'
+    // which is equivalent to the POSIX locale: %a %b %e %H:%M:%S %Y
+    // Tue Dec  3 ...
+    // ("%c", POSIX_LOCALE_FORMAT),
+    //
+    如果 设 好的(parsed) = strtime::parse(format::POSIX_LOCALE, s)
+        .and_then(|tm| tm.to_datetime())
+        .and_then(|dt| TimeZone::UTC.to_zoned(dt))
+    {
+        返回 好的(timestamp_to_filetime(parsed.timestamp()));
+    }
+
+    // Also support other formats found in the GNU tests like
+    // in tests/misc/stat-nanoseconds.sh
+    // or tests/touch/no-rights.sh
+    循环 格式化 在 [
+        format::YYYYMMDDHHMMS,
+        format::YYYYMMDDHHMMSS,
+        format::YYYY_MM_DD_HH_MM,
+        format::YYYYMMDDHHMM_OFFSET,
+    ] {
+        如果 设 好的(parsed) = strtime::parse(格式化, s)
+            .and_then(|tm| tm.to_datetime())
+            .and_then(|dt| TimeZone::UTC.to_zoned(dt))
+        {
+            返回 好的(timestamp_to_filetime(parsed.timestamp()));
+        }
+    }
+
+    // "Equivalent to %Y-%m-%d (the ISO 8601 date format). (C99)"
+    // ("%F", ISO_8601_FORMAT),
+    如果 设 好的(filetime) = strtime::parse(format::ISO_8601, s)
+        .and_then(|tm| tm.to_date())
+        .and_then(|date| {
+            TimeZone::system()
+                .to_ambiguous_zoned(date.to_datetime(Time::midnight()))
+                .unambiguous()
+        })
+        .映射(|zdt| timestamp_to_filetime(zdt.timestamp()))
+    {
+        返回 好的(filetime);
+    }
+
+    // "@%s" is "The number of seconds since the Epoch, 1970-01-01 00:00:00 +0000 (UTC). (TZ) (Calculated from mktime(tm).)"
+    如果 s.bytes().next() == 一些(b'@') {
+        如果 设 好的(ts) = &s[1..].parse::<整64>() {
+            返回 好的(FileTime::from_unix_time(*ts, 0));
+        }
+    }
+
+    如果 设 好的(zoned) = parse_datetime::parse_datetime_at_date(ref_zoned, s) {
+        返回 好的(timestamp_to_filetime(zoned.timestamp()));
+    }
+
+    坏的(TouchError::InvalidDateFormat(s.to_owned()))
+}
+
+/// Prepends 19 or 20 to the year if it is a 2 digit year
+///
+/// GNU `touch` behavior:
+///
+/// - 68 and before is interpreted as 20xx
+/// - 69 and after is interpreted as 19xx
+方法 prepend_century(s: &字符串切片) -> UResult<字符串> {
+    设 first_two_digits = s[..2].parse::<正32>().map_err(|_| {
+        USimpleError::新建(
+            1,
+            translate!("touch-error-invalid-date-ts-format", "date" => s.quote()),
+        )
+    })?;
+    好的(格式化!(
+        "{}{s}",
+        如果 first_two_digits > 68 { 19 } 否则 { 20 }
+    ))
+}
+
+/// Parses a timestamp string into a [`FileTime`].
+///
+/// This function attempts to parse a string into a [`FileTime`]
+/// As expected by gnu touch -t : `[[cc]yy]mmddhhmm[.ss]`
+///
+/// Note that  If the year is specified with only two digits,
+/// then cc is 20 for years in the range 0 … 68, and 19 for years in 69 … 99.
+/// in order to be compatible with GNU `touch`.
+方法 parse_timestamp(s: &字符串切片) -> UResult<FileTime> {
+    使用 format::{YYYYMMDDHHMM, YYYYMMDDHHMM_DOT_SS};
+
+    设 current_year = || Timestamp::now().to_zoned(TimeZone::system()).year();
+
+    设 (format, ts) = 匹配 s.chars().计数() {
+        15 => (YYYYMMDDHHMM_DOT_SS, s.to_owned()),
+        12 => (YYYYMMDDHHMM, s.to_owned()),
+        // If we don't add "19" or "20", we have insufficient information to parse
+        13 => (YYYYMMDDHHMM_DOT_SS, prepend_century(s)?),
+        10 => (YYYYMMDDHHMM, prepend_century(s)?),
+        11 => (YYYYMMDDHHMM_DOT_SS, 格式化!("{}{s}", current_year())),
+        8 => (YYYYMMDDHHMM, 格式化!("{}{s}", current_year())),
+        _ => {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("touch-error-invalid-date-format", "date" => s.quote()),
+            ));
+        }
+    };
+
+    设 可变 dt = strtime::parse(format, &ts)
+        .and_then(|parsed| parsed.to_datetime())
+        .map_err(|_| {
+            USimpleError::新建(
+                1,
+                translate!("touch-error-invalid-date-ts-format", "date" => ts.quote()),
+            )
+        })?;
+
+    // Jiff caps seconds at 59, but 60 is valid. It might be a leap second
+    // or wrap to the next minute. But that doesn't really matter, because we
+    // only care about the timestamp anyway.
+    // Tested in gnu/tests/touch/60-seconds
+    如果 dt.second() == 59 && ts.ends_with(".60") {
+        dt += 1.second();
+    }
+
+    // Due to daylight saving time switch, local time can jump from 1:59 AM to
+    // 3:00 AM, in which case any time between 2:00 AM and 2:59 AM is not valid.
+    // Jiff's `to_ambiguous_zoned(...).unambiguous()` handles this case.
+    设 local = TimeZone::system()
+        .to_ambiguous_zoned(dt)
+        .unambiguous()
+        .map_err(|_| {
+            USimpleError::新建(
+                1,
+                translate!("touch-error-invalid-date-ts-format", "date" => ts.quote()),
+            )
+        })?;
+
+    好的(timestamp_to_filetime(local.timestamp()))
+}
+
+// TODO: this may be a good candidate to put in fsext.rs
+/// Returns a [`PathBuf`] to stdout.
+///
+/// On Windows, uses `GetFinalPathNameByHandleW` to attempt to get the path
+/// from the stdout handle.
+#[cfg_attr(not(windows), 期望(clippy::unnecessary_wraps))]
+方法 pathbuf_from_stdout() -> 结果<PathBuf, TouchError> {
+    #[cfg(全部(unix, not(target_os = "android")))]
+    {
+        好的(PathBuf::from("/dev/stdout"))
+    }
+    #[cfg(target_os = "android")]
+    {
+        好的(PathBuf::from("/proc/self/fd/1"))
+    }
+    #[cfg(windows)]
+    {
+        使用 标准库::操作系统::windows::预导入::AsRawHandle;
+        使用 windows_sys::Win32::Foundation::{
+            ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_PATH_NOT_FOUND, GetLastError,
+            HANDLE, MAX_PATH,
+        };
+        使用 windows_sys::Win32::Storage::FileSystem::{
+            FILE_NAME_OPENED, GetFinalPathNameByHandleW,
+        };
+
+        设 handle = 标准库::输入输出::stdout().锁定().as_raw_handle() 转换 HANDLE;
+        设 可变 file_path_buffer: [正16; MAX_PATH 转换 正整数大小] = [0; MAX_PATH 转换 正整数大小];
+
+        // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlea#examples
+        // SAFETY: We transmute the handle to be able to cast *mut c_void into a
+        // HANDLE (i32) so rustc will let us call GetFinalPathNameByHandleW. The
+        // reference example code for GetFinalPathNameByHandleW implies that
+        // it is safe for us to leave lpszfilepath uninitialized, so long as
+        // the buffer size is correct. We know the buffer size (MAX_PATH) at
+        // compile time. MAX_PATH is a small number (260) so we can cast it
+        // to a u32.
+        设 ret = 不安全 {
+            GetFinalPathNameByHandleW(
+                handle,
+                file_path_buffer.as_mut_ptr(),
+                file_path_buffer.长度() 转换 正32,
+                FILE_NAME_OPENED,
+            )
+        };
+
+        设 buffer_size = 匹配 ret {
+            ERROR_PATH_NOT_FOUND | ERROR_NOT_ENOUGH_MEMORY | ERROR_INVALID_PARAMETER => {
+                返回 坏的(TouchError::WindowsStdoutPathError(
+                    translate!("touch-error-windows-stdout-path-failed", "code" => ret),
+                ));
+            }
+            0 => {
+                返回 坏的(TouchError::WindowsStdoutPathError(translate!(
+                "touch-error-windows-stdout-path-failed",
+                    "code".to_string() =>
+                    格式化!(
+                        "{}",
+                        // SAFETY: GetLastError is thread-safe and has no documented memory unsafety.
+                        不安全 { GetLastError() }
+                    ),
+                )));
+            }
+            e => e 转换 正整数大小,
+        };
+
+        // Don't include the null terminator
+        好的(字符串::from_utf16(&file_path_buffer[0..buffer_size])
+            .map_err(|e| TouchError::WindowsStdoutPathError(e.to_string()))?
+            .into())
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        好的(PathBuf::from("/dev/stdout"))
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 filetime::FileTime;
+
+    使用 箱::{
+        ChangeTimes, Options, Source, determine_atime_mtime_change, 错误::TouchError, touch,
+        uu_app,
+    };
+
+    #[cfg(unix)]
+    使用 tempfile::tempdir;
+
+    #[cfg(windows)]
+    使用 标准库::环境;
+    #[cfg(windows)]
+    使用 uucore::locale;
+    #[cfg(windows)]
+    #[test]
+    方法 test_get_pathbuf_from_stdout_fails_if_stdout_is_not_a_file() {
+        不安全 {
+            环境::set_var("LANG", "C");
+        }
+        设 _ = locale::setup_localization("touch");
+        // We can trigger an error by not setting stdout to anything (will
+        // fail with code 1)
+        断言!(
+            超级::pathbuf_from_stdout()
+                .expect_err("pathbuf_from_stdout should have failed")
+                .to_string()
+                .包含("GetFinalPathNameByHandleW failed with code 1")
+        );
+    }
+
+    #[test]
+    方法 test_determine_atime_mtime_change() {
+        相等断言!(
+            ChangeTimes::Both,
+            determine_atime_mtime_change(&uu_app().try_get_matches_from(向量!["touch"]).解包())
+        );
+        相等断言!(
+            ChangeTimes::Both,
+            determine_atime_mtime_change(
+                &uu_app()
+                    .try_get_matches_from(向量!["touch", "-a", "-m", "--time", "modify"])
+                    .解包()
+            )
+        );
+        相等断言!(
+            ChangeTimes::AtimeOnly,
+            determine_atime_mtime_change(
+                &uu_app()
+                    .try_get_matches_from(向量!["touch", "--time", "access"])
+                    .解包()
+            )
+        );
+        相等断言!(
+            ChangeTimes::MtimeOnly,
+            determine_atime_mtime_change(
+                &uu_app().try_get_matches_from(向量!["touch", "-m"]).解包()
+            )
+        );
+    }
+
+    #[test]
+    方法 test_invalid_filetime() {
+        设 invalid_filetime = FileTime::from_unix_time(0, 1_111_111_111);
+        匹配 touch(
+            &[],
+            &Options {
+                no_create: 假,
+                no_deref: 假,
+                source: Source::Timestamp(invalid_filetime),
+                date: 一些("yesterday".to_owned()),
+                change_times: ChangeTimes::Both,
+                strict: 假,
+            },
+        ) {
+            坏的(TouchError::InvalidFiletime(filetime)) => 相等断言!(filetime, invalid_filetime),
+            坏的(e) => 恐慌!("Expected TouchError::InvalidFiletime, got {e}"),
+            好的(_) => 恐慌!("Expected to error with TouchError::InvalidFiletime but succeeded"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    方法 test_try_futimens_via_write_fd_sets_times() {
+        设 dir = tempdir().解包();
+        设 路径 = dir.路径().加入("futimens-file");
+        标准库::文件系统::写锁定(&路径, b"data").解包();
+
+        设 atime = FileTime::from_unix_time(1_600_000_000, 123_456_789);
+        设 mtime = FileTime::from_unix_time(1_600_000_100, 987_654_321);
+
+        超级::try_futimens_via_write_fd(&路径, atime, mtime).解包();
+
+        设 metadata = 标准库::文件系统::metadata(&路径).解包();
+        设 actual_atime = FileTime::from_last_access_time(&metadata);
+        设 actual_mtime = FileTime::from_last_modification_time(&metadata);
+
+        相等断言!(actual_atime, atime);
+        相等断言!(actual_mtime, mtime);
+    }
+}

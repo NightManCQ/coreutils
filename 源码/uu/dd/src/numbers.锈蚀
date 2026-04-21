@@ -1,0 +1,132 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Functions for formatting a number as a magnitude and a unit suffix.
+
+使用 uucore::parser::parse_size::{IEC_BASES, SI_BASES};
+
+常量 IEC_SUFFIXES: [&字符串切片; 9] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
+常量 SI_SUFFIXES: [&字符串切片; 9] = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
+
+/// A `SuffixType` determines whether the suffixes are 1000 or 1024 based.
+#[derive(克隆协议, 复制协议)]
+公有(箱) 枚举 SuffixType {
+    Iec,
+    Si,
+}
+
+实现 SuffixType {
+    方法 base_and_suffix(自身, n: 正128) -> (正128, &'静态 字符串切片) {
+        设 (bases, suffixes) = 匹配 自身 {
+            自身类型::Iec => (IEC_BASES, IEC_SUFFIXES),
+            自身类型::Si => (SI_BASES, SI_SUFFIXES),
+        };
+        设 可变 i = 0;
+        当 bases[i + 1] - bases[i] < n && i < suffixes.长度() {
+            i += 1;
+        }
+        (bases[i], suffixes[i])
+    }
+}
+
+/// Convert a number into a magnitude and a multi-byte unit suffix.
+///
+/// The returned string has a maximum length of 5 chars, for example: "1.1kB", "999kB", "1MB".
+公有(箱) 方法 to_magnitude_and_suffix(n: 正128, suffix_type: SuffixType) -> 字符串 {
+    设 (base, suffix) = suffix_type.base_and_suffix(n);
+    // TODO To match dd on my machine, we would need to round like
+    // this:
+    //
+    // 1049 => 1.0 kB
+    // 1050 => 1.0 kB  # why is this different?
+    // 1051 => 1.1 kB
+    // ...
+    // 1149 => 1.1 kB
+    // 1150 => 1.2 kB
+    // ...
+    // 1250 => 1.2 kB
+    // 1251 => 1.3 kB
+    // ..
+    // 10500 => 10 kB
+    // 10501 => 11 kB
+    //
+    设 quotient = (n 转换 点64) / (base 转换 点64);
+    如果 quotient < 10.0 {
+        格式化!("{quotient:.1} {suffix}")
+    } 否则 {
+        格式化!("{} {suffix}", quotient.round())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 箱::numbers::{SuffixType, to_magnitude_and_suffix};
+
+    #[test]
+    方法 test_to_magnitude_and_suffix_powers_of_1024() {
+        相等断言!(to_magnitude_and_suffix(1024, SuffixType::Iec), "1.0 KiB");
+        相等断言!(to_magnitude_and_suffix(2048, SuffixType::Iec), "2.0 KiB");
+        相等断言!(to_magnitude_and_suffix(4096, SuffixType::Iec), "4.0 KiB");
+        相等断言!(
+            to_magnitude_and_suffix(1024 * 1024, SuffixType::Iec),
+            "1.0 MiB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(2 * 1024 * 1024, SuffixType::Iec),
+            "2.0 MiB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1024 * 1024 * 1024, SuffixType::Iec),
+            "1.0 GiB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(34 * 1024 * 1024 * 1024, SuffixType::Iec),
+            "34 GiB"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_to_magnitude_and_suffix_not_powers_of_1024() {
+        相等断言!(to_magnitude_and_suffix(1, SuffixType::Si), "1.0 B");
+        相等断言!(to_magnitude_and_suffix(999, SuffixType::Si), "999 B");
+
+        相等断言!(to_magnitude_and_suffix(1000, SuffixType::Si), "1.0 kB");
+        相等断言!(to_magnitude_and_suffix(1001, SuffixType::Si), "1.0 kB");
+        相等断言!(to_magnitude_and_suffix(1023, SuffixType::Si), "1.0 kB");
+        相等断言!(to_magnitude_and_suffix(1025, SuffixType::Si), "1.0 kB");
+        相等断言!(to_magnitude_and_suffix(10_001, SuffixType::Si), "10 kB");
+        相等断言!(to_magnitude_and_suffix(999_000, SuffixType::Si), "999 kB");
+
+        相等断言!(to_magnitude_and_suffix(999_001, SuffixType::Si), "1.0 MB");
+        相等断言!(to_magnitude_and_suffix(999_999, SuffixType::Si), "1.0 MB");
+        相等断言!(to_magnitude_and_suffix(1_000_000, SuffixType::Si), "1.0 MB");
+        相等断言!(to_magnitude_and_suffix(1_000_001, SuffixType::Si), "1.0 MB");
+        相等断言!(to_magnitude_and_suffix(1_100_000, SuffixType::Si), "1.1 MB");
+        相等断言!(to_magnitude_and_suffix(1_100_001, SuffixType::Si), "1.1 MB");
+        相等断言!(to_magnitude_and_suffix(1_900_000, SuffixType::Si), "1.9 MB");
+        相等断言!(to_magnitude_and_suffix(1_900_001, SuffixType::Si), "1.9 MB");
+        相等断言!(to_magnitude_and_suffix(9_900_000, SuffixType::Si), "9.9 MB");
+        相等断言!(to_magnitude_and_suffix(9_900_001, SuffixType::Si), "9.9 MB");
+        相等断言!(
+            to_magnitude_and_suffix(999_000_000, SuffixType::Si),
+            "999 MB"
+        );
+
+        相等断言!(
+            to_magnitude_and_suffix(999_000_001, SuffixType::Si),
+            "1.0 GB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_000_000, SuffixType::Si),
+            "1.0 GB"
+        );
+        相等断言!(
+            to_magnitude_and_suffix(1_000_000_001, SuffixType::Si),
+            "1.0 GB"
+        );
+    }
+}

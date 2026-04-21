@@ -1,0 +1,54 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::OsString;
+使用 标准库::操作系统::windows::ffi::OsStringExt;
+使用 标准库::路径::PathBuf;
+使用 uucore::文件系统::FileInformation;
+使用 winapi_util::AsHandleRef;
+使用 windows_sys::Win32::Storage::FileSystem::{
+    FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_NT,
+};
+
+/// An unsafe overwrite occurs when the same file is used as both stdin and stdout
+/// and the stdout file is not empty.
+公有 方法 is_unsafe_overwrite<I: AsHandleRef, O: AsHandleRef>(input: &I, output: &O) -> 布尔 {
+    如果 !is_same_file_by_path(input, output) {
+        返回 假;
+    }
+
+    // Check if the output file is empty
+    FileInformation::from_file(output).is_ok_and(|info| info.file_size() > 0)
+}
+
+/// Get the file path for a file handle
+方法 get_file_path_from_handle<F: AsHandleRef>(file: &F) -> 选项<PathBuf> {
+    设 handle = file.as_raw();
+    设 可变 path_buf = 向量![0正16; 4096];
+
+    // SAFETY: We should check how many bytes was written to `path_buf`
+    // and only read that many bytes from it.
+    设 长度 = 不安全 {
+        GetFinalPathNameByHandleW(
+            handle,
+            path_buf.as_mut_ptr(),
+            path_buf.长度() 转换 正32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_NT,
+        )
+    };
+    如果 长度 == 0 {
+        返回 无;
+    }
+    设 路径 = OsString::from_wide(&path_buf[..长度 转换 正整数大小]);
+    一些(PathBuf::from(路径))
+}
+
+/// Compare two file handles if they correspond to the same file
+方法 is_same_file_by_path<A: AsHandleRef, B: AsHandleRef>(a: &A, b: &B) -> 布尔 {
+    匹配 (get_file_path_from_handle(a), get_file_path_from_handle(b)) {
+        (一些(path1), 一些(path2)) => path1 == path2,
+        _ => 假,
+    }
+}

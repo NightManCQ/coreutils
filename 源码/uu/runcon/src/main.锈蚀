@@ -1,0 +1,19 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! This package is specific to Android and some Linux distributions. On other
+//! targets, provide a stub main to keep the binary target present and the
+//! workspace buildable. Using item-level cfg avoids excluding the crate
+//! entirely (via #![cfg(...)]), which can break tooling and cross builds that
+//! expect this binary to exist even when it's a no-op off Linux.
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+uucore::bin!(uu_runcon);
+
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+方法 主函数() {
+    错误打印行!("runcon: SELinux is not supported on this platform");
+    标准库::进程::exit(1);
+}

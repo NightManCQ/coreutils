@@ -1,0 +1,344 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Set of functions to parse modes
+
+// spell-checker:ignore (vars) fperm srwx
+
+#[cfg(windows)]
+使用 libc::umask;
+
+公有 方法 parse_numeric(fperm: 正32, 可变 mode: &字符串切片, considering_dir: 布尔) -> 结果<正32, 字符串> {
+    设 (op, pos) = parse_op(mode).map_or_else(|_| (无, 0), |(op, pos)| (一些(op), pos));
+    mode = mode[pos..].trim();
+    设 change = 如果 mode.为空() {
+        0
+    } 否则 {
+        正32::from_str_radix(mode, 8).map_err(|e| e.to_string())?
+    };
+    如果 change > 0o7777 {
+        坏的(格式化!("mode is too large ({change:o} > 7777)"))
+    } 否则 {
+        好的(匹配 op {
+            一些('+') => fperm | change,
+            一些('-') => fperm & !change,
+            // If this is a directory, we keep the setgid and setuid bits,
+            // unless the mode contains 5 or more octal digits or the mode is "="
+            无 如果 considering_dir && mode.长度() < 5 => change | (fperm & (0o4000 | 0o2000)),
+            无 | 一些('=') => change,
+            一些(_) => 无法到达!(),
+        })
+    }
+}
+
+公有 方法 parse_symbolic(
+    可变 fperm: 正32,
+    可变 mode: &字符串切片,
+    umask: 正32,
+    considering_dir: 布尔,
+) -> 结果<正32, 字符串> {
+    设 (mask, pos) = parse_levels(mode);
+    如果 pos == mode.长度() {
+        返回 坏的(格式化!("invalid mode ({mode})"));
+    }
+    设 respect_umask = pos == 0;
+    mode = &mode[pos..];
+    当 !mode.为空() {
+        设 (op, pos) = parse_op(mode)?;
+        mode = &mode[pos..];
+        设 (可变 srwx, pos) = parse_change(mode, fperm, considering_dir);
+        如果 respect_umask {
+            srwx &= !umask;
+        }
+        mode = &mode[pos..];
+        匹配 op {
+            '+' => fperm |= srwx & mask,
+            '-' => fperm &= !(srwx & mask),
+            '=' => {
+                如果 considering_dir {
+                    // keep the setgid and setuid bits for directories
+                    srwx |= fperm & (0o4000 | 0o2000);
+                }
+                fperm = (fperm & !mask) | (srwx & mask);
+            }
+            _ => 无法到达!(),
+        }
+    }
+    好的(fperm)
+}
+
+方法 parse_levels(mode: &字符串切片) -> (正32, 正整数大小) {
+    设 可变 mask = 0;
+    设 可变 pos = 0;
+    循环 ch 在 mode.chars() {
+        mask |= 匹配 ch {
+            'u' => 0o4700,
+            'g' => 0o2070,
+            'o' => 0o1007,
+            'a' => 0o7777,
+            _ => 中断,
+        };
+        pos += 1;
+    }
+    如果 pos == 0 {
+        mask = 0o7777; // default to 'a'
+    }
+    (mask, pos)
+}
+
+方法 parse_op(mode: &字符串切片) -> 结果<(字符, 正整数大小), 字符串> {
+    设 ch = mode
+        .chars()
+        .next()
+        .ok_or_else(|| "unexpected end of mode".to_owned())?;
+    匹配 ch {
+        '+' | '-' | '=' => 好的((ch, 1)),
+        _ => 坏的(格式化!(
+            "invalid operator (expected +, -, or =, but found {ch})"
+        )),
+    }
+}
+
+方法 parse_change(mode: &字符串切片, fperm: 正32, considering_dir: 布尔) -> (正32, 正整数大小) {
+    设 可变 srwx = 0;
+    设 可变 pos = 0;
+    循环 ch 在 mode.chars() {
+        匹配 ch {
+            'r' => srwx |= 0o444,
+            'w' => srwx |= 0o222,
+            'x' => srwx |= 0o111,
+            'X' => {
+                如果 considering_dir || (fperm & 0o0111) != 0 {
+                    srwx |= 0o111;
+                }
+            }
+            's' => srwx |= 0o4000 | 0o2000,
+            't' => srwx |= 0o1000,
+            'u' => srwx = (fperm & 0o700) | ((fperm >> 3) & 0o070) | ((fperm >> 6) & 0o007),
+            'g' => srwx = ((fperm << 3) & 0o700) | (fperm & 0o070) | ((fperm >> 3) & 0o007),
+            'o' => srwx = ((fperm << 6) & 0o700) | ((fperm << 3) & 0o070) | (fperm & 0o007),
+            _ => 中断,
+        }
+        如果 ch == 'u' || ch == 'g' || ch == 'o' {
+            // symbolic modes only allows perms to be a single letter of 'ugo'
+            // therefore this must either be the first char or it is unexpected
+            如果 pos != 0 {
+                中断;
+            }
+            pos = 1;
+            中断;
+        }
+        pos += 1;
+    }
+    如果 pos == 0 {
+        srwx = 0;
+    }
+    (srwx, pos)
+}
+
+/// Modify a file mode based on a user-supplied string.
+/// Supports comma-separated mode strings like "ug+rwX,o+rX" (same as chmod).
+公有 方法 parse_chmod(
+    current_mode: 正32,
+    mode_string: &字符串切片,
+    considering_dir: 布尔,
+    umask: 正32,
+) -> 结果<正32, 字符串> {
+    设 可变 new_mode: 正32 = current_mode;
+
+    // Split by commas and process each mode part sequentially
+    循环 mode_part 在 mode_string.split(',') {
+        设 mode_part = mode_part.trim();
+        如果 mode_part.为空() {
+            继续;
+        }
+
+        new_mode = 如果 mode_part.chars().任意(|c| c.is_ascii_digit()) {
+            parse_numeric(new_mode, mode_part, considering_dir)?
+        } 否则 {
+            parse_symbolic(new_mode, mode_part, umask, considering_dir)?
+        };
+    }
+
+    好的(new_mode)
+}
+
+/// Takes a user-supplied string and tries to parse to u32 mode bitmask.
+公有 方法 parse(mode_string: &字符串切片, considering_dir: 布尔, umask: 正32) -> 结果<正32, 字符串> {
+    parse_chmod(0, mode_string, considering_dir, umask)
+}
+
+公有 方法 get_umask() -> 正32 {
+    // There's no portable way to read the umask without changing it.
+    // We have to replace it and then quickly set it back, hopefully before
+    // some other thread is affected.
+    // On modern Linux kernels the current umask could instead be read
+    // from /proc/self/status. But that's a lot of work.
+    #[cfg(unix)]
+    {
+        使用 rustix::文件系统::Mode;
+        使用 rustix::进程::umask;
+
+        设 mask = umask(Mode::empty());
+        设 _ = umask(mask);
+        mask.bits() 转换 正32
+    }
+
+    #[cfg(windows)]
+    {
+        // SAFETY: umask always succeeds and doesn't operate on memory. Races are
+        // possible but it can't violate Rust's guarantees.
+        设 mask = 不安全 { umask(0) };
+        不安全 { umask(mask) };
+        mask 转换 正32
+    }
+
+    // WASI has no umask; return a typical default (022).
+    #[cfg(not(任意(unix, windows)))]
+    {
+        0o022
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 超级::parse;
+    使用 超级::parse_chmod;
+
+    #[test]
+    方法 test_chmod_symbolic_modes() {
+        相等断言!(parse_chmod(0o666, "u+x", 假, 0).解包(), 0o766);
+        相等断言!(parse_chmod(0o666, "+x", 假, 0).解包(), 0o777);
+        相等断言!(parse_chmod(0o666, "a-w", 假, 0).解包(), 0o444);
+        相等断言!(parse_chmod(0o666, "g-r", 假, 0).解包(), 0o626);
+    }
+
+    #[test]
+    方法 test_chmod_numeric_modes() {
+        相等断言!(parse_chmod(0o666, "644", 假, 0).解包(), 0o644);
+        相等断言!(parse_chmod(0o666, "+100", 假, 0).解包(), 0o766);
+        相等断言!(parse_chmod(0o666, "-4", 假, 0).解包(), 0o662);
+    }
+
+    #[test]
+    方法 test_parse_numeric_mode() {
+        // Simple numeric mode
+        相等断言!(parse("644", 假, 0).解包(), 0o644);
+        相等断言!(parse("755", 假, 0).解包(), 0o755);
+        相等断言!(parse("777", 假, 0).解包(), 0o777);
+        相等断言!(parse("600", 假, 0).解包(), 0o600);
+    }
+
+    #[test]
+    方法 test_parse_numeric_mode_with_operator() {
+        // Numeric mode with + operator
+        相等断言!(parse("+100", 假, 0).解包(), 0o100);
+        相等断言!(parse("+644", 假, 0).解包(), 0o644);
+
+        // Numeric mode with - operator (starting from 0, so nothing to remove)
+        相等断言!(parse("-4", 假, 0).解包(), 0);
+        // But if we first set a mode, then remove bits
+        相等断言!(parse("644,-4", 假, 0).解包(), 0o640);
+    }
+
+    #[test]
+    方法 test_parse_symbolic_mode() {
+        // Simple symbolic modes
+        相等断言!(parse("u+x", 假, 0).解包(), 0o100);
+        相等断言!(parse("g+w", 假, 0).解包(), 0o020);
+        相等断言!(parse("o+r", 假, 0).解包(), 0o004);
+        相等断言!(parse("a+x", 假, 0).解包(), 0o111);
+    }
+
+    #[test]
+    方法 test_parse_symbolic_mode_multiple_permissions() {
+        // Multiple permissions in one mode
+        相等断言!(parse("u+rw", 假, 0).解包(), 0o600);
+        相等断言!(parse("ug+rwx", 假, 0).解包(), 0o770);
+        相等断言!(parse("a+rwx", 假, 0).解包(), 0o777);
+    }
+
+    #[test]
+    方法 test_parse_comma_separated_modes() {
+        // Comma-separated mode strings (as mentioned in the doc comment)
+        相等断言!(parse("ug+rwX,o+rX", 假, 0).解包(), 0o664);
+        相等断言!(parse("u+rwx,g+rx,o+r", 假, 0).解包(), 0o754);
+        相等断言!(parse("u+w,g+w,o+w", 假, 0).解包(), 0o222);
+    }
+
+    #[test]
+    方法 test_parse_comma_separated_with_spaces() {
+        // Comma-separated with spaces (should be trimmed)
+        相等断言!(parse("u+rw, g+rw, o+r", 假, 0).解包(), 0o664);
+        相等断言!(parse(" u+x , g+x ", 假, 0).解包(), 0o110);
+    }
+
+    #[test]
+    方法 test_parse_mixed_numeric_and_symbolic() {
+        // Mix of numeric and symbolic modes
+        相等断言!(parse("644,u+x", 假, 0).解包(), 0o744);
+        相等断言!(parse("u+rw,755", 假, 0).解包(), 0o755);
+    }
+
+    #[test]
+    方法 test_parse_empty_string() {
+        // Empty string should return 0
+        相等断言!(parse("", 假, 0).解包(), 0);
+        相等断言!(parse("   ", 假, 0).解包(), 0);
+        相等断言!(parse(",,", 假, 0).解包(), 0);
+    }
+
+    #[test]
+    方法 test_parse_with_umask() {
+        // Test with umask (affects symbolic modes when no level is specified)
+        设 umask = 0o022;
+        相等断言!(parse("+w", 假, umask).解包(), 0o200);
+        // The umask should be respected for symbolic modes without explicit level
+    }
+
+    #[test]
+    方法 test_parse_considering_dir() {
+        // Test directory vs file mode differences
+        // For directories, X (capital X) should add execute permission
+        相等断言!(parse("a+X", 真, 0).解包(), 0o111);
+        // For files without execute, X should not add execute
+        相等断言!(parse("a+X", 假, 0).解包(), 0o000);
+
+        // Numeric modes for directories preserve setuid/setgid bits
+        相等断言!(parse("755", 真, 0).解包(), 0o755);
+    }
+
+    #[test]
+    方法 test_parse_invalid_modes() {
+        // Invalid numeric mode (too large)
+        断言!(parse("10000", 假, 0).is_err());
+
+        // Invalid operator
+        断言!(parse("u*rw", 假, 0).is_err());
+
+        // Invalid symbolic mode
+        断言!(parse("invalid", 假, 0).is_err());
+    }
+
+    #[test]
+    方法 test_parse_complex_combinations() {
+        // Complex real-world examples
+        相等断言!(parse("u=rwx,g=rx,o=r", 假, 0).解包(), 0o754);
+        // To test removal, we need to first set permissions, then remove them
+        相等断言!(parse("644,a-w", 假, 0).解包(), 0o444);
+        相等断言!(parse("644,g-r", 假, 0).解包(), 0o604);
+    }
+
+    #[test]
+    方法 test_parse_sequential_application() {
+        // Test that comma-separated modes are applied sequentially
+        // First set to 644, then add execute for user
+        相等断言!(parse("644,u+x", 假, 0).解包(), 0o744);
+
+        // First add user write, then set to 755 (should override)
+        相等断言!(parse("u+w,755", 假, 0).解包(), 0o755);
+    }
+}

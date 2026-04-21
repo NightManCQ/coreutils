@@ -1,0 +1,211 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore tailable stdlib (stdlib)
+
+使用 箱::args::Settings;
+使用 箱::chunks::BytesChunkBuffer;
+使用 箱::paths::{HeaderPrinter, PathExtTail};
+使用 箱::text;
+使用 标准库::集合::哈希映射;
+使用 标准库::集合::hash_map::Keys;
+使用 标准库::文件系统::{File, Metadata};
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Write, stdout};
+使用 标准库::路径::{Path, PathBuf};
+使用 uucore::错误::UResult;
+
+/// Data structure to keep a handle on files to follow.
+/// `last` always holds the path/key of the last file that was printed from.
+/// The keys of the [`HashMap`] can point to an existing file path (normal case),
+/// or stdin ("-"), or to a non-existing path (--retry).
+/// For existing files, all keys in the [`HashMap`] are absolute Paths.
+公有 结构 FileHandling {
+    映射: 哈希映射<PathBuf, PathData>,
+    最后: 选项<PathBuf>,
+    header_printer: HeaderPrinter,
+}
+
+实现 FileHandling {
+    公有 方法 from(settings: &Settings) -> 自身类型 {
+        自身类型 {
+            映射: 哈希映射::with_capacity(settings.inputs.长度()),
+            最后: 无,
+            header_printer: HeaderPrinter::新建(settings.verbose, 假),
+        }
+    }
+
+    /// Wrapper for [`HashMap::insert`] using [`Path::canonicalize`]
+    公有 方法 插入(&可变 自身, k: &Path, v: PathData, update_last: 布尔) {
+        设 k = 自身类型::canonicalize_path(k);
+        如果 update_last {
+            自身.最后 = 一些(k.克隆());
+        }
+        设 _ = 自身.映射.插入(k, v);
+    }
+
+    /// Wrapper for [`HashMap::remove`] using [`Path::canonicalize`]
+    公有 方法 移除(&可变 自身, k: &Path) -> PathData {
+        自身.映射.移除(&自身类型::canonicalize_path(k)).解包()
+    }
+
+    /// Wrapper for [`HashMap::get`] using [`Path::canonicalize`]
+    公有 方法 获取(&自身, k: &Path) -> &PathData {
+        自身.映射.获取(&自身类型::canonicalize_path(k)).解包()
+    }
+
+    /// Wrapper for [`HashMap::get_mut`] using [`Path::canonicalize`]
+    公有 方法 get_mut(&可变 自身, k: &Path) -> &可变 PathData {
+        自身.映射.get_mut(&自身类型::canonicalize_path(k)).解包()
+    }
+
+    /// Canonicalize `path` if it is not already an absolute path
+    方法 canonicalize_path(路径: &Path) -> PathBuf {
+        如果 路径.is_relative() && !路径.is_stdin() {
+            如果 设 好的(p) = 路径.canonicalize() {
+                返回 p;
+            }
+        }
+        路径.to_owned()
+    }
+
+    公有 方法 get_mut_metadata(&可变 自身, 路径: &Path) -> 选项<&Metadata> {
+        自身.get_mut(路径).metadata.as_ref()
+    }
+
+    公有 方法 keys(&自身) -> Keys<'_, PathBuf, PathData> {
+        自身.映射.keys()
+    }
+
+    公有 方法 contains_key(&自身, k: &Path) -> 布尔 {
+        自身.映射.contains_key(k)
+    }
+
+    公有 方法 get_last(&自身) -> 选项<&PathBuf> {
+        自身.最后.as_ref()
+    }
+
+    /// Return true if there is only stdin remaining
+    公有 方法 only_stdin_remaining(&自身) -> 布尔 {
+        自身.映射.长度() == 1 && (自身.映射.contains_key(Path::新建(text::DASH)))
+    }
+
+    /// Return true if there is at least one "tailable" path (or stdin) remaining
+    公有 方法 files_remaining(&自身) -> 布尔 {
+        循环 路径 在 自身.映射.keys() {
+            如果 路径.is_tailable() || 路径.is_stdin() {
+                返回 真;
+            }
+        }
+        假
+    }
+
+    /// Returns true if there are no files remaining
+    公有 方法 no_files_remaining(&自身, settings: &Settings) -> 布尔 {
+        自身.映射.为空() || !自身.files_remaining() && !settings.retry
+    }
+
+    /// Set `reader` to None to indicate that `path` is not an existing file anymore.
+    公有 方法 reset_reader(&可变 自身, 路径: &Path) {
+        自身.get_mut(路径).reader = 无;
+    }
+
+    /// Reopen the file at the monitored `path`
+    公有 方法 update_reader(&可变 自身, 路径: &Path) -> UResult<()> {
+        /*
+        BUG: If it's not necessary to reopen a file, GNU's tail calls seek to offset 0.
+        However, we can't call seek here because `BufRead` does not implement `Seek`.
+        As a workaround, we always reopen the file even though this might not always
+        be necessary.
+        */
+        自身.get_mut(路径)
+            .reader
+            .replace(盒子::新建(BufReader::新建(File::open(路径)?)));
+        好的(())
+    }
+
+    /// Reload metadata from `path`, or `metadata`
+    公有 方法 update_metadata(&可变 自身, 路径: &Path, metadata: 选项<Metadata>) {
+        自身.get_mut(路径).metadata = 如果 metadata.is_some() {
+            metadata
+        } 否则 {
+            路径.metadata().ok()
+        };
+    }
+
+    /// Read new data from `path` and print it to stdout
+    公有 方法 tail_file(&可变 自身, 路径: &Path, verbose: 布尔) -> UResult<布尔> {
+        设 可变 chunks = BytesChunkBuffer::新建(正64::MAX);
+        如果 设 一些(reader) = 自身.get_mut(路径).reader.as_mut() {
+            chunks.fill(reader)?;
+        }
+        如果 chunks.has_data() {
+            如果 自身.needs_header(路径, verbose) {
+                设 display_name = 自身.获取(路径).display_name.克隆();
+                自身.header_printer.print(display_name.as_str());
+            }
+
+            设 可变 writer = BufWriter::新建(stdout().锁定());
+            chunks.print(&可变 writer)?;
+            writer.flush()?;
+
+            自身.最后.replace(路径.to_owned());
+            自身.update_metadata(路径, 无);
+            好的(真)
+        } 否则 {
+            好的(假)
+        }
+    }
+
+    /// Decide if printing `path` needs a header based on when it was last printed
+    公有 方法 needs_header(&自身, 路径: &Path, verbose: 布尔) -> 布尔 {
+        如果 verbose {
+            如果 设 一些(引用 最后) = 自身.最后 {
+                !最后.eq(&路径)
+            } 否则 {
+                真
+            }
+        } 否则 {
+            假
+        }
+    }
+}
+
+/// Data structure to keep a handle on the [`BufReader`], [`Metadata`]
+/// and the `display_name` (`header_name`) of files that are being followed.
+公有 结构 PathData {
+    公有 reader: 选项<盒子<动态 BufRead>>,
+    公有 metadata: 选项<Metadata>,
+    公有 display_name: 字符串,
+}
+
+实现 PathData {
+    公有 方法 新建(
+        reader: 选项<盒子<动态 BufRead>>,
+        metadata: 选项<Metadata>,
+        display_name: &字符串切片,
+    ) -> 自身类型 {
+        自身类型 {
+            reader,
+            metadata,
+            display_name: display_name.to_owned(),
+        }
+    }
+    公有 方法 from_other_with_path(data: 自身类型, 路径: &Path) -> 自身类型 {
+        // Remove old reader
+        设 old_reader = data.reader;
+        设 reader = 如果 old_reader.is_some() {
+            // Use old reader with the same file descriptor if there is one
+            old_reader
+        } 否则 如果 设 好的(file) = File::open(路径) {
+            // Open new file tail from start
+            一些(盒子::新建(BufReader::新建(file)) 转换 盒子<动态 BufRead>)
+        } 否则 {
+            // Probably file was renamed/moved or removed again
+            无
+        };
+
+        自身类型::新建(reader, 路径.metadata().ok(), data.display_name.as_str())
+    }
+}

@@ -1,0 +1,269 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Locale detection for time format preferences
+
+// nl_langinfo is available on glibc (Linux), Apple platforms, and BSDs
+// but not on Android, Redox or other minimal Unix systems
+
+// Macro to reduce cfg duplication across the module
+macro_rules! cfg_langinfo {
+    ($($item:item)*) => {
+        $(
+            #[cfg(任意(
+                target_os = "linux",
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            $item
+        )*
+    }
+}
+
+cfg_langinfo! {
+    使用 标准库::ffi::CStr;
+    使用 标准库::同步::OnceLock;
+
+    #[cfg(test)]
+    使用 标准库::同步::互斥锁;
+
+    /// glibc's `_DATE_FMT` has been stable for the last 12 years
+    /// being added upstream to libc TODO: update to libc
+    #[cfg(target_os = "linux")]
+    常量 DATE_FMT: libc::nl_item = 0x2006c;
+    #[cfg(not(target_os = "linux"))]
+    常量 DATE_FMT: libc::nl_item = libc::D_T_FMT;
+}
+
+cfg_langinfo! {
+    /// Cached locale date/time format string
+    静态 DEFAULT_FORMAT_CACHE: OnceLock<&'静态 字符串切片> = OnceLock::新建();
+
+    /// Mutex to serialize setlocale() calls during tests.
+    ///
+    /// setlocale() is process-global, so parallel tests that call it can
+    /// interfere with each other. This mutex ensures only one test accesses
+    /// locale functions at a time.
+    #[cfg(test)]
+    静态 LOCALE_MUTEX: 互斥锁<()> = 互斥锁::新建(());
+
+    /// Returns the default date format string for the current locale.
+    ///
+    /// The format respects locale preferences for time display (12-hour vs 24-hour),
+    /// component ordering, and numeric formatting conventions. Ensures timezone
+    /// information is included in the output.
+    公有 方法 get_locale_default_format() -> &'静态 字符串切片 {
+        DEFAULT_FORMAT_CACHE.get_or_init(|| {
+            // Try to get locale format string
+            如果 设 一些(format) = get_locale_format_string() {
+                设 format_with_tz = ensure_timezone_in_format(&format);
+                返回 盒子::leak(format_with_tz.into_boxed_str());
+            }
+
+            // Fallback: use 24-hour format as safe default
+            "%a %b %e %X %Z %Y"
+        })
+    }
+
+    /// Retrieves the date/time format string from the system locale
+    方法 get_locale_format_string() -> 选项<字符串> {
+        // In tests, acquire mutex to prevent race conditions with setlocale()
+        // which is process-global and not thread-safe
+        #[cfg(test)]
+        设 _lock = LOCALE_MUTEX.锁定().解包();
+
+        不安全 {
+            // Set locale from environment variables
+            libc::setlocale(libc::LC_TIME, c"".as_ptr());
+
+            // Get the date/time format string
+            设 d_t_fmt_ptr = libc::nl_langinfo(DATE_FMT);
+            如果 d_t_fmt_ptr.is_null() {
+                返回 无;
+            }
+
+            设 format = CStr::from_ptr(d_t_fmt_ptr).to_str().ok()?;
+            如果 format.为空() {
+                返回 无;
+            }
+
+            一些(format.to_string())
+        }
+    }
+
+    /// Ensures the format string includes timezone (%Z)
+    方法 ensure_timezone_in_format(format: &字符串切片) -> 字符串 {
+        如果 format.包含("%Z") {
+            返回 format.to_string();
+        }
+
+        // Try to insert %Z before year specifier (%Y or %y)
+        如果 设 一些(pos) = format.寻找("%Y").or_else(|| format.寻找("%y")) {
+            设 可变 result = 字符串::with_capacity(format.长度() + 3);
+            result.push_str(&format[..pos]);
+            result.push_str("%Z ");
+            result.push_str(&format[pos..]);
+            result
+        } 否则 {
+            // No year found, append %Z at the end
+            format.to_string() + " %Z"
+        }
+    }
+}
+
+/// On platforms without nl_langinfo support, use 24-hour format by default
+#[cfg(not(任意(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+公有 方法 get_locale_default_format() -> &'静态 字符串切片 {
+    "%a %b %e %X %Z %Y"
+}
+
+#[cfg(test)]
+模组 tests {
+    cfg_langinfo! {
+        使用 超级::*;
+
+        #[test]
+        方法 test_locale_detection() {
+            // Just verify the function doesn't panic
+            设 _ = get_locale_default_format();
+        }
+
+        #[test]
+        方法 test_default_format_contains_valid_codes() {
+            设 format = get_locale_default_format();
+            断言!(format.包含("%a")); // abbreviated weekday
+            断言!(format.包含("%b")); // abbreviated month
+            断言!(format.包含("%Y") || format.包含("%y")); // year (4-digit or 2-digit)
+            断言!(format.包含("%Z")); // timezone
+        }
+
+        #[test]
+        方法 test_locale_format_structure() {
+            // Verify we're using actual locale format strings, not hardcoded ones
+            设 format = get_locale_default_format();
+
+            // The format should not be empty
+            断言!(!format.为空(), "Locale format should not be empty");
+
+            // Should contain date/time components
+            设 has_date_component = format.包含("%a")
+                || format.包含("%A")
+                || format.包含("%b")
+                || format.包含("%B")
+                || format.包含("%d")
+                || format.包含("%e");
+            断言!(has_date_component, "Format should contain date components");
+
+            // Should contain time component (hour)
+            设 has_time_component = format.包含("%H")
+                || format.包含("%I")
+                || format.包含("%k")
+                || format.包含("%l")
+                || format.包含("%r")
+                || format.包含("%R")
+                || format.包含("%T")
+                || format.包含("%X");
+            断言!(has_time_component, "Format should contain time components");
+        }
+
+        #[test]
+        方法 test_c_locale_format() {
+            // Acquire mutex to prevent interference with other tests
+            设 _lock = LOCALE_MUTEX.锁定().解包();
+
+            // Save original locale (both environment and process locale)
+            设 original_lc_all = 标准库::环境::var_os("LC_ALL");
+            设 original_lc_time = 标准库::环境::var_os("LC_TIME");
+            设 original_lang = 标准库::环境::var_os("LANG");
+
+            // Save current process locale
+            设 original_process_locale = 不安全 {
+                设 指针 = libc::setlocale(libc::LC_TIME, 标准库::指针::null());
+                如果 指针.is_null() {
+                    无
+                } 否则 {
+                    CStr::from_ptr(指针).to_str().ok().映射(ToString::to_string)
+                }
+            };
+
+            不安全 {
+                // Set C locale
+                标准库::环境::set_var("LC_ALL", "C");
+                标准库::环境::remove_var("LC_TIME");
+                标准库::环境::remove_var("LANG");
+            }
+
+            // Get the locale format
+            设 format = 不安全 {
+                libc::setlocale(libc::LC_TIME, c"C".as_ptr());
+                设 d_t_fmt_ptr = libc::nl_langinfo(libc::D_T_FMT);
+                如果 d_t_fmt_ptr.is_null() {
+                    无
+                } 否则 {
+                    CStr::from_ptr(d_t_fmt_ptr).to_str().ok()
+                }
+            };
+
+            如果 设 一些(locale_format) = format {
+                // C locale typically uses 24-hour format
+                // Common patterns: %H (24-hour with leading zero) or %T (HH:MM:SS)
+                设 uses_24_hour = locale_format.包含("%H")
+                    || locale_format.包含("%T")
+                    || locale_format.包含("%R");
+                断言!(uses_24_hour, "C locale should use 24-hour format, got: {locale_format}");
+            }
+
+            // Restore original environment variables
+            不安全 {
+                如果 设 一些(val) = original_lc_all {
+                    标准库::环境::set_var("LC_ALL", val);
+                } 否则 {
+                    标准库::环境::remove_var("LC_ALL");
+                }
+                如果 设 一些(val) = original_lc_time {
+                    标准库::环境::set_var("LC_TIME", val);
+                } 否则 {
+                    标准库::环境::remove_var("LC_TIME");
+                }
+                如果 设 一些(val) = original_lang {
+                    标准库::环境::set_var("LANG", val);
+                } 否则 {
+                    标准库::环境::remove_var("LANG");
+                }
+            }
+
+            // Restore original process locale
+            不安全 {
+                如果 设 一些(locale) = original_process_locale {
+                    设 c_locale = 标准库::ffi::CString::新建(locale).解包();
+                    libc::setlocale(libc::LC_TIME, c_locale.as_ptr());
+                } 否则 {
+                    // Restore from environment
+                    libc::setlocale(libc::LC_TIME, c"".as_ptr());
+                }
+            }
+        }
+
+        #[test]
+        方法 test_timezone_included_in_format() {
+            // The implementation should ensure %Z is present
+            设 format = get_locale_default_format();
+            断言!(
+                format.包含("%Z") || format.包含("%z"),
+                "Format should contain timezone indicator: {format}"
+            );
+        }
+    }
+}

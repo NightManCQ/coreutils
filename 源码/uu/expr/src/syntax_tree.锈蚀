@@ -1,0 +1,1365 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) ints paren prec multibytes aaaabc
+
+使用 标准库::{单元格::Cell, 集合::BTreeMap};
+
+使用 num_bigint::BigInt;
+使用 num_traits::ToPrimitive;
+使用 onig::{MatchParam, Regex, RegexOptions, SearchOptions, Syntax};
+
+使用 箱::{
+    ExprError, ExprResult,
+    locale_aware::{
+        locale_aware_index, locale_aware_length, locale_aware_substr, locale_comparison,
+    },
+};
+
+公有(箱) 类型 MaybeNonUtf8String = 向量<正8>;
+公有(箱) 类型 MaybeNonUtf8Str = [正8];
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 BinOp {
+    Relation(RelationOp),
+    Numeric(NumericOp),
+    字符串(StringOp),
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 RelationOp {
+    Lt,
+    Leq,
+    相等比较协议,
+    Neq,
+    Gt,
+    Geq,
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 NumericOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 StringOp {
+    Match,
+    Index,
+    And,
+    Or,
+}
+
+实现 BinOp {
+    方法 eval(自身, left: ExprResult<NumOrStr>, right: ExprResult<NumOrStr>) -> ExprResult<NumOrStr> {
+        匹配 自身 {
+            自身类型::Relation(op) => op.eval(left, right),
+            自身类型::Numeric(op) => op.eval(left, right),
+            自身类型::字符串(op) => op.eval(left, right),
+        }
+    }
+}
+
+实现 RelationOp {
+    方法 eval(自身, a: ExprResult<NumOrStr>, b: ExprResult<NumOrStr>) -> ExprResult<NumOrStr> {
+        // Make sure that the given comparison validates the relational operator.
+        设 check_cmp = |比较| {
+            使用 RelationOp::{相等比较协议, Geq, Gt, Leq, Lt, Neq};
+            使用 标准库::比较::排序顺序::{Equal, Greater, Less};
+            matches!(
+                (自身, 比较),
+                (Lt | Leq | Neq, Less) | (Leq | 相等比较协议 | Geq, Equal) | (Gt | Geq | Neq, Greater)
+            )
+        };
+
+        设 a = a?;
+        设 b = b?;
+        设 b = 如果 设 (一些(a), 一些(b)) = (&a.to_bigint(), &b.to_bigint()) {
+            check_cmp(a.比较(b))
+        } 否则 {
+            // These comparisons should be using locale settings
+
+            设 a = a.eval_as_string();
+            设 b = b.eval_as_string();
+
+            check_cmp(locale_comparison(&a, &b))
+        };
+        如果 b { 好的(1.into()) } 否则 { 好的(0.into()) }
+    }
+}
+
+实现 NumericOp {
+    方法 eval(自身, left: ExprResult<NumOrStr>, right: ExprResult<NumOrStr>) -> ExprResult<NumOrStr> {
+        设 a = left?.eval_as_bigint()?;
+        设 b = right?.eval_as_bigint()?;
+        好的(NumOrStr::Num(匹配 自身 {
+            自身类型::Add => a + b,
+            自身类型::Sub => a - b,
+            自身类型::Mul => a * b,
+            自身类型::Div => 匹配 a.checked_div(&b) {
+                一些(x) => x,
+                无 => 返回 坏的(ExprError::DivisionByZero),
+            },
+            自身类型::Mod => {
+                如果 a.checked_div(&b).is_none() {
+                    返回 坏的(ExprError::DivisionByZero);
+                }
+                a % b
+            }
+        }))
+    }
+}
+
+实现 StringOp {
+    方法 eval(自身, left: ExprResult<NumOrStr>, right: ExprResult<NumOrStr>) -> ExprResult<NumOrStr> {
+        匹配 自身 {
+            自身类型::Or => {
+                设 left = left?;
+                如果 is_truthy(&left) {
+                    返回 好的(left);
+                }
+                设 right = right?;
+                如果 is_truthy(&right) {
+                    返回 好的(right);
+                }
+                好的(0.into())
+            }
+            自身类型::And => {
+                设 left = left?;
+                如果 !is_truthy(&left) {
+                    返回 好的(0.into());
+                }
+                设 right = right?;
+                如果 !is_truthy(&right) {
+                    返回 好的(0.into());
+                }
+                好的(left)
+            }
+            自身类型::Match => {
+                设 left_bytes = left?.eval_as_string();
+                设 right_bytes = right?.eval_as_string();
+                evaluate_match_expression(left_bytes, right_bytes)
+            }
+            自身类型::Index => {
+                设 left = left?.eval_as_string();
+                设 right = right?.eval_as_string();
+
+                好的(locale_aware_index(&left, &right).into())
+            }
+        }
+    }
+}
+
+/// Check if regex pattern character iterator is at the end of a regex expression or subexpression
+方法 is_end_of_expression<I>(pattern_chars: &I) -> 布尔
+何处
+    I: 迭代器协议<Item = 字符> + 克隆协议,
+{
+    设 可变 pattern_chars_clone = pattern_chars.克隆();
+    匹配 pattern_chars_clone.next() {
+        一些('\\') => matches!(pattern_chars_clone.next(), 一些(')' | '|')),
+        无 => 真, // No characters left
+        _ => 假,
+    }
+}
+
+/// Check if regex pattern character iterator is at the start of a valid range quantifier.
+/// The iterator's start position is expected to be after the opening brace.
+/// Range quantifier ends to closing brace.
+///
+/// # Examples of valid range quantifiers
+///
+/// - `r"\{3\}"`
+/// - `r"\{3,\}"`
+/// - `r"\{,6\}"`
+/// - `r"\{3,6\}"`
+/// - `r"\{,\}"`
+方法 verify_range_quantifier<I>(pattern_chars: &I) -> 结果<(), ExprError>
+何处
+    I: 迭代器协议<Item = 字符> + 克隆协议,
+{
+    设 可变 pattern_chars_clone = pattern_chars.克隆().peekable();
+    如果 pattern_chars_clone.peek().is_none() {
+        返回 坏的(ExprError::UnmatchedOpeningBrace);
+    }
+
+    // Parse the string between braces
+    设 可变 quantifier = 字符串::新建();
+    设 可变 prev = '\0';
+    设 可变 curr_is_escaped = 假;
+    当 设 一些(curr) = pattern_chars_clone.next() {
+        curr_is_escaped = prev == '\\' && !curr_is_escaped;
+        如果 curr_is_escaped && curr == '}' {
+            中断;
+        }
+        如果 pattern_chars_clone.peek().is_none() {
+            返回 坏的(ExprError::UnmatchedOpeningBrace);
+        }
+        如果 prev != '\0' {
+            quantifier.压入(prev);
+        }
+        prev = curr;
+    }
+
+    // Check if parsed quantifier is valid
+    设 re = Regex::新建(r"^([0-9]*,[0-9]*|[0-9]+)$").期望("valid regular expression");
+    如果 设 一些(captures) = re.captures(&quantifier) {
+        设 matched = captures.at(0).unwrap_or_default();
+        匹配 matched.split_once(',') {
+            一些(("", "")) => 好的(()),
+            一些((x, "") | ("", x)) 如果 x.parse::<整16>().is_ok() => 好的(()),
+            一些((_, "") | ("", _)) => 坏的(ExprError::TooBigRangeQuantifierIndex),
+            一些((f, l)) => 匹配 (f.parse::<整16>(), l.parse::<整16>()) {
+                (好的(f), 好的(l)) 如果 f > l => 坏的(ExprError::InvalidBracketContent),
+                (好的(_), 好的(_)) => 好的(()),
+                _ => 坏的(ExprError::TooBigRangeQuantifierIndex),
+            },
+            无 如果 matched.parse::<整16>().is_ok() => 好的(()),
+            无 => 坏的(ExprError::TooBigRangeQuantifierIndex),
+        }
+    } 否则 {
+        坏的(ExprError::InvalidBracketContent)
+    }
+}
+
+/// Check for errors in a supplied regular expression
+///
+/// GNU coreutils shows messages for invalid regular expressions
+/// differently from the oniguruma library used by the regex crate.
+/// This method attempts to do these checks manually in one pass
+/// through the regular expression.
+///
+/// This method is not comprehensively checking all cases in which
+/// a regular expression could be invalid; any cases not caught will
+/// result in a [`ExprError::InvalidRegexExpression`] when passing the
+/// regular expression through the Oniguruma bindings. This method is
+/// intended to just identify a few situations for which GNU coreutils
+/// has specific error messages.
+方法 check_posix_regex_errors(pattern: &字符串切片) -> ExprResult<()> {
+    设 可变 escaped_parens: 正64 = 0;
+    设 可变 prev = '\0';
+    设 可变 curr_is_escaped = 假;
+
+    循环 curr 在 pattern.chars() {
+        curr_is_escaped = prev == '\\' && !curr_is_escaped;
+        匹配 (curr_is_escaped, curr) {
+            (真, '(') => escaped_parens += 1,
+            (真, ')') => {
+                escaped_parens = escaped_parens
+                    .checked_sub(1)
+                    .ok_or(ExprError::UnmatchedClosingParenthesis)?;
+            }
+            _ => {}
+        }
+        prev = curr;
+    }
+
+    匹配 escaped_parens {
+        0 => 好的(()),
+        _ => 坏的(ExprError::UnmatchedOpeningParenthesis),
+    }
+}
+
+/// Build a regex from a pattern string with locale-aware encoding
+方法 build_regex(pattern_bytes: 向量<正8>) -> ExprResult<(Regex, 字符串)> {
+    使用 onig::EncodedBytes;
+    使用 uucore::i18n::{UEncoding, get_locale_encoding};
+
+    设 encoding = get_locale_encoding();
+
+    // For pattern processing, we need to handle it based on locale
+    设 pattern_str = 字符串::from_utf8(pattern_bytes.克隆())
+        .unwrap_or_else(|_| 字符串::from_utf8_lossy(&pattern_bytes).into());
+    check_posix_regex_errors(&pattern_str)?;
+
+    // Transpile the input pattern from BRE syntax to `onig` crate's `Syntax::grep`
+    设 可变 re_string = 字符串::with_capacity(pattern_str.长度() + 1);
+    设 可变 pattern_chars = pattern_str.chars().peekable();
+    设 可变 prev = '\0';
+    设 可变 prev_is_escaped = 假;
+    设 可变 is_start_of_expression = 真;
+
+    // All patterns are anchored so they begin with a caret (^)
+    如果 pattern_chars.peek() != 一些(&'^') {
+        re_string.压入('^');
+    }
+
+    当 设 一些(curr) = pattern_chars.next() {
+        设 curr_is_escaped = prev == '\\' && !prev_is_escaped;
+        设 is_first_character = prev == '\0';
+
+        匹配 curr {
+            // Character class negation "[^a]"
+            // Explicitly escaped caret "\^"
+            '^' 如果 !is_start_of_expression && !matches!(prev, '[' | '\\') => {
+                re_string.push_str(r"\^");
+            }
+            '$' 如果 !curr_is_escaped && !is_end_of_expression(&pattern_chars) => {
+                re_string.push_str(r"\$");
+            }
+            '\\' 如果 !curr_is_escaped && pattern_chars.peek().is_none() => {
+                返回 坏的(ExprError::TrailingBackslash);
+            }
+            '{' 如果 curr_is_escaped => {
+                // Handle '{' literally at the start of an expression
+                如果 is_start_of_expression {
+                    如果 re_string.ends_with('\\') {
+                        设 _ = re_string.弹出();
+                    }
+                    re_string.压入(curr);
+                } 否则 {
+                    // Check if the following section is a valid range quantifier
+                    verify_range_quantifier(&pattern_chars)?;
+
+                    re_string.压入(curr);
+                    // Set the lower bound of range quantifier to 0 if it is missing
+                    如果 pattern_chars.peek() == 一些(&',') {
+                        re_string.压入('0');
+                    }
+                }
+            }
+            _ => re_string.压入(curr),
+        }
+
+        // Capturing group "\(abc\)"
+        // Alternative pattern "a\|b"
+        is_start_of_expression = curr == '\\' && is_first_character
+            || curr_is_escaped && matches!(curr, '(' | '|')
+            || curr == '\\' && prev_is_escaped && matches!(prev, '(' | '|');
+
+        prev_is_escaped = curr_is_escaped;
+        prev = curr;
+    }
+
+    // Create regex with proper encoding
+    设 re = 匹配 encoding {
+        UEncoding::Utf8 => {
+            // For UTF-8 locale, use UTF-8 encoding
+            Regex::with_options_and_encoding(
+                &re_string,
+                RegexOptions::REGEX_OPTION_SINGLELINE | RegexOptions::REGEX_OPTION_MULTILINE,
+                Syntax::grep(),
+            )
+        }
+        UEncoding::Ascii => {
+            // For non-UTF-8 locale, use ASCII encoding
+            Regex::with_options_and_encoding(
+                EncodedBytes::ascii(re_string.as_bytes()),
+                RegexOptions::REGEX_OPTION_SINGLELINE | RegexOptions::REGEX_OPTION_MULTILINE,
+                Syntax::grep(),
+            )
+        }
+    }
+    .map_err(|错误| 匹配 错误.code() {
+        // "invalid repeat range {lower,upper}"
+        -123 => ExprError::InvalidBracketContent,
+        // "too big number for repeat range"
+        -201 => ExprError::TooBigRangeQuantifierIndex,
+        _ => ExprError::InvalidRegexExpression,
+    })?;
+
+    好的((re, re_string))
+}
+
+/// Run a regex search, treating runtime match errors as no match.
+方法 regex_search<T: onig::EncodedChars>(
+    regex: &Regex,
+    chars: T,
+    to: 正整数大小,
+    region: &可变 onig::Region,
+) -> 选项<正整数大小> {
+    regex
+        .search_with_param(
+            chars,
+            0,
+            to,
+            SearchOptions::SEARCH_OPTION_NONE,
+            一些(region),
+            MatchParam::默认(),
+        )
+        .unwrap_or(无)
+}
+
+/// Find matches in the input using the compiled regex
+方法 find_match(regex: Regex, re_string: 字符串, left_bytes: 向量<正8>) -> 字符串 {
+    使用 onig::EncodedBytes;
+    使用 uucore::i18n::{UEncoding, get_locale_encoding};
+
+    设 encoding = get_locale_encoding();
+
+    // Match against the input using the appropriate encoding
+    设 可变 region = onig::Region::新建();
+    匹配 encoding {
+        UEncoding::Utf8 => {
+            // In UTF-8 locale, check if input is valid UTF-8
+            如果 设 好的(left_str) = 标准库::字符串切片::from_utf8(&left_bytes) {
+                // Valid UTF-8, match as UTF-8
+                设 pos = regex_search(&regex, left_str, left_str.长度(), &可变 region);
+
+                如果 pos.is_some() {
+                    如果 regex.captures_len() > 0 {
+                        // Get first capture group
+                        region
+                            .pos(1)
+                            .映射(|(start, end)| left_str[start..end].to_string())
+                            .unwrap_or_default()
+                    } 否则 {
+                        // Count characters in the match
+                        设 (start, end) = region.pos(0).解包();
+                        left_str[start..end].chars().计数().to_string()
+                    }
+                } 否则 {
+                    // No match
+                    如果 regex.captures_len() > 0 {
+                        字符串::新建()
+                    } 否则 {
+                        "0".to_string()
+                    }
+                }
+            } 否则 {
+                // Invalid UTF-8 in UTF-8 locale
+                // Try to match as bytes using ASCII encoding
+                设 left_encoded = EncodedBytes::ascii(&left_bytes);
+                // Need to create ASCII version of regex too
+                设 re_ascii = Regex::with_options_and_encoding(
+                    EncodedBytes::ascii(re_string.as_bytes()),
+                    RegexOptions::REGEX_OPTION_SINGLELINE | RegexOptions::REGEX_OPTION_MULTILINE,
+                    Syntax::grep(),
+                )
+                .ok();
+
+                如果 设 一些(re_ascii) = re_ascii {
+                    设 pos = regex_search(&re_ascii, left_encoded, left_bytes.长度(), &可变 region);
+
+                    如果 pos.is_some() {
+                        如果 re_ascii.captures_len() > 0 {
+                            // Get first capture group
+                            region
+                                .pos(1)
+                                .映射(|(start, end)| {
+                                    // Return empty string for invalid UTF-8 capture in UTF-8 locale
+                                    如果 标准库::字符串切片::from_utf8(&left_bytes[start..end]).is_err() {
+                                        字符串::新建()
+                                    } 否则 {
+                                        字符串::from_utf8_lossy(&left_bytes[start..end])
+                                            .into_owned()
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } 否则 {
+                            // No capture groups - return 0 for invalid UTF-8 in UTF-8 locale
+                            "0".to_string()
+                        }
+                    } 否则 {
+                        // No match
+                        如果 re_ascii.captures_len() > 0 {
+                            字符串::新建()
+                        } 否则 {
+                            "0".to_string()
+                        }
+                    }
+                } 否则 {
+                    // Couldn't create ASCII regex - no match
+                    如果 regex.captures_len() > 0 {
+                        字符串::新建()
+                    } 否则 {
+                        "0".to_string()
+                    }
+                }
+            }
+        }
+        UEncoding::Ascii => {
+            // In ASCII/C locale, work with bytes directly
+            设 left_encoded = EncodedBytes::ascii(&left_bytes);
+            设 pos = regex_search(&regex, left_encoded, left_bytes.长度(), &可变 region);
+
+            如果 pos.is_some() {
+                如果 regex.captures_len() > 0 {
+                    // Get first capture group - return raw bytes for C locale
+                    如果 设 一些((start, end)) = region.pos(1) {
+                        设 capture_bytes = &left_bytes[start..end];
+                        // Return raw bytes as String for consistency with other cases
+                        返回 字符串::from_utf8_lossy(capture_bytes).into_owned();
+                    }
+                    字符串::新建()
+                } 否则 {
+                    // Return byte count of match
+                    设 (start, end) = region.pos(0).解包();
+                    (end - start).to_string()
+                }
+            } 否则 {
+                // No match
+                如果 regex.captures_len() > 0 {
+                    字符串::新建()
+                } 否则 {
+                    "0".to_string()
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate a match expression with locale-aware regex matching
+方法 evaluate_match_expression(left_bytes: 向量<正8>, right_bytes: 向量<正8>) -> ExprResult<NumOrStr> {
+    设 (regex, re_string) = build_regex(right_bytes)?;
+
+    // Special case for ASCII locale with capture groups that need to return raw bytes
+    使用 uucore::i18n::{UEncoding, get_locale_encoding};
+    设 encoding = get_locale_encoding();
+
+    如果 matches!(encoding, UEncoding::Ascii) && regex.captures_len() > 0 {
+        // Try to find the actual capture bytes for ASCII locale
+        设 可变 region = onig::Region::新建();
+        设 left_encoded = onig::EncodedBytes::ascii(&left_bytes);
+        设 pos = regex_search(&regex, left_encoded, left_bytes.长度(), &可变 region);
+
+        如果 pos.is_some() {
+            如果 设 一些((start, end)) = region.pos(1) {
+                设 capture_bytes = &left_bytes[start..end];
+                返回 好的(MaybeNonUtf8String::from(capture_bytes.to_vec()).into());
+            }
+        }
+    }
+
+    好的(find_match(regex, re_string, left_bytes).into())
+}
+
+/// Precedence for infix binary operators
+常量 PRECEDENCE: &[&[(&MaybeNonUtf8Str, BinOp)]] = &[
+    &[(b"|", BinOp::字符串(StringOp::Or))],
+    &[(b"&", BinOp::字符串(StringOp::And))],
+    &[
+        (b"<", BinOp::Relation(RelationOp::Lt)),
+        (b"<=", BinOp::Relation(RelationOp::Leq)),
+        (b"=", BinOp::Relation(RelationOp::相等比较协议)),
+        (b"!=", BinOp::Relation(RelationOp::Neq)),
+        (b">=", BinOp::Relation(RelationOp::Geq)),
+        (b">", BinOp::Relation(RelationOp::Gt)),
+    ],
+    &[
+        (b"+", BinOp::Numeric(NumericOp::Add)),
+        (b"-", BinOp::Numeric(NumericOp::Sub)),
+    ],
+    &[
+        (b"*", BinOp::Numeric(NumericOp::Mul)),
+        (b"/", BinOp::Numeric(NumericOp::Div)),
+        (b"%", BinOp::Numeric(NumericOp::Mod)),
+    ],
+    &[(b":", BinOp::字符串(StringOp::Match))],
+];
+
+#[derive(调试协议, 克隆协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 NumOrStr {
+    Num(BigInt),
+    Str(MaybeNonUtf8String),
+}
+
+实现 转换协议<正整数大小> 循环 NumOrStr {
+    方法 from(数字: 正整数大小) -> 自身类型 {
+        自身类型::Num(BigInt::from(数字))
+    }
+}
+
+实现 转换协议<BigInt> 循环 NumOrStr {
+    方法 from(数字: BigInt) -> 自身类型 {
+        自身类型::Num(数字)
+    }
+}
+
+实现 转换协议<字符串> 循环 NumOrStr {
+    方法 from(字符串切片: 字符串) -> 自身类型 {
+        自身类型::Str(字符串切片.into())
+    }
+}
+
+实现 转换协议<MaybeNonUtf8String> 循环 NumOrStr {
+    方法 from(字符串切片: MaybeNonUtf8String) -> 自身类型 {
+        自身类型::Str(字符串切片)
+    }
+}
+
+实现 NumOrStr {
+    公有 方法 to_bigint(&自身) -> 选项<BigInt> {
+        匹配 自身 {
+            自身类型::Num(数字) => 一些(数字.克隆()),
+            自身类型::Str(字符串切片) => 标准库::字符串切片::from_utf8(字符串切片).ok()?.parse::<BigInt>().ok(),
+        }
+    }
+
+    公有 方法 eval_as_bigint(自身) -> ExprResult<BigInt> {
+        匹配 自身 {
+            自身类型::Num(数字) => 好的(数字),
+            自身类型::Str(字符串切片) => 字符串::from_utf8(字符串切片)
+                .map_err(|_| ExprError::NonIntegerArgument)?
+                .parse::<BigInt>()
+                .map_err(|_| ExprError::NonIntegerArgument),
+        }
+    }
+
+    公有 方法 eval_as_string(自身) -> MaybeNonUtf8String {
+        匹配 自身 {
+            自身类型::Num(数字) => 数字.to_string().into(),
+            自身类型::Str(字符串切片) => 字符串切片,
+        }
+    }
+}
+
+#[derive(调试协议, 克隆协议)]
+公有 结构 AstNode {
+    id: 正32,
+    inner: AstNodeInner,
+}
+
+// We derive Eq and PartialEq only for tests because we want to ignore the id field.
+#[derive(调试协议, 克隆协议)]
+#[cfg_attr(test, derive(相等比较协议, 偏等比较协议))]
+公有 枚举 AstNodeInner {
+    Leaf {
+        value: MaybeNonUtf8String,
+    },
+    BinOp {
+        op_type: BinOp,
+        left: 盒子<AstNode>,
+        right: 盒子<AstNode>,
+    },
+    Substr {
+        string: 盒子<AstNode>,
+        pos: 盒子<AstNode>,
+        length: 盒子<AstNode>,
+    },
+    Length {
+        string: 盒子<AstNode>,
+    },
+}
+
+实现 AstNode {
+    公有 方法 parse(input: &[实现 作为引用协议<MaybeNonUtf8Str>]) -> ExprResult<自身类型> {
+        Parser::新建(input).parse()
+    }
+
+    公有 方法 eval(&自身) -> ExprResult<NumOrStr> {
+        // This function implements a recursive tree-walking algorithm, but uses an explicit
+        // stack approach instead of native recursion to avoid potential stack overflow
+        // on deeply nested expressions.
+
+        设 可变 stack = 向量![自身];
+        设 可变 result_stack = BTreeMap::新建();
+
+        当 设 一些(node) = stack.弹出() {
+            匹配 &node.inner {
+                AstNodeInner::Leaf { value, .. } => {
+                    result_stack.插入(node.id, 好的(value.to_owned().into()));
+                }
+                AstNodeInner::BinOp {
+                    op_type,
+                    left,
+                    right,
+                } => {
+                    设 (一些(right), 一些(left)) = (
+                        result_stack.移除(&right.id),
+                        result_stack.移除(&left.id),
+                    ) 否则 {
+                        stack.压入(node);
+                        stack.压入(right);
+                        stack.压入(left);
+                        继续;
+                    };
+
+                    设 result = op_type.eval(left, right);
+                    result_stack.插入(node.id, result);
+                }
+                AstNodeInner::Substr {
+                    string,
+                    pos,
+                    length,
+                } => {
+                    设 (一些(string), 一些(pos), 一些(length)) = (
+                        result_stack.移除(&string.id),
+                        result_stack.移除(&pos.id),
+                        result_stack.移除(&length.id),
+                    ) 否则 {
+                        stack.压入(node);
+                        stack.压入(string);
+                        stack.压入(pos);
+                        stack.压入(length);
+                        继续;
+                    };
+
+                    设 string: MaybeNonUtf8String = string?.eval_as_string();
+
+                    // The GNU docs say:
+                    //
+                    // > If either position or length is negative, zero, or
+                    // > non-numeric, returns the null string.
+                    //
+                    // So we coerce errors into 0 to make that the only case we
+                    // have to care about.
+                    设 pos = pos?
+                        .eval_as_bigint()
+                        .ok()
+                        .and_then(|n| n.to_usize())
+                        .unwrap_or(0);
+                    设 length = length?
+                        .eval_as_bigint()
+                        .ok()
+                        .and_then(|n| n.to_usize())
+                        .unwrap_or(0);
+
+                    如果 设 (一些(pos), 一些(_)) = (pos.checked_sub(1), length.checked_sub(1)) {
+                        设 result = locale_aware_substr(string, pos, length);
+                        result_stack.插入(node.id, 好的(result.into()));
+                    } 否则 {
+                        result_stack.插入(node.id, 好的(字符串::新建().into()));
+                    }
+                }
+                AstNodeInner::Length { string } => {
+                    // Push onto the stack
+
+                    设 一些(string) = result_stack.移除(&string.id) 否则 {
+                        stack.压入(node);
+                        stack.压入(string);
+                        继续;
+                    };
+
+                    设 length = locale_aware_length(&string?.eval_as_string());
+                    result_stack.插入(node.id, 好的(length.into()));
+                }
+            }
+        }
+
+        // The final result should be the only one left on the result stack
+        result_stack.移除(&自身.id).解包()
+    }
+}
+
+thread_local! {
+    静态 NODE_ID: Cell<正32> = 常量 { Cell::新建(1) };
+}
+
+/// We create unique identifiers for each node in the AST.
+/// This is used to transform the recursive algorithm into an iterative one.
+/// It is used to store the result of each node's evaluation in a `BtreeMap`.
+方法 get_next_id() -> 正32 {
+    NODE_ID.with(|id| {
+        设 current = id.获取();
+        id.set(current + 1);
+        current
+    })
+}
+
+结构 Parser<'a, S: 作为引用协议<MaybeNonUtf8Str>> {
+    input: &'a [S],
+    index: 正整数大小,
+}
+
+实现<'a, S: 作为引用协议<MaybeNonUtf8Str>> Parser<'a, S> {
+    方法 新建(input: &'a [S]) -> 自身类型 {
+        自身类型 { input, index: 0 }
+    }
+
+    方法 next(&可变 自身) -> ExprResult<&'a MaybeNonUtf8Str> {
+        设 next = 自身.input.获取(自身.index);
+        如果 设 一些(next) = next {
+            自身.index += 1;
+            好的(next.as_ref())
+        } 否则 {
+            // The indexing won't panic, because we know that the input size
+            // is greater than zero.
+            坏的(ExprError::MissingArgument(
+                字符串::from_utf8_lossy(自身.input[自身.index - 1].as_ref()).into_owned(),
+            ))
+        }
+    }
+
+    方法 accept<T>(&可变 自身, f: 实现 Fn(&MaybeNonUtf8Str) -> 选项<T>) -> 选项<T> {
+        设 next = 自身.input.获取(自身.index)?;
+        设 tok = f(next.as_ref());
+        如果 设 一些(tok) = tok {
+            自身.index += 1;
+            一些(tok)
+        } 否则 {
+            无
+        }
+    }
+
+    方法 parse(&可变 自身) -> ExprResult<AstNode> {
+        如果 自身.input.为空() {
+            返回 坏的(ExprError::MissingOperand);
+        }
+        设 res = 自身.parse_expression()?;
+        如果 设 一些(arg) = 自身.input.获取(自身.index) {
+            返回 坏的(ExprError::UnexpectedArgument(
+                字符串::from_utf8_lossy(arg.as_ref()).into_owned(),
+            ));
+        }
+        好的(res)
+    }
+
+    方法 parse_expression(&可变 自身) -> ExprResult<AstNode> {
+        自身.parse_precedence(0)
+    }
+
+    方法 parse_op(&可变 自身, precedence: 正整数大小) -> 选项<BinOp> {
+        自身.accept(|s| {
+            循环 (op_string, op) 在 PRECEDENCE[precedence] {
+                如果 s == *op_string {
+                    返回 一些(*op);
+                }
+            }
+            无
+        })
+    }
+
+    方法 parse_precedence(&可变 自身, precedence: 正整数大小) -> ExprResult<AstNode> {
+        如果 precedence >= PRECEDENCE.长度() {
+            返回 自身.parse_simple_expression();
+        }
+
+        设 可变 left = 自身.parse_precedence(precedence + 1)?;
+        当 设 一些(op) = 自身.parse_op(precedence) {
+            设 right = 自身.parse_precedence(precedence + 1)?;
+            left = AstNode {
+                id: get_next_id(),
+                inner: AstNodeInner::BinOp {
+                    op_type: op,
+                    left: 盒子::新建(left),
+                    right: 盒子::新建(right),
+                },
+            };
+        }
+        好的(left)
+    }
+
+    方法 parse_simple_expression(&可变 自身) -> ExprResult<AstNode> {
+        设 first = 自身.next()?;
+        设 inner = 匹配 first {
+            b"match" => {
+                设 left = 自身.parse_simple_expression()?;
+                设 right = 自身.parse_simple_expression()?;
+                AstNodeInner::BinOp {
+                    op_type: BinOp::字符串(StringOp::Match),
+                    left: 盒子::新建(left),
+                    right: 盒子::新建(right),
+                }
+            }
+            b"substr" => {
+                设 string = 自身.parse_simple_expression()?;
+                设 pos = 自身.parse_simple_expression()?;
+                设 length = 自身.parse_simple_expression()?;
+                AstNodeInner::Substr {
+                    string: 盒子::新建(string),
+                    pos: 盒子::新建(pos),
+                    length: 盒子::新建(length),
+                }
+            }
+            b"index" => {
+                设 left = 自身.parse_simple_expression()?;
+                设 right = 自身.parse_simple_expression()?;
+                AstNodeInner::BinOp {
+                    op_type: BinOp::字符串(StringOp::Index),
+                    left: 盒子::新建(left),
+                    right: 盒子::新建(right),
+                }
+            }
+            b"length" => {
+                设 string = 自身.parse_simple_expression()?;
+                AstNodeInner::Length {
+                    string: 盒子::新建(string),
+                }
+            }
+            b"+" => AstNodeInner::Leaf {
+                value: 自身.next()?.into(),
+            },
+            b"(" => {
+                设 s = 自身.parse_expression()?;
+
+                匹配 自身.next() {
+                    好的(b")") => {}
+                    // Since we have parsed at least a '(', there will be a token
+                    // at `self.index - 1`. So this indexing won't panic.
+                    好的(_) => {
+                        返回 坏的(ExprError::ExpectedClosingBraceInsteadOf(
+                            字符串::from_utf8_lossy(自身.input[自身.index - 1].as_ref()).into(),
+                        ));
+                    }
+                    坏的(ExprError::MissingArgument(_)) => {
+                        返回 坏的(ExprError::ExpectedClosingBraceAfter(
+                            字符串::from_utf8_lossy(自身.input[自身.index - 1].as_ref()).into(),
+                        ));
+                    }
+                    坏的(e) => 返回 坏的(e),
+                }
+                s.inner
+            }
+            s => AstNodeInner::Leaf { value: s.into() },
+        };
+        好的(AstNode {
+            id: get_next_id(),
+            inner,
+        })
+    }
+}
+
+/// Determine whether `expr` should evaluate the string as "truthy"
+///
+/// Truthy strings are either empty or match the regex "-?0+".
+公有 方法 is_truthy(s: &NumOrStr) -> 布尔 {
+    匹配 s {
+        NumOrStr::Num(数字) => 数字 != &BigInt::from(0),
+        NumOrStr::Str(字符串切片) => {
+            // Edge case: `-` followed by nothing is truthy
+            如果 字符串切片 == b"-" {
+                返回 真;
+            }
+
+            设 可变 bytes = 字符串切片.迭代().copied();
+
+            // Empty string is falsy
+            设 一些(first) = bytes.next() 否则 {
+                返回 假;
+            };
+
+            设 is_zero = (first == b'-' || first == b'0') && bytes.全部(|b| b == b'0');
+            !is_zero
+        }
+    }
+}
+
+#[cfg(test)]
+模组 test {
+    使用 箱::ExprError;
+    使用 箱::syntax_tree::verify_range_quantifier;
+
+    使用 超级::{
+        AstNode, AstNodeInner, BinOp, NumericOp, RelationOp, StringOp, check_posix_regex_errors,
+        get_next_id,
+    };
+
+    实现 偏等比较协议 循环 AstNode {
+        方法 eq(&自身, other: &自身类型) -> 布尔 {
+            自身.inner == other.inner
+        }
+    }
+
+    实现 相等比较协议 循环 AstNode {}
+
+    实现 转换协议<&字符串切片> 循环 AstNode {
+        方法 from(value: &字符串切片) -> 自身类型 {
+            自身类型 {
+                id: get_next_id(),
+                inner: AstNodeInner::Leaf {
+                    value: value.into(),
+                },
+            }
+        }
+    }
+
+    方法 op(op_type: BinOp, left: 实现 转换为目标协议<AstNode>, right: 实现 转换为目标协议<AstNode>) -> AstNode {
+        AstNode {
+            id: get_next_id(),
+            inner: AstNodeInner::BinOp {
+                op_type,
+                left: 盒子::新建(left.into()),
+                right: 盒子::新建(right.into()),
+            },
+        }
+    }
+
+    方法 length(string: 实现 转换为目标协议<AstNode>) -> AstNode {
+        AstNode {
+            id: get_next_id(),
+            inner: AstNodeInner::Length {
+                string: 盒子::新建(string.into()),
+            },
+        }
+    }
+
+    方法 substr(
+        string: 实现 转换为目标协议<AstNode>,
+        pos: 实现 转换为目标协议<AstNode>,
+        length: 实现 转换为目标协议<AstNode>,
+    ) -> AstNode {
+        AstNode {
+            id: get_next_id(),
+            inner: AstNodeInner::Substr {
+                string: 盒子::新建(string.into()),
+                pos: 盒子::新建(pos.into()),
+                length: 盒子::新建(length.into()),
+            },
+        }
+    }
+
+    #[test]
+    方法 infix_operators() {
+        设 cases = [
+            ("|", BinOp::字符串(StringOp::Or)),
+            ("&", BinOp::字符串(StringOp::And)),
+            ("<", BinOp::Relation(RelationOp::Lt)),
+            ("<=", BinOp::Relation(RelationOp::Leq)),
+            ("=", BinOp::Relation(RelationOp::相等比较协议)),
+            ("!=", BinOp::Relation(RelationOp::Neq)),
+            (">=", BinOp::Relation(RelationOp::Geq)),
+            (">", BinOp::Relation(RelationOp::Gt)),
+            ("+", BinOp::Numeric(NumericOp::Add)),
+            ("-", BinOp::Numeric(NumericOp::Sub)),
+            ("*", BinOp::Numeric(NumericOp::Mul)),
+            ("/", BinOp::Numeric(NumericOp::Div)),
+            ("%", BinOp::Numeric(NumericOp::Mod)),
+            (":", BinOp::字符串(StringOp::Match)),
+        ];
+        循环 (string, value) 在 cases {
+            相等断言!(AstNode::parse(&["1", string, "2"]), 好的(op(value, "1", "2")));
+        }
+    }
+
+    #[test]
+    方法 other_operators() {
+        相等断言!(
+            AstNode::parse(&["match", "1", "2"]),
+            好的(op(BinOp::字符串(StringOp::Match), "1", "2")),
+        );
+        相等断言!(
+            AstNode::parse(&["index", "1", "2"]),
+            好的(op(BinOp::字符串(StringOp::Index), "1", "2")),
+        );
+        相等断言!(AstNode::parse(&["length", "1"]), 好的(length("1")));
+        相等断言!(
+            AstNode::parse(&["substr", "1", "2", "3"]),
+            好的(substr("1", "2", "3")),
+        );
+    }
+
+    #[test]
+    方法 precedence() {
+        相等断言!(
+            AstNode::parse(&["1", "+", "2", "*", "3"]),
+            好的(op(
+                BinOp::Numeric(NumericOp::Add),
+                "1",
+                op(BinOp::Numeric(NumericOp::Mul), "2", "3")
+            ))
+        );
+        相等断言!(
+            AstNode::parse(&["(", "1", "+", "2", ")", "*", "3"]),
+            好的(op(
+                BinOp::Numeric(NumericOp::Mul),
+                op(BinOp::Numeric(NumericOp::Add), "1", "2"),
+                "3"
+            ))
+        );
+        相等断言!(
+            AstNode::parse(&["1", "*", "2", "+", "3"]),
+            好的(op(
+                BinOp::Numeric(NumericOp::Add),
+                op(BinOp::Numeric(NumericOp::Mul), "1", "2"),
+                "3"
+            )),
+        );
+    }
+
+    #[test]
+    方法 missing_closing_parenthesis() {
+        相等断言!(
+            AstNode::parse(&["(", "42"]),
+            坏的(ExprError::ExpectedClosingBraceAfter("42".to_string()))
+        );
+        相等断言!(
+            AstNode::parse(&["(", "42", "a"]),
+            坏的(ExprError::ExpectedClosingBraceInsteadOf("a".to_string()))
+        );
+    }
+
+    #[test]
+    方法 empty_substitution() {
+        // causes a panic in 0.0.25
+        设 result = AstNode::parse(&["a", ":", r"\(b\)*"])
+            .解包()
+            .eval()
+            .解包();
+        相等断言!(result.eval_as_string(), b"");
+    }
+
+    #[test]
+    方法 starting_stars_become_escaped() {
+        设 result = AstNode::parse(&["cats", ":", r"*cats"])
+            .解包()
+            .eval()
+            .解包();
+        相等断言!(result.eval_as_string(), b"0");
+
+        设 result = AstNode::parse(&["*cats", ":", r"*cats"])
+            .解包()
+            .eval()
+            .解包();
+        相等断言!(result.eval_as_string(), b"5");
+    }
+
+    #[test]
+    方法 only_match_in_beginning() {
+        设 result = AstNode::parse(&["budget", ":", r"get"])
+            .解包()
+            .eval()
+            .解包();
+        相等断言!(result.eval_as_string(), b"0");
+    }
+
+    #[test]
+    方法 check_regex_valid() {
+        断言!(check_posix_regex_errors(r"(a+b) \(a* b\)").is_ok());
+    }
+
+    #[test]
+    方法 check_regex_simple_repeating_pattern() {
+        断言!(check_posix_regex_errors(r"\(a+b\)\{4\}").is_ok());
+    }
+
+    #[test]
+    方法 check_regex_missing_closing() {
+        相等断言!(
+            check_posix_regex_errors(r"\(abc"),
+            坏的(ExprError::UnmatchedOpeningParenthesis)
+        );
+    }
+
+    #[test]
+    方法 check_regex_missing_opening() {
+        相等断言!(
+            check_posix_regex_errors(r"abc\)"),
+            坏的(ExprError::UnmatchedClosingParenthesis)
+        );
+    }
+
+    #[test]
+    方法 test_is_valid_range_quantifier() {
+        断言!(verify_range_quantifier(&"3\\}".chars()).is_ok());
+        断言!(verify_range_quantifier(&"3,\\}".chars()).is_ok());
+        断言!(verify_range_quantifier(&",6\\}".chars()).is_ok());
+        断言!(verify_range_quantifier(&"3,6\\}".chars()).is_ok());
+        断言!(verify_range_quantifier(&",\\}".chars()).is_ok());
+        断言!(verify_range_quantifier(&"32767\\}anything".chars()).is_ok());
+        相等断言!(
+            verify_range_quantifier(&"\\{3,6\\}".chars()),
+            坏的(ExprError::InvalidBracketContent)
+        );
+        相等断言!(
+            verify_range_quantifier(&"\\}".chars()),
+            坏的(ExprError::InvalidBracketContent)
+        );
+        相等断言!(
+            verify_range_quantifier(&"".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&"3".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&"3,".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&",6".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&"3,6".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&",".chars()),
+            坏的(ExprError::UnmatchedOpeningBrace)
+        );
+        相等断言!(
+            verify_range_quantifier(&"32768\\}".chars()),
+            坏的(ExprError::TooBigRangeQuantifierIndex)
+        );
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_basic() {
+        使用 超级::evaluate_match_expression;
+
+        // Basic literal match
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"hello".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"5");
+
+        // No match
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"world".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"0");
+
+        // Partial match from beginning
+        设 result = evaluate_match_expression(b"hello world".to_vec(), b"hello".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"5");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_regex_patterns() {
+        使用 超级::evaluate_match_expression;
+
+        // Dot matches any character
+        设 result = evaluate_match_expression(b"abc".to_vec(), b"a.c".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Star quantifier
+        设 result = evaluate_match_expression(b"aaaabc".to_vec(), b"a*bc".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"6");
+
+        // Plus quantifier (escaped in BRE)
+        设 result = evaluate_match_expression(b"aaaabc".to_vec(), b"a\\+bc".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"6");
+
+        // Question mark quantifier (escaped in BRE)
+        设 result = evaluate_match_expression(b"abc".to_vec(), b"ab\\?c".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_capture_groups() {
+        使用 超级::evaluate_match_expression;
+
+        // Simple capture group
+        设 result =
+            evaluate_match_expression(b"hello123".to_vec(), b"hello\\([0-9]*\\)".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"123");
+
+        // Empty capture group
+        设 result =
+            evaluate_match_expression(b"hello".to_vec(), b"hello\\([0-9]*\\)".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"");
+
+        // No capture group, just match length
+        设 result =
+            evaluate_match_expression(b"hello123".to_vec(), b"hello[0-9]*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"8");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_character_classes() {
+        使用 超级::evaluate_match_expression;
+
+        // Simple character class
+        设 result = evaluate_match_expression(b"abc123".to_vec(), b"[a-z]*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Negated character class
+        设 result = evaluate_match_expression(b"123abc".to_vec(), b"[^a-z]*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Digit character class
+        设 result = evaluate_match_expression(b"123abc".to_vec(), b"[0-9]*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_anchoring() {
+        使用 超级::evaluate_match_expression;
+
+        // Patterns are automatically anchored at start
+        设 result = evaluate_match_expression(b"world hello".to_vec(), b"hello".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"0");
+
+        // Explicit start anchor (redundant but should work)
+        设 result =
+            evaluate_match_expression(b"hello world".to_vec(), b"^hello".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"5");
+
+        // End anchor
+        设 result =
+            evaluate_match_expression(b"hello world".to_vec(), b"world$".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"0"); // Should fail because not at start
+
+        设 result = evaluate_match_expression(b"world".to_vec(), b"world$".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"5");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_special_characters() {
+        使用 超级::evaluate_match_expression;
+
+        // Escaped special characters
+        设 result = evaluate_match_expression(b"a.b".to_vec(), b"a\\.b".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Escaped asterisk
+        设 result = evaluate_match_expression(b"a*b".to_vec(), b"a\\*b".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Caret not at beginning should be escaped
+        设 result = evaluate_match_expression(b"a^b".to_vec(), b"a^b".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Dollar not at end should be escaped
+        设 result = evaluate_match_expression(b"a$b".to_vec(), b"a$b".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_range_quantifiers() {
+        使用 超级::evaluate_match_expression;
+
+        // Fixed count quantifier
+        设 result = evaluate_match_expression(b"aaa".to_vec(), b"a\\{3\\}".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"3");
+
+        // Range quantifier
+        设 result = evaluate_match_expression(b"aa".to_vec(), b"a\\{1,3\\}".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"2");
+
+        // Minimum quantifier
+        设 result = evaluate_match_expression(b"aaaa".to_vec(), b"a\\{2,\\}".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"4");
+
+        // Maximum quantifier
+        设 result = evaluate_match_expression(b"aa".to_vec(), b"a\\{,3\\}".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"2");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_empty_and_edge_cases() {
+        使用 超级::evaluate_match_expression;
+
+        // Empty input string
+        设 result = evaluate_match_expression(b"".to_vec(), b".*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"0");
+
+        // Empty pattern (should match empty string)
+        设 result = evaluate_match_expression(b"".to_vec(), b"".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"0");
+
+        // Pattern matching empty string
+        设 result = evaluate_match_expression(b"hello".to_vec(), b".*".to_vec()).解包();
+        相等断言!(result.eval_as_string(), b"5");
+    }
+
+    #[test]
+    方法 test_evaluate_match_expression_error_cases() {
+        使用 超级::evaluate_match_expression;
+
+        // Unmatched opening parenthesis
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"\\(hello".to_vec());
+        断言!(matches!(
+            result,
+            坏的(ExprError::UnmatchedOpeningParenthesis)
+        ));
+
+        // Unmatched closing parenthesis
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"hello\\)".to_vec());
+        断言!(matches!(
+            result,
+            坏的(ExprError::UnmatchedClosingParenthesis)
+        ));
+
+        // Trailing backslash
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"hello\\".to_vec());
+        断言!(matches!(result, 坏的(ExprError::TrailingBackslash)));
+
+        // Invalid bracket content
+        设 result = evaluate_match_expression(b"hello".to_vec(), b"a\\{invalid\\}".to_vec());
+        断言!(matches!(result, 坏的(ExprError::InvalidBracketContent)));
+    }
+}

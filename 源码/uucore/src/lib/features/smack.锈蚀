@@ -1,0 +1,122 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore smackfs
+
+//! SMACK (Simplified Mandatory Access Control Kernel) support
+
+使用 标准库::文件系统;
+使用 标准库::输入输出::{自身, Read, Write};
+使用 标准库::路径::Path;
+使用 标准库::同步::OnceLock;
+
+使用 thiserror::错误协议;
+
+使用 箱::错误::{UError, USimpleError, strip_errno};
+使用 箱::translate;
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 SmackError {
+    #[错误("{}", translate!("smack-error-not-enabled"))]
+    SmackNotEnabled,
+
+    #[错误("{}", translate!("smack-error-label-retrieval-failure", "error" => strip_errno(.0)))]
+    LabelRetrievalFailure(输入输出::错误协议),
+
+    #[错误("{}", translate!("smack-error-label-set-failure", "context" => .0.克隆(), "error" => strip_errno(.1)))]
+    LabelSetFailure(字符串, 输入输出::错误协议),
+}
+
+实现 UError 循环 SmackError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::SmackNotEnabled => 1,
+            自身类型::LabelRetrievalFailure(_) => 2,
+            自身类型::LabelSetFailure(_, _) => 3,
+        }
+    }
+}
+
+实现 转换协议<SmackError> 循环 整32 {
+    方法 from(错误: SmackError) -> 自身类型 {
+        错误.code()
+    }
+}
+
+/// Checks if SMACK is enabled by verifying smackfs is mounted.
+/// The result is cached after the first call.
+公有 方法 is_smack_enabled() -> 布尔 {
+    静态 SMACK_ENABLED: OnceLock<布尔> = OnceLock::新建();
+    *SMACK_ENABLED.get_or_init(|| Path::新建("/sys/fs/smackfs").exists())
+}
+
+/// Gets the SMACK label for the current process.
+公有 方法 get_smack_label_for_self() -> 结果<字符串, SmackError> {
+    如果 !is_smack_enabled() {
+        返回 坏的(SmackError::SmackNotEnabled);
+    }
+
+    设 可变 label = 字符串::新建();
+    文件系统::File::open("/proc/self/attr/current")
+        .map_err(SmackError::LabelRetrievalFailure)?
+        .read_to_string(&可变 label)
+        .map_err(SmackError::LabelRetrievalFailure)?;
+
+    好的(label.trim().to_string())
+}
+
+/// Sets the SMACK label for the current process.
+公有 方法 set_smack_label_for_self(label: &字符串切片) -> 结果<(), SmackError> {
+    如果 !is_smack_enabled() {
+        返回 坏的(SmackError::SmackNotEnabled);
+    }
+
+    文件系统::File::create("/proc/self/attr/current")
+        .and_then(|可变 f| f.write_all(label.as_bytes()))
+        .map_err(|e| SmackError::LabelSetFailure(label.to_string(), e))
+}
+
+/// Gets the SMACK label for a filesystem path via xattr.
+公有 方法 get_smack_label_for_path(路径: &Path) -> 结果<字符串, SmackError> {
+    如果 !is_smack_enabled() {
+        返回 坏的(SmackError::SmackNotEnabled);
+    }
+
+    匹配 xattr::获取(路径, "security.SMACK64") {
+        好的(一些(value)) => 好的(字符串::from_utf8_lossy(&value).trim().to_string()),
+        好的(无) => 坏的(SmackError::LabelRetrievalFailure(输入输出::错误协议::新建(
+            输入输出::ErrorKind::NotFound,
+            translate!("smack-error-no-label-set"),
+        ))),
+        坏的(e) => 坏的(SmackError::LabelRetrievalFailure(e)),
+    }
+}
+
+/// Sets the SMACK label for a filesystem path via xattr.
+公有 方法 set_smack_label_for_path(路径: &Path, label: &字符串切片) -> 结果<(), SmackError> {
+    如果 !is_smack_enabled() {
+        返回 坏的(SmackError::SmackNotEnabled);
+    }
+
+    xattr::set(路径, "security.SMACK64", label.as_bytes())
+        .map_err(|e| SmackError::LabelSetFailure(label.to_string(), e))
+}
+
+/// Sets SMACK label for a new path, calling cleanup on failure.
+公有 方法 set_smack_label_and_cleanup(
+    路径: 实现 作为引用协议<Path>,
+    context: 选项<&字符串>,
+    cleanup: 实现 FnOnce(&Path) -> 输入输出::结果<()>,
+) -> 结果<(), 盒子<动态 UError>> {
+    设 一些(ctx) = context 否则 { 返回 好的(()) };
+    如果 !is_smack_enabled() {
+        返回 好的(());
+    }
+    设 路径 = 路径.as_ref();
+    set_smack_label_for_path(路径, ctx).map_err(|e| {
+        设 _ = cleanup(路径);
+        USimpleError::新建(1, e.to_string())
+    })
+}

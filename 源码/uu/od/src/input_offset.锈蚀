@@ -1,0 +1,121 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::输入输出::{自身, Write};
+
+#[derive(复制协议, 克隆协议, 调试协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 Radix {
+    Decimal,
+    Hexadecimal,
+    Octal,
+    NoPrefix,
+}
+
+/// provides the byte offset printed at the left margin
+公有 结构 InputOffset {
+    /// The radix to print the byte offset. [`Radix::NoPrefix`] will not print a byte offset.
+    radix: Radix,
+    /// The current position. Initialize at `new`, increase using `increase_position`.
+    byte_pos: 正64,
+    /// An optional label printed in parentheses, typically different from `byte_pos`,
+    /// but will increase with the same value if `byte_pos` in increased.
+    label: 选项<正64>,
+}
+
+实现 InputOffset {
+    /// creates a new `InputOffset` using the provided values.
+    公有 方法 新建(radix: Radix, byte_pos: 正64, label: 选项<正64>) -> 自身类型 {
+        自身类型 {
+            radix,
+            byte_pos,
+            label,
+        }
+    }
+
+    /// Increase `byte_pos` and `label` if a label is used.
+    公有 方法 increase_position(&可变 自身, n: 正64) {
+        自身.byte_pos += n;
+        如果 设 一些(l) = 自身.label {
+            自身.label = 一些(l + n);
+        }
+    }
+
+    #[cfg(test)]
+    方法 set_radix(&可变 自身, radix: Radix) {
+        自身.radix = radix;
+    }
+
+    /// returns a string with the current byte offset
+    公有 方法 format_byte_offset(&自身) -> 字符串 {
+        匹配 (自身.radix, 自身.label) {
+            (Radix::Decimal, 无) => 格式化!("{:07}", 自身.byte_pos),
+            (Radix::Decimal, 一些(l)) => 格式化!("{:07} ({l:07})", 自身.byte_pos),
+            (Radix::Hexadecimal, 无) => 格式化!("{:06X}", 自身.byte_pos),
+            (Radix::Hexadecimal, 一些(l)) => 格式化!("{:06X} ({l:06X})", 自身.byte_pos),
+            (Radix::Octal, 无) => 格式化!("{:07o}", 自身.byte_pos),
+            (Radix::Octal, 一些(l)) => 格式化!("{:07o} ({l:07o})", 自身.byte_pos),
+            (Radix::NoPrefix, 无) => 字符串::新建(),
+            (Radix::NoPrefix, 一些(l)) => 格式化!("({l:07o})"),
+        }
+    }
+
+    /// Prints the byte offset followed by a newline, or nothing at all if
+    /// both `Radix::NoPrefix` was set and no label (--traditional) is used.
+    公有 方法 print_final_offset<W: Write>(&自身, out: &可变 W) -> 输入输出::结果<()> {
+        如果 自身.radix != Radix::NoPrefix || 自身.label.is_some() {
+            writeln!(out, "{}", 自身.format_byte_offset())?;
+        }
+        好的(())
+    }
+}
+
+#[test]
+方法 test_input_offset() {
+    设 可变 sut = InputOffset::新建(Radix::Hexadecimal, 10, 无);
+    相等断言!("00000A", &sut.format_byte_offset());
+    sut.increase_position(10);
+    相等断言!("000014", &sut.format_byte_offset());
+
+    // note normally the radix will not change after initialization
+    sut.set_radix(Radix::Decimal);
+    相等断言!("0000020", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::Hexadecimal);
+    相等断言!("000014", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::Octal);
+    相等断言!("0000024", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::NoPrefix);
+    相等断言!("", &sut.format_byte_offset());
+
+    sut.increase_position(10);
+    sut.set_radix(Radix::Octal);
+    相等断言!("0000036", &sut.format_byte_offset());
+}
+
+#[test]
+方法 test_input_offset_with_label() {
+    设 可变 sut = InputOffset::新建(Radix::Hexadecimal, 10, 一些(20));
+    相等断言!("00000A (000014)", &sut.format_byte_offset());
+    sut.increase_position(10);
+    相等断言!("000014 (00001E)", &sut.format_byte_offset());
+
+    // note normally the radix will not change after initialization
+    sut.set_radix(Radix::Decimal);
+    相等断言!("0000020 (0000030)", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::Hexadecimal);
+    相等断言!("000014 (00001E)", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::Octal);
+    相等断言!("0000024 (0000036)", &sut.format_byte_offset());
+
+    sut.set_radix(Radix::NoPrefix);
+    相等断言!("(0000036)", &sut.format_byte_offset());
+
+    sut.increase_position(10);
+    sut.set_radix(Radix::Octal);
+    相等断言!("0000036 (0000050)", &sut.format_byte_offset());
+}

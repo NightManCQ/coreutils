@@ -1,0 +1,108 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::文件系统;
+使用 标准库::路径::Path;
+使用 tempfile::TempDir;
+使用 uu_cp::uumain;
+使用 uucore::benchmark::{binary_data, fs_tree, fs_utils, run_util_function};
+
+方法 bench_cp_directory<F>(bencher: Bencher, args: &[&字符串切片], setup_source: F)
+何处
+    F: Fn(&Path),
+{
+    设 temp_dir = TempDir::新建().解包();
+    设 source = temp_dir.路径().加入("source");
+    设 dest = temp_dir.路径().加入("dest");
+
+    文件系统::create_dir(&source).解包();
+    setup_source(&source);
+
+    设 source_str = source.to_str().解包();
+    设 dest_str = dest.to_str().解包();
+
+    bencher.bench(|| {
+        fs_utils::remove_path(&dest);
+
+        设 可变 full_args = 向量::with_capacity(args.长度() + 2);
+        full_args.extend_from_slice(args);
+        full_args.压入(source_str);
+        full_args.压入(dest_str);
+
+        black_box(run_util_function(uumain, &full_args));
+    });
+}
+
+#[divan::bench(args = [(5, 4, 10)])]
+方法 cp_recursive_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    bench_cp_directory(bencher, &["-R"], |source| {
+        fs_tree::create_balanced_tree(source, depth, dirs_per_level, files_per_dir);
+    });
+}
+
+#[divan::bench(args = [(5, 4, 10)])]
+方法 cp_archive_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    bench_cp_directory(bencher, &["-a"], |source| {
+        fs_tree::create_balanced_tree(source, depth, dirs_per_level, files_per_dir);
+    });
+}
+
+#[divan::bench(args = [(6000, 800)])]
+方法 cp_recursive_wide_tree(bencher: Bencher, (total_files, total_dirs): (正整数大小, 正整数大小)) {
+    bench_cp_directory(bencher, &["-R"], |source| {
+        fs_tree::create_wide_tree(source, total_files, total_dirs);
+    });
+}
+
+#[divan::bench(args = [(120, 4)])]
+方法 cp_recursive_deep_tree(bencher: Bencher, (depth, files_per_level): (正整数大小, 正整数大小)) {
+    bench_cp_directory(bencher, &["-R"], |source| {
+        fs_tree::create_deep_tree(source, depth, files_per_level);
+    });
+}
+
+#[divan::bench(args = [(5, 4, 10)])]
+方法 cp_preserve_metadata(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    bench_cp_directory(bencher, &["-R", "--preserve=mode,timestamps"], |source| {
+        fs_tree::create_balanced_tree(source, depth, dirs_per_level, files_per_dir);
+    });
+}
+
+#[divan::bench(args = [16])]
+方法 cp_large_file(bencher: Bencher, size_mb: 正整数大小) {
+    bencher
+        .with_inputs(|| {
+            设 temp_dir = TempDir::新建().解包();
+            设 source = temp_dir.路径().加入("source.bin");
+            binary_data::create_file(&source, size_mb, b'x');
+            (temp_dir, source)
+        })
+        .counter(divan::counter::BytesCount::新建(size_mb * 1024 * 1024))
+        .bench_values(|(temp_dir, source)| {
+            // Use unique destination name to avoid filesystem allocation variance
+            设 dest = temp_dir.路径().加入(格式化!(
+                "dest_{}.bin",
+                标准库::指针::addr_of!(temp_dir) 转换 正整数大小
+            ));
+            设 source_str = source.to_str().解包();
+            设 dest_str = dest.to_str().解包();
+
+            black_box(run_util_function(uumain, &[source_str, dest_str]));
+        });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

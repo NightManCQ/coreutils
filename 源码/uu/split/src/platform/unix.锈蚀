@@ -1,0 +1,180 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::输入输出::{BufWriter, 错误协议, 结果};
+使用 标准库::输入输出::{ErrorKind, Write};
+使用 标准库::路径::Path;
+使用 标准库::进程::{Child, Command, Stdio};
+使用 uucore::display::Quotable;
+使用 uucore::错误::USimpleError;
+使用 uucore::文件系统;
+使用 uucore::文件系统::FileInformation;
+使用 uucore::show;
+使用 uucore::translate;
+
+/// A writer that writes to a `shell_process`' stdin
+///
+/// We use a shell process (not directly calling a sub-process) so we can forward the name of the
+/// corresponding output file (xaa, xab, xac… ). This is the way it was implemented in GNU split.
+结构 FilterWriter {
+    /// Running shell process
+    shell_process: Child,
+}
+
+实现 Write 循环 FilterWriter {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 结果<正整数大小> {
+        自身.shell_process
+            .stdin
+            .as_mut()
+            .期望("failed to get shell stdin")
+            .写锁定(buf)
+    }
+    方法 flush(&可变 自身) -> 结果<()> {
+        自身.shell_process
+            .stdin
+            .as_mut()
+            .期望("failed to get shell stdin")
+            .flush()
+    }
+}
+
+/// Have an environment variable set at a value during this lifetime
+结构 WithEnvVarSet {
+    /// Env var key
+    previous_var_key: 字符串,
+    /// Previous value set to this key
+    previous_var_value: 选项<OsString>,
+}
+实现 WithEnvVarSet {
+    /// Save previous value assigned to key, set key=value
+    方法 新建(key: &字符串切片, value: &OsStr) -> 自身类型 {
+        设 previous_env_value = 环境::var_os(key);
+        不安全 {
+            环境::set_var(key, value);
+        }
+        自身类型 {
+            previous_var_key: 字符串::from(key),
+            previous_var_value: previous_env_value,
+        }
+    }
+}
+
+实现 Drop 循环 WithEnvVarSet {
+    /// Restore previous value now that this is being dropped by context
+    方法 drop(&可变 自身) {
+        如果 设 一些(prev_value) = &自身.previous_var_value {
+            不安全 {
+                环境::set_var(&自身.previous_var_key, prev_value);
+            }
+        } 否则 {
+            不安全 {
+                环境::remove_var(&自身.previous_var_key);
+            }
+        }
+    }
+}
+实现 FilterWriter {
+    /// Create a new filter running a command with $FILE pointing at the output name
+    ///
+    /// #Arguments
+    ///
+    /// * `command` - The shell command to execute
+    /// * `filepath` - Path of the output file (forwarded to command as $FILE)
+    方法 新建(command: &字符串切片, filepath: &OsStr) -> 结果<自身类型> {
+        // set $FILE, save previous value (if there was one)
+        设 _with_env_var_set = WithEnvVarSet::新建("FILE", filepath);
+
+        设 shell_process =
+            Command::新建(环境::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
+                .arg("-c")
+                .arg(command)
+                .stdin(Stdio::piped())
+                .生成()?;
+
+        好的(自身类型 { shell_process })
+    }
+}
+
+实现 Drop 循环 FilterWriter {
+    /// flush stdin, close it and wait on `shell_process` before dropping self
+    方法 drop(&可变 自身) {
+        {
+            // close stdin by dropping it
+            设 _stdin = 自身.shell_process.stdin.as_mut();
+        }
+        设 exit_status = 自身
+            .shell_process
+            .wait()
+            .期望("Couldn't wait for child process");
+        如果 设 一些(return_code) = exit_status.code() {
+            如果 return_code != 0 {
+                show!(USimpleError::新建(
+                    1,
+                    translate!("split-error-shell-process-returned", "code" => return_code)
+                ));
+            }
+        } 否则 {
+            show!(USimpleError::新建(
+                1,
+                translate!("split-error-shell-process-terminated")
+            ));
+        }
+    }
+}
+
+/// Instantiate either a file writer or a "write to shell process's stdin" writer
+公有 方法 instantiate_current_writer(
+    过滤: 选项<&字符串切片>,
+    filename: &OsStr,
+    is_new: 布尔,
+) -> 结果<BufWriter<盒子<动态 Write>>> {
+    匹配 过滤 {
+        无 => {
+            设 file = 如果 is_new {
+                // create new file
+                标准库::文件系统::OpenOptions::新建()
+                    .写锁定(真)
+                    .create(真)
+                    .truncate(真)
+                    .open(Path::新建(filename))
+                    .map_err(|e| 匹配 e.kind() {
+                        ErrorKind::IsADirectory => 错误协议::other(
+                            translate!("split-error-is-a-directory", "dir" => filename.quote()),
+                        ),
+                        _ => 错误协议::other(
+                            translate!("split-error-unable-to-open-file", "file" => filename.quote()),
+                        ),
+                    })?
+            } 否则 {
+                // re-open file that we previously created to append to it
+                标准库::文件系统::OpenOptions::新建()
+                    .append(真)
+                    .open(Path::新建(filename))
+                    .map_err(|_| {
+                        错误协议::other(translate!(
+                            "split-error-unable-to-reopen-file",
+                            "file" => filename.quote()
+                        ))
+                    })?
+            };
+            好的(BufWriter::新建(盒子::新建(file) 转换 盒子<动态 Write>))
+        }
+        一些(filter_command) => 好的(BufWriter::新建(盒子::新建(
+            // spawn a shell command and write to it
+            FilterWriter::新建(filter_command, filename)?,
+        ) 转换 盒子<动态 Write>)),
+    }
+}
+
+公有 方法 paths_refer_to_same_file(p1: &OsStr, p2: &OsStr) -> 布尔 {
+    // We have to take symlinks and relative paths into account.
+    设 p1 = 如果 p1 == "-" {
+        FileInformation::from_file(&标准库::输入输出::stdin())
+    } 否则 {
+        FileInformation::from_path(Path::新建(p1), 真)
+    };
+    文件系统::infos_refer_to_same_file(p1, FileInformation::from_path(Path::新建(p2), 真))
+}

@@ -1,0 +1,400 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Output traits and types for programmatic access to ls functionality.
+//!
+//! This module provides a visitor/sink pattern that separates file enumeration
+//! logic from output formatting. This allows programmatic consumers (shells,
+//! file managers, etc.) to receive structured data without parsing text output.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use std::path::Path;
+//! use uu_ls::{Config, list_with_output, EntryInfo, LsOutput, StreamingOutput};
+//!
+//! struct MySink {
+//!     pub count: usize,
+//! }
+//!
+//! impl MySink {
+//!     fn new() -> Self {
+//!         Self { count: 0 }
+//!     }
+//! }
+//!
+//! impl LsOutput for MySink {
+//!     fn stream_mode(&self) -> StreamMode {
+//!         StreamMode::Streaming
+//!     }
+//!
+//!     fn write_entry(&mut self, entry: &EntryInfo) -> uucore::error::UResult<()> {
+//!         println!("{} -> {:?}", entry.path.display(), entry.file_type);
+//!         self.count += 1;
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let config = Config::from(&matches)?;
+//! let mut output = MySink::new();
+//! list_with_output(vec![Path::new(".")], &config, &mut output)?;
+//! println!("processed {} entries", output.count);
+//! ```
+
+//! Alternatively, use [`StreamingOutput`] when you want a reusable streaming sink
+//! that collects `EntryInfo` objects as they arrive.
+
+使用 箱::{Config, PathData};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::{FileType, Metadata};
+使用 标准库::路径::PathBuf;
+使用 uucore::错误::UResult;
+
+/// Information about a single file/directory entry.
+///
+/// This struct provides programmatic access to file metadata without
+/// requiring text parsing. All fields are pre-computed and ready for use.
+#[derive(调试协议, 克隆协议)]
+公有 结构 EntryInfo {
+    /// The full path to the file
+    公有 路径: PathBuf,
+    /// The display name (file name portion, may differ from path for . and ..)
+    公有 display_name: OsString,
+    /// The file type (file, directory, symlink, etc.)
+    公有 file_type: 选项<FileType>,
+    /// File metadata (size, permissions, timestamps, etc.)
+    公有 metadata: 选项<Metadata>,
+    /// Security context (SELinux) if available
+    公有 security_context: 字符串,
+    /// Whether this entry was specified on the command line
+    公有 command_line: 布尔,
+    /// Whether symlinks should be dereferenced for this entry
+    公有 must_dereference: 布尔,
+}
+
+实现 EntryInfo {
+    /// Returns true if this entry represents a directory
+    公有 方法 is_dir(&自身) -> 布尔 {
+        自身.file_type.as_ref().is_some_and(FileType::is_dir)
+    }
+
+    /// Returns true if this entry represents a regular file
+    公有 方法 is_file(&自身) -> 布尔 {
+        自身.file_type.as_ref().is_some_and(FileType::is_file)
+    }
+
+    /// Returns true if this entry represents a symbolic link
+    公有 方法 is_symlink(&自身) -> 布尔 {
+        自身.file_type.as_ref().is_some_and(FileType::is_symlink)
+    }
+
+    /// Returns the file size in bytes, if metadata is available
+    公有 方法 size(&自身) -> 选项<正64> {
+        自身.metadata.as_ref().映射(Metadata::长度)
+    }
+
+    /// Returns the file name as a string slice, if valid UTF-8
+    公有 方法 file_name(&自身) -> 选项<&字符串切片> {
+        自身.display_name.to_str()
+    }
+}
+
+/// Streaming mode for `LsOutput` sinks.
+///
+/// `Batch` sinks receive a directory's entries all at once via
+/// [`LsOutput::write_entries`]. `Streaming` sinks receive one entry at a time via
+/// [`LsOutput::write_entry`].
+公有 枚举 StreamMode {
+    Batch,
+    Streaming,
+}
+
+/// Trait for receiving ls output entries.
+///
+/// Implement this trait to receive structured data from the ls enumeration
+/// process. The trait is designed to support both streaming (one entry at a time)
+/// and batched (all entries at once) use cases.
+///
+/// For programmatic access, implement [`write_entry`](LsOutput::write_entry) to
+/// receive each entry individually.
+///
+/// The internal `TextOutput` implementation uses [`write_entries`](LsOutput::write_entries)
+/// to receive batches for proper column alignment and grid formatting.
+公有 协议 LsOutput {
+    /// Returns the preferred output mode for this sink.
+    ///
+    /// Default is `Batch` so text-formatting sinks can continue to receive full
+    /// directory batches. Streaming sinks should override this to return
+    /// `StreamMode::Streaming`.
+    方法 stream_mode(&自身) -> StreamMode {
+        StreamMode::Batch
+    }
+
+    /// Called for each file/directory entry (streaming mode).
+    ///
+    /// Default implementation does nothing. Override this for programmatic access
+    /// where you want to process entries one at a time.
+    方法 write_entry(&可变 自身, _entry: &EntryInfo) -> UResult<()> {
+        好的(())
+    }
+
+    /// Called with a batch of entries for a directory.
+    ///
+    /// Default implementation calls `write_entry` for each entry.
+    /// Override this for text output that needs all entries for formatting.
+    方法 write_entries(&可变 自身, entries: &[PathData], config: &Config) -> UResult<()> {
+        循环 entry 在 entries {
+            自身.write_entry(&entry.to_entry_info(config))?;
+        }
+        好的(())
+    }
+
+    /// Called when entering a directory (for recursive listings or multiple arguments).
+    ///
+    /// # Arguments
+    /// * `path_data` - The directory being entered
+    /// * `config` - The ls configuration
+    /// * `is_first` - Whether this is the first directory (affects newline handling)
+    方法 write_dir_header(
+        &可变 自身,
+        _path_data: &PathData,
+        _config: &Config,
+        _is_first: 布尔,
+    ) -> UResult<()> {
+        好的(())
+    }
+
+    /// Called to report the total blocks for a directory in long format.
+    ///
+    /// The `total_size` parameter is the total number of blocks used by
+    /// files in the directory.
+    方法 write_total(&可变 自身, _total_size: 正64, _config: &Config) -> UResult<()> {
+        好的(())
+    }
+
+    /// Called to flush any buffered output (e.g., before error messages).
+    方法 flush(&可变 自身) -> UResult<()> {
+        好的(())
+    }
+
+    /// Called when all entries have been written.
+    ///
+    /// Use this for final cleanup, printing dired output, etc.
+    方法 finalize(&可变 自身, _config: &Config) -> UResult<()> {
+        好的(())
+    }
+
+    /// Called at the start of listing, before any entries are processed.
+    ///
+    /// Use this for initialization that needs the config (e.g., color reset).
+    方法 initialize(&可变 自身, _config: &Config) -> UResult<()> {
+        好的(())
+    }
+}
+
+/// A dedicated streaming output sink.
+///
+/// This sink is intended for programmatic consumers that want to receive
+/// `EntryInfo` objects one at a time as they are emitted. It implements
+/// [`LsOutput::stream_mode`] as `StreamMode::Streaming`.
+///
+/// # Example
+///
+/// ```ignore
+/// use uu_ls::{Config, list_with_output, StreamingOutput};
+/// use std::path::Path;
+///
+/// let mut output = StreamingOutput::new();
+/// list_with_output(vec![Path::new(".")], &config, &mut output)?;
+///
+/// for entry in output.entries() {
+///     println!("{}: {} bytes",
+///         entry.display_name.to_string_lossy(),
+///         entry.size().unwrap_or(0));
+/// }
+/// ```
+#[derive(调试协议, 默认协议)]
+公有 结构 StreamingOutput {
+    entries: 向量<EntryInfo>,
+    directories: 向量<PathBuf>,
+    totals: 向量<正64>,
+}
+
+实现 StreamingOutput {
+    /// Create a new empty streaming sink.
+    公有 方法 新建() -> 自身类型 {
+        自身类型::默认()
+    }
+
+    /// Get all collected entries
+    公有 方法 entries(&自身) -> &[EntryInfo] {
+        &自身.entries
+    }
+
+    /// Consume the collector and return all entries
+    公有 方法 into_entries(自身) -> 向量<EntryInfo> {
+        自身.entries
+    }
+
+    /// Get all directory headers that were encountered
+    公有 方法 directories(&自身) -> &[PathBuf] {
+        &自身.directories
+    }
+
+    /// Get all totals that were written
+    公有 方法 totals(&自身) -> &[正64] {
+        &自身.totals
+    }
+
+    /// Clear all collected data
+    公有 方法 clear(&可变 自身) {
+        自身.entries.clear();
+        自身.directories.clear();
+        自身.totals.clear();
+    }
+}
+
+实现 LsOutput 循环 StreamingOutput {
+    方法 stream_mode(&自身) -> StreamMode {
+        StreamMode::Streaming
+    }
+
+    方法 write_entry(&可变 自身, entry: &EntryInfo) -> UResult<()> {
+        自身.entries.压入(entry.克隆());
+        好的(())
+    }
+
+    方法 write_dir_header(
+        &可变 自身,
+        path_data: &PathData,
+        _config: &Config,
+        _is_first: 布尔,
+    ) -> UResult<()> {
+        自身.directories.压入(path_data.路径().to_path_buf());
+        好的(())
+    }
+
+    方法 write_total(&可变 自身, total_size: 正64, _config: &Config) -> UResult<()> {
+        自身.totals.压入(total_size);
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_entry_info_is_dir() {
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/dir"),
+            display_name: OsString::from("dir"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        断言!(!entry.is_dir());
+    }
+
+    #[test]
+    方法 test_entry_info_size() {
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/file"),
+            display_name: OsString::from("file"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        相等断言!(entry.size(), 无);
+    }
+
+    #[test]
+    方法 test_entry_info_file_name() {
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/file.txt"),
+            display_name: OsString::from("file.txt"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        相等断言!(entry.file_name(), 一些("file.txt"));
+    }
+
+    #[test]
+    方法 test_streaming_output_new() {
+        设 collector = StreamingOutput::新建();
+        断言!(collector.entries().为空());
+        断言!(collector.directories().为空());
+        断言!(collector.totals().为空());
+    }
+
+    #[test]
+    方法 test_streaming_output_write_entry() {
+        设 可变 collector = StreamingOutput::新建();
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/file"),
+            display_name: OsString::from("file"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        collector.write_entry(&entry).解包();
+        相等断言!(collector.entries().长度(), 1);
+        相等断言!(collector.entries()[0].display_name, OsString::from("file"));
+    }
+
+    #[test]
+    方法 test_streaming_output_clear() {
+        设 可变 collector = StreamingOutput::新建();
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/file"),
+            display_name: OsString::from("file"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        collector.write_entry(&entry).解包();
+
+        collector.clear();
+        断言!(collector.entries().为空());
+        断言!(collector.directories().为空());
+        断言!(collector.totals().为空());
+    }
+
+    #[test]
+    方法 test_streaming_output_into_entries() {
+        设 可变 collector = StreamingOutput::新建();
+        设 entry = EntryInfo {
+            路径: PathBuf::from("/test/file"),
+            display_name: OsString::from("file"),
+            file_type: 无,
+            metadata: 无,
+            security_context: 字符串::新建(),
+            command_line: 假,
+            must_dereference: 假,
+        };
+        collector.write_entry(&entry).解包();
+
+        设 entries = collector.into_entries();
+        相等断言!(entries.长度(), 1);
+        相等断言!(entries[0].display_name, OsString::from("file"));
+    }
+
+    #[test]
+    方法 test_streaming_output_flush() {
+        设 可变 collector = StreamingOutput::新建();
+        断言!(collector.flush().is_ok());
+    }
+}

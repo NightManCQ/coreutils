@@ -1,0 +1,53 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::单元格::Cell;
+使用 windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
+使用 windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
+使用 windows_sys::core::BOOL;
+
+公有 类型 Pid = 正32;
+
+公有 结构 ProcessChecker {
+    dead: Cell<布尔>,
+    handle: HANDLE,
+}
+
+实现 ProcessChecker {
+    公有 方法 新建(process_id: Pid) -> 自身类型 {
+        #[allow(non_snake_case)]
+        设 FALSE: BOOL = 0;
+        设 h = 不安全 { OpenProcess(PROCESS_SYNCHRONIZE, FALSE, process_id) };
+        自身类型 {
+            dead: Cell::新建(h.is_null()),
+            handle: h,
+        }
+    }
+
+    公有 方法 is_dead(&自身) -> 布尔 {
+        如果 !自身.dead.获取() {
+            自身.dead.set(不安全 {
+                设 status = WaitForSingleObject(自身.handle, 0);
+                status == WAIT_OBJECT_0 || status == WAIT_FAILED
+            });
+        }
+
+        自身.dead.获取()
+    }
+}
+
+实现 Drop 循环 ProcessChecker {
+    方法 drop(&可变 自身) {
+        不安全 {
+            CloseHandle(自身.handle);
+        }
+    }
+}
+
+公有 方法 supports_pid_checks(_pid: Pid) -> 布尔 {
+    真
+}

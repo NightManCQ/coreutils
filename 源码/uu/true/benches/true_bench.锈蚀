@@ -1,0 +1,22 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 uu_true::uumain;
+使用 uucore::benchmark::run_util_function;
+
+/// Benchmark multiple consecutive invocations (avoid less than 1 ns)
+#[divan::bench]
+方法 true_consecutive_calls(bencher: Bencher) {
+    bencher.bench(|| {
+        循环 _ 在 0..100 {
+            black_box(run_util_function(uumain, &[]));
+        }
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

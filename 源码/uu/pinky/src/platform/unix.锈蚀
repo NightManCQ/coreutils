@@ -1,0 +1,307 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) BUFSIZE gecos fullname, mesg iobuf
+
+使用 箱::Capitalize;
+使用 箱::options;
+使用 箱::uu_app;
+
+使用 uucore::entries::{Locate, Passwd};
+使用 uucore::错误::UResult;
+使用 uucore::libc::S_IWGRP;
+使用 uucore::translate;
+使用 uucore::utmpx::{自身, Utmpx, UtmpxRecord, 时间};
+
+使用 标准库::输入输出::BufReader;
+使用 标准库::输入输出::预导入::*;
+
+使用 标准库::文件系统::File;
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+使用 标准库::路径::PathBuf;
+
+方法 get_long_usage() -> 字符串 {
+    格式化!(
+        "{}{}",
+        translate!("pinky-long-usage-description"),
+        utmpx::DEFAULT_FILE
+    )
+}
+
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result(uu_app().after_help(get_long_usage()), args)?;
+
+    设 users: 向量<字符串> = matches
+        .get_many::<字符串>(options::USER)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    // If true, display the hours:minutes since each user has touched
+    // the keyboard, or blank if within the last minute, or days followed
+    // by a 'd' if not within the last day.
+    设 可变 include_idle = 真;
+
+    // If true, display a line at the top describing each field.
+    设 include_heading = !matches.get_flag(options::OMIT_HEADINGS);
+
+    // if true, display the user's full name from pw_gecos.
+    设 可变 include_fullname = 真;
+
+    // if true, display the user's ~/.project file when doing long format.
+    设 include_project = !matches.get_flag(options::OMIT_PROJECT_FILE);
+
+    // if true, display the user's ~/.plan file when doing long format.
+    设 include_plan = !matches.get_flag(options::OMIT_PLAN_FILE);
+
+    // if true, display the user's home directory and shell
+    // when doing long format.
+    设 include_home_and_shell = !matches.get_flag(options::OMIT_HOME_DIR);
+
+    // if true, use the "short" output format.
+    设 do_short_format = !matches.get_flag(options::LONG_FORMAT);
+
+    // If true, attempt to canonicalize hostname via a DNS lookup.
+    设 do_lookup = matches.get_flag(options::LOOKUP);
+
+    /* if true, display the ut_host field. */
+    设 可变 include_where = 真;
+
+    如果 matches.get_flag(options::OMIT_NAME) {
+        include_fullname = 假;
+    }
+    如果 matches.get_flag(options::OMIT_NAME_HOST) {
+        include_fullname = 假;
+        include_where = 假;
+    }
+    如果 matches.get_flag(options::OMIT_NAME_HOST_TIME) {
+        include_fullname = 假;
+        include_idle = 假;
+        include_where = 假;
+    }
+
+    设 pk = Pinky {
+        do_lookup,
+        include_idle,
+        include_heading,
+        include_fullname,
+        include_project,
+        include_plan,
+        include_home_and_shell,
+        include_where,
+        names: users,
+    };
+
+    如果 do_short_format {
+        pk.short_pinky();
+    } 否则 {
+        pk.long_pinky();
+    }
+    好的(())
+}
+
+结构 Pinky {
+    do_lookup: 布尔,
+    include_idle: 布尔,
+    include_heading: 布尔,
+    include_fullname: 布尔,
+    include_project: 布尔,
+    include_plan: 布尔,
+    include_where: 布尔,
+    include_home_and_shell: 布尔,
+    names: 向量<字符串>,
+}
+
+方法 idle_string(when: 整64) -> 字符串 {
+    thread_local! {
+        静态 NOW: 时间::OffsetDateTime = 时间::OffsetDateTime::now_local().unwrap_or_else(|_| 时间::OffsetDateTime::now_utc());
+    }
+    NOW.with(|n| {
+        设 duration = n.unix_timestamp() - when;
+        如果 duration < 60 {
+            // less than 1min
+            "     ".to_owned()
+        } 否则 如果 duration < 24 * 3600 {
+            // less than 1day
+            设 hours = duration / (60 * 60);
+            设 minutes = (duration % (60 * 60)) / 60;
+            格式化!("{hours:02}:{minutes:02}")
+        } 否则 {
+            // more than 1day
+            设 days = duration / (24 * 3600);
+            格式化!("{days}d")
+        }
+    })
+}
+
+方法 time_string(ut: &UtmpxRecord) -> 字符串 {
+    设 time_format: 向量<时间::format_description::FormatItem> = 如果 ["LC_ALL", "LC_TIME", "LANG"]
+        .into_iter()
+        .find_map(标准库::环境::var_os)
+        .as_deref()
+        == 一些(标准库::ffi::OsStr::新建("C"))
+    {
+        // "%b %e %H:%M"
+        时间::format_description::parse("[month repr:short] [day padding:space] [hour]:[minute]")
+            .解包()
+    } 否则 {
+        // "%Y-%m-%d %H:%M"
+        时间::format_description::parse("[year]-[month]-[day] [hour]:[minute]").解包()
+    };
+    ut.login_time().format(&time_format).解包()
+}
+
+方法 gecos_to_fullname(pw: &Passwd) -> 选项<字符串> {
+    设 可变 gecos = 如果 设 一些(gecos) = &pw.user_info {
+        gecos.克隆()
+    } 否则 {
+        返回 无;
+    };
+    如果 设 一些(n) = gecos.寻找(',') {
+        gecos.truncate(n);
+    }
+    一些(gecos.replace('&', &pw.name.capitalize()))
+}
+
+实现 Pinky {
+    方法 print_entry(&自身, ut: &UtmpxRecord) {
+        设 可变 pts_path = PathBuf::from("/dev");
+        pts_path.压入(ut.tty_device().as_str());
+
+        设 mesg;
+        设 last_change;
+
+        #[allow(clippy::unnecessary_cast)]
+        如果 设 好的(meta) = pts_path.metadata() {
+            mesg = 如果 (meta.mode() & (S_IWGRP 转换 正32)) == 0 {
+                '*'
+            } 否则 {
+                ' '
+            };
+            last_change = meta.atime();
+        } 否则 {
+            mesg = '?';
+            last_change = 0;
+        }
+
+        打印!("{1:<8.0$}", utmpx::UT_NAMESIZE, ut.user());
+
+        如果 自身.include_fullname {
+            设 fullname = 如果 设 好的(pw) = Passwd::locate(ut.user().as_ref()) {
+                gecos_to_fullname(&pw)
+            } 否则 {
+                无
+            };
+            如果 设 一些(fullname) = fullname {
+                打印!(" {fullname:<19.19}");
+            } 否则 {
+                打印!(" {:19}", "        ???");
+            }
+        }
+
+        打印!(" {mesg}{:<8.*}", utmpx::UT_LINESIZE, ut.tty_device());
+
+        如果 自身.include_idle {
+            如果 last_change == 0 {
+                打印!(" {:<6}", "?????");
+            } 否则 {
+                打印!(" {:<6}", idle_string(last_change));
+            }
+        }
+
+        打印!(" {}", time_string(ut));
+
+        如果 自身.include_where {
+            设 s: 字符串 = 如果 自身.do_lookup {
+                ut.canon_host().unwrap_or(ut.host())
+            } 否则 {
+                ut.host()
+            };
+
+            如果 !s.为空() {
+                打印!(" {s}");
+            }
+        }
+
+        打印行!();
+    }
+
+    方法 print_heading(&自身) {
+        打印!("{:<8}", translate!("pinky-column-login"));
+        如果 自身.include_fullname {
+            打印!(" {:<19}", translate!("pinky-column-name"));
+        }
+        打印!(" {:<9}", translate!("pinky-column-tty"));
+        如果 自身.include_idle {
+            打印!(" {:<6}", translate!("pinky-column-idle"));
+        }
+        打印!(" {:<16}", translate!("pinky-column-when"));
+        如果 自身.include_where {
+            打印!(" {}", translate!("pinky-column-where"));
+        }
+        打印行!();
+    }
+
+    方法 short_pinky(&自身) {
+        如果 自身.include_heading {
+            自身.print_heading();
+        }
+        循环 ut 在 Utmpx::iter_all_records() {
+            如果 ut.is_user_process()
+                && (自身.names.为空() || 自身.names.迭代().任意(|n| n.as_str() == ut.user()))
+            {
+                自身.print_entry(&ut);
+            }
+        }
+    }
+
+    方法 long_pinky(&自身) {
+        循环 u 在 &自身.names {
+            打印!(
+                "{} {u:<28}{} ",
+                translate!("pinky-login-name-label"),
+                translate!("pinky-real-life-label")
+            );
+            如果 设 好的(pw) = Passwd::locate(u.as_str()) {
+                设 fullname = gecos_to_fullname(&pw).unwrap_or_default();
+                设 user_dir = pw.user_dir.unwrap_or_default();
+                设 user_shell = pw.user_shell.unwrap_or_default();
+                打印行!(" {fullname}");
+                如果 自身.include_home_and_shell {
+                    打印!("{} {user_dir:<29}", translate!("pinky-directory-label"));
+                    打印行!("{}  {user_shell}", translate!("pinky-shell-label"));
+                }
+                如果 自身.include_project {
+                    设 可变 p = PathBuf::from(&user_dir);
+                    p.压入(".project");
+                    如果 设 好的(f) = File::open(p) {
+                        打印!("{} ", translate!("pinky-project-label"));
+                        read_to_console(f);
+                    }
+                }
+                如果 自身.include_plan {
+                    设 可变 p = PathBuf::from(&user_dir);
+                    p.压入(".plan");
+                    如果 设 好的(f) = File::open(p) {
+                        打印行!("{}:", translate!("pinky-plan-label"));
+                        read_to_console(f);
+                    }
+                }
+                打印行!();
+            } 否则 {
+                打印行!(" ???");
+            }
+        }
+    }
+}
+
+方法 read_to_console<F: Read>(f: F) {
+    设 可变 reader = BufReader::新建(f);
+    设 可变 iobuf = 向量::新建();
+    如果 reader.read_to_end(&可变 iobuf).is_ok() {
+        打印!("{}", 字符串::from_utf8_lossy(&iobuf));
+    }
+}

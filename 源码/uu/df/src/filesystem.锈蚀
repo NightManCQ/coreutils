@@ -1,0 +1,427 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Provides a summary representation of a filesystem.
+//!
+//! A [`Filesystem`] struct represents a device containing a
+//! filesystem mounted at a particular directory. It also includes
+//! information on amount of space available and amount of space used.
+// spell-checker:ignore canonicalized
+#[cfg(unix)]
+使用 标准库::输入输出;
+#[cfg(unix)]
+使用 标准库::路径::PathBuf;
+使用 标准库::{ffi::OsString, 路径::Path};
+
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+#[cfg(unix)]
+使用 uucore::fsext::{FsMeta, pretty_fstype, statfs};
+使用 uucore::fsext::{FsUsage, MountInfo};
+
+/// Summary representation of a filesystem.
+///
+/// A [`Filesystem`] struct represents a device containing a
+/// filesystem mounted at a particular directory. The
+/// [`Filesystem::mount_info`] field exposes that information. The
+/// [`Filesystem::usage`] field provides information on the amount of
+/// space available on the filesystem and the amount of space used.
+#[derive(调试协议, 克隆协议)]
+公有(箱) 结构 Filesystem {
+    /// The file given on the command line if any.
+    ///
+    /// When invoking `df` with a positional argument, it displays
+    /// usage information for the filesystem that contains the given
+    /// file. If given, this field contains that filename.
+    公有 file: 选项<OsString>,
+
+    /// Information about the mounted device, mount directory, and related options.
+    公有 mount_info: MountInfo,
+
+    /// Information about the amount of space used on the filesystem.
+    公有 usage: FsUsage,
+}
+
+#[derive(调试协议, 偏等比较协议)]
+公有(箱) 枚举 FsError {
+    #[cfg(not(windows))]
+    OverMounted,
+    InvalidPath,
+    MountMissing,
+}
+
+/// Check whether `mount` has been over-mounted.
+///
+/// `mount` is considered over-mounted if it there is an element in
+/// `mounts` after mount that has the same `mount_dir`.
+#[cfg(not(windows))]
+方法 is_over_mounted(mounts: &[MountInfo], mount: &MountInfo) -> 布尔 {
+    设 last_mount_for_dir = mounts.迭代().rfind(|m| m.mount_dir == mount.mount_dir);
+
+    如果 设 一些(lmi) = last_mount_for_dir {
+        lmi.dev_name != mount.dev_name
+    } 否则 {
+        // Should be unreachable if `mount` is in `mounts`
+        假
+    }
+}
+
+/// Find mount point by walking up the directory tree until device ID changes.
+#[cfg(unix)]
+公有(箱) 方法 find_mount_point<P: 作为引用协议<Path>>(路径: P) -> 输入输出::结果<PathBuf> {
+    设 可变 current = 路径.as_ref().canonicalize()?;
+    设 current_dev = current.metadata()?.dev();
+
+    无限循环 {
+        设 parent = 匹配 current.parent() {
+            一些(p) 如果 !p.as_os_str().为空() => p,
+            _ => 返回 好的(current),
+        };
+
+        设 parent_dev = parent.metadata()?.dev();
+        如果 parent_dev != current_dev {
+            返回 好的(current);
+        }
+
+        如果 parent == current {
+            返回 好的(current);
+        }
+
+        current = parent.to_path_buf();
+    }
+}
+
+/// Find the mount info that best matches a given filesystem path.
+///
+/// This function returns the element of `mounts` on which `path` is
+/// mounted. If there are no matches, this function returns
+/// [`None`]. If there are two or more matches, then the single
+/// [`MountInfo`] with the device name corresponding to the entered path.
+///
+/// If `canonicalize` is `true`, then the `path` is canonicalized
+/// before checking whether it matches any mount directories.
+///
+/// # See also
+///
+/// * [`Path::canonicalize`]
+/// * [`MountInfo::mount_dir`]
+方法 mount_info_from_path<P>(
+    mounts: &[MountInfo],
+    路径: P,
+    // This is really only used for testing purposes.
+    canonicalize: 布尔,
+) -> 结果<&MountInfo, FsError>
+何处
+    P: 作为引用协议<Path>,
+{
+    // TODO Refactor this function with `Stater::find_mount_point()`
+    // in the `stat` crate.
+    设 路径 = 如果 canonicalize {
+        路径.as_ref()
+            .canonicalize()
+            .map_err(|_| FsError::InvalidPath)?
+    } 否则 {
+        路径.as_ref().to_path_buf()
+    };
+
+    // Find the potential mount point that matches entered path
+    设 maybe_mount_point = mounts
+        .迭代()
+        // Create pair MountInfo, canonicalized device name
+        // TODO Abstract from accessing real filesystem to
+        // make code more testable
+        .映射(|m| (m, 标准库::文件系统::canonicalize(&m.dev_name)))
+        // Ignore non existing paths
+        .过滤(|m| m.1.is_ok())
+        .映射(|m| (m.0, m.1.ok().解包()))
+        // Try to find canonicalized device name corresponding to entered path
+        .寻找(|m| m.1.eq(&路径))
+        .映射(|m| m.0);
+
+    maybe_mount_point
+        .or_else(|| {
+            mounts
+                .迭代()
+                .过滤(|mi| 路径.starts_with(&mi.mount_dir))
+                .max_by_key(|mi| mi.mount_dir.长度())
+        })
+        .ok_or(FsError::MountMissing)
+}
+
+实现 Filesystem {
+    // TODO: resolve uuid in `mount_info.dev_name` if exists
+    公有(箱) 方法 新建(mount_info: MountInfo, file: 选项<OsString>) -> 选项<自身类型> {
+        设 stat_path = 如果 mount_info.mount_dir.为空() {
+            #[cfg(unix)]
+            {
+                mount_info.dev_name.克隆().into()
+            }
+            #[cfg(windows)]
+            {
+                // On windows, we expect the volume id
+                mount_info.dev_id.克隆().into()
+            }
+        } 否则 {
+            mount_info.mount_dir.克隆()
+        };
+        #[cfg(unix)]
+        设 usage = FsUsage::新建(statfs(&stat_path).ok()?);
+        #[cfg(windows)]
+        设 usage = FsUsage::新建(Path::新建(&stat_path)).ok()?;
+        一些(自身类型 {
+            file,
+            mount_info,
+            usage,
+        })
+    }
+
+    /// Find and create the filesystem from the given mount
+    /// after checking that the it hasn't been over-mounted
+    #[cfg(not(windows))]
+    公有(箱) 方法 from_mount(
+        mounts: &[MountInfo],
+        mount: &MountInfo,
+        file: 选项<OsString>,
+    ) -> 结果<自身类型, FsError> {
+        如果 is_over_mounted(mounts, mount) {
+            坏的(FsError::OverMounted)
+        } 否则 {
+            自身类型::新建(mount.克隆(), file).ok_or(FsError::MountMissing)
+        }
+    }
+
+    /// Find and create the filesystem from the given mount.
+    #[cfg(windows)]
+    公有(箱) 方法 from_mount(mount: &MountInfo, file: 选项<OsString>) -> 结果<自身类型, FsError> {
+        自身类型::新建(mount.克隆(), file).ok_or(FsError::MountMissing)
+    }
+
+    /// Find and create the filesystem that best matches a given path.
+    ///
+    /// This function returns a new `Filesystem` derived from the
+    /// element of `mounts` on which `path` is mounted. If there are
+    /// no matches, this function returns [`None`]. If there are two
+    /// or more matches, then the single [`Filesystem`] with the
+    /// longest mount directory is returned.
+    ///
+    /// The `path` is canonicalized before checking whether it matches
+    /// any mount directories.
+    ///
+    /// # See also
+    ///
+    /// * [`Path::canonicalize`]
+    /// * [`MountInfo::mount_dir`]
+    ///
+    公有(箱) 方法 from_path<P>(mounts: &[MountInfo], 路径: P) -> 结果<自身类型, FsError>
+    何处
+        P: 作为引用协议<Path>,
+    {
+        设 file = 路径.as_ref().as_os_str().to_owned();
+        设 canonicalize = 真;
+
+        设 result = mount_info_from_path(mounts, 路径, canonicalize);
+        #[cfg(windows)]
+        返回 result.and_then(|mount_info| 自身类型::from_mount(mount_info, 一些(file)));
+        #[cfg(not(windows))]
+        返回 result.and_then(|mount_info| 自身类型::from_mount(mounts, mount_info, 一些(file)));
+    }
+
+    /// Fallback using statfs when mount table is unavailable.
+    #[cfg(unix)]
+    公有(箱) 方法 from_path_direct<P>(路径: P) -> 结果<自身类型, FsError>
+    何处
+        P: 作为引用协议<Path>,
+    {
+        设 file = 路径.as_ref().as_os_str().to_owned();
+
+        设 canonical_path = 路径
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| FsError::InvalidPath)?;
+
+        设 stat_result = statfs(canonical_path.as_os_str()).map_err(|_| FsError::MountMissing)?;
+        设 mount_dir = find_mount_point(&canonical_path).map_err(|_| FsError::MountMissing)?;
+        设 fs_type = pretty_fstype(stat_result.fs_type()).into_owned();
+
+        设 mount_info = MountInfo {
+            dev_id: 字符串::新建(),
+            dev_name: "-".to_string(),
+            fs_type,
+            mount_dir: mount_dir.into_os_string(),
+            mount_option: 字符串::新建(),
+            mount_root: OsString::新建(),
+            remote: 假,
+            dummy: 假,
+        };
+
+        设 usage = FsUsage::新建(stat_result);
+
+        好的(自身类型 {
+            file: 一些(file),
+            mount_info,
+            usage,
+        })
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    模组 mount_info_from_path {
+
+        使用 标准库::ffi::OsString;
+
+        使用 uucore::fsext::MountInfo;
+
+        使用 箱::filesystem::{FsError, mount_info_from_path};
+
+        /// Create a fake `MountInfo` with the given directory name.
+        方法 mount_info(mount_dir: &字符串切片) -> MountInfo {
+            MountInfo {
+                dev_id: 字符串::默认(),
+                dev_name: 字符串::默认(),
+                fs_type: 字符串::默认(),
+                mount_dir: OsString::from(mount_dir),
+                mount_option: 字符串::默认(),
+                mount_root: OsString::默认(),
+                remote: 默认协议::默认(),
+                dummy: 默认协议::默认(),
+            }
+        }
+
+        /// Check whether two `MountInfo` instances are equal.
+        方法 mount_info_eq(m1: &MountInfo, m2: &MountInfo) -> 布尔 {
+            m1.dev_id == m2.dev_id
+                && m1.dev_name == m2.dev_name
+                && m1.fs_type == m2.fs_type
+                && m1.mount_dir == m2.mount_dir
+                && m1.mount_option == m2.mount_option
+                && m1.mount_root == m2.mount_root
+                && m1.remote == m2.remote
+                && m1.dummy == m2.dummy
+        }
+
+        #[test]
+        方法 test_empty_mounts() {
+            相等断言!(
+                mount_info_from_path(&[], "/", 假).unwrap_err(),
+                FsError::MountMissing
+            );
+        }
+
+        #[test]
+        方法 test_bad_path() {
+            相等断言!(
+                // This path better not exist....
+                mount_info_from_path(&[], "/non-existent-path", 真).unwrap_err(),
+                FsError::InvalidPath
+            );
+        }
+
+        #[test]
+        方法 test_exact_match() {
+            设 mounts = [mount_info("/foo")];
+            设 actual = mount_info_from_path(&mounts, "/foo", 假).解包();
+            断言!(mount_info_eq(actual, &mounts[0]));
+        }
+
+        #[test]
+        方法 test_prefix_match() {
+            设 mounts = [mount_info("/foo")];
+            设 actual = mount_info_from_path(&mounts, "/foo/bar", 假).解包();
+            断言!(mount_info_eq(actual, &mounts[0]));
+        }
+
+        #[test]
+        方法 test_multiple_matches() {
+            设 mounts = [mount_info("/foo"), mount_info("/foo/bar")];
+            设 actual = mount_info_from_path(&mounts, "/foo/bar", 假).解包();
+            断言!(mount_info_eq(actual, &mounts[1]));
+        }
+
+        #[test]
+        方法 test_no_match() {
+            设 mounts = [mount_info("/foo")];
+            相等断言!(
+                mount_info_from_path(&mounts, "/bar", 假).unwrap_err(),
+                FsError::MountMissing
+            );
+        }
+
+        #[test]
+        方法 test_partial_match() {
+            设 mounts = [mount_info("/foo/bar")];
+            相等断言!(
+                mount_info_from_path(&mounts, "/foo/baz", 假).unwrap_err(),
+                FsError::MountMissing
+            );
+        }
+
+        #[test]
+        方法 test_dev_name_match() {
+            设 tmp = tempfile::TempDir::新建().期望("Failed to create temp dir");
+            设 dev_name = 标准库::文件系统::canonicalize(tmp.路径())
+                .期望("Failed to canonicalize tmp path")
+                .to_string_lossy()
+                .to_string();
+
+            设 可变 mount_info = mount_info("/foo");
+            mount_info.dev_name = dev_name.克隆();
+            设 mounts = [mount_info];
+            设 actual = mount_info_from_path(&mounts, dev_name, 假).解包();
+            断言!(mount_info_eq(actual, &mounts[0]));
+        }
+    }
+
+    #[cfg(not(windows))]
+    模组 over_mount {
+        使用 标准库::ffi::OsString;
+
+        使用 箱::filesystem::{Filesystem, FsError, is_over_mounted};
+        使用 uucore::fsext::MountInfo;
+
+        方法 mount_info_with_dev_name(mount_dir: &字符串切片, dev_name: 选项<&字符串切片>) -> MountInfo {
+            MountInfo {
+                dev_id: 字符串::默认(),
+                dev_name: dev_name.映射(字符串::from).unwrap_or_default(),
+                fs_type: 字符串::默认(),
+                mount_dir: OsString::from(mount_dir),
+                mount_option: 字符串::默认(),
+                mount_root: OsString::默认(),
+                remote: 默认协议::默认(),
+                dummy: 默认协议::默认(),
+            }
+        }
+
+        #[test]
+        方法 test_over_mount() {
+            设 mount_info1 = mount_info_with_dev_name("/foo", 一些("dev_name_1"));
+            设 mount_info2 = mount_info_with_dev_name("/foo", 一些("dev_name_2"));
+            设 mounts = [mount_info1, mount_info2];
+            断言!(is_over_mounted(&mounts, &mounts[0]));
+        }
+
+        #[test]
+        方法 test_over_mount_not_over_mounted() {
+            设 mount_info1 = mount_info_with_dev_name("/foo", 一些("dev_name_1"));
+            设 mount_info2 = mount_info_with_dev_name("/foo", 一些("dev_name_2"));
+            设 mounts = [mount_info1, mount_info2];
+            断言!(!is_over_mounted(&mounts, &mounts[1]));
+        }
+
+        #[test]
+        方法 test_from_mount_over_mounted() {
+            设 mount_info1 = mount_info_with_dev_name("/foo", 一些("dev_name_1"));
+            设 mount_info2 = mount_info_with_dev_name("/foo", 一些("dev_name_2"));
+
+            设 mounts = [mount_info1, mount_info2];
+
+            相等断言!(
+                Filesystem::from_mount(&mounts, &mounts[0], 无).unwrap_err(),
+                FsError::OverMounted
+            );
+        }
+    }
+}

@@ -1,0 +1,516 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 超级::ExtendedBigDecimal;
+使用 箱::format::spec::ArgumentLocation;
+使用 箱::{
+    错误::set_exit_code,
+    os_str_as_bytes,
+    parser::num_parser::{ExtendedParser, ExtendedParserError},
+    quoting_style::{QuotingStyle, locale_aware_escape_name},
+    show_error, show_warning,
+};
+使用 os_display::Quotable;
+使用 标准库::{
+    ffi::{OsStr, OsString},
+    数字::NonZero,
+};
+
+/// An argument for formatting
+///
+/// Each of these variants is only accepted by their respective directives. For
+/// example, [`FormatArgument::Char`] requires a `%c` directive.
+///
+/// The [`FormatArgument::Unparsed`] variant contains a string that can be
+/// parsed into other types. This is used by the `printf` utility.
+#[derive(克隆协议, 调试协议, 偏等比较协议)]
+公有 枚举 FormatArgument {
+    Char(字符),
+    字符串(OsString),
+    UnsignedInt(正64),
+    SignedInt(整64),
+    Float(ExtendedBigDecimal),
+    /// Special argument that gets coerced into the other variants
+    Unparsed(OsString),
+}
+
+/// A struct that holds a slice of format arguments and provides methods to access them
+#[derive(调试协议, 偏等比较协议)]
+公有 结构 FormatArguments<'a> {
+    args: &'a [FormatArgument],
+    next_arg_position: 正整数大小,
+    highest_arg_position: 选项<正整数大小>,
+    current_offset: 正整数大小,
+}
+
+实现<'a> FormatArguments<'a> {
+    /// Create a new FormatArguments from a slice of FormatArgument
+    公有 方法 新建(args: &'a [FormatArgument]) -> 自身类型 {
+        自身类型 {
+            args,
+            next_arg_position: 0,
+            highest_arg_position: 无,
+            current_offset: 0,
+        }
+    }
+
+    /// Get the next argument that would be used
+    公有 方法 peek_arg(&自身) -> 选项<&'a FormatArgument> {
+        自身.args.获取(自身.next_arg_position)
+    }
+
+    /// Check if all arguments have been consumed
+    公有 方法 is_exhausted(&自身) -> 布尔 {
+        自身.current_offset >= 自身.args.长度()
+    }
+
+    公有 方法 start_next_batch(&可变 自身) {
+        自身.current_offset = 自身
+            .next_arg_position
+            .max(自身.highest_arg_position.map_or(0, |x| x.saturating_add(1)));
+        自身.next_arg_position = 自身.current_offset;
+    }
+
+    公有 方法 next_char(&可变 自身, position: ArgumentLocation) -> 正8 {
+        匹配 自身.next_arg(position) {
+            一些(FormatArgument::Char(c)) => *c 转换 正8,
+            一些(FormatArgument::Unparsed(操作系统)) => 匹配 os_str_as_bytes(操作系统) {
+                好的(bytes) => bytes.first().copied().unwrap_or(b'\0'),
+                坏的(_) => b'\0',
+            },
+            _ => b'\0',
+        }
+    }
+
+    公有 方法 next_string(&可变 自身, position: ArgumentLocation) -> &'a OsStr {
+        匹配 自身.next_arg(position) {
+            一些(FormatArgument::Unparsed(操作系统) | FormatArgument::字符串(操作系统)) => 操作系统,
+            _ => "".as_ref(),
+        }
+    }
+
+    公有 方法 next_i64(&可变 自身, position: ArgumentLocation) -> 整64 {
+        匹配 自身.next_arg(position) {
+            一些(FormatArgument::SignedInt(n)) => *n,
+            一些(FormatArgument::Unparsed(操作系统)) => 自身类型::get_num::<整64>(操作系统),
+            _ => 0,
+        }
+    }
+
+    公有 方法 next_u64(&可变 自身, position: ArgumentLocation) -> 正64 {
+        匹配 自身.next_arg(position) {
+            一些(FormatArgument::UnsignedInt(n)) => *n,
+            一些(FormatArgument::Unparsed(操作系统)) => 自身类型::get_num::<正64>(操作系统),
+            _ => 0,
+        }
+    }
+
+    公有 方法 next_extended_big_decimal(&可变 自身, position: ArgumentLocation) -> ExtendedBigDecimal {
+        匹配 自身.next_arg(position) {
+            一些(FormatArgument::Float(n)) => n.克隆(),
+            一些(FormatArgument::Unparsed(操作系统)) => 自身类型::get_num::<ExtendedBigDecimal>(操作系统),
+            _ => ExtendedBigDecimal::zero(),
+        }
+    }
+
+    // Parse an OsStr that we know to start with a '/"
+    方法 parse_quote_start<T>(操作系统: &OsStr) -> 结果<T, ExtendedParserError<T>>
+    何处
+        T: ExtendedParser + 转换协议<正8> + 转换协议<正32> + 默认协议,
+    {
+        // If this fails (this can only happens on Windows), then just
+        // return NotNumeric.
+        设 好的(s) = os_str_as_bytes(操作系统) 否则 {
+            返回 坏的(ExtendedParserError::NotNumeric);
+        };
+
+        设 (一些((b'"', bytes)) | 一些((b'\'', bytes))) = s.split_first() 否则 {
+            // This really can't happen, the string we are given must start with '/".
+            调试断言!(假);
+            返回 坏的(ExtendedParserError::NotNumeric);
+        };
+
+        如果 bytes.为空() {
+            返回 坏的(ExtendedParserError::NotNumeric);
+        }
+
+        设 (val, 长度) = 如果 设 一些(c) = bytes
+            .utf8_chunks()
+            .next()
+            .期望("bytes should not be empty")
+            .valid()
+            .chars()
+            .next()
+        {
+            // Valid UTF-8 character, cast the codepoint to u32 then T
+            // (largest unicode codepoint is only 3 bytes, so this is safe)
+            ((c 转换 正32).into(), c.len_utf8())
+        } 否则 {
+            // Not a valid UTF-8 character, use the first byte
+            (bytes[0].into(), 1)
+        };
+        // Emit a warning if there are additional characters
+        如果 bytes.长度() > 长度 {
+            返回 坏的(ExtendedParserError::PartialMatch(
+                val,
+                字符串::from_utf8_lossy(&bytes[长度..]).into_owned(),
+            ));
+        }
+
+        好的(val)
+    }
+
+    方法 get_num<T>(操作系统: &OsStr) -> T
+    何处
+        T: ExtendedParser + 转换协议<正8> + 转换协议<正32> + 默认协议,
+    {
+        设 s = 操作系统.to_string_lossy();
+        设 first = s.as_bytes().first().copied();
+
+        设 quote_start = first == 一些(b'"') || first == 一些(b'\'');
+        设 parsed = 如果 quote_start {
+            // The string begins with a quote
+            自身类型::parse_quote_start(操作系统)
+        } 否则 {
+            T::extended_parse(&s)
+        };
+
+        // Get the best possible value, even if parsed was an error.
+        extract_value(parsed, &s, quote_start)
+    }
+
+    方法 get_at_relative_position(&可变 自身, pos: NonZero<正整数大小>) -> 选项<&'a FormatArgument> {
+        设 pos: 正整数大小 = pos.into();
+        设 pos = (pos - 1).saturating_add(自身.current_offset);
+        自身.highest_arg_position = 一些(自身.highest_arg_position.map_or(pos, |x| x.max(pos)));
+        自身.args.获取(pos)
+    }
+
+    方法 next_arg(&可变 自身, position: ArgumentLocation) -> 选项<&'a FormatArgument> {
+        匹配 position {
+            ArgumentLocation::NextArgument => {
+                设 arg = 自身.args.获取(自身.next_arg_position);
+                自身.next_arg_position += 1;
+                arg
+            }
+            ArgumentLocation::Position(pos) => 自身.get_at_relative_position(pos),
+        }
+    }
+}
+
+方法 extract_value<T: 默认协议>(
+    p: 结果<T, ExtendedParserError<T>>,
+    input: &字符串切片,
+    quote_start: 布尔,
+) -> T {
+    匹配 p {
+        好的(v) => v,
+        坏的(e) => {
+            set_exit_code(1);
+            设 input = locale_aware_escape_name(OsStr::新建(input), QuotingStyle::C_NO_QUOTES);
+            匹配 e {
+                ExtendedParserError::Overflow(v) => {
+                    show_error!("{}: Numerical result out of range", input.quote());
+                    v
+                }
+                ExtendedParserError::Underflow(v) => {
+                    show_error!("{}: Numerical result out of range", input.quote());
+                    v
+                }
+                ExtendedParserError::NotNumeric => {
+                    show_error!("{}: expected a numeric value", input.quote());
+                    默认协议::默认()
+                }
+                ExtendedParserError::PartialMatch(v, rest) => {
+                    如果 quote_start {
+                        set_exit_code(0);
+                        show_warning!(
+                            "{rest}: character(s) following character constant have been ignored"
+                        );
+                    } 否则 {
+                        show_error!("{}: value not completely converted", input.quote());
+                    }
+
+                    v
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_format_arguments_empty() {
+        设 args = FormatArguments::新建(&[]);
+        相等断言!(无, args.peek_arg());
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_format_arguments_single_element() {
+        设 可变 args = FormatArguments::新建(&[FormatArgument::Char('a')]);
+        断言!(!args.is_exhausted());
+        相等断言!(一些(&FormatArgument::Char('a')), args.peek_arg());
+        断言!(!args.is_exhausted()); // Peek shouldn't consume
+        相等断言!(b'a', args.next_char(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(args.is_exhausted()); // After batch, exhausted with a single arg
+        相等断言!(无, args.peek_arg());
+    }
+
+    #[test]
+    方法 test_sequential_next_char() {
+        // Test with consistent sequential next_char calls
+        设 可变 args = FormatArguments::新建(&[
+            FormatArgument::Char('z'),
+            FormatArgument::Char('y'),
+            FormatArgument::Char('x'),
+            FormatArgument::Char('w'),
+            FormatArgument::Char('v'),
+            FormatArgument::Char('u'),
+            FormatArgument::Char('t'),
+            FormatArgument::Char('s'),
+        ]);
+
+        // First batch - two sequential calls
+        相等断言!(b'z', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b'y', args.next_char(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same pattern
+        相等断言!(b'x', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b'w', args.next_char(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Third batch - same pattern
+        相等断言!(b'v', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b'u', args.next_char(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Fourth batch - same pattern (last batch)
+        相等断言!(b't', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b's', args.next_char(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_sequential_different_methods() {
+        // Test with different method types in sequence
+        设 args = [
+            FormatArgument::Char('a'),
+            FormatArgument::字符串("hello".into()),
+            FormatArgument::Unparsed("123".into()),
+            FormatArgument::字符串("world".into()),
+            FormatArgument::Char('z'),
+            FormatArgument::字符串("test".into()),
+        ];
+        设 可变 args = FormatArguments::新建(&args);
+
+        // First batch - next_char followed by next_string
+        相等断言!(b'a', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!("hello", args.next_string(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same pattern
+        相等断言!(b'1', args.next_char(ArgumentLocation::NextArgument)); // First byte of 123
+        相等断言!("world", args.next_string(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Third batch - same pattern (last batch)
+        相等断言!(b'z', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!("test", args.next_string(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    方法 non_zero_pos(n: 正整数大小) -> ArgumentLocation {
+        ArgumentLocation::Position(NonZero::新建(n).解包())
+    }
+
+    #[test]
+    方法 test_position_access_pattern() {
+        // Test with consistent positional access patterns
+        设 可变 args = FormatArguments::新建(&[
+            FormatArgument::Char('a'),
+            FormatArgument::Char('b'),
+            FormatArgument::Char('c'),
+            FormatArgument::Char('d'),
+            FormatArgument::Char('e'),
+            FormatArgument::Char('f'),
+            FormatArgument::Char('g'),
+            FormatArgument::Char('h'),
+            FormatArgument::Char('i'),
+        ]);
+
+        // First batch - positional access
+        相等断言!(b'b', args.next_char(non_zero_pos(2))); // Position 2
+        相等断言!(b'a', args.next_char(non_zero_pos(1))); // Position 1
+        相等断言!(b'c', args.next_char(non_zero_pos(3))); // Position 3
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same positional pattern
+        相等断言!(b'e', args.next_char(non_zero_pos(2))); // Position 2
+        相等断言!(b'd', args.next_char(non_zero_pos(1))); // Position 1
+        相等断言!(b'f', args.next_char(non_zero_pos(3))); // Position 3
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Third batch - same positional pattern (last batch)
+        相等断言!(b'h', args.next_char(non_zero_pos(2))); // Position 2
+        相等断言!(b'g', args.next_char(non_zero_pos(1))); // Position 1
+        相等断言!(b'i', args.next_char(non_zero_pos(3))); // Position 3
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_mixed_access_pattern() {
+        // Test with mixed sequential and positional access
+        设 可变 args = FormatArguments::新建(&[
+            FormatArgument::Char('a'),
+            FormatArgument::Char('b'),
+            FormatArgument::Char('c'),
+            FormatArgument::Char('d'),
+            FormatArgument::Char('e'),
+            FormatArgument::Char('f'),
+            FormatArgument::Char('g'),
+            FormatArgument::Char('h'),
+        ]);
+
+        // First batch - mix of sequential and positional
+        相等断言!(b'a', args.next_char(ArgumentLocation::NextArgument)); // Sequential
+        相等断言!(b'c', args.next_char(non_zero_pos(3))); // Positional
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same mixed pattern
+        相等断言!(b'd', args.next_char(ArgumentLocation::NextArgument)); // Sequential
+        相等断言!(b'f', args.next_char(non_zero_pos(3))); // Positional
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Last batch - same mixed pattern
+        相等断言!(b'g', args.next_char(ArgumentLocation::NextArgument)); // Sequential
+        相等断言!(b'\0', args.next_char(non_zero_pos(3))); // Out of bounds
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_numeric_argument_types() {
+        // Test with numeric argument types
+        设 args = [
+            FormatArgument::SignedInt(10),
+            FormatArgument::UnsignedInt(20),
+            FormatArgument::Float(ExtendedBigDecimal::zero()),
+            FormatArgument::SignedInt(30),
+            FormatArgument::UnsignedInt(40),
+            FormatArgument::Float(ExtendedBigDecimal::zero()),
+        ];
+        设 可变 args = FormatArguments::新建(&args);
+
+        // First batch - i64, u64, decimal
+        相等断言!(10, args.next_i64(ArgumentLocation::NextArgument));
+        相等断言!(20, args.next_u64(ArgumentLocation::NextArgument));
+        设 result = args.next_extended_big_decimal(ArgumentLocation::NextArgument);
+        相等断言!(ExtendedBigDecimal::zero(), result);
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same pattern
+        相等断言!(30, args.next_i64(ArgumentLocation::NextArgument));
+        相等断言!(40, args.next_u64(ArgumentLocation::NextArgument));
+        设 result = args.next_extended_big_decimal(ArgumentLocation::NextArgument);
+        相等断言!(ExtendedBigDecimal::zero(), result);
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_unparsed_arguments() {
+        // Test with unparsed arguments that get coerced
+        设 args = [
+            FormatArgument::Unparsed("hello".into()),
+            FormatArgument::Unparsed("123".into()),
+            FormatArgument::Unparsed("hello".into()),
+            FormatArgument::Unparsed("456".into()),
+        ];
+        设 可变 args = FormatArguments::新建(&args);
+
+        // First batch - string, number
+        相等断言!("hello", args.next_string(ArgumentLocation::NextArgument));
+        相等断言!(123, args.next_i64(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same pattern
+        相等断言!("hello", args.next_string(ArgumentLocation::NextArgument));
+        相等断言!(456, args.next_i64(ArgumentLocation::NextArgument));
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_mixed_types_with_positions() {
+        // Test with mixed types and positional access
+        设 args = [
+            FormatArgument::Char('a'),
+            FormatArgument::字符串("test".into()),
+            FormatArgument::UnsignedInt(42),
+            FormatArgument::Char('b'),
+            FormatArgument::字符串("more".into()),
+            FormatArgument::UnsignedInt(99),
+        ];
+        设 可变 args = FormatArguments::新建(&args);
+
+        // First batch - positional access of different types
+        相等断言!(b'a', args.next_char(non_zero_pos(1)));
+        相等断言!("test", args.next_string(non_zero_pos(2)));
+        相等断言!(42, args.next_u64(non_zero_pos(3)));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch - same pattern
+        相等断言!(b'b', args.next_char(non_zero_pos(1)));
+        相等断言!("more", args.next_string(non_zero_pos(2)));
+        相等断言!(99, args.next_u64(non_zero_pos(3)));
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+
+    #[test]
+    方法 test_partial_last_batch() {
+        // Test with a partial last batch (fewer elements than batch size)
+        设 可变 args = FormatArguments::新建(&[
+            FormatArgument::Char('a'),
+            FormatArgument::Char('b'),
+            FormatArgument::Char('c'),
+            FormatArgument::Char('d'),
+            FormatArgument::Char('e'), // Last batch has fewer elements
+        ]);
+
+        // First batch
+        相等断言!(b'a', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b'c', args.next_char(non_zero_pos(3)));
+        args.start_next_batch();
+        断言!(!args.is_exhausted());
+
+        // Second batch (partial)
+        相等断言!(b'd', args.next_char(ArgumentLocation::NextArgument));
+        相等断言!(b'\0', args.next_char(non_zero_pos(3))); // Out of bounds
+        args.start_next_batch();
+        断言!(args.is_exhausted());
+    }
+}

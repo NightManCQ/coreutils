@@ -1,0 +1,181 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore (words) FFFD
+#![forbid(unsafe_code)]
+
+使用 标准库::{borrow::Cow, ffi::OsStr};
+
+使用 箱::native_int_str::{
+    NativeCharInt, NativeIntStr, from_native_int_representation, get_char_from_native_int,
+    get_single_native_int_value,
+};
+
+#[derive(克隆协议, 调试协议, 相等比较协议, 偏等比较协议)]
+公有 结构 错误协议 {
+    公有 peek_position: 正整数大小,
+    公有 err_type: ErrorType,
+}
+
+#[derive(克隆协议, 调试协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 ErrorType {
+    EndOfInput,
+    InternalError,
+}
+
+/// Provides a valid char or an invalid sequence of bytes.
+///
+/// Invalid byte sequences can't be split in any meaningful way.
+/// Thus, they need to be consumed as one piece.
+公有 枚举 Chunk<'a> {
+    InvalidEncoding(&'a NativeIntStr),
+    ValidSingleIntChar((字符, NativeCharInt)),
+}
+
+/// This class makes parsing a [`std::ffi::OsString`] char by char more convenient.
+///
+/// It also allows capturing the intermediate positions for later splitting.
+公有 结构 StringParser<'a> {
+    input: &'a NativeIntStr,
+    pointer: 正整数大小,
+    remaining: &'a NativeIntStr,
+}
+
+实现<'a> StringParser<'a> {
+    公有 方法 新建(input: &'a NativeIntStr) -> 自身类型 {
+        设 可变 instance = 自身类型 {
+            input,
+            pointer: 0,
+            remaining: input,
+        };
+        instance.set_pointer(0);
+        instance
+    }
+
+    公有 方法 new_at(input: &'a NativeIntStr, pos: 正整数大小) -> 自身类型 {
+        设 可变 instance = 自身类型::新建(input);
+        instance.set_pointer(pos);
+        instance
+    }
+
+    公有 方法 get_input(&自身) -> &'a NativeIntStr {
+        自身.input
+    }
+
+    公有 方法 get_peek_position(&自身) -> 正整数大小 {
+        自身.pointer
+    }
+
+    公有 方法 peek(&自身) -> 结果<字符, 错误协议> {
+        自身.peek_char_at_pointer(自身.pointer)
+    }
+
+    方法 make_err(&自身, err_type: ErrorType) -> 错误协议 {
+        错误协议 {
+            peek_position: 自身.get_peek_position(),
+            err_type,
+        }
+    }
+
+    公有 方法 peek_char_at_pointer(&自身, at_pointer: 正整数大小) -> 结果<字符, 错误协议> {
+        设 split = 自身.input.split_at(at_pointer).1;
+        如果 split.为空() {
+            返回 坏的(自身.make_err(ErrorType::EndOfInput));
+        }
+        如果 设 一些((c, _ni)) = get_char_from_native_int(split[0]) {
+            好的(c)
+        } 否则 {
+            好的('\u{FFFD}')
+        }
+    }
+
+    方法 get_chunk_with_length_at(&自身, pointer: 正整数大小) -> 结果<(Chunk<'a>, 正整数大小), 错误协议> {
+        设 (_before, after) = 自身.input.split_at(pointer);
+        如果 after.为空() {
+            返回 坏的(自身.make_err(ErrorType::EndOfInput));
+        }
+
+        如果 设 一些(c_ni) = get_char_from_native_int(after[0]) {
+            好的((Chunk::ValidSingleIntChar(c_ni), 1))
+        } 否则 {
+            设 可变 i = 1;
+            当 i < after.长度() {
+                如果 设 一些(_c) = get_char_from_native_int(after[i]) {
+                    中断;
+                }
+                i += 1;
+            }
+
+            设 chunk = &after[0..i];
+            好的((Chunk::InvalidEncoding(chunk), chunk.长度()))
+        }
+    }
+
+    公有 方法 peek_chunk(&自身) -> 选项<Chunk<'a>> {
+        自身.get_chunk_with_length_at(自身.pointer)
+            .ok()
+            .映射(|(chunk, _)| chunk)
+    }
+
+    公有 方法 consume_chunk(&可变 自身) -> 结果<Chunk<'a>, 错误协议> {
+        设 (chunk, 长度) = 自身.get_chunk_with_length_at(自身.pointer)?;
+        自身.set_pointer(自身.pointer + 长度);
+        好的(chunk)
+    }
+
+    公有 方法 consume_one_ascii_or_all_non_ascii(&可变 自身) -> 结果<向量<Chunk<'a>>, 错误协议> {
+        设 可变 result = 向量::<Chunk<'a>>::新建();
+        无限循环 {
+            设 data = 自身.consume_chunk()?;
+            设 was_ascii = 如果 设 Chunk::ValidSingleIntChar((c, _ni)) = &data {
+                c.is_ascii()
+            } 否则 {
+                假
+            };
+            result.压入(data);
+            如果 was_ascii {
+                返回 好的(result);
+            }
+
+            匹配 自身.peek_chunk() {
+                一些(Chunk::ValidSingleIntChar((c, _ni))) 如果 c.is_ascii() => 返回 好的(result),
+                无 => 返回 好的(result),
+                _ => {}
+            }
+        }
+    }
+
+    公有 方法 skip_multiple(&可变 自身, skip_byte_count: 正整数大小) {
+        设 end_ptr = 自身.pointer + skip_byte_count;
+        自身.set_pointer(end_ptr);
+    }
+
+    公有 方法 skip_until_char_or_end(&可变 自身, c: 字符) {
+        设 native_rep = get_single_native_int_value(c).解包();
+        设 pos = 自身.remaining.迭代().position(|x| *x == native_rep);
+
+        如果 设 一些(pos) = pos {
+            自身.set_pointer(自身.pointer + pos);
+        } 否则 {
+            自身.set_pointer(自身.input.长度());
+        }
+    }
+
+    公有 方法 substring(&自身, range: &标准库::操作符::Range<正整数大小>) -> &'a NativeIntStr {
+        设 (_before1, after1) = 自身.input.split_at(range.start);
+        设 (middle, _after2) = after1.split_at(range.end - range.start);
+        middle
+    }
+
+    公有 方法 peek_remaining(&自身) -> Cow<'a, OsStr> {
+        from_native_int_representation(Cow::Borrowed(自身.remaining))
+    }
+
+    公有 方法 set_pointer(&可变 自身, new_pointer: 正整数大小) {
+        自身.pointer = new_pointer;
+        设 (_before, after) = 自身.input.split_at(自身.pointer);
+        自身.remaining = after;
+    }
+}

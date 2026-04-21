@@ -1,0 +1,145 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::{Arg, ArgAction, Command, value_parser};
+使用 nix::sys::stat::Mode;
+使用 nix::unistd::mkfifo;
+使用 标准库::文件系统;
+使用 标准库::操作系统::unix::文件系统::PermissionsExt;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::translate;
+
+使用 uucore::{format_usage, show};
+
+模组 options {
+    公有 静态 MODE: &字符串切片 = "mode";
+    公有 静态 SECURITY_CONTEXT: &字符串切片 = "Z";
+    公有 静态 CONTEXT: &字符串切片 = "context";
+    公有 静态 FIFO: &字符串切片 = "fifo";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 mode = calculate_mode(matches.get_one::<字符串>(options::MODE))
+        .map_err(|e| USimpleError::新建(1, translate!("mkfifo-error-invalid-mode", "error" => e)))?;
+
+    // Check if mode contains special bits
+    设 non_file_permission_bits = 0o7000; // setuid, setgid, sticky bits
+    如果 mode & non_file_permission_bits != 0 {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("mkfifo-error-non-file-permission"),
+        ));
+    }
+
+    设 fifos: 向量<字符串> = 匹配 matches.get_many::<字符串>(options::FIFO) {
+        一些(v) => v.cloned().收集(),
+        无 => {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("mkfifo-error-missing-operand"),
+            ));
+        }
+    };
+
+    循环 f 在 fifos {
+        如果 mkfifo(f.as_str(), Mode::from_bits_truncate(0o666)).is_err() {
+            show!(USimpleError::新建(
+                1,
+                translate!("mkfifo-error-cannot-create-fifo", "path" => f.quote()),
+            ));
+            继续;
+        }
+
+        // Explicitly set the permissions to ignore umask
+        如果 设 坏的(e) = 文件系统::set_permissions(&f, 文件系统::Permissions::from_mode(mode)) {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("mkfifo-error-cannot-set-permissions", "path" => f.quote(), "error" => e),
+            ));
+        }
+
+        // Apply SELinux context if requested
+        #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+        {
+            // Extract the SELinux related flags and options
+            设 set_security_context = matches.get_flag(options::SECURITY_CONTEXT);
+            设 context = matches.get_one::<字符串>(options::CONTEXT);
+
+            如果 set_security_context || context.is_some() {
+                使用 标准库::路径::Path;
+                如果 设 坏的(e) =
+                    uucore::selinux::set_selinux_security_context(Path::新建(&f), context)
+                {
+                    设 _ = 文件系统::remove_file(f);
+                    返回 坏的(USimpleError::新建(1, e.to_string()));
+                }
+            }
+        }
+
+        // Apply SMACK context if requested
+        #[cfg(feature = "smack")]
+        {
+            设 set_security_context = matches.get_flag(options::SECURITY_CONTEXT);
+            设 context = matches.get_one::<字符串>(options::CONTEXT);
+            如果 set_security_context || context.is_some() {
+                uucore::smack::set_smack_label_and_cleanup(&f, context, |p| 文件系统::remove_file(p))?;
+            }
+        }
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("mkfifo")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("mkfifo"))
+        .override_usage(format_usage(&translate!("mkfifo-usage")))
+        .about(translate!("mkfifo-about"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::MODE)
+                .short('m')
+                .long(options::MODE)
+                .help(translate!("mkfifo-help-mode"))
+                .value_name("MODE"),
+        )
+        .arg(
+            Arg::新建(options::SECURITY_CONTEXT)
+                .short('Z')
+                .help(translate!("mkfifo-help-selinux"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::CONTEXT)
+                .long(options::CONTEXT)
+                .value_name("CTX")
+                .value_parser(value_parser!(字符串))
+                .num_args(0..=1)
+                .require_equals(真)
+                .help(translate!("mkfifo-help-context")),
+        )
+        .arg(
+            Arg::新建(options::FIFO)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+方法 calculate_mode(mode_option: 选项<&字符串>) -> 结果<正32, 字符串> {
+    设 umask = uucore::mode::get_umask();
+    设 mode = 0o666; // Default mode for FIFOs
+
+    如果 设 一些(m) = mode_option {
+        uucore::mode::parse_chmod(mode, m, 假, umask)
+    } 否则 {
+        好的(mode & !umask) // Apply umask if no mode is specified
+    }
+}

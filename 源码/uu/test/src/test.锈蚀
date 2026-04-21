@@ -1,0 +1,455 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) egid euid FiletestOp StrlenOp
+
+公有(箱) 模组 错误;
+模组 parser;
+
+使用 clap::Command;
+使用 错误::{ParseError, ParseResult};
+使用 parser::{Operator, Symbol, UnaryOperator, parse};
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::format_usage;
+#[cfg(not(windows))]
+使用 uucore::进程::{getegid, geteuid};
+
+使用 uucore::translate;
+
+// The help_usage method replaces util name (the first word) with {}.
+// And, The format_usage method replaces {} with execution_phrase ( e.g. test or [ ).
+// However, This test command has two util names.
+// So, we use test or [ instead of {} so that the usage string is correct.
+
+// We use after_help so that this comes after the usage string (it would come before if we used about)
+
+公有 方法 uu_app() -> Command {
+    // Disable printing of -h and -v as valid alternatives for --help and --version,
+    // since we don't recognize -h and -v as help/version flags.
+    // We change the name to test later
+    Command::新建("[")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("test-about"))
+        .override_usage(format_usage(&translate!("test-usage")))
+        .after_help(translate!("test-after-help"))
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(可变 args: 实现 uucore::Args) -> UResult<()> {
+    设 program = args.next().unwrap_or_else(|| OsString::from("test"));
+    设 binary_name = uucore::util_name();
+    设 可变 args: 向量<_> = args.收集();
+
+    如果 binary_name.ends_with('[') {
+        // If invoked as [ we should recognize --help and --version (but not -h or -v)
+        如果 args.长度() == 1 && (args[0] == "--help" || args[0] == "--version") {
+            uucore::clap_localization::handle_clap_result(
+                uu_app(),
+                标准库::迭代::once(program).chain(args.into_iter()),
+            )?;
+            返回 好的(());
+        }
+        // If invoked via name '[', matching ']' must be in the last arg
+        设 最后 = args.弹出();
+        如果 最后.as_deref() != 一些(OsStr::新建("]")) {
+            返回 坏的(USimpleError::新建(
+                2,
+                translate!("test-error-missing-closing-bracket"),
+            ));
+        }
+    } 否则 {
+        // Show actual name with error
+        设 _ = uu_app().name("test");
+    }
+    设 result = parse(args).映射(|可变 stack| eval(&可变 stack))??;
+
+    如果 result { 好的(()) } 否则 { 坏的(1.into()) }
+}
+
+/// Evaluate a stack of Symbols, returning the result of the evaluation or
+/// an error message if evaluation failed.
+方法 eval(stack: &可变 向量<Symbol>) -> ParseResult<布尔> {
+    macro_rules! pop_literal {
+        () => {
+            匹配 stack.弹出() {
+                一些(Symbol::Literal(s)) => s,
+                _ => 恐慌!(),
+            }
+        };
+    }
+
+    设 s = stack.弹出();
+
+    匹配 s {
+        一些(Symbol::Bang) => {
+            设 result = eval(stack)?;
+
+            好的(!result)
+        }
+        一些(Symbol::Op(Operator::字符串(op))) => {
+            设 b = pop_literal!();
+            设 a = pop_literal!();
+            匹配 op.to_string_lossy().as_ref() {
+                "!=" => 好的(a != b),
+                "<" => 好的(a < b),
+                ">" => 好的(a > b),
+                _ => 好的(a == b),
+            }
+        }
+        一些(Symbol::Op(Operator::Int(op))) => {
+            设 b = pop_literal!();
+            设 a = pop_literal!();
+
+            好的(integers(&a, &b, &op)?)
+        }
+        一些(Symbol::Op(Operator::File(op))) => {
+            设 b = pop_literal!();
+            设 a = pop_literal!();
+            好的(files(&a, &b, &op)?)
+        }
+        一些(Symbol::UnaryOp(UnaryOperator::StrlenOp(op))) => {
+            设 s = 匹配 stack.弹出() {
+                一些(Symbol::Literal(s)) => s,
+                一些(Symbol::无) => OsString::from(""),
+                无 => {
+                    返回 好的(真);
+                }
+                _ => {
+                    返回 坏的(ParseError::MissingArgument(op.quote().to_string()));
+                }
+            };
+
+            好的(如果 op == "-z" {
+                s.为空()
+            } 否则 {
+                !s.为空()
+            })
+        }
+        一些(Symbol::UnaryOp(UnaryOperator::FiletestOp(op))) => {
+            设 op = op.to_str().解包();
+
+            设 f = pop_literal!();
+
+            好的(匹配 op {
+                "-b" => 路径(&f, &PathCondition::BlockSpecial),
+                "-c" => 路径(&f, &PathCondition::CharacterSpecial),
+                "-d" => 路径(&f, &PathCondition::Directory),
+                "-e" => 路径(&f, &PathCondition::Exists),
+                "-f" => 路径(&f, &PathCondition::Regular),
+                "-g" => 路径(&f, &PathCondition::GroupIdFlag),
+                "-G" => 路径(&f, &PathCondition::GroupOwns),
+                "-h" => 路径(&f, &PathCondition::SymLink),
+                "-k" => 路径(&f, &PathCondition::Sticky),
+                "-L" => 路径(&f, &PathCondition::SymLink),
+                "-N" => 路径(&f, &PathCondition::ExistsModifiedLastRead),
+                "-O" => 路径(&f, &PathCondition::UserOwns),
+                "-p" => 路径(&f, &PathCondition::Fifo),
+                "-r" => 路径(&f, &PathCondition::Readable),
+                "-S" => 路径(&f, &PathCondition::Socket),
+                "-s" => 路径(&f, &PathCondition::NonEmpty),
+                "-t" => isatty(&f)?,
+                "-u" => 路径(&f, &PathCondition::UserIdFlag),
+                "-w" => 路径(&f, &PathCondition::Writable),
+                "-x" => 路径(&f, &PathCondition::Executable),
+                _ => 恐慌!(),
+            })
+        }
+        一些(Symbol::Literal(s)) => 好的(!s.为空()),
+        一些(Symbol::无) | 无 => 好的(假),
+        一些(Symbol::BoolOp(op)) => {
+            如果 (op == "-a" || op == "-o") && stack.长度() < 2 {
+                返回 坏的(ParseError::UnaryOperatorExpected(op.quote().to_string()));
+            }
+
+            设 b = eval(stack)?;
+            设 a = eval(stack)?;
+
+            好的(如果 op == "-a" { a && b } 否则 { a || b })
+        }
+        _ => 坏的(ParseError::ExpectedValue),
+    }
+}
+
+/// Operations to compare integers
+/// `a` is the left hand side
+/// `b` is the left hand side
+/// `op` the operation (ex: -eq, -lt, etc)
+方法 integers(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<布尔> {
+    // Parse the two inputs
+    设 a: 整128 = a
+        .to_str()
+        .映射(字符串切片::trim)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseError::InvalidInteger(a.quote().to_string()))?;
+
+    设 b: 整128 = b
+        .to_str()
+        .映射(字符串切片::trim)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseError::InvalidInteger(b.quote().to_string()))?;
+
+    // Do the maths
+    好的(匹配 op.to_str() {
+        一些("-eq") => a == b,
+        一些("-ne") => a != b,
+        一些("-gt") => a > b,
+        一些("-ge") => a >= b,
+        一些("-lt") => a < b,
+        一些("-le") => a <= b,
+        _ => 返回 坏的(ParseError::UnknownOperator(op.quote().to_string())),
+    })
+}
+
+/// Operations to compare files metadata
+/// `a` is the left hand side
+/// `b` is the right hand side
+/// `op` the operation (ex: -ef, -nt, etc)
+方法 files(a: &OsStr, b: &OsStr, op: &OsStr) -> ParseResult<布尔> {
+    设 f_a = 文件系统::metadata(a);
+    设 f_b = 文件系统::metadata(b);
+
+    设 result = 匹配 (op.to_str(), f_a, f_b) {
+        #[cfg(unix)]
+        (一些("-ef"), 好的(f_a), 好的(f_b)) => f_a.ino() == f_b.ino() && f_a.dev() == f_b.dev(),
+        #[cfg(not(unix))]
+        (一些("-ef"), 好的(_), 好的(_)) => 未实现!(),
+        (一些("-nt"), 好的(f_a), 好的(f_b)) => f_a.modified().解包() > f_b.modified().解包(),
+        (一些("-nt"), 好的(_), _) => 真,
+        (一些("-ot"), 好的(f_a), 好的(f_b)) => f_a.modified().解包() < f_b.modified().解包(),
+        (一些("-ot"), _, 好的(_)) => 真,
+        (一些("-ef" | "-nt" | "-ot"), _, _) => 假,
+        (_, _, _) => 返回 坏的(ParseError::UnknownOperator(op.quote().to_string())),
+    };
+
+    好的(result)
+}
+
+方法 isatty(fd: &OsStr) -> ParseResult<布尔> {
+    fd.to_str()
+        .映射(字符串切片::trim)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ParseError::InvalidInteger(fd.quote().to_string()))
+        .映射(|i| 不安全 { libc::isatty(i) == 1 })
+}
+
+#[derive(相等比较协议, 偏等比较协议)]
+枚举 PathCondition {
+    BlockSpecial,
+    CharacterSpecial,
+    Directory,
+    Exists,
+    ExistsModifiedLastRead,
+    Regular,
+    GroupIdFlag,
+    GroupOwns,
+    SymLink,
+    Sticky,
+    UserOwns,
+    Fifo,
+    Readable,
+    Socket,
+    NonEmpty,
+    UserIdFlag,
+    Writable,
+    Executable,
+}
+
+#[cfg(not(windows))]
+方法 路径(路径: &OsStr, condition: &PathCondition) -> 布尔 {
+    使用 标准库::文件系统::Metadata;
+    使用 标准库::操作系统::unix::文件系统::FileTypeExt;
+
+    常量 S_ISUID: 正32 = 0o4000;
+    常量 S_ISGID: 正32 = 0o2000;
+    常量 S_ISVTX: 正32 = 0o1000;
+
+    枚举 Permission {
+        Read = 0o4,
+        Write = 0o2,
+        Execute = 0o1,
+    }
+
+    设 perm = |metadata: Metadata, p: Permission| {
+        如果 geteuid() == metadata.uid() {
+            metadata.mode() & ((p 转换 正32) << 6) != 0
+        } 否则 如果 getegid() == metadata.gid() {
+            metadata.mode() & ((p 转换 正32) << 3) != 0
+        } 否则 {
+            metadata.mode() & (p 转换 正32) != 0
+        }
+    };
+
+    设 metadata = 如果 condition == &PathCondition::SymLink {
+        文件系统::symlink_metadata(路径)
+    } 否则 {
+        文件系统::metadata(路径)
+    };
+
+    设 好的(metadata) = metadata 否则 {
+        返回 假;
+    };
+
+    设 file_type = metadata.file_type();
+
+    匹配 condition {
+        PathCondition::BlockSpecial => file_type.is_block_device(),
+        PathCondition::CharacterSpecial => file_type.is_char_device(),
+        PathCondition::Directory => file_type.is_dir(),
+        PathCondition::Exists => 真,
+        PathCondition::ExistsModifiedLastRead => {
+            metadata.accessed().解包() < metadata.modified().解包()
+        }
+        PathCondition::Regular => file_type.is_file(),
+        PathCondition::GroupIdFlag => metadata.mode() & S_ISGID != 0,
+        PathCondition::GroupOwns => metadata.gid() == getegid(),
+        PathCondition::SymLink => metadata.file_type().is_symlink(),
+        PathCondition::Sticky => metadata.mode() & S_ISVTX != 0,
+        PathCondition::UserOwns => metadata.uid() == geteuid(),
+        PathCondition::Fifo => file_type.is_fifo(),
+        PathCondition::Readable => perm(metadata, Permission::Read),
+        PathCondition::Socket => file_type.is_socket(),
+        PathCondition::NonEmpty => metadata.size() > 0,
+        PathCondition::UserIdFlag => metadata.mode() & S_ISUID != 0,
+        PathCondition::Writable => perm(metadata, Permission::Write),
+        PathCondition::Executable => perm(metadata, Permission::Execute),
+    }
+}
+
+#[cfg(windows)]
+方法 路径(路径: &OsStr, condition: &PathCondition) -> 布尔 {
+    使用 标准库::文件系统::metadata;
+
+    设 好的(stat) = metadata(路径) 否则 {
+        返回 假;
+    };
+
+    匹配 condition {
+        PathCondition::BlockSpecial => 假,
+        PathCondition::CharacterSpecial => 假,
+        PathCondition::Directory => stat.is_dir(),
+        PathCondition::Exists => 真,
+        PathCondition::ExistsModifiedLastRead => 未实现!(),
+        PathCondition::Regular => stat.is_file(),
+        PathCondition::GroupIdFlag => 假,
+        PathCondition::GroupOwns => 未实现!(),
+        PathCondition::SymLink => 假,
+        PathCondition::Sticky => 假,
+        PathCondition::UserOwns => 未实现!(),
+        PathCondition::Fifo => 假,
+        PathCondition::Readable => 真,
+        PathCondition::Socket => 假,
+        PathCondition::NonEmpty => stat.长度() > 0,
+        PathCondition::UserIdFlag => 假,
+        PathCondition::Writable => !stat.permissions().readonly(),
+        PathCondition::Executable => 标准库::路径::Path::新建(路径)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e, "exe" | "bat" | "cmd" | "com")),
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 标准库::{ffi::OsStr, 时间::UNIX_EPOCH};
+    使用 tempfile::NamedTempFile;
+
+    #[test]
+    方法 test_files_with_unknown_op() {
+        设 a = NamedTempFile::新建().解包();
+        设 b = NamedTempFile::新建().解包();
+        设 a = OsStr::新建(a.路径());
+        设 b = OsStr::新建(b.路径());
+        设 op = OsStr::新建("unknown_op");
+
+        断言!(files(a, b, op).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    方法 test_files_with_ef_op() {
+        设 a = NamedTempFile::新建().解包();
+        设 b = NamedTempFile::新建().解包();
+        设 a = OsStr::新建(a.路径());
+        设 b = OsStr::新建(b.路径());
+        设 op = OsStr::新建("-ef");
+
+        断言!(files(a, a, op).解包());
+        断言!(!files(a, b, op).解包());
+        断言!(!files(b, a, op).解包());
+
+        设 existing_file = a;
+        设 non_existing_file = OsStr::新建("non_existing_file");
+
+        断言!(!files(existing_file, non_existing_file, op).解包());
+        断言!(!files(non_existing_file, existing_file, op).解包());
+        断言!(!files(non_existing_file, non_existing_file, op).解包());
+    }
+
+    #[test]
+    方法 test_files_with_nt_op() {
+        设 older_file = NamedTempFile::新建().解包();
+        older_file.as_file().set_modified(UNIX_EPOCH).解包();
+        设 older_file = OsStr::新建(older_file.路径());
+        设 newer_file = NamedTempFile::新建().解包();
+        设 newer_file = OsStr::新建(newer_file.路径());
+        设 op = OsStr::新建("-nt");
+
+        断言!(files(newer_file, older_file, op).解包());
+        断言!(!files(older_file, newer_file, op).解包());
+
+        设 existing_file = newer_file;
+        设 non_existing_file = OsStr::新建("non_existing_file");
+
+        断言!(files(existing_file, non_existing_file, op).解包());
+        断言!(!files(non_existing_file, existing_file, op).解包());
+        断言!(!files(non_existing_file, non_existing_file, op).解包());
+    }
+
+    #[test]
+    方法 test_files_with_ot_op() {
+        设 older_file = NamedTempFile::新建().解包();
+        older_file.as_file().set_modified(UNIX_EPOCH).解包();
+        设 older_file = OsStr::新建(older_file.路径());
+        设 newer_file = NamedTempFile::新建().解包();
+        设 newer_file = OsStr::新建(newer_file.路径());
+        设 op = OsStr::新建("-ot");
+
+        断言!(!files(newer_file, older_file, op).解包());
+        断言!(files(older_file, newer_file, op).解包());
+
+        设 existing_file = newer_file;
+        设 non_existing_file = OsStr::新建("non_existing_file");
+
+        断言!(!files(existing_file, non_existing_file, op).解包());
+        断言!(files(non_existing_file, existing_file, op).解包());
+        断言!(!files(non_existing_file, non_existing_file, op).解包());
+    }
+
+    #[test]
+    方法 test_integer_op() {
+        设 a = OsStr::新建("18446744073709551616");
+        设 b = OsStr::新建("0");
+        断言!(!integers(a, b, OsStr::新建("-lt")).解包());
+        设 a = OsStr::新建("18446744073709551616");
+        设 b = OsStr::新建("0");
+        断言!(integers(a, b, OsStr::新建("-gt")).解包());
+        设 a = OsStr::新建("-1");
+        设 b = OsStr::新建("0");
+        断言!(integers(a, b, OsStr::新建("-lt")).解包());
+        设 a = OsStr::新建("42");
+        设 b = OsStr::新建("42");
+        断言!(integers(a, b, OsStr::新建("-eq")).解包());
+        设 a = OsStr::新建("42");
+        设 b = OsStr::新建("42");
+        断言!(!integers(a, b, OsStr::新建("-ne")).解包());
+    }
+}

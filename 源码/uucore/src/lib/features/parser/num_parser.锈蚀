@@ -1,0 +1,1190 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Utilities for parsing numbers in various formats
+
+// spell-checker:ignore powf copysign prec ilog inity infinit infs bigdecimal extendedbigdecimal biguint underflowed muls
+
+使用 bigdecimal::{
+    BigDecimal,
+    num_bigint::{BigInt, BigUint, Sign},
+};
+使用 num_traits::Signed;
+使用 num_traits::ToPrimitive;
+使用 num_traits::Zero;
+
+使用 箱::extendedbigdecimal::ExtendedBigDecimal;
+
+/// Base for number parsing
+#[derive(克隆协议, 复制协议, 偏等比较协议)]
+枚举 Base {
+    /// Binary base
+    Binary = 2,
+
+    /// Octal base
+    Octal = 8,
+
+    /// Decimal base
+    Decimal = 10,
+
+    /// Hexadecimal base
+    Hexadecimal = 16,
+}
+
+实现 Base {
+    /// Return the digit value of a character in the given base
+    方法 digit(自身, c: 字符) -> 选项<正64> {
+        方法 from_decimal(c: 字符) -> 正64 {
+            正64::from(c) - 正64::from('0')
+        }
+        匹配 自身 {
+            自身类型::Binary => ('0'..='1').包含(&c).then(|| from_decimal(c)),
+            自身类型::Octal => ('0'..='7').包含(&c).then(|| from_decimal(c)),
+            自身类型::Decimal => c.is_ascii_digit().then(|| from_decimal(c)),
+            自身类型::Hexadecimal => 匹配 c.to_ascii_lowercase() {
+                '0'..='9' => 一些(from_decimal(c)),
+                c @ 'a'..='f' => 一些(正64::from(c) - 正64::from('a') + 10),
+                _ => 无,
+            },
+        }
+    }
+
+    /// Greedily parse as many digits as possible from the string
+    /// Returns parsed digits (if any), and the rest of the string.
+    方法 parse_digits(自身, 字符串切片: &字符串切片) -> (选项<BigUint>, &字符串切片) {
+        设 (digits, _, rest) = 自身.parse_digits_count(字符串切片, 无);
+        (digits, rest)
+    }
+
+    /// Greedily parse as many digits as possible from the string, adding to already parsed digits.
+    /// This is meant to be used (directly) for the part after a decimal point.
+    /// Returns parsed digits (if any), the number of parsed digits, and the rest of the string.
+    方法 parse_digits_count(
+        自身,
+        字符串切片: &字符串切片,
+        digits: 选项<BigUint>,
+    ) -> (选项<BigUint>, 整64, &字符串切片) {
+        设 可变 digits: 选项<BigUint> = digits;
+        设 可变 计数: 整64 = 0;
+        设 可变 rest = 字符串切片;
+
+        // Doing operations on BigUint is really expensive, so we do as much as we
+        // can on u64, then add them to the BigUint.
+        设 可变 digits_tmp: 正64 = 0;
+        设 可变 count_tmp: 整64 = 0;
+        设 可变 mul_tmp: 正64 = 1;
+        当 设 一些(d) = rest.chars().next().and_then(|c| 自身.digit(c)) {
+            (digits_tmp, count_tmp, mul_tmp) = (
+                digits_tmp * 自身 转换 正64 + d,
+                count_tmp + 1,
+                mul_tmp * 自身 转换 正64,
+            );
+            rest = &rest[1..];
+            // In base 16, we parse 4 bits at a time, so we can parse 16 digits at most in a u64.
+            如果 count_tmp >= 15 {
+                // Accumulate what we have so far
+                (digits, 计数) = (
+                    一些(digits.unwrap_or_default() * mul_tmp + digits_tmp),
+                    计数 + count_tmp,
+                );
+                // Reset state
+                (digits_tmp, count_tmp, mul_tmp) = (0, 0, 1);
+            }
+        }
+
+        // Accumulate the leftovers (if any)
+        如果 mul_tmp > 1 {
+            (digits, 计数) = (
+                一些(digits.unwrap_or_default() * mul_tmp + digits_tmp),
+                计数 + count_tmp,
+            );
+        }
+        (digits, 计数, rest)
+    }
+}
+
+/// Type returned if a number could not be parsed in its entirety
+#[derive(调试协议, 偏等比较协议)]
+公有 枚举 ExtendedParserError<T> {
+    /// The input as a whole makes no sense
+    NotNumeric,
+    /// The beginning of the input made sense and has been parsed,
+    /// while the remaining doesn't.
+    PartialMatch(T, 字符串),
+    /// The value has overflowed the type storage. The returned value
+    /// is saturated (e.g. positive or negative infinity, or min/max
+    /// value for the integer type).
+    Overflow(T),
+    // The value has underflowed the float storage (and is now 0.0 or -0.0).
+    // Does not apply to integer parsing.
+    Underflow(T),
+}
+
+实现<T> ExtendedParserError<T>
+何处
+    T: Zero,
+{
+    /// Extract the value out of an error, if possible.
+    方法 extract(自身) -> T {
+        匹配 自身 {
+            自身类型::NotNumeric => T::zero(),
+            自身类型::PartialMatch(v, _) => v,
+            自身类型::Overflow(v) => v,
+            自身类型::Underflow(v) => v,
+        }
+    }
+
+    /// Map an error to another, using the provided conversion function.
+    /// The error (self) takes precedence over errors happening during the
+    /// conversion.
+    方法 映射<U>(
+        自身,
+        f: 实现 FnOnce(T) -> 结果<U, ExtendedParserError<U>>,
+    ) -> ExtendedParserError<U>
+    何处
+        U: Zero,
+    {
+        方法 extract<U>(v: 结果<U, ExtendedParserError<U>>) -> U
+        何处
+            U: Zero,
+        {
+            v.unwrap_or_else(ExtendedParserError::extract)
+        }
+
+        匹配 自身 {
+            自身类型::NotNumeric => ExtendedParserError::NotNumeric,
+            自身类型::PartialMatch(v, rest) => ExtendedParserError::PartialMatch(extract(f(v)), rest),
+            自身类型::Overflow(v) => ExtendedParserError::Overflow(extract(f(v))),
+            自身类型::Underflow(v) => ExtendedParserError::Underflow(extract(f(v))),
+        }
+    }
+}
+
+/// A number parser for binary, octal, decimal, hexadecimal and single characters.
+///
+/// It is implemented for `u64`/`i64`, where no fractional part is parsed,
+/// and `f64` float, where octal and binary formats are not allowed.
+公有 协议 ExtendedParser {
+    // We pick a hopefully different name for our parser, to avoid clash with standard traits.
+    方法 extended_parse(input: &字符串切片) -> 结果<自身类型, ExtendedParserError<自身类型>>
+    何处
+        自身类型: Sized;
+}
+
+实现 ExtendedParser 循环 整64 {
+    /// Parse a number as i64. No fractional part is allowed.
+    方法 extended_parse(input: &字符串切片) -> 结果<自身类型, ExtendedParserError<自身类型>> {
+        方法 into_i64(ebd: ExtendedBigDecimal) -> 结果<整64, ExtendedParserError<整64>> {
+            匹配 ebd {
+                ExtendedBigDecimal::BigDecimal(bd) => {
+                    设 (digits, scale) = bd.into_bigint_and_scale();
+                    如果 scale == 0 {
+                        设 negative = digits.sign() == Sign::Minus;
+                        匹配 整64::try_from(digits) {
+                            好的(i) => 好的(i),
+                            _ => 坏的(ExtendedParserError::Overflow(如果 negative {
+                                整64::MIN
+                            } 否则 {
+                                整64::MAX
+                            })),
+                        }
+                    } 否则 {
+                        // Should not happen.
+                        坏的(ExtendedParserError::NotNumeric)
+                    }
+                }
+                ExtendedBigDecimal::MinusZero => 好的(0),
+                // No other case should not happen.
+                _ => 坏的(ExtendedParserError::NotNumeric),
+            }
+        }
+
+        匹配 parse(input, ParseTarget::Integral, &[]) {
+            好的(v) => into_i64(v),
+            坏的(e) => 坏的(e.映射(into_i64)),
+        }
+    }
+}
+
+实现 ExtendedParser 循环 正64 {
+    /// Parse a number as u64. No fractional part is allowed.
+    方法 extended_parse(input: &字符串切片) -> 结果<自身类型, ExtendedParserError<自身类型>> {
+        方法 into_u64(ebd: ExtendedBigDecimal) -> 结果<正64, ExtendedParserError<正64>> {
+            匹配 ebd {
+                ExtendedBigDecimal::BigDecimal(bd) => {
+                    设 (digits, scale) = bd.into_bigint_and_scale();
+                    如果 scale == 0 {
+                        设 (sign, digits) = digits.into_parts();
+
+                        匹配 正64::try_from(digits) {
+                            好的(i) => {
+                                如果 sign == Sign::Minus {
+                                    好的(!i + 1)
+                                } 否则 {
+                                    好的(i)
+                                }
+                            }
+                            _ => 坏的(ExtendedParserError::Overflow(正64::MAX)),
+                        }
+                    } 否则 {
+                        // Should not happen.
+                        坏的(ExtendedParserError::NotNumeric)
+                    }
+                }
+                ExtendedBigDecimal::MinusZero => 好的(0),
+                _ => 坏的(ExtendedParserError::NotNumeric),
+            }
+        }
+
+        匹配 parse(input, ParseTarget::Integral, &[]) {
+            好的(v) => into_u64(v),
+            坏的(e) => 坏的(e.映射(into_u64)),
+        }
+    }
+}
+
+实现 ExtendedParser 循环 点64 {
+    /// Parse a number as f64
+    方法 extended_parse(input: &字符串切片) -> 结果<自身类型, ExtendedParserError<自身类型>> {
+        方法 into_f64(ebd: ExtendedBigDecimal) -> 结果<点64, ExtendedParserError<点64>> {
+            // TODO: _Some_ of this is generic, so this should probably be implemented as an ExtendedBigDecimal trait (ToPrimitive).
+            设 v = 匹配 ebd {
+                ExtendedBigDecimal::BigDecimal(bd) => {
+                    设 f = bd.to_f64().解包();
+                    如果 f.is_infinite() {
+                        返回 坏的(ExtendedParserError::Overflow(f));
+                    }
+                    如果 f.is_zero() && !bd.is_zero() {
+                        返回 坏的(ExtendedParserError::Underflow(f));
+                    }
+                    f
+                }
+                ExtendedBigDecimal::MinusZero => -0.0,
+                ExtendedBigDecimal::Nan => 点64::NAN,
+                ExtendedBigDecimal::MinusNan => -点64::NAN,
+                ExtendedBigDecimal::Infinity => 点64::INFINITY,
+                ExtendedBigDecimal::MinusInfinity => -点64::INFINITY,
+            };
+            好的(v)
+        }
+
+        匹配 parse(input, ParseTarget::Decimal, &[]) {
+            好的(v) => into_f64(v),
+            坏的(e) => 坏的(e.映射(into_f64)),
+        }
+    }
+}
+
+实现 ExtendedParser 循环 ExtendedBigDecimal {
+    /// Parse a number as an ExtendedBigDecimal
+    方法 extended_parse(input: &字符串切片) -> 结果<自身类型, ExtendedParserError<自身类型>> {
+        parse(input, ParseTarget::Decimal, &[])
+    }
+}
+
+方法 parse_digits(base: Base, 字符串切片: &字符串切片, fractional: 布尔) -> (选项<BigUint>, 整64, &字符串切片) {
+    // Parse the integral part of the number
+    设 (digits, rest) = base.parse_digits(字符串切片);
+
+    // If allowed, parse the fractional part of the number if there can be one and the
+    // input contains a '.' decimal separator.
+    如果 fractional {
+        如果 设 一些(rest) = rest.strip_prefix('.') {
+            返回 base.parse_digits_count(rest, digits);
+        }
+    }
+
+    (digits, 0, rest)
+}
+
+方法 parse_exponent(base: Base, 字符串切片: &字符串切片) -> (选项<BigInt>, &字符串切片) {
+    设 exp_chars = 匹配 base {
+        Base::Decimal => ['e', 'E'],
+        Base::Hexadecimal => ['p', 'P'],
+        _ => 无法到达!(),
+    };
+
+    // Parse the exponent part, only decimal numbers are allowed.
+    // We only update `rest` if an exponent is actually parsed.
+    如果 设 一些(rest) = 字符串切片.strip_prefix(exp_chars) {
+        设 (sign, rest) = 如果 设 一些(rest) = rest.strip_prefix('-') {
+            (Sign::Minus, rest)
+        } 否则 如果 设 一些(rest) = rest.strip_prefix('+') {
+            (Sign::Plus, rest)
+        } 否则 {
+            // Something else, or nothing at all: keep going.
+            (Sign::Plus, rest) // No explicit sign is equivalent to `+`.
+        };
+
+        设 (exp_uint, rest) = Base::Decimal.parse_digits(rest);
+        如果 设 一些(exp_uint) = exp_uint {
+            返回 (一些(BigInt::from_biguint(sign, exp_uint)), rest);
+        }
+    }
+
+    // Nothing parsed
+    (无, 字符串切片)
+}
+
+/// Parse a multiplier from allowed suffixes (e.g. s/m/h).
+方法 parse_suffix_multiplier<'a>(字符串切片: &'a 字符串切片, allowed_suffixes: &[(字符, 正32)]) -> (正32, &'a 字符串切片) {
+    如果 设 一些(ch) = 字符串切片.chars().next() {
+        如果 设 一些(mul) = allowed_suffixes
+            .迭代()
+            .find_map(|(c, t)| (ch == *c).then_some(*t))
+        {
+            返回 (mul, &字符串切片[1..]);
+        }
+    }
+
+    // No suffix, just return 1 and intact string
+    (1, 字符串切片)
+}
+
+方法 parse_special_value(
+    input: &字符串切片,
+    negative: 布尔,
+    allowed_suffixes: &[(字符, 正32)],
+) -> 结果<ExtendedBigDecimal, ExtendedParserError<ExtendedBigDecimal>> {
+    设 input_lc = input.to_ascii_lowercase();
+
+    // Array of ("String to match", return value when sign positive, when sign negative)
+    常量 MATCH_TABLE: &[(&字符串切片, ExtendedBigDecimal)] = &[
+        ("infinity", ExtendedBigDecimal::Infinity),
+        ("inf", ExtendedBigDecimal::Infinity),
+        ("nan", ExtendedBigDecimal::Nan),
+    ];
+
+    循环 (字符串切片, ebd) 在 MATCH_TABLE {
+        如果 input_lc.starts_with(字符串切片) {
+            设 可变 special = ebd.克隆();
+            如果 negative {
+                special = -special;
+            }
+
+            // "infs" is a valid duration, so parse suffix multiplier in the original input string, but ignore the multiplier.
+            设 (_, rest) = parse_suffix_multiplier(&input[字符串切片.长度()..], allowed_suffixes);
+
+            返回 如果 rest.为空() {
+                好的(special)
+            } 否则 {
+                坏的(ExtendedParserError::PartialMatch(special, rest.to_string()))
+            };
+        }
+    }
+
+    坏的(ExtendedParserError::NotNumeric)
+}
+
+/// Underflow/Overflow errors always contain 0 or infinity.
+/// overflow: true for overflow, false for underflow.
+方法 make_error(overflow: 布尔, negative: 布尔) -> ExtendedParserError<ExtendedBigDecimal> {
+    设 可变 v = 如果 overflow {
+        ExtendedBigDecimal::Infinity
+    } 否则 {
+        ExtendedBigDecimal::zero()
+    };
+    如果 negative {
+        v = -v;
+    }
+    如果 overflow {
+        ExtendedParserError::Overflow(v)
+    } 否则 {
+        ExtendedParserError::Underflow(v)
+    }
+}
+
+/// Construct an [`ExtendedBigDecimal`] based on parsed data
+方法 construct_extended_big_decimal(
+    digits: BigUint,
+    negative: 布尔,
+    base: Base,
+    scale: 整64,
+    exponent: BigInt,
+) -> 结果<ExtendedBigDecimal, ExtendedParserError<ExtendedBigDecimal>> {
+    如果 digits == BigUint::zero() {
+        // Return return 0 if the digits are zero. In particular, we do not ever
+        // return Overflow/Underflow errors in that case.
+        返回 好的(如果 negative {
+            ExtendedBigDecimal::MinusZero
+        } 否则 {
+            ExtendedBigDecimal::zero()
+        });
+    }
+
+    设 sign = 如果 negative { Sign::Minus } 否则 { Sign::Plus };
+    设 signed_digits = BigInt::from_biguint(sign, digits);
+    设 bd = 如果 scale == 0 && exponent.is_zero() {
+        BigDecimal::from_bigint(signed_digits, 0)
+    } 否则 如果 base == Base::Decimal {
+        如果 exponent.is_zero() {
+            // Optimization: Converting scale to Bigint and back is relatively slow.
+            BigDecimal::from_bigint(signed_digits, scale)
+        } 否则 {
+            设 new_scale = -exponent + scale;
+
+            // BigDecimal "only" supports i64 scale.
+            // Note that new_scale is a negative exponent: large positive value causes an underflow, large negative values an overflow.
+            如果 设 一些(new_scale) = new_scale.to_i64() {
+                BigDecimal::from_bigint(signed_digits, new_scale)
+            } 否则 {
+                返回 坏的(make_error(new_scale.is_negative(), negative));
+            }
+        }
+    } 否则 如果 base == Base::Hexadecimal {
+        // pow "only" supports u32 values, just error out if given more than 2**32 fractional digits.
+        如果 scale > 正32::MAX.into() {
+            返回 坏的(ExtendedParserError::NotNumeric);
+        }
+
+        // Base is 16, init at scale 0 then divide by base**scale.
+        设 bd = BigDecimal::from_bigint(signed_digits, 0)
+            / BigDecimal::from_bigint(BigInt::from(16).pow(scale 转换 正32), 0);
+
+        // powi "only" supports i64 values. Just overflow/underflow if the value provided
+        // is > 2**64 or < 2**-64.
+        设 一些(exponent) = exponent.to_i64() 否则 {
+            返回 坏的(make_error(exponent.is_positive(), negative));
+        };
+
+        // Confusingly, exponent is in base 2 for hex floating point numbers.
+        设 base: BigDecimal = 2.into();
+        // Note: We cannot overflow/underflow BigDecimal here, as we will not be able to reach the
+        // maximum/minimum scale (i64 range).
+        设 pow2 = base.powi(exponent);
+
+        bd * pow2
+    } 否则 {
+        // scale != 0, which means that integral_only is not set, so only base 10 and 16 are allowed.
+        无法到达!();
+    };
+    好的(ExtendedBigDecimal::BigDecimal(bd))
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 ParseTarget {
+    Decimal,
+    Integral,
+    持续时间,
+}
+
+公有(箱) 方法 parse(
+    input: &字符串切片,
+    target: ParseTarget,
+    allowed_suffixes: &[(字符, 正32)],
+) -> 结果<ExtendedBigDecimal, ExtendedParserError<ExtendedBigDecimal>> {
+    // Note: literals with ' and " prefixes are parsed earlier on in argument parsing,
+    // before UTF-8 conversion.
+
+    设 trimmed_input = input.trim_ascii_start();
+
+    // Initial minus/plus sign
+    设 (negative, unsigned) = 如果 设 一些(trimmed_input) = trimmed_input.strip_prefix('-') {
+        (真, trimmed_input)
+    } 否则 如果 设 一些(trimmed_input) = trimmed_input.strip_prefix('+') {
+        (假, trimmed_input)
+    } 否则 {
+        (假, trimmed_input)
+    };
+
+    // Parse an optional base prefix ("0b" / "0B" / "0" / "0x" / "0X"). "0" is octal unless a
+    // fractional part is allowed in which case it is an insignificant leading 0. A "0" prefix
+    // will not be consumed in case the parsable string contains only "0": the leading extra "0"
+    // will have no influence on the result.
+    设 (base, rest) = 如果 设 一些(rest) = unsigned.strip_prefix('0') {
+        如果 设 一些(rest) = rest.strip_prefix(['x', 'X']) {
+            (Base::Hexadecimal, rest)
+        } 否则 如果 target == ParseTarget::Integral {
+            // Binary/Octal only allowed for integer parsing.
+            如果 设 一些(rest) = rest.strip_prefix(['b', 'B']) {
+                (Base::Binary, rest)
+            } 否则 {
+                (Base::Octal, unsigned)
+            }
+        } 否则 {
+            (Base::Decimal, unsigned)
+        }
+    } 否则 {
+        (Base::Decimal, unsigned)
+    };
+
+    // We only parse fractional and exponent part of the number in base 10/16 floating point numbers.
+    设 parse_frac_exp =
+        matches!(base, Base::Decimal | Base::Hexadecimal) && target != ParseTarget::Integral;
+
+    // Parse the integral and fractional (if supported) part of the number
+    设 (digits, scale, rest) = parse_digits(base, rest, parse_frac_exp);
+
+    // Parse exponent part of the number for supported bases.
+    设 (exponent, rest) = 如果 parse_frac_exp {
+        parse_exponent(base, rest)
+    } 否则 {
+        (无, rest)
+    };
+
+    // If no digit has been parsed, check if this is a special value, or declare the parsing unsuccessful
+    如果 digits.is_none() {
+        // If we trimmed an initial `0x`/`0b`, return a partial match.
+        如果 设 一些(partial) = unsigned.strip_prefix("0") {
+            设 ebd = 如果 negative {
+                ExtendedBigDecimal::MinusZero
+            } 否则 {
+                ExtendedBigDecimal::zero()
+            };
+            返回 坏的(ExtendedParserError::PartialMatch(ebd, partial.to_string()));
+        }
+
+        返回 如果 target == ParseTarget::Integral {
+            坏的(ExtendedParserError::NotNumeric)
+        } 否则 {
+            parse_special_value(unsigned, negative, allowed_suffixes)
+        };
+    }
+
+    设 (mul, rest) = parse_suffix_multiplier(rest, allowed_suffixes);
+
+    设 digits = digits.解包() * mul;
+
+    设 ebd_result =
+        construct_extended_big_decimal(digits, negative, base, scale, exponent.unwrap_or_default());
+
+    // Return what has been parsed so far. If there are extra characters, mark the
+    // parsing as a partial match.
+    如果 rest.为空() {
+        ebd_result
+    } 否则 {
+        坏的(ExtendedParserError::PartialMatch(
+            ebd_result.unwrap_or_else(ExtendedParserError::extract),
+            rest.to_string(),
+        ))
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::字符串切片::FromStr;
+
+    使用 bigdecimal::BigDecimal;
+
+    使用 箱::extendedbigdecimal::ExtendedBigDecimal;
+
+    使用 超级::{ExtendedParser, ExtendedParserError};
+
+    #[test]
+    方法 test_decimal_u64() {
+        相等断言!(好的(123), 正64::extended_parse("123"));
+        相等断言!(好的(正64::MAX), 正64::extended_parse(&格式化!("{}", 正64::MAX)));
+        相等断言!(好的(0), 正64::extended_parse("-0"));
+        相等断言!(好的(正64::MAX), 正64::extended_parse("-1"));
+        相等断言!(
+            好的(正64::MAX / 2 + 1),
+            正64::extended_parse("-9223372036854775808") // i64::MIN
+        );
+        相等断言!(
+            好的(1_123_372_036_854_675_616),
+            正64::extended_parse("-17323372036854876000") // 2*i64::MIN
+        );
+        相等断言!(好的(1), 正64::extended_parse("-18446744073709551615")); // -u64::MAX
+        断言!(matches!(
+            正64::extended_parse("-18446744073709551616"), // -u64::MAX - 1
+            坏的(ExtendedParserError::Overflow(正64::MAX))
+        ));
+        断言!(matches!(
+            正64::extended_parse("-92233720368547758150"),
+            坏的(ExtendedParserError::Overflow(正64::MAX))
+        ));
+        断言!(matches!(
+            正64::extended_parse("-170141183460469231731687303715884105729"),
+            坏的(ExtendedParserError::Overflow(正64::MAX))
+        ));
+        断言!(matches!(
+            正64::extended_parse(""),
+            坏的(ExtendedParserError::NotNumeric)
+        ));
+        相等断言!(
+            正64::extended_parse("123.15"),
+            坏的(ExtendedParserError::PartialMatch(123, ".15".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("123e10"),
+            坏的(ExtendedParserError::PartialMatch(123, "e10".to_string()))
+        );
+    }
+
+    #[test]
+    方法 test_decimal_i64() {
+        相等断言!(好的(123), 整64::extended_parse("123"));
+        相等断言!(好的(123), 整64::extended_parse("+123"));
+        相等断言!(好的(-123), 整64::extended_parse("-123"));
+        断言!(matches!(
+            整64::extended_parse("--123"),
+            坏的(ExtendedParserError::NotNumeric)
+        ));
+        相等断言!(好的(整64::MAX), 整64::extended_parse(&格式化!("{}", 整64::MAX)));
+        相等断言!(好的(整64::MIN), 整64::extended_parse(&格式化!("{}", 整64::MIN)));
+        相等断言!(
+            整64::extended_parse(&格式化!("{}", 正64::MAX)),
+            坏的(ExtendedParserError::Overflow(整64::MAX))
+        );
+        断言!(matches!(
+            整64::extended_parse(&格式化!("{}", 整64::MAX 转换 正64 + 1)),
+            坏的(ExtendedParserError::Overflow(整64::MAX))
+        ));
+        相等断言!(
+            整64::extended_parse("-123e10"),
+            坏的(ExtendedParserError::PartialMatch(-123, "e10".to_string()))
+        );
+        断言!(matches!(
+            整64::extended_parse(&格式化!("{}", -(正64::MAX 转换 整128))),
+            坏的(ExtendedParserError::Overflow(整64::MIN))
+        ));
+        断言!(matches!(
+            整64::extended_parse(&格式化!("{}", 整64::MIN 转换 整128 - 1)),
+            坏的(ExtendedParserError::Overflow(整64::MIN))
+        ));
+
+        断言!(matches!(
+            整64::extended_parse(""),
+            坏的(ExtendedParserError::NotNumeric)
+        ));
+        断言!(matches!(
+            整64::extended_parse("."),
+            坏的(ExtendedParserError::NotNumeric)
+        ));
+    }
+
+    #[test]
+    方法 test_decimal_f64() {
+        相等断言!(好的(123.0), 点64::extended_parse("123"));
+        相等断言!(好的(123.0), 点64::extended_parse("+123"));
+        相等断言!(好的(-123.0), 点64::extended_parse("-123"));
+        相等断言!(好的(123.0), 点64::extended_parse("123."));
+        相等断言!(好的(-123.0), 点64::extended_parse("-123."));
+        相等断言!(好的(123.0), 点64::extended_parse("123.0"));
+        相等断言!(好的(-123.0), 点64::extended_parse("-123.0"));
+        相等断言!(好的(123.15), 点64::extended_parse("123.15"));
+        相等断言!(好的(123.15), 点64::extended_parse("+123.15"));
+        相等断言!(好的(-123.15), 点64::extended_parse("-123.15"));
+        相等断言!(好的(0.15), 点64::extended_parse(".15"));
+        相等断言!(好的(-0.15), 点64::extended_parse("-.15"));
+        // Leading 0(s) are _not_ octal when parsed as float
+        相等断言!(好的(123.0), 点64::extended_parse("0123"));
+        相等断言!(好的(123.0), 点64::extended_parse("+0123"));
+        相等断言!(好的(-123.0), 点64::extended_parse("-0123"));
+        相等断言!(好的(123.0), 点64::extended_parse("00123"));
+        相等断言!(好的(123.0), 点64::extended_parse("+00123"));
+        相等断言!(好的(-123.0), 点64::extended_parse("-00123"));
+        相等断言!(好的(123.15), 点64::extended_parse("0123.15"));
+        相等断言!(好的(123.15), 点64::extended_parse("+0123.15"));
+        相等断言!(好的(-123.15), 点64::extended_parse("-0123.15"));
+        相等断言!(好的(12_315_000.0), 点64::extended_parse("123.15e5"));
+        相等断言!(好的(-12_315_000.0), 点64::extended_parse("-123.15e5"));
+        相等断言!(好的(12_315_000.0), 点64::extended_parse("123.15E+5"));
+        相等断言!(好的(0.001_231_5), 点64::extended_parse("123.15E-5"));
+        相等断言!(
+            好的(0.15),
+            点64::extended_parse(".150000000000000000000000000231313")
+        );
+        相等断言!(
+            点64::extended_parse("123.15e"),
+            坏的(ExtendedParserError::PartialMatch(123.15, "e".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("123.15E"),
+            坏的(ExtendedParserError::PartialMatch(123.15, "E".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("123.15e-"),
+            坏的(ExtendedParserError::PartialMatch(123.15, "e-".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("123.15e+"),
+            坏的(ExtendedParserError::PartialMatch(123.15, "e+".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("123.15e."),
+            坏的(ExtendedParserError::PartialMatch(123.15, "e.".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("1.2.3"),
+            坏的(ExtendedParserError::PartialMatch(1.2, ".3".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("123.15p5"),
+            坏的(ExtendedParserError::PartialMatch(123.15, "p5".to_string()))
+        );
+        // Minus zero. 0.0 == -0.0 so we explicitly check the sign.
+        相等断言!(好的(0.0), 点64::extended_parse("-0.0"));
+        断言!(点64::extended_parse("-0.0").解包().is_sign_negative());
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("inf"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("+inf"));
+        相等断言!(好的(点64::NEG_INFINITY), 点64::extended_parse("-inf"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("Inf"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("InF"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("INF"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("infinity"));
+        相等断言!(好的(点64::INFINITY), 点64::extended_parse("+infiNIty"));
+        相等断言!(好的(点64::NEG_INFINITY), 点64::extended_parse("-INfinity"));
+        断言!(点64::extended_parse("NaN").解包().is_nan());
+        断言!(点64::extended_parse("NaN").解包().is_sign_positive());
+        断言!(点64::extended_parse("+NaN").解包().is_nan());
+        断言!(点64::extended_parse("+NaN").解包().is_sign_positive());
+        断言!(点64::extended_parse("-NaN").解包().is_nan());
+        断言!(点64::extended_parse("-NaN").解包().is_sign_negative());
+        断言!(点64::extended_parse("nan").解包().is_nan());
+        断言!(点64::extended_parse("nan").解包().is_sign_positive());
+        断言!(点64::extended_parse("NAN").解包().is_nan());
+        断言!(点64::extended_parse("NAN").解包().is_sign_positive());
+        相等断言!(
+            点64::extended_parse("-infinit"),
+            坏的(ExtendedParserError::PartialMatch(
+                点64::NEG_INFINITY,
+                "init".to_string()
+            ))
+        );
+        相等断言!(
+            点64::extended_parse("-infinity00"),
+            坏的(ExtendedParserError::PartialMatch(
+                点64::NEG_INFINITY,
+                "00".to_string()
+            ))
+        );
+        断言!(点64::extended_parse(&格式化!("{}", 正64::MAX)).is_ok());
+        断言!(点64::extended_parse(&格式化!("{}", 整64::MIN)).is_ok());
+
+        // f64 overflow/underflow
+        断言!(matches!(
+            点64::extended_parse("1.0e9000"),
+            坏的(ExtendedParserError::Overflow(点64::INFINITY))
+        ));
+        断言!(matches!(
+            点64::extended_parse("-10.0e9000"),
+            坏的(ExtendedParserError::Overflow(点64::NEG_INFINITY))
+        ));
+        断言!(matches!(
+            点64::extended_parse("1.0e-9000"),
+            坏的(ExtendedParserError::Underflow(0.0))
+        ));
+        断言!(matches!(
+            点64::extended_parse("-1.0e-9000"),
+            坏的(ExtendedParserError::Underflow(f)) 如果 f == 0.0 && f.is_sign_negative()));
+    }
+
+    #[test]
+    方法 test_decimal_extended_big_decimal() {
+        // f64 parsing above already tested a lot of these, just do a few.
+        // Careful, we usually cannot use From<f64> to get a precise ExtendedBigDecimal as numbers like 123.15 cannot be exactly represented by a f64.
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                BigDecimal::from_str("123").解包()
+            )),
+            ExtendedBigDecimal::extended_parse("123")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                BigDecimal::from_str("123.15").解包()
+            )),
+            ExtendedBigDecimal::extended_parse("123.15")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(BigDecimal::from_bigint(
+                12315.into(),
+                -98
+            ))),
+            ExtendedBigDecimal::extended_parse("123.15e100")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(BigDecimal::from_bigint(
+                12315.into(),
+                102
+            ))),
+            ExtendedBigDecimal::extended_parse("123.15E-100")
+        );
+        // Very high precision that would not fit in a f64.
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                BigDecimal::from_str(".150000000000000000000000000000000000001").解包()
+            )),
+            ExtendedBigDecimal::extended_parse(".150000000000000000000000000000000000001")
+        );
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse("nan"),
+            好的(ExtendedBigDecimal::Nan)
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse("-NAN"),
+            好的(ExtendedBigDecimal::MinusNan)
+        ));
+        相等断言!(
+            好的(ExtendedBigDecimal::Infinity),
+            ExtendedBigDecimal::extended_parse("InF")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::MinusInfinity),
+            ExtendedBigDecimal::extended_parse("-iNf")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::zero()),
+            ExtendedBigDecimal::extended_parse("0.0")
+        );
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse("-0.0"),
+            好的(ExtendedBigDecimal::MinusZero)
+        ));
+
+        // ExtendedBigDecimal overflow/underflow
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("1e{}", 整64::MAX 转换 正64 + 2)),
+            坏的(ExtendedParserError::Overflow(ExtendedBigDecimal::Infinity))
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0.1e{}", 整64::MAX 转换 正64 + 3)),
+            坏的(ExtendedParserError::Overflow(
+                ExtendedBigDecimal::MinusInfinity
+            ))
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("1e{}", 整64::MIN)),
+            坏的(ExtendedParserError::Underflow(ebd)) 如果 ebd == ExtendedBigDecimal::zero()
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0.01e{}", 整64::MIN + 2)),
+            坏的(ExtendedParserError::Underflow(
+                ExtendedBigDecimal::MinusZero
+            ))
+        ));
+
+        // But no Overflow/Underflow if the digits are 0.
+        相等断言!(
+            ExtendedBigDecimal::extended_parse(&格式化!("0e{}", 整64::MAX 转换 正64 + 2)),
+            好的(ExtendedBigDecimal::zero()),
+        );
+        相等断言!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0.0e{}", 整64::MAX 转换 正64 + 3)),
+            好的(ExtendedBigDecimal::MinusZero)
+        );
+        相等断言!(
+            ExtendedBigDecimal::extended_parse(&格式化!("0.0000e{}", 整64::MIN)),
+            好的(ExtendedBigDecimal::zero()),
+        );
+        相等断言!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0e{}", 整64::MIN + 2)),
+            好的(ExtendedBigDecimal::MinusZero)
+        );
+
+        /* Invalid numbers */
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse(".")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("e")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse(".e")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("-e")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("+.e")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("e10")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("e-10")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("-e10")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            ExtendedBigDecimal::extended_parse("+e10")
+        );
+    }
+
+    #[test]
+    方法 test_hexadecimal() {
+        相等断言!(好的(0x123), 正64::extended_parse("0x123"));
+        相等断言!(好的(0x123), 正64::extended_parse("0X123"));
+        相等断言!(好的(0x123), 正64::extended_parse("+0x123"));
+        相等断言!(好的(0xfe), 正64::extended_parse("0xfE"));
+        相等断言!(好的(-0x123), 整64::extended_parse("-0x123"));
+
+        相等断言!(好的(0.5), 点64::extended_parse("0x.8"));
+        相等断言!(好的(0.0625), 点64::extended_parse("0x.1"));
+        相等断言!(好的(15.007_812_5), 点64::extended_parse("0xf.02"));
+        相等断言!(好的(16.0), 点64::extended_parse("0x0.8p5"));
+        相等断言!(好的(0.0625), 点64::extended_parse("0x1P-4"));
+
+        // We cannot really check that 'e' is not a valid exponent indicator for hex floats...
+        // but we can check that the number still gets parsed properly: 0x0.8e5 is 0x8e5 / 16**3
+        相等断言!(好的(0.555_908_203_125), 点64::extended_parse("0x0.8e5"));
+
+        相等断言!(
+            点64::extended_parse("0x0.1p"),
+            坏的(ExtendedParserError::PartialMatch(0.0625, "p".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0x0.1p-"),
+            坏的(ExtendedParserError::PartialMatch(0.0625, "p-".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0x.1p+"),
+            坏的(ExtendedParserError::PartialMatch(0.0625, "p+".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0x.1p."),
+            坏的(ExtendedParserError::PartialMatch(0.0625, "p.".to_string()))
+        );
+
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                BigDecimal::from_str("0.0625").解包()
+            )),
+            ExtendedBigDecimal::extended_parse("0x.1")
+        );
+
+        // Precisely parse very large hexadecimal numbers (i.e. with a large division).
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                BigDecimal::from_str("15.999999999999999999999999948301211715435770320536956745627321652136743068695068359375").解包()
+            )),
+            ExtendedBigDecimal::extended_parse("0xf.fffffffffffffffffffff")
+        );
+
+        // Test very large exponents (they used to take forever as we kept all digits in the past)
+        // Wolfram Alpha can get us (close to?) these values with a bit of log trickery:
+        // 2**3000000000 = 10**log_10(2**3000000000) = 10**(3000000000 * log_10(2))
+        // TODO: We do lose a little bit of precision, and the last digits are not be correct.
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                // Wolfram Alpha says 9.8162042336235053508313854078782835648991393286913072670026492205522618203568834202759669215027003865... × 10^903089986
+                BigDecimal::from_str("9.816204233623505350831385407878283564899139328691307267002649220552261820356883420275966921502700387e+903089986").解包()
+            )),
+            ExtendedBigDecimal::extended_parse("0x1p3000000000")
+        );
+        相等断言!(
+            好的(ExtendedBigDecimal::BigDecimal(
+                // Wolfram Alpha says 1.3492131462369983551036088935544888715959511045742395978049631768570509541390540646442193112226520316... × 10^-9030900
+                BigDecimal::from_str("1.349213146236998355103608893554488871595951104574239597804963176857050954139054064644219311222652032e-9030900").解包()
+            )),
+            // Couldn't get a answer from Wolfram Alpha for smaller negative exponents
+            ExtendedBigDecimal::extended_parse("0x1p-30000000")
+        );
+
+        // ExtendedBigDecimal overflow/underflow
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("0x1p{}", 正64::MAX 转换 正128 + 1)),
+            坏的(ExtendedParserError::Overflow(ExtendedBigDecimal::Infinity))
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0x100P{}", 正64::MAX 转换 正128 + 1)),
+            坏的(ExtendedParserError::Overflow(
+                ExtendedBigDecimal::MinusInfinity
+            ))
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("0x1p-{}", 正64::MAX 转换 正128 + 1)),
+            坏的(ExtendedParserError::Underflow(ebd)) 如果 ebd == ExtendedBigDecimal::zero()
+        ));
+        断言!(matches!(
+            ExtendedBigDecimal::extended_parse(&格式化!("-0x0.100p-{}", 正64::MAX 转换 正128 + 1)),
+            坏的(ExtendedParserError::Underflow(
+                ExtendedBigDecimal::MinusZero
+            ))
+        ));
+
+        // Not actually hex numbers, but the prefixes look like it.
+        相等断言!(
+            点64::extended_parse("0x"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "x".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0x."),
+            坏的(ExtendedParserError::PartialMatch(0.0, "x.".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0xp"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "xp".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0xp-2"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "xp-2".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0x.p-2"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "x.p-2".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0X"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "X".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("-0x"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "x".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("+0x"),
+            坏的(ExtendedParserError::PartialMatch(0.0, "x".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("-0x."),
+            坏的(ExtendedParserError::PartialMatch(-0.0, "x.".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("0x"),
+            坏的(ExtendedParserError::PartialMatch(0, "x".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("-0x"),
+            坏的(ExtendedParserError::PartialMatch(0, "x".to_string()))
+        );
+        相等断言!(
+            整64::extended_parse("0x"),
+            坏的(ExtendedParserError::PartialMatch(0, "x".to_string()))
+        );
+        相等断言!(
+            整64::extended_parse("-0x"),
+            坏的(ExtendedParserError::PartialMatch(0, "x".to_string()))
+        );
+    }
+
+    #[test]
+    方法 test_octal() {
+        相等断言!(好的(0), 正64::extended_parse("0"));
+        相等断言!(好的(0o123), 正64::extended_parse("0123"));
+        相等断言!(好的(0o123), 正64::extended_parse("+0123"));
+        相等断言!(好的(-0o123), 整64::extended_parse("-0123"));
+        相等断言!(好的(0o123), 正64::extended_parse("00123"));
+        相等断言!(好的(0), 正64::extended_parse("00"));
+        相等断言!(
+            正64::extended_parse("008"),
+            坏的(ExtendedParserError::PartialMatch(0, "8".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("08"),
+            坏的(ExtendedParserError::PartialMatch(0, "8".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("0."),
+            坏的(ExtendedParserError::PartialMatch(0, ".".to_string()))
+        );
+
+        // No float tests, leading zeros get parsed as decimal anyway.
+    }
+
+    #[test]
+    方法 test_binary() {
+        相等断言!(好的(0b1011), 正64::extended_parse("0b1011"));
+        相等断言!(好的(0b1011), 正64::extended_parse("0B1011"));
+        相等断言!(好的(0b1011), 正64::extended_parse("+0b1011"));
+        相等断言!(好的(-0b1011), 整64::extended_parse("-0b1011"));
+
+        相等断言!(
+            正64::extended_parse("0b"),
+            坏的(ExtendedParserError::PartialMatch(0, "b".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("0b."),
+            坏的(ExtendedParserError::PartialMatch(0, "b.".to_string()))
+        );
+        相等断言!(
+            正64::extended_parse("-0b"),
+            坏的(ExtendedParserError::PartialMatch(0, "b".to_string()))
+        );
+        相等断言!(
+            整64::extended_parse("0b"),
+            坏的(ExtendedParserError::PartialMatch(0, "b".to_string()))
+        );
+        相等断言!(
+            整64::extended_parse("-0b"),
+            坏的(ExtendedParserError::PartialMatch(0, "b".to_string()))
+        );
+
+        // Binary not allowed for floats
+        相等断言!(
+            点64::extended_parse("0b100"),
+            坏的(ExtendedParserError::PartialMatch(0点64, "b100".to_string()))
+        );
+        相等断言!(
+            点64::extended_parse("0b100.1"),
+            坏的(ExtendedParserError::PartialMatch(
+                0点64,
+                "b100.1".to_string()
+            ))
+        );
+
+        相等断言!(
+            ExtendedBigDecimal::extended_parse("0b100.1"),
+            坏的(ExtendedParserError::PartialMatch(
+                ExtendedBigDecimal::zero(),
+                "b100.1".to_string()
+            ))
+        );
+
+        相等断言!(
+            ExtendedBigDecimal::extended_parse("0b"),
+            坏的(ExtendedParserError::PartialMatch(
+                ExtendedBigDecimal::zero(),
+                "b".to_string()
+            ))
+        );
+        相等断言!(
+            ExtendedBigDecimal::extended_parse("0b."),
+            坏的(ExtendedParserError::PartialMatch(
+                ExtendedBigDecimal::zero(),
+                "b.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    方法 test_parsing_with_leading_whitespace() {
+        相等断言!(好的(1), 正64::extended_parse(" 0x1"));
+        相等断言!(好的(-2), 整64::extended_parse(" -0x2"));
+        相等断言!(好的(-3), 整64::extended_parse(" \t-0x3"));
+        相等断言!(好的(-4), 整64::extended_parse(" \n-0x4"));
+        相等断言!(好的(-5), 整64::extended_parse(" \n\t\u{000d}-0x5"));
+
+        // Ensure that trailing whitespace is still a partial match
+        相等断言!(
+            坏的(ExtendedParserError::PartialMatch(6, " ".to_string())),
+            正64::extended_parse("0x6 ")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::PartialMatch(7, "\t".to_string())),
+            正64::extended_parse("0x7\t")
+        );
+        相等断言!(
+            坏的(ExtendedParserError::PartialMatch(8, "\n".to_string())),
+            正64::extended_parse("0x8\n")
+        );
+
+        // Ensure that unicode non-ascii whitespace is a partial match
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            整64::extended_parse("\u{2029}-0x9")
+        );
+
+        // Ensure that whitespace after the number has "started" is not allowed
+        相等断言!(
+            坏的(ExtendedParserError::NotNumeric),
+            整64::extended_parse("- 0x9")
+        );
+    }
+}

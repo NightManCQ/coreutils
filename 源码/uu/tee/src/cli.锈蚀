@@ -1,0 +1,103 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore nopipe
+
+使用 clap::{Arg, ArgAction, Command, builder::PossibleValue};
+使用 标准库::ffi::OsString;
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+公有 使用 uucore::{format_usage, translate};
+
+公有 模组 options {
+    公有 常量 APPEND: &字符串切片 = "append";
+    公有 常量 IGNORE_INTERRUPTS: &字符串切片 = "ignore-interrupts";
+    公有 常量 FILE: &字符串切片 = "file";
+    公有 常量 IGNORE_PIPE_ERRORS: &字符串切片 = "ignore-pipe-errors";
+    公有 常量 OUTPUT_ERROR: &字符串切片 = "output-error";
+}
+
+#[derive(克隆协议, 调试协议)]
+公有 枚举 OutputErrorMode {
+    /// Diagnose write error on any output
+    Warn,
+    /// Diagnose write error on any output that is not a pipe
+    WarnNoPipe,
+    /// Exit upon write error on any output
+    Exit,
+    /// Exit upon write error on any output that is not a pipe
+    ExitNoPipe,
+}
+
+#[allow(dead_code)]
+公有 结构 Options {
+    公有 append: 布尔,
+    公有 ignore_interrupts: 布尔,
+    公有 ignore_pipe_errors: 布尔,
+    公有 files: 向量<OsString>,
+    公有 output_error: 选项<OutputErrorMode>,
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("tee")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("tee"))
+        .about(translate!("tee-about"))
+        .override_usage(format_usage(&translate!("tee-usage")))
+        .after_help(translate!("tee-after-help"))
+        .infer_long_args(真)
+        // Since we use value-specific help texts for "--output-error", clap's "short help" and "long help" differ.
+        // However, this is something that the GNU tests explicitly test for, so we *always* show the long help instead.
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建("--help")
+                .short('h')
+                .long("help")
+                .help(translate!("tee-help-help"))
+                .action(ArgAction::HelpLong),
+        )
+        .arg(
+            Arg::新建(options::APPEND)
+                .long(options::APPEND)
+                .short('a')
+                .help(translate!("tee-help-append"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::APPEND),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_INTERRUPTS)
+                .long(options::IGNORE_INTERRUPTS)
+                .short('i')
+                .help(translate!("tee-help-ignore-interrupts"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_PIPE_ERRORS)
+                .short('p')
+                .help(translate!("tee-help-ignore-pipe-errors"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OUTPUT_ERROR)
+                .long(options::OUTPUT_ERROR)
+                .require_equals(真)
+                .num_args(0..=1)
+                .default_missing_value("warn-nopipe")
+                .value_parser(ShortcutValueParser::新建([
+                    PossibleValue::新建("warn").help(translate!("tee-help-output-error-warn")),
+                    PossibleValue::新建("warn-nopipe")
+                        .help(translate!("tee-help-output-error-warn-nopipe")),
+                    PossibleValue::新建("exit").help(translate!("tee-help-output-error-exit")),
+                    PossibleValue::新建("exit-nopipe")
+                        .help(translate!("tee-help-output-error-exit-nopipe")),
+                ]))
+                .help(translate!("tee-help-output-error")),
+        )
+}

@@ -1,0 +1,97 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#![cfg(任意(target_os = "linux", target_os = "android"))]
+
+使用 标准库::ffi::OsString;
+使用 标准库::格式化::Write;
+使用 标准库::输入输出;
+
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::translate;
+
+公有(箱) 类型 结果<T> = 标准库::result::结果<T, 错误协议>;
+
+#[derive(错误协议, 调试协议)]
+公有(箱) 枚举 错误协议 {
+    #[错误("{}", translate!("chcon-error-no-context-specified"))]
+    MissingContext,
+
+    #[错误("{}", translate!("chcon-error-no-files-specified"))]
+    MissingFiles,
+
+    #[错误("{}", translate!("chcon-error-data-out-of-range"))]
+    OutOfRange,
+
+    #[错误("{0}")]
+    ArgumentsMismatch(字符串),
+
+    #[错误(transparent)]
+    CommandLine(#[from] clap::错误协议),
+
+    #[错误("{}", translate!("chcon-error-operation-failed", "operation" => operation.克隆()))]
+    SELinux {
+        operation: 字符串,
+        #[source]
+        source: selinux::errors::错误协议,
+    },
+
+    #[错误("{}", translate!("chcon-error-operation-failed", "operation" => operation.克隆()))]
+    Io {
+        operation: 字符串,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("chcon-error-operation-failed-on", "operation" => operation.克隆(), "operand" => operand1.quote()))]
+    Io1 {
+        operation: 字符串,
+        operand1: OsString,
+        #[source]
+        source: 输入输出::错误协议,
+    },
+}
+
+实现 错误协议 {
+    公有(箱) 方法 from_io(operation: 实现 转换为目标协议<字符串>, source: 输入输出::错误协议) -> 自身类型 {
+        自身类型::Io {
+            operation: operation.into(),
+            source,
+        }
+    }
+
+    公有(箱) 方法 from_io1(
+        operation: 实现 转换为目标协议<字符串>,
+        operand1: 实现 转换为目标协议<OsString>,
+        source: 输入输出::错误协议,
+    ) -> 自身类型 {
+        自身类型::Io1 {
+            operation: operation.into(),
+            operand1: operand1.into(),
+            source,
+        }
+    }
+
+    公有(箱) 方法 from_selinux(
+        operation: 实现 转换为目标协议<字符串>,
+        source: selinux::errors::错误协议,
+    ) -> 自身类型 {
+        自身类型::SELinux {
+            operation: operation.into(),
+            source,
+        }
+    }
+}
+
+公有(箱) 方法 report_full_error(可变 err: &动态 标准库::错误::错误协议) -> 字符串 {
+    设 可变 desc = 字符串::with_capacity(256);
+    write!(desc, "{err}").解包();
+    当 设 一些(source) = err.source() {
+        err = source;
+        write!(desc, ". {err}").解包();
+    }
+    desc
+}

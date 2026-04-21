@@ -1,0 +1,35 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::比较::max;
+使用 标准库::操作符::{Add, AddAssign};
+
+#[derive(调试协议, 默认协议, 复制协议, 克隆协议)]
+公有 结构 WordCount {
+    公有 bytes: 正整数大小,
+    公有 chars: 正整数大小,
+    公有 lines: 正整数大小,
+    公有 words: 正整数大小,
+    公有 max_line_length: 正整数大小,
+}
+
+实现 Add 循环 WordCount {
+    类型 Output = 自身类型;
+
+    方法 add(自身, other: 自身类型) -> 自身类型 {
+        自身类型 {
+            bytes: 自身.bytes + other.bytes,
+            chars: 自身.chars + other.chars,
+            lines: 自身.lines + other.lines,
+            words: 自身.words + other.words,
+            max_line_length: max(自身.max_line_length, other.max_line_length),
+        }
+    }
+}
+
+实现 AddAssign 循环 WordCount {
+    方法 add_assign(&可变 自身, other: 自身类型) {
+        *自身 = *自身 + other;
+    }
+}

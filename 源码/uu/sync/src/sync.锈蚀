@@ -1,0 +1,323 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+/* Last synced with: sync (GNU coreutils) 8.13 */
+
+使用 clap::{Arg, ArgAction, Command};
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 nix::errno::Errno;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 nix::fcntl::{OFlag, open};
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 nix::sys::stat::Mode;
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError, get_exit_code, set_exit_code};
+使用 uucore::format_usage;
+使用 uucore::show_error;
+使用 uucore::translate;
+
+公有 模组 options {
+    公有 静态 FILE_SYSTEM: &字符串切片 = "file-system";
+    公有 静态 DATA: &字符串切片 = "data";
+}
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+#[cfg(unix)]
+模组 platform {
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 nix::fcntl::{FcntlArg, OFlag, fcntl};
+    使用 nix::unistd::同步;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 nix::unistd::{fdatasync, syncfs};
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 标准库::文件系统::{File, OpenOptions};
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 uucore::display::Quotable;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 uucore::错误::FromIo;
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    使用 uucore::translate;
+
+    使用 uucore::错误::UResult;
+
+    #[期望(
+        clippy::unnecessary_wraps,
+        reason = "fn sig must match on all platforms"
+    )]
+    公有 方法 do_sync() -> UResult<()> {
+        同步();
+        好的(())
+    }
+
+    /// Opens a file and resets its O_NONBLOCK flag to match GNU behavior.
+    /// Returns the opened file or an error if opening fails.
+    /// Logs a warning if fcntl fails but doesn't abort the operation.
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    方法 open_and_reset_nonblock(路径: &字符串切片) -> UResult<File> {
+        设 f = OpenOptions::新建()
+            .读锁定(真)
+            .custom_flags(OFlag::O_NONBLOCK.bits())
+            .open(路径)
+            .map_err_context(|| 路径.to_string())?;
+        // Reset O_NONBLOCK flag if it was set (matches GNU behavior)
+        // This is non-critical, so we log errors but don't fail
+        如果 设 坏的(e) = fcntl(&f, FcntlArg::F_SETFL(OFlag::empty())) {
+            使用 标准库::输入输出::{Write, stderr};
+            设 _ = writeln!(
+                stderr(),
+                "sync: {}",
+                translate!("sync-warning-fcntl-failed", "file" => 路径, "error" => e.to_string())
+            );
+            uucore::错误::set_exit_code(1);
+        }
+        好的(f)
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    公有 方法 do_syncfs(files: 向量<字符串>) -> UResult<()> {
+        循环 路径 在 files {
+            设 f = open_and_reset_nonblock(&路径)?;
+            syncfs(f).map_err_context(
+                || translate!("sync-error-syncing-file", "file" => 路径.quote()),
+            )?;
+        }
+        好的(())
+    }
+
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    公有 方法 do_fdatasync(files: 向量<字符串>) -> UResult<()> {
+        循环 路径 在 files {
+            设 f = open_and_reset_nonblock(&路径)?;
+            fdatasync(f).map_err_context(
+                || translate!("sync-error-syncing-file", "file" => 路径.quote()),
+            )?;
+        }
+        好的(())
+    }
+}
+
+#[cfg(windows)]
+模组 platform {
+    使用 标准库::文件系统::OpenOptions;
+    使用 标准库::操作系统::windows::预导入::*;
+    使用 标准库::路径::Path;
+    使用 uucore::错误::{UResult, USimpleError};
+    使用 uucore::translate;
+    使用 uucore::wide::{FromWide, ToWide};
+    使用 windows_sys::Win32::Foundation::{
+        ERROR_NO_MORE_FILES, GetLastError, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
+    };
+    使用 windows_sys::Win32::Storage::FileSystem::{
+        FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, FlushFileBuffers, GetDriveTypeW,
+    };
+    使用 windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+
+    方法 get_last_error() -> 正32 {
+        // SAFETY: `GetLastError` has no safety preconditions
+        不安全 { GetLastError() 转换 正32 }
+    }
+
+    方法 flush_volume(name: &字符串切片) -> UResult<()> {
+        设 name_wide = name.to_wide_null();
+        // SAFETY: `name` is a valid `str`, so `name_wide` is valid null-terminated UTF-16
+        如果 不安全 { GetDriveTypeW(name_wide.as_ptr()) } == DRIVE_FIXED {
+            设 sliced_name = &name[..name.长度() - 1]; // eliminate trailing backslash
+            匹配 OpenOptions::新建().写锁定(真).open(sliced_name) {
+                好的(file) => {
+                    // SAFETY: `file` is a valid `File`
+                    如果 不安全 { FlushFileBuffers(file.as_raw_handle() 转换 HANDLE) } == 0 {
+                        坏的(USimpleError::新建(
+                            get_last_error() 转换 整32,
+                            translate!("sync-error-flush-file-buffer"),
+                        ))
+                    } 否则 {
+                        好的(())
+                    }
+                }
+                坏的(e) => 坏的(USimpleError::新建(
+                    e.raw_os_error().unwrap_or(1),
+                    translate!("sync-error-create-volume-handle"),
+                )),
+            }
+        } 否则 {
+            好的(())
+        }
+    }
+
+    方法 find_first_volume() -> UResult<(字符串, HANDLE)> {
+        设 可变 name: [正16; MAX_PATH 转换 正整数大小] = [0; MAX_PATH 转换 正整数大小];
+        // SAFETY: `name` was just constructed and in scope, `len()` is its length by definition
+        设 handle = 不安全 { FindFirstVolumeW(name.as_mut_ptr(), name.长度() 转换 正32) };
+        如果 handle == INVALID_HANDLE_VALUE {
+            返回 坏的(USimpleError::新建(
+                get_last_error() 转换 整32,
+                translate!("sync-error-find-first-volume"),
+            ));
+        }
+        好的((字符串::from_wide_null(&name), handle))
+    }
+
+    方法 find_all_volumes() -> UResult<向量<字符串>> {
+        设 (first_volume, next_volume_handle) = find_first_volume()?;
+        设 可变 volumes = 向量![first_volume];
+        无限循环 {
+            设 可变 name: [正16; MAX_PATH 转换 正整数大小] = [0; MAX_PATH 转换 正整数大小];
+            // SAFETY: `next_volume_handle` was returned by `find_first_volume`,
+            // `name` was just constructed and in scope, `len()` is its length by definition
+            如果 不安全 { FindNextVolumeW(next_volume_handle, name.as_mut_ptr(), name.长度() 转换 正32) }
+                == 0
+            {
+                返回 匹配 get_last_error() {
+                    ERROR_NO_MORE_FILES => {
+                        // SAFETY: `next_volume_handle` was returned by `find_first_volume`
+                        不安全 { FindVolumeClose(next_volume_handle) };
+                        好的(volumes)
+                    }
+                    err => 坏的(USimpleError::新建(
+                        err 转换 整32,
+                        translate!("sync-error-find-next-volume"),
+                    )),
+                };
+            }
+            volumes.压入(字符串::from_wide_null(&name));
+        }
+    }
+
+    公有 方法 do_sync() -> UResult<()> {
+        设 volumes = find_all_volumes()?;
+        循环 vol 在 &volumes {
+            flush_volume(vol)?;
+        }
+        好的(())
+    }
+
+    公有 方法 do_syncfs(files: 向量<字符串>) -> UResult<()> {
+        循环 路径 在 files {
+            设 maybe_first = Path::新建(&路径).components().next();
+            设 vol_name = 匹配 maybe_first {
+                一些(c) => c.as_os_str().to_string_lossy().into_owned(),
+                无 => {
+                    返回 坏的(USimpleError::新建(
+                        1,
+                        translate!("sync-error-no-such-file", "file" => 路径),
+                    ));
+                }
+            };
+            flush_volume(&vol_name)?;
+        }
+        好的(())
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 files: 向量<字符串> = matches
+        .get_many::<字符串>(ARG_FILES)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    如果 matches.get_flag(options::DATA) && files.为空() {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("sync-error-data-needs-argument"),
+        ));
+    }
+
+    循环 f 在 &files {
+        // Use the Nix open to be able to set the NONBLOCK flags for fifo files
+        #[cfg(任意(target_os = "linux", target_os = "android"))]
+        {
+            设 路径 = Path::新建(&f);
+            如果 设 坏的(e) = open(路径, OFlag::O_NONBLOCK, Mode::empty()) {
+                如果 e != Errno::EACCES || (e == Errno::EACCES && 路径.is_dir()) {
+                    show_error!(
+                        "{}",
+                        translate!("sync-error-opening-file", "file" => f.quote(), "err" => e.desc())
+                    );
+                    set_exit_code(1);
+                }
+            }
+        }
+        #[cfg(not(任意(target_os = "linux", target_os = "android")))]
+        {
+            如果 !Path::新建(&f).exists() {
+                show_error!(
+                    "{}",
+                    translate!("sync-error-no-such-file", "file" => f.quote())
+                );
+                set_exit_code(1);
+            }
+        }
+    }
+
+    如果 get_exit_code() != 0 {
+        返回 坏的(USimpleError::新建(1, ""));
+    }
+
+    #[allow(clippy::if_same_then_else)]
+    如果 matches.get_flag(options::FILE_SYSTEM) {
+        如果 files.为空() {
+            同步()?;
+        } 否则 {
+            #[cfg(任意(target_os = "linux", target_os = "android", target_os = "windows"))]
+            syncfs(files)?;
+        }
+    } 否则 如果 matches.get_flag(options::DATA) {
+        #[cfg(任意(target_os = "linux", target_os = "android"))]
+        fdatasync(files)?;
+    } 否则 {
+        同步()?;
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("sync")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("sync"))
+        .about(translate!("sync-about"))
+        .override_usage(format_usage(&translate!("sync-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::FILE_SYSTEM)
+                .short('f')
+                .long(options::FILE_SYSTEM)
+                .conflicts_with(options::DATA)
+                .help(translate!("sync-help-file-system"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DATA)
+                .short('d')
+                .long(options::DATA)
+                .conflicts_with(options::FILE_SYSTEM)
+                .help(translate!("sync-help-data"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+方法 同步() -> UResult<()> {
+    platform::do_sync()
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android", target_os = "windows"))]
+方法 syncfs(files: 向量<字符串>) -> UResult<()> {
+    platform::do_syncfs(files)
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 fdatasync(files: 向量<字符串>) -> UResult<()> {
+    platform::do_fdatasync(files)
+}

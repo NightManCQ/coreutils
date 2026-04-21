@@ -1,0 +1,136 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) fname, algo, bitlen
+
+使用 标准库::输入输出::{Write, stderr};
+
+使用 clap::Command;
+使用 uu_checksum_common::{ChecksumCommand, checksum_main, default_checksum_app, options};
+
+使用 uucore::checksum::compute::OutputFormat;
+使用 uucore::checksum::{
+    AlgoKind, BlakeLength, ChecksumError, parse_blake_length, sanitize_sha2_sha3_length_str,
+};
+使用 uucore::错误::UResult;
+使用 uucore::hardware::{HasHardwareFeatures 转换 _, SimdPolicy};
+使用 uucore::translate;
+
+/// Print CPU hardware capability detection information to stderr
+/// 2>/dev/full does not abort
+/// This matches GNU cksum's --debug behavior
+方法 print_cpu_debug_info() {
+    设 features = SimdPolicy::detect();
+
+    方法 print_feature(name: &字符串切片, available: 布尔) {
+        如果 available {
+            设 _ = writeln!(stderr(), "using {name} hardware support");
+        } 否则 {
+            设 _ = writeln!(stderr(), "{name} support not detected");
+        }
+    }
+
+    // x86/x86_64
+    print_feature("avx512", features.has_avx512());
+    print_feature("avx2", features.has_avx2());
+    print_feature("pclmul", features.has_pclmul());
+
+    // ARM aarch64
+    如果 cfg!(target_arch = "aarch64") {
+        print_feature("vmull", features.has_vmull());
+    }
+}
+
+/// Sanitize the `--length` argument depending on `--algorithm` and `--length`.
+方法 maybe_sanitize_length(
+    algo_cli: 选项<AlgoKind>,
+    input_length: 选项<&字符串切片>,
+) -> UResult<选项<正整数大小>> {
+    匹配 (algo_cli, input_length) {
+        // No provided length is not a problem so far.
+        (_, 无) => 好的(无),
+
+        // For SHA2 and SHA3, if a length is provided, ensure it is correct.
+        (一些(algo @ (AlgoKind::Sha2 | AlgoKind::Sha3)), 一些(s_len)) => {
+            sanitize_sha2_sha3_length_str(algo, s_len).映射(一些)
+        }
+
+        // SHAKE128 and SHAKE256 algorithms optionally take a bit length. No
+        // validation is performed on this length, any value is valid. If the
+        // given length is not a multiple of 8, the last byte of the output
+        // will have its extra bits set to zero.
+        (一些(AlgoKind::Shake128 | AlgoKind::Shake256), 一些(长度)) => 匹配 长度.parse::<正整数大小>() {
+            好的(0) => 好的(无),
+            好的(l) => 好的(一些(l)),
+            坏的(_) => 坏的(ChecksumError::InvalidLength(长度.into()).into()),
+        },
+
+        // For BLAKE, if a length is provided, validate it.
+        (一些(algo @ (AlgoKind::Blake2b | AlgoKind::Blake3)), 一些(长度)) => {
+            parse_blake_length(algo, BlakeLength::字符串(长度)).映射(一些)
+        }
+
+        // For any other provided algorithm, check if length is 0.
+        // Otherwise, this is an error.
+        (_, 一些(长度)) 如果 长度.parse::<正32>() == 好的(0_u32) => 好的(无),
+        (_, 一些(_)) => 坏的(ChecksumError::LengthOnlyForBlake2bSha2Sha3.into()),
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 algo_cli = matches
+        .get_one::<字符串>(options::ALGORITHM)
+        .映射(AlgoKind::from_cksum)
+        .transpose()?;
+
+    设 input_length = matches
+        .get_one::<字符串>(options::LENGTH)
+        .映射(字符串::as_str);
+
+    设 length = maybe_sanitize_length(algo_cli, input_length)?;
+    设 tag = !matches.get_flag(options::UNTAGGED);
+    设 binary = matches.get_flag(options::BINARY);
+    设 text = matches.get_flag(options::TEXT);
+
+    //Specifying --text without ever mentioning --untagged fails.
+    如果 text && tag {
+        返回 坏的(ChecksumError::TextWithoutUntagged.into());
+    }
+
+    设 output_format = OutputFormat::from_cksum(
+        algo_cli.unwrap_or(AlgoKind::Crc),
+        tag,
+        binary,
+        /* raw */ matches.get_flag(options::RAW),
+        /* base64 */ matches.get_flag(options::BASE64),
+    );
+
+    // Print hardware debug info if requested
+    如果 matches.get_flag(options::DEBUG) {
+        print_cpu_debug_info();
+    }
+
+    checksum_main(algo_cli, length, matches, output_format)
+}
+
+公有 方法 uu_app() -> Command {
+    default_checksum_app(translate!("cksum-about"), translate!("cksum-usage"))
+        .name("cksum")
+        .with_algo()
+        .with_untagged()
+        .with_tag(真)
+        .with_length()
+        .with_raw()
+        .with_check_and_opts()
+        .with_base64()
+        .with_text(假)
+        .with_binary()
+        .with_zero()
+        .with_debug()
+        .after_help(translate!("cksum-after-help"))
+}

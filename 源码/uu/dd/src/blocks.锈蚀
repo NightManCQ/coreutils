@@ -1,0 +1,371 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore datastructures rstat rposition cflags ctable
+
+使用 箱::conversion_tables::ConversionTable;
+使用 箱::datastructures::ConversionMode;
+使用 箱::progress::ReadStat;
+
+常量 NEWLINE: 正8 = b'\n';
+常量 SPACE: 正8 = b' ';
+
+/// Split a slice into chunks, padding or truncating as necessary.
+///
+/// The slice `buf` is split on newlines, then each block is resized
+/// to `cbs` bytes, padding with spaces if necessary. This function
+/// expects the input bytes to be ASCII-encoded.
+///
+/// If `sync` is true and there has been at least one partial record
+/// read from the input (as indicated in `rstat`), then leave an
+/// all-spaces block at the end. Otherwise, remove the last block if
+/// it is all spaces.
+方法 block(buf: &[正8], cbs: 正整数大小, 同步: 布尔, rstat: &可变 ReadStat) -> 向量<向量<正8>> {
+    设 可变 blocks = buf.split(|&e| e == NEWLINE).映射(<[正8]>::to_vec).折叠(
+        向量::新建(),
+        |可变 blocks, 可变 split| {
+            如果 split.长度() > cbs {
+                rstat.records_truncated += 1;
+            }
+            split.resize(cbs, SPACE);
+            blocks.压入(split);
+
+            blocks
+        },
+    );
+
+    // If `sync` is true and there has been at least one partial
+    // record read from the input, then leave the all-spaces block at
+    // the end. Otherwise, remove it.
+    设 _ = blocks
+        .pop_if(|最后| (!同步 || rstat.reads_partial == 0) && 最后.迭代().全部(|&e| e == SPACE));
+
+    blocks
+}
+
+/// Trims padding from each cbs-length partition of buf
+/// as specified by conv=unblock and cbs=N
+/// Expects ascii encoded data
+方法 unblock(buf: &[正8], cbs: 正整数大小) -> 向量<正8> {
+    buf.chunks(cbs).折叠(向量::新建(), |可变 acc, block| {
+        如果 设 一些(last_char_idx) = block.迭代().rposition(|&e| e != SPACE) {
+            // Include text up to last space.
+            acc.extend(&block[..=last_char_idx]);
+        }
+
+        acc.压入(NEWLINE);
+        acc
+    })
+}
+
+/// Apply the specified conversion, blocking, and/or unblocking in the right order.
+///
+/// The `mode` specifies the combination of conversion, blocking, and
+/// unblocking to apply and the order in which to apply it. This
+/// function is responsible only for applying the operations.
+///
+/// `buf` is the buffer of input bytes to transform. This function
+/// mutates this input and also returns a new buffer of bytes
+/// representing the result of the transformation.
+///
+/// `rstat` maintains a running total of the number of partial and
+/// complete blocks read before calling this function. In certain
+/// settings of `mode`, this function will update the number of
+/// records truncated; that's why `rstat` is borrowed mutably.
+公有(箱) 方法 conv_block_unblock_helper(
+    buf: 向量<正8>,
+    mode: &ConversionMode,
+    rstat: &可变 ReadStat,
+) -> 向量<正8> {
+    方法 apply_conversion(buf: 向量<正8>, ct: &ConversionTable) -> 实现 迭代器协议<Item = 正8> + '_ {
+        buf.into_iter().映射(|b| ct[b 转换 正整数大小])
+    }
+
+    匹配 mode {
+        ConversionMode::ConvertOnly(ct) => apply_conversion(buf, ct).收集(),
+        ConversionMode::BlockThenConvert(ct, cbs, 同步) => {
+            设 blocks = block(&buf, *cbs, *同步, rstat);
+            blocks
+                .into_iter()
+                .flat_map(|block| apply_conversion(block, ct))
+                .收集()
+        }
+        ConversionMode::ConvertThenBlock(ct, cbs, 同步) => {
+            设 buf: 向量<_> = apply_conversion(buf, ct).收集();
+            block(&buf, *cbs, *同步, rstat)
+                .into_iter()
+                .flatten()
+                .收集()
+        }
+        ConversionMode::BlockOnly(cbs, 同步) => block(&buf, *cbs, *同步, rstat)
+            .into_iter()
+            .flatten()
+            .收集(),
+        ConversionMode::UnblockThenConvert(ct, cbs) => {
+            设 buf = unblock(&buf, *cbs);
+            apply_conversion(buf, ct).收集()
+        }
+        ConversionMode::ConvertThenUnblock(ct, cbs) => {
+            设 buf: 向量<_> = apply_conversion(buf, ct).收集();
+            unblock(&buf, *cbs)
+        }
+        ConversionMode::UnblockOnly(cbs) => unblock(&buf, *cbs),
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 箱::blocks::{block, unblock};
+    使用 箱::progress::ReadStat;
+
+    常量 NEWLINE: 正8 = b'\n';
+    常量 SPACE: 正8 = b' ';
+
+    #[test]
+    方法 block_test_no_nl() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(res, 向量![向量![0正8, 1正8, 2正8, 3正8]]);
+    }
+
+    #[test]
+    方法 block_test_no_nl_short_record() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8];
+        设 res = block(&buf, 8, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE]]
+        );
+    }
+
+    #[test]
+    方法 block_test_no_nl_trunc() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8, 4正8];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        // Commented section(s) should be truncated and appear for reference only.
+        相等断言!(res, 向量![向量![0正8, 1正8, 2正8, 3正8 /*, 4u8*/]]);
+        相等断言!(rs.records_truncated, 1);
+    }
+
+    #[test]
+    方法 block_test_nl_gt_cbs_trunc() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [
+            0正8, 1正8, 2正8, 3正8, 4正8, NEWLINE, 0正8, 1正8, 2正8, 3正8, 4正8, NEWLINE, 5正8, 6正8, 7正8, 8正8,
+        ];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                // Commented section(s) should be truncated and appear for reference only.
+                向量![0正8, 1正8, 2正8, 3正8],
+                // vec![4u8, SPACE, SPACE, SPACE],
+                向量![0正8, 1正8, 2正8, 3正8],
+                // vec![4u8, SPACE, SPACE, SPACE],
+                向量![5正8, 6正8, 7正8, 8正8],
+            ]
+        );
+        相等断言!(rs.records_truncated, 2);
+    }
+
+    #[test]
+    方法 block_test_surrounded_nl() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8, NEWLINE, 4正8, 5正8, 6正8, 7正8, 8正8];
+        设 res = block(&buf, 8, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE],
+                向量![4正8, 5正8, 6正8, 7正8, 8正8, SPACE, SPACE, SPACE],
+            ]
+        );
+    }
+
+    #[test]
+    方法 block_test_multiple_nl_same_cbs_block() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [
+            0正8, 1正8, 2正8, 3正8, NEWLINE, 4正8, NEWLINE, 5正8, 6正8, 7正8, 8正8, 9正8,
+        ];
+        设 res = block(&buf, 8, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE],
+                向量![4正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE],
+                向量![5正8, 6正8, 7正8, 8正8, 9正8, SPACE, SPACE, SPACE],
+            ]
+        );
+    }
+
+    #[test]
+    方法 block_test_multiple_nl_diff_cbs_block() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [
+            0正8, 1正8, 2正8, 3正8, NEWLINE, 4正8, 5正8, 6正8, 7正8, NEWLINE, 8正8, 9正8,
+        ];
+        设 res = block(&buf, 8, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE],
+                向量![4正8, 5正8, 6正8, 7正8, SPACE, SPACE, SPACE, SPACE],
+                向量![8正8, 9正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE],
+            ]
+        );
+    }
+
+    #[test]
+    方法 block_test_end_nl_diff_cbs_block() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8, NEWLINE];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(res, 向量![向量![0正8, 1正8, 2正8, 3正8]]);
+    }
+
+    #[test]
+    方法 block_test_end_nl_same_cbs_block() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, NEWLINE];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(res, 向量![向量![0正8, 1正8, 2正8, SPACE]]);
+    }
+
+    #[test]
+    方法 block_test_double_end_nl() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, NEWLINE, NEWLINE];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![向量![0正8, 1正8, 2正8, SPACE], 向量![SPACE, SPACE, SPACE, SPACE]]
+        );
+    }
+
+    #[test]
+    方法 block_test_start_nl() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [NEWLINE, 0正8, 1正8, 2正8, 3正8];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![向量![SPACE, SPACE, SPACE, SPACE], 向量![0正8, 1正8, 2正8, 3正8]]
+        );
+    }
+
+    #[test]
+    方法 block_test_double_surrounded_nl_no_trunc() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [0正8, 1正8, 2正8, 3正8, NEWLINE, NEWLINE, 4正8, 5正8, 6正8, 7正8];
+        设 res = block(&buf, 8, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE],
+                向量![SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE],
+                向量![4正8, 5正8, 6正8, 7正8, SPACE, SPACE, SPACE, SPACE],
+            ]
+        );
+    }
+
+    #[test]
+    方法 block_test_double_surrounded_nl_double_trunc() {
+        设 可变 rs = ReadStat::默认();
+        设 buf = [
+            0正8, 1正8, 2正8, 3正8, NEWLINE, NEWLINE, 4正8, 5正8, 6正8, 7正8, 8正8,
+        ];
+        设 res = block(&buf, 4, 假, &可变 rs);
+
+        相等断言!(
+            res,
+            向量![
+                // Commented section(s) should be truncated and appear for reference only.
+                向量![0正8, 1正8, 2正8, 3正8],
+                向量![SPACE, SPACE, SPACE, SPACE],
+                向量![4正8, 5正8, 6正8, 7正8 /*, 8u8*/],
+            ]
+        );
+        相等断言!(rs.records_truncated, 1);
+    }
+
+    #[test]
+    方法 unblock_test_full_cbs() {
+        设 buf = [0正8, 1正8, 2正8, 3正8, 4正8, 5正8, 6正8, 7正8];
+        设 res = unblock(&buf, 8);
+
+        相等断言!(res, 向量![0正8, 1正8, 2正8, 3正8, 4正8, 5正8, 6正8, 7正8, NEWLINE]);
+    }
+
+    #[test]
+    方法 unblock_test_all_space() {
+        设 buf = [SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE];
+        设 res = unblock(&buf, 8);
+
+        相等断言!(res, 向量![NEWLINE]);
+    }
+
+    #[test]
+    方法 unblock_test_decoy_spaces() {
+        设 buf = [0正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, 7正8];
+        设 res = unblock(&buf, 8);
+
+        相等断言!(
+            res,
+            向量![0正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, 7正8, NEWLINE],
+        );
+    }
+
+    #[test]
+    方法 unblock_test_strip_single_cbs() {
+        设 buf = [0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE];
+        设 res = unblock(&buf, 8);
+
+        相等断言!(res, 向量![0正8, 1正8, 2正8, 3正8, NEWLINE]);
+    }
+
+    #[test]
+    方法 unblock_test_strip_multi_cbs() {
+        设 buf = 向量![
+            向量![0正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE],
+            向量![0正8, 1正8, SPACE, SPACE, SPACE, SPACE, SPACE, SPACE],
+            向量![0正8, 1正8, 2正8, SPACE, SPACE, SPACE, SPACE, SPACE],
+            向量![0正8, 1正8, 2正8, 3正8, SPACE, SPACE, SPACE, SPACE],
+        ]
+        .into_iter()
+        .flatten()
+        .收集::<向量<_>>();
+
+        设 res = unblock(&buf, 8);
+
+        设 exp = 向量![
+            向量![0正8, NEWLINE],
+            向量![0正8, 1正8, NEWLINE],
+            向量![0正8, 1正8, 2正8, NEWLINE],
+            向量![0正8, 1正8, 2正8, 3正8, NEWLINE],
+        ]
+        .into_iter()
+        .flatten()
+        .收集::<向量<_>>();
+
+        相等断言!(res, exp);
+    }
+}

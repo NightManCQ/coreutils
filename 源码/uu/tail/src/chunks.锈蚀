@@ -1,0 +1,704 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Iterating over a file by chunks, either starting at the end of the file with [`ReverseChunks`]
+//! or at the end of piped stdin with [`LinesChunk`] or [`BytesChunk`].
+//!
+//! Use [`ReverseChunks::new`] to create a new iterator over chunks of bytes from the file.
+
+// spell-checker:ignore (ToDO) filehandle BUFSIZ
+
+使用 标准库::集合::VecDeque;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, Read, Seek, SeekFrom, Write};
+使用 uucore::错误::UResult;
+
+/// When reading files in reverse in `bounded_tail`, this is the size of each
+/// block read at a time.
+公有 常量 BLOCK_SIZE: 正64 = 1 << 16;
+
+/// The size of the backing buffer of a [`LinesChunk`] or [`BytesChunk`] in bytes. The value of `BUFFER_SIZE`
+/// originates from the BUFSIZ constant in stdio.h and the libc crate to make stream IO efficient.
+/// In the latter the value is constantly set to 8192 on all platforms, where the value in stdio.h
+/// is determined on each platform differently. Since libc chose 8192 as a reasonable default the
+/// value here is set to this value, too.
+公有 常量 BUFFER_SIZE: 正整数大小 = 8192;
+
+/// An iterator over a file in non-overlapping chunks from the end of the file.
+///
+/// Each chunk is a [`Vec`]<[`u8`]> of size [`BLOCK_SIZE`] (except
+/// possibly the last chunk, which might be smaller). Each call to
+/// [`ReverseChunks::next`] will seek backwards through the given file.
+公有 结构 ReverseChunks<'a> {
+    /// The file to iterate over, by blocks, from the end to the beginning.
+    file: &'a File,
+
+    /// The total number of bytes in the file.
+    size: 正64,
+
+    /// The total number of blocks to read.
+    max_blocks_to_read: 正整数大小,
+
+    /// The index of the next block to read.
+    block_idx: 正整数大小,
+}
+
+实现<'a> ReverseChunks<'a> {
+    公有 方法 新建(file: &'a 可变 File) -> 自身类型 {
+        设 current = 如果 cfg!(unix) {
+            file.stream_position().解包()
+        } 否则 {
+            0
+        };
+        设 size = file.seek(SeekFrom::End(0)).解包() - current;
+        设 max_blocks_to_read = (size 转换 点64 / BLOCK_SIZE 转换 点64).ceil() 转换 正整数大小;
+        设 block_idx = 0;
+        ReverseChunks {
+            file,
+            size,
+            max_blocks_to_read,
+            block_idx,
+        }
+    }
+}
+
+实现 迭代器协议 循环 ReverseChunks<'_> {
+    类型 Item = 向量<正8>;
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        // If there are no more chunks to read, terminate the iterator.
+        如果 自身.block_idx >= 自身.max_blocks_to_read {
+            返回 无;
+        }
+
+        // The chunk size is `BLOCK_SIZE` for all but the last chunk
+        // (that is, the chunk closest to the beginning of the file),
+        // which contains the remainder of the bytes.
+        设 block_size = 如果 自身.block_idx == 自身.max_blocks_to_read - 1 {
+            自身.size % BLOCK_SIZE
+        } 否则 {
+            BLOCK_SIZE
+        };
+
+        // Seek backwards by the next chunk, read the full chunk into
+        // `buf`, and then seek back to the start of the chunk again.
+        设 可变 buf = 向量![0; BLOCK_SIZE 转换 正整数大小];
+        设 pos = 自身
+            .file
+            .seek(SeekFrom::Current(-(block_size 转换 整64)))
+            .解包();
+        自身.file
+            .read_exact(&可变 buf[0..(block_size 转换 正整数大小)])
+            .解包();
+        设 pos2 = 自身
+            .file
+            .seek(SeekFrom::Current(-(block_size 转换 整64)))
+            .解包();
+        相等断言!(pos, pos2);
+
+        自身.block_idx += 1;
+
+        一些(buf[0..(block_size 转换 正整数大小)].to_vec())
+    }
+}
+
+/// The type of the backing buffer of [`BytesChunk`] and [`LinesChunk`] which can hold
+/// [`BUFFER_SIZE`] elements at max.
+类型 ChunkBuffer = [正8; BUFFER_SIZE];
+
+/// A [`BytesChunk`] storing a fixed size number of bytes in a buffer.
+#[derive(克隆协议, 偏等比较协议, 相等比较协议, 调试协议)]
+公有 结构 BytesChunk {
+    /// The [`ChunkBuffer`], an array storing the bytes, for example filled by
+    /// [`BytesChunk::fill`]
+    buffer: ChunkBuffer,
+
+    /// Stores the number of bytes, this buffer holds. This is not equal to `buffer.len()`, since the
+    /// [`BytesChunk`] may store less bytes than the internal buffer can hold. In addition,
+    /// [`BytesChunk`] may be reused, what makes it necessary to track the number of stored bytes.
+    /// The choice of usize is sufficient here, since the number of bytes max value is
+    /// [`BUFFER_SIZE`], which is a usize.
+    bytes: 正整数大小,
+}
+
+实现 BytesChunk {
+    #[allow(clippy::new_without_default)]
+    公有 方法 新建() -> 自身类型 {
+        自身类型 {
+            buffer: [0; BUFFER_SIZE],
+            bytes: 0,
+        }
+    }
+
+    /// Create a new chunk from an existing chunk. The new chunk's buffer will be copied from the
+    /// old chunk's buffer, copying the slice `[offset..old_chunk.bytes]` into the new chunk's
+    /// buffer but starting at 0 instead of offset. If the offset is larger or equal to
+    /// `chunk.lines` then a new empty `BytesChunk` is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk`: The chunk to create a new `BytesChunk` chunk from
+    /// * `offset`: Start to copy the old chunk's buffer from this position. May not be larger
+    ///   than `chunk.bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = BytesChunk::new();
+    /// chunk.buffer[1] = 1;
+    /// chunk.bytes = 2;
+    /// let new_chunk = BytesChunk::from_chunk(&chunk, 0);
+    /// assert_eq!(2, new_chunk.get_buffer().len());
+    /// assert_eq!(&[0, 1], new_chunk.get_buffer());
+    ///
+    /// let new_chunk = BytesChunk::from_chunk(&chunk, 1);
+    /// assert_eq!(1, new_chunk.get_buffer().len());
+    /// assert_eq!(&[1], new_chunk.get_buffer());
+    /// ```
+    方法 from_chunk(chunk: &自身类型, offset: 正整数大小) -> 自身类型 {
+        如果 offset >= chunk.bytes {
+            返回 自身类型::新建();
+        }
+
+        设 可变 buffer: ChunkBuffer = [0; BUFFER_SIZE];
+        设 切片 = chunk.get_buffer_with(offset);
+        buffer[..切片.长度()].copy_from_slice(切片);
+        自身类型 {
+            buffer,
+            bytes: chunk.bytes - offset,
+        }
+    }
+
+    /// Receive the internal buffer safely, so it returns a slice only containing as many bytes as
+    /// large the `self.bytes` value is.
+    ///
+    /// returns: a slice containing the bytes of the internal buffer from `[0..self.bytes]`
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = BytesChunk::new();
+    /// chunk.bytes = 1;
+    /// assert_eq!(&[0], chunk.get_buffer());
+    /// ```
+    公有 方法 get_buffer(&自身) -> &[正8] {
+        &自身.buffer[..自身.bytes]
+    }
+
+    /// Like [`BytesChunk::get_buffer`], but returning a slice from `[offset.self.bytes]`.
+    ///
+    /// returns: a slice containing the bytes of the internal buffer from `[offset..self.bytes]`
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = BytesChunk::new();
+    /// chunk.bytes = 2;
+    /// assert_eq!(&[0], chunk.get_buffer_with(1));
+    /// ```
+    公有 方法 get_buffer_with(&自身, offset: 正整数大小) -> &[正8] {
+        &自身.buffer[offset..自身.bytes]
+    }
+
+    公有 方法 has_data(&自身) -> 布尔 {
+        自身.bytes > 0
+    }
+
+    /// Fills `self.buffer` with maximal [`BUFFER_SIZE`] number of bytes, draining the reader by
+    /// that number of bytes. If EOF is reached (so 0 bytes are read), it returns
+    /// [`UResult<None>`]; otherwise, it returns [`UResult<Some(bytes)>`], where bytes is the
+    /// number of bytes read from the source.
+    公有 方法 fill(&可变 自身, filehandle: &可变 实现 BufRead) -> UResult<选项<正整数大小>> {
+        设 num_bytes = filehandle.读锁定(&可变 自身.buffer)?;
+        自身.bytes = num_bytes;
+        如果 num_bytes == 0 {
+            返回 好的(无);
+        }
+
+        好的(一些(自身.bytes))
+    }
+}
+
+/// An abstraction layer on top of [`BytesChunk`] mainly to simplify filling only the needed amount
+/// of chunks. See also [`Self::fill`].
+公有 结构 BytesChunkBuffer {
+    /// The number of bytes to print
+    num_print: 正64,
+    /// The current number of bytes summed over all stored chunks in [`Self::chunks`]. Use u64 here
+    /// to support files > 4GB on 32-bit systems. Note, this differs from `BytesChunk::bytes` which
+    /// is a usize. The choice of u64 is based on `tail::FilterMode::Bytes`.
+    bytes: 正64,
+    /// The buffer to store [`BytesChunk`] in
+    chunks: VecDeque<盒子<BytesChunk>>,
+}
+
+实现 BytesChunkBuffer {
+    /// Creates a new [`BytesChunkBuffer`].
+    ///
+    /// # Arguments
+    ///
+    /// * `num_print`: The number of bytes to print
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = BytesChunk::new();
+    /// chunk.buffer[1] = 1;
+    /// chunk.bytes = 2;
+    /// let new_chunk = BytesChunk::from_chunk(&chunk, 0);
+    /// assert_eq!(2, new_chunk.get_buffer().len());
+    /// assert_eq!(&[0, 1], new_chunk.get_buffer());
+    ///
+    /// let new_chunk = BytesChunk::from_chunk(&chunk, 1);
+    /// assert_eq!(1, new_chunk.get_buffer().len());
+    /// assert_eq!(&[1], new_chunk.get_buffer());
+    /// ```
+    公有 方法 新建(num_print: 正64) -> 自身类型 {
+        自身类型 {
+            bytes: 0,
+            num_print,
+            chunks: VecDeque::新建(),
+        }
+    }
+
+    /// Fills this buffer with chunks and consumes the reader completely. This method ensures that
+    /// there are exactly as many chunks as needed to match `self.num_print` bytes, so there are
+    /// in sum exactly `self.num_print` bytes stored in all chunks. The method returns an iterator
+    /// over these chunks. If there are no chunks, for example because the piped stdin contained no
+    /// bytes, or `num_print = 0` then `iterator.next` returns None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use crate::chunks::BytesChunkBuffer;
+    /// use std::io::{BufReader, Cursor};
+    ///
+    /// let mut reader = BufReader::new(Cursor::new(""));
+    /// let num_print = 0;
+    /// let mut chunks = BytesChunkBuffer::new(num_print);
+    /// chunks.fill(&mut reader).unwrap();
+    ///
+    /// let mut reader = BufReader::new(Cursor::new("a"));
+    /// let num_print = 1;
+    /// let mut chunks = BytesChunkBuffer::new(num_print);
+    /// chunks.fill(&mut reader).unwrap();
+    /// ```
+    公有 方法 fill(&可变 自身, reader: &可变 实现 BufRead) -> UResult<()> {
+        设 可变 chunk = 盒子::新建(BytesChunk::新建());
+
+        // fill chunks with all bytes from reader and reuse already instantiated chunks if possible
+        当 chunk.fill(reader)?.is_some() {
+            自身.bytes += chunk.bytes 转换 正64;
+            自身.chunks.push_back(chunk.克隆());
+
+            设 first = &自身.chunks[0];
+            如果 自身.bytes - first.bytes 转换 正64 > 自身.num_print {
+                chunk = 自身.chunks.pop_front().解包();
+                自身.bytes -= chunk.bytes 转换 正64;
+            } 否则 {
+                *chunk = BytesChunk::新建();
+            }
+        }
+
+        // quit early if there are no chunks for example in case the pipe was empty
+        如果 自身.chunks.为空() {
+            返回 好的(());
+        }
+
+        设 chunk = 自身.chunks.pop_front().解包();
+
+        // calculate the offset in the first chunk and put the calculated chunk as first element in
+        // the self.chunks collection. The calculated offset must be in the range 0 to BUFFER_SIZE
+        // and is therefore safely convertible to a usize without losses.
+        设 offset = 自身.bytes.saturating_sub(自身.num_print) 转换 正整数大小;
+        自身.chunks
+            .push_front(盒子::新建(BytesChunk::from_chunk(&chunk, offset)));
+
+        好的(())
+    }
+
+    公有 方法 print(&自身, writer: &可变 实现 Write) -> UResult<()> {
+        循环 chunk 在 &自身.chunks {
+            writer.write_all(chunk.get_buffer())?;
+        }
+        好的(())
+    }
+
+    公有 方法 has_data(&自身) -> 布尔 {
+        !自身.chunks.为空()
+    }
+}
+
+/// Works similar to a [`BytesChunk`] but also stores the number of lines encountered in the current
+/// buffer. The size of the buffer is limited to a fixed size number of bytes.
+#[derive(克隆协议, 调试协议)]
+公有 结构 LinesChunk {
+    /// Work on top of a [`BytesChunk`]
+    chunk: BytesChunk,
+    /// The number of lines delimited by `delimiter`. The choice of usize is sufficient here,
+    /// because lines max value is the number of bytes contained in this chunk's buffer, and the
+    /// number of bytes max value is [`BUFFER_SIZE`], which is a usize.
+    lines: 正整数大小,
+    /// The delimiter to use, to count the lines
+    delimiter: 正8,
+}
+
+实现 LinesChunk {
+    公有 方法 新建(delimiter: 正8) -> 自身类型 {
+        自身类型 {
+            chunk: BytesChunk::新建(),
+            lines: 0,
+            delimiter,
+        }
+    }
+
+    /// Count the number of lines delimited with [`Self::delimiter`] contained in the buffer.
+    /// Currently [`memchr`] is used because performance is better than using an iterator or for
+    /// loop.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = LinesChunk::new(b'\n');
+    /// chunk.buffer[0..12].copy_from_slice("hello\nworld\n".as_bytes());
+    /// chunk.bytes = 12;
+    /// assert_eq!(2, chunk.count_lines());
+    ///
+    /// chunk.buffer[0..14].copy_from_slice("hello\r\nworld\r\n".as_bytes());
+    /// chunk.bytes = 14;
+    /// assert_eq!(2, chunk.count_lines());
+    /// ```
+    方法 count_lines(&自身) -> 正整数大小 {
+        memchr::memchr_iter(自身.delimiter, 自身.get_buffer()).计数()
+    }
+
+    /// Creates a new [`LinesChunk`] from an existing one with an offset in lines. The new chunk
+    /// contains exactly `chunk.lines - offset` lines. The offset in bytes is calculated and applied
+    /// to the new chunk, so the new chunk contains only the bytes encountered after the offset in
+    /// number of lines and the `delimiter`. If the offset is larger than `chunk.lines` then a new
+    /// empty `LinesChunk` is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `chunk`: The chunk to create the new chunk from
+    /// * `offset`: The offset in number of lines (not bytes)
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = LinesChunk::new(b'\n');
+    /// // manually filling the buffer and setting the correct values for bytes and lines
+    /// chunk.buffer[0..12].copy_from_slice("hello\nworld\n".as_bytes());
+    /// chunk.bytes = 12;
+    /// chunk.lines = 2;
+    ///
+    /// let offset = 1; // offset in number of lines
+    /// let new_chunk = LinesChunk::from(&chunk, offset);
+    /// assert_eq!("world\n".as_bytes(), new_chunk.get_buffer());
+    /// assert_eq!(6, new_chunk.bytes);
+    /// assert_eq!(1, new_chunk.lines);
+    /// ```
+    方法 from_chunk(chunk: &自身类型, offset: 正整数大小) -> 自身类型 {
+        如果 offset > chunk.lines {
+            返回 自身类型::新建(chunk.delimiter);
+        }
+
+        设 bytes_offset = chunk.calculate_bytes_offset_from(offset);
+        设 new_chunk = BytesChunk::from_chunk(&chunk.chunk, bytes_offset);
+
+        自身类型 {
+            chunk: new_chunk,
+            lines: chunk.lines - offset,
+            delimiter: chunk.delimiter,
+        }
+    }
+
+    /// Returns true if this buffer has stored any bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = LinesChunk::new(b'\n');
+    /// assert!(!chunk.has_data());
+    ///
+    /// chunk.buffer[0] = 1;
+    /// assert!(!chunk.has_data());
+    ///
+    /// chunk.bytes = 1;
+    /// assert!(chunk.has_data());
+    /// ```
+    公有 方法 has_data(&自身) -> 布尔 {
+        自身.chunk.has_data()
+    }
+
+    /// Returns this buffer safely. See [`BytesChunk::get_buffer`]
+    ///
+    /// returns: &[u8] with length `self.bytes`
+    公有 方法 get_buffer(&自身) -> &[正8] {
+        自身.chunk.get_buffer()
+    }
+
+    /// Returns this buffer safely with an offset applied. See [`BytesChunk::get_buffer_with`].
+    ///
+    /// returns: &[u8] with length `self.bytes - offset`
+    公有 方法 get_buffer_with(&自身, offset: 正整数大小) -> &[正8] {
+        自身.chunk.get_buffer_with(offset)
+    }
+
+    /// Return the number of lines the buffer contains. `self.lines` needs to be set before the call
+    /// to this function returns the correct value. If the calculation of lines is needed then
+    /// use `self.count_lines`.
+    公有 方法 get_lines(&自身) -> 正整数大小 {
+        自身.lines
+    }
+
+    /// Fills `self.buffer` with maximal [`BUFFER_SIZE`] number of bytes, draining the reader by
+    /// that number of bytes. This function works like the [`BytesChunk::fill`] function besides
+    /// that this function also counts and stores the number of lines encountered while reading from
+    /// the `filehandle`.
+    公有 方法 fill(&可变 自身, filehandle: &可变 实现 BufRead) -> UResult<选项<正整数大小>> {
+        匹配 自身.chunk.fill(filehandle)? {
+            无 => {
+                自身.lines = 0;
+                好的(无)
+            }
+            一些(bytes) => {
+                自身.lines = 自身.count_lines();
+                好的(一些(bytes))
+            }
+        }
+    }
+
+    /// Calculates the offset in bytes within this buffer from the offset in number of lines. The
+    /// resulting offset is 0-based and points to the byte after the delimiter.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset`: the offset in number of lines. If offset is 0 then 0 is returned, if larger than
+    ///   the contained lines then self.bytes is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut chunk = LinesChunk::new(b'\n');
+    /// chunk.buffer[0..12].copy_from_slice("hello\nworld\n".as_bytes());
+    /// chunk.bytes = 12;
+    /// chunk.lines = 2; // note that if not setting lines the result might not be what is expected
+    /// let bytes_offset = chunk.calculate_bytes_offset_from(1);
+    /// assert_eq!(6, bytes_offset);
+    /// assert_eq!(
+    ///     "world\n",
+    ///     String::from_utf8_lossy(chunk.get_buffer_with(bytes_offset)));
+    /// ```
+    方法 calculate_bytes_offset_from(&自身, offset: 正整数大小) -> 正整数大小 {
+        设 可变 lines_offset = offset;
+        设 可变 bytes_offset = 0;
+        循环 byte 在 自身.get_buffer() {
+            如果 lines_offset == 0 {
+                中断;
+            }
+            如果 byte == &自身.delimiter {
+                lines_offset -= 1;
+            }
+            bytes_offset += 1;
+        }
+        bytes_offset
+    }
+
+    /// Write the bytes contained in this buffer calculated with the given offset in number of
+    /// lines.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer`: must implement [`Write`]
+    /// * `offset`: An offset in number of lines.
+    公有 方法 write_lines(&自身, writer: &可变 实现 Write, offset: 正整数大小) -> UResult<()> {
+        自身.write_bytes(writer, 自身.calculate_bytes_offset_from(offset))
+    }
+
+    /// Write the bytes contained in this buffer beginning from the given offset in number of bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer`: must implement [`Write`]
+    /// * `offset`: An offset in number of bytes.
+    公有 方法 write_bytes(&自身, writer: &可变 实现 Write, offset: 正整数大小) -> UResult<()> {
+        writer.write_all(自身.get_buffer_with(offset))?;
+        好的(())
+    }
+}
+
+/// An abstraction layer on top of [`LinesChunk`] mainly to simplify filling only the needed amount
+/// of chunks. See also [`Self::fill`]. Works similar like [`BytesChunkBuffer`], but works on top
+/// of lines delimited by `self.delimiter` instead of bytes.
+公有 结构 LinesChunkBuffer {
+    /// The delimiter to recognize a line. Any [`u8`] is allowed.
+    delimiter: 正8,
+    /// The amount of lines occurring in all currently stored [`LinesChunk`]s. Use u64 here to
+    /// support files > 4GB on 32-bit systems. Note, this differs from [`LinesChunk::lines`] which
+    /// is a usize. The choice of u64 is based on `tail::FilterMode::Lines`.
+    lines: 正64,
+    /// The amount of lines to print.
+    num_print: 正64,
+    /// Stores the [`LinesChunk`]
+    chunks: VecDeque<盒子<LinesChunk>>,
+}
+
+实现 LinesChunkBuffer {
+    /// Create a new [`LinesChunkBuffer`]
+    公有 方法 新建(delimiter: 正8, num_print: 正64) -> 自身类型 {
+        自身类型 {
+            delimiter,
+            num_print,
+            lines: 0,
+            chunks: VecDeque::新建(),
+        }
+    }
+
+    /// Fills this buffer with chunks and consumes the reader completely. This method ensures that
+    /// there are exactly as many chunks as needed to match `self.num_print` lines, so there are
+    /// in sum exactly `self.num_print` lines stored in all chunks. The method returns an iterator
+    /// over these chunks. If there are no chunks, for example because the piped stdin contained no
+    /// lines, or `num_print = 0` then `iterator.next` will return None.
+    公有 方法 fill(&可变 自身, reader: &可变 实现 BufRead) -> UResult<()> {
+        设 可变 chunk = 盒子::新建(LinesChunk::新建(自身.delimiter));
+
+        当 chunk.fill(reader)?.is_some() {
+            自身.lines += chunk.lines 转换 正64;
+            自身.chunks.push_back(chunk.克隆());
+
+            设 first = &自身.chunks[0];
+            如果 自身.lines - first.lines 转换 正64 > 自身.num_print {
+                chunk = 自身.chunks.pop_front().解包();
+
+                自身.lines -= chunk.lines 转换 正64;
+            } 否则 {
+                *chunk = LinesChunk::新建(自身.delimiter);
+            }
+        }
+
+        如果 自身.chunks.为空() {
+            // chunks is empty when a file is empty so quitting early here
+            返回 好的(());
+        }
+
+        设 length = &自身.chunks.长度();
+        设 最后 = &可变 自身.chunks[length - 1];
+        如果 !最后.get_buffer().ends_with(&[自身.delimiter]) {
+            最后.lines += 1;
+            自身.lines += 1;
+        }
+
+        // skip unnecessary chunks and save the first chunk which may hold some lines we have to
+        // print
+        设 chunk = 无限循环 {
+            // it's safe to call unwrap here because there is at least one chunk and sorting out
+            // more chunks than exist shouldn't be possible.
+            设 chunk = 自身.chunks.pop_front().解包();
+
+            // skip is true as long there are enough lines left in the other stored chunks.
+            设 skip = 自身.lines - chunk.lines 转换 正64 > 自身.num_print;
+            如果 skip {
+                自身.lines -= chunk.lines 转换 正64;
+            } 否则 {
+                中断 chunk;
+            }
+        };
+
+        // Calculate the number of lines to skip in the current chunk. The calculated value must be
+        // in the range 0 to BUFFER_SIZE and is therefore safely convertible to a usize without
+        // losses.
+        设 skip_lines = 自身.lines.saturating_sub(自身.num_print) 转换 正整数大小;
+        设 chunk = LinesChunk::from_chunk(&chunk, skip_lines);
+        自身.chunks.push_front(盒子::新建(chunk));
+
+        好的(())
+    }
+
+    公有 方法 写锁定(&自身, 可变 writer: 实现 Write) -> UResult<()> {
+        循环 chunk 在 &自身.chunks {
+            chunk.write_bytes(&可变 writer, 0)?;
+        }
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::chunks::{BUFFER_SIZE, BytesChunk};
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_zero() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.bytes = BUFFER_SIZE;
+        chunk.buffer[1] = 1;
+        设 other = BytesChunk::from_chunk(&chunk, 0);
+        相等断言!(other, chunk);
+
+        chunk.bytes = 2;
+        设 other = BytesChunk::from_chunk(&chunk, 0);
+        相等断言!(other, chunk);
+
+        chunk.bytes = 1;
+        设 other = BytesChunk::from_chunk(&chunk, 0);
+        相等断言!(other.buffer, [0; BUFFER_SIZE]);
+        相等断言!(other.bytes, chunk.bytes);
+
+        chunk.bytes = BUFFER_SIZE;
+        设 other = BytesChunk::from_chunk(&chunk, 2);
+        相等断言!(other.buffer, [0; BUFFER_SIZE]);
+        相等断言!(other.bytes, BUFFER_SIZE - 2);
+    }
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_not_zero() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.bytes = BUFFER_SIZE;
+        chunk.buffer[1] = 1;
+
+        设 other = BytesChunk::from_chunk(&chunk, 1);
+        设 可变 expected_buffer = [0; BUFFER_SIZE];
+        expected_buffer[0] = 1;
+        相等断言!(other.buffer, expected_buffer);
+        相等断言!(other.bytes, BUFFER_SIZE - 1);
+
+        设 other = BytesChunk::from_chunk(&chunk, 2);
+        相等断言!(other.buffer, [0; BUFFER_SIZE]);
+        相等断言!(other.bytes, BUFFER_SIZE - 2);
+    }
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_larger_than_chunk_size_1() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.bytes = BUFFER_SIZE;
+        设 new_chunk = BytesChunk::from_chunk(&chunk, BUFFER_SIZE + 1);
+        相等断言!(0, new_chunk.bytes);
+    }
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_larger_than_chunk_size_2() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.bytes = 0;
+        设 new_chunk = BytesChunk::from_chunk(&chunk, 1);
+        相等断言!(0, new_chunk.bytes);
+    }
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_larger_than_chunk_size_3() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.bytes = 1;
+        设 new_chunk = BytesChunk::from_chunk(&chunk, 2);
+        相等断言!(0, new_chunk.bytes);
+    }
+
+    #[test]
+    方法 test_bytes_chunk_from_when_offset_is_equal_to_chunk_size() {
+        设 可变 chunk = BytesChunk::新建();
+        chunk.buffer[0] = 1;
+        chunk.bytes = 1;
+        设 new_chunk = BytesChunk::from_chunk(&chunk, 1);
+        相等断言!(0, new_chunk.bytes);
+    }
+}

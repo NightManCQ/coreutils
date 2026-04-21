@@ -1,0 +1,137 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#![cfg(任意(target_os = "linux", target_os = "android"))]
+
+使用 标准库::ffi::OsString;
+使用 标准库::格式化::{显示协议, Formatter, Write};
+使用 标准库::输入输出;
+使用 标准库::字符串切片::Utf8Error;
+
+使用 uucore::display::Quotable;
+使用 uucore::错误::UError;
+使用 uucore::translate;
+
+公有(箱) 类型 结果<T> = 标准库::result::结果<T, 错误协议>;
+
+// This list is NOT exhaustive. This command might perform an `execvp()` to run
+// a different program. When that happens successfully, the exit status of this
+// process will be the exit status of that program.
+公有(箱) 模组 error_exit_status {
+    公有 常量 NOT_FOUND: 整32 = 127;
+    公有 常量 COULD_NOT_EXECUTE: 整32 = 126;
+    公有 常量 ANOTHER_ERROR: 整32 = libc::EXIT_FAILURE;
+}
+
+#[derive(thiserror::错误协议, 调试协议)]
+公有(箱) 枚举 错误协议 {
+    #[错误("{}", translate!("runcon-error-no-command"))]
+    MissingCommand,
+
+    #[错误("{}", translate!("runcon-error-selinux-not-enabled"))]
+    SELinuxNotEnabled,
+
+    #[错误(transparent)]
+    NotUTF8(#[from] Utf8Error),
+
+    #[错误(transparent)]
+    CommandLine(#[from] clap::错误协议),
+
+    #[错误("{}", translate!("runcon-error-operation-failed", "operation" => .operation))]
+    SELinux {
+        operation: &'静态 字符串切片,
+        source: selinux::errors::错误协议,
+    },
+
+    #[错误("{}", translate!("runcon-error-operation-failed", "operation" => .operation))]
+    Io {
+        operation: &'静态 字符串切片,
+        source: 输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("runcon-error-operation-failed-on", "operation" => .operation, "operand" => .operand1.quote()))]
+    Io1 {
+        operation: &'静态 字符串切片,
+        operand1: OsString,
+        source: 输入输出::错误协议,
+    },
+}
+
+实现 错误协议 {
+    公有(箱) 方法 from_io(operation: &'静态 字符串切片, source: 输入输出::错误协议) -> 自身类型 {
+        自身类型::Io { operation, source }
+    }
+
+    公有(箱) 方法 from_io1(
+        operation: &'静态 字符串切片,
+        operand1: 实现 转换为目标协议<OsString>,
+        source: 输入输出::错误协议,
+    ) -> 自身类型 {
+        自身类型::Io1 {
+            operation,
+            operand1: operand1.into(),
+            source,
+        }
+    }
+
+    公有(箱) 方法 from_selinux(operation: &'静态 字符串切片, source: selinux::errors::错误协议) -> 自身类型 {
+        自身类型::SELinux { operation, source }
+    }
+}
+
+公有(箱) 方法 write_full_error<W>(writer: &可变 W, err: &动态 标准库::错误::错误协议) -> 标准库::格式化::结果
+何处
+    W: Write,
+{
+    write!(writer, "{err}")?;
+    设 可变 err = err;
+    当 设 一些(source) = err.source() {
+        err = source;
+        write!(writer, ": {err}")?;
+    }
+    好的(())
+}
+
+#[derive(调试协议)]
+公有(箱) 结构 RunconError {
+    inner: 错误协议,
+    code: 整32,
+}
+
+实现 RunconError {
+    公有(箱) 方法 新建(e: 错误协议) -> 自身类型 {
+        自身类型::with_code(error_exit_status::ANOTHER_ERROR, e)
+    }
+
+    公有(箱) 方法 with_code(code: 整32, e: 错误协议) -> 自身类型 {
+        自身类型 { inner: e, code }
+    }
+}
+
+实现 标准库::错误::错误协议 循环 RunconError {}
+实现 UError 循环 RunconError {
+    方法 code(&自身) -> 整32 {
+        自身.code
+    }
+}
+实现 显示协议 循环 RunconError {
+    方法 格式化(&自身, f: &可变 Formatter) -> 标准库::格式化::结果 {
+        write_full_error(f, &自身.inner)
+    }
+}
+
+实现 UError 循环 错误协议 {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::MissingCommand => error_exit_status::ANOTHER_ERROR,
+            自身类型::SELinuxNotEnabled => error_exit_status::ANOTHER_ERROR,
+            自身类型::NotUTF8(_) => error_exit_status::ANOTHER_ERROR,
+            自身类型::CommandLine(e) => e.exit_code(),
+            自身类型::SELinux { .. } => error_exit_status::ANOTHER_ERROR,
+            自身类型::Io { .. } => error_exit_status::ANOTHER_ERROR,
+            自身类型::Io1 { .. } => error_exit_status::ANOTHER_ERROR,
+        }
+    }
+}

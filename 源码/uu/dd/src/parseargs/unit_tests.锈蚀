@@ -1,0 +1,502 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore fname, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, behaviour, bmax, bremain, btotal, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rposition, rremain, rsofar, rstat, sigusr, sigval, wlen, wstat, oconv
+
+使用 超级::*;
+
+使用 箱::StatusLevel;
+使用 箱::conversion_tables::{
+    ASCII_TO_EBCDIC_UCASE_TO_LCASE, ASCII_TO_IBM, EBCDIC_TO_ASCII_LCASE_TO_UCASE,
+};
+使用 箱::parseargs::Parser;
+
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+#[allow(clippy::useless_vec)]
+#[test]
+方法 unimplemented_flags_should_error_non_linux() {
+    设 可变 succeeded = 向量::新建();
+
+    // The following flags are only implemented in linux
+    循环 flag 在 [
+        "direct",
+        "directory",
+        "dsync",
+        "sync",
+        "nonblock",
+        "noatime",
+        "noctty",
+        "nofollow",
+    ] {
+        设 arg = 格式化!("iflag={flag}");
+        如果 Parser::新建().parse([&arg]).is_ok() {
+            succeeded.压入(arg);
+        }
+
+        设 arg = 格式化!("oflag={flag}");
+        如果 Parser::新建().parse([&arg]).is_ok() {
+            succeeded.压入(arg);
+        }
+    }
+
+    断言!(
+        succeeded.为空(),
+        "The following flags did not panic as expected: {succeeded:?}",
+    );
+}
+
+#[test]
+#[allow(clippy::useless_vec)]
+方法 unimplemented_flags_should_error() {
+    设 可变 succeeded = 向量::新建();
+
+    // The following flags are not implemented
+    循环 flag 在 ["cio", "nolinks", "text", "binary"] {
+        设 arg = 格式化!("iflag={flag}");
+        如果 Parser::新建().parse([&arg]).is_ok() {
+            succeeded.压入(arg);
+        }
+
+        设 arg = 格式化!("oflag={flag}");
+        如果 Parser::新建().parse([&arg]).is_ok() {
+            succeeded.压入(arg);
+        }
+    }
+
+    断言!(
+        succeeded.为空(),
+        "The following flags did not panic as expected: {succeeded:?}"
+    );
+}
+
+#[test]
+方法 test_status_level_absent() {
+    设 args = ["if=foo.file", "of=bar.file"];
+
+    相等断言!(Parser::新建().parse(args).解包().status, 无);
+}
+
+#[test]
+方法 test_status_level_none() {
+    设 args = ["status=none", "if=foo.file", "of=bar.file"];
+
+    相等断言!(
+        Parser::新建().parse(args).解包().status,
+        一些(StatusLevel::无)
+    );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+方法 test_all_top_level_args_no_leading_dashes() {
+    设 args = [
+        "if=foo.file",
+        "of=bar.file",
+        "ibs=10",
+        "obs=10",
+        "cbs=1",
+        "bs=100",
+        "count=2",
+        "skip=2",
+        "seek=2",
+        "iseek=2",
+        "oseek=2",
+        "status=progress",
+        "conv=ascii,ucase",
+        "iflag=count_bytes,skip_bytes",
+        "oflag=append,seek_bytes",
+    ];
+
+    设 settings = Parser::新建().parse(args).解包();
+
+    // ibs=10 and obs=10 are overwritten by bs=100
+    相等断言!(settings.ibs, 100);
+    相等断言!(settings.obs, 100);
+
+    // count=2 iflag=count_bytes
+    相等断言!(settings.计数, 一些(Num::Bytes(2)));
+
+    // seek=2 oflag=seek_bytes
+    相等断言!(settings.seek, 2);
+
+    // skip=2 iflag=skip_bytes
+    相等断言!(settings.skip, 2);
+
+    // status=progress
+    相等断言!(settings.status, 一些(StatusLevel::Progress));
+
+    // conv=ascii,ucase
+    相等断言!(
+        settings.iconv,
+        IConvFlags {
+            // ascii implies unblock
+            mode: 一些(ConversionMode::ConvertThenUnblock(
+                &EBCDIC_TO_ASCII_LCASE_TO_UCASE,
+                1
+            )),
+            ..IConvFlags::默认()
+        },
+    );
+
+    // no conv flags apply to output
+    相等断言!(settings.oconv, OConvFlags::默认());
+
+    // iconv=count_bytes,skip_bytes
+    相等断言!(
+        settings.iflags,
+        IFlags {
+            count_bytes: 真,
+            skip_bytes: 真,
+            ..IFlags::默认()
+        },
+    );
+
+    // oconv=append,seek_bytes
+    相等断言!(
+        settings.oflags,
+        OFlags {
+            append: 真,
+            seek_bytes: 真,
+            ..OFlags::默认()
+        },
+    );
+}
+
+#[test]
+方法 test_status_level_progress() {
+    设 args = ["if=foo.file", "of=bar.file", "status=progress"];
+
+    设 settings = Parser::新建().parse(args).解包();
+
+    相等断言!(settings.status, 一些(StatusLevel::Progress));
+}
+
+#[test]
+方法 test_status_level_noxfer() {
+    设 args = ["if=foo.file", "status=noxfer", "of=bar.file"];
+
+    设 settings = Parser::新建().parse(args).解包();
+
+    相等断言!(settings.status, 一些(StatusLevel::Noxfer));
+}
+
+#[test]
+方法 test_multiple_flags_options() {
+    设 args = [
+        "iflag=fullblock,count_bytes",
+        "iflag=skip_bytes",
+        "oflag=append",
+        "oflag=seek_bytes",
+        "conv=ascii,ucase",
+        "conv=unblock",
+        "cbs=512",
+    ];
+    设 settings = Parser::新建().parse(args).解包();
+
+    // iflag
+    相等断言!(
+        settings.iflags,
+        IFlags {
+            fullblock: 真,
+            count_bytes: 真,
+            skip_bytes: 真,
+            ..默认协议::默认()
+        }
+    );
+
+    // oflag
+    相等断言!(
+        settings.oflags,
+        OFlags {
+            append: 真,
+            seek_bytes: 真,
+            ..默认协议::默认()
+        }
+    );
+
+    // conv
+    相等断言!(
+        settings.iconv,
+        IConvFlags {
+            mode: 一些(ConversionMode::ConvertThenUnblock(
+                &EBCDIC_TO_ASCII_LCASE_TO_UCASE,
+                512
+            )),
+            ..默认协议::默认()
+        }
+    );
+}
+
+#[test]
+方法 test_override_multiple_options() {
+    设 args = [
+        "if=foo.file",
+        "if=correct.file",
+        "of=bar.file",
+        "of=correct.file",
+        "ibs=256",
+        "ibs=1024",
+        "obs=256",
+        "obs=1024",
+        "cbs=1",
+        "cbs=2",
+        "skip=0",
+        "skip=2",
+        "seek=0",
+        "seek=2",
+        "iseek=0",
+        "iseek=2",
+        "oseek=0",
+        "oseek=2",
+        "status=none",
+        "status=noxfer",
+        "count=512",
+        "count=1024",
+        "iflag=count_bytes",
+    ];
+
+    设 settings = Parser::新建().parse(args).解包();
+
+    相等断言!(settings.infile, 一些("correct.file".into()));
+    相等断言!(settings.outfile, 一些("correct.file".into()));
+    相等断言!(settings.ibs, 1024);
+    相等断言!(settings.obs, 1024);
+    相等断言!(settings.status, 一些(StatusLevel::Noxfer));
+    相等断言!(settings.skip, 2048);
+    相等断言!(settings.seek, 2048);
+    相等断言!(settings.计数, 一些(Num::Bytes(1024)));
+}
+
+// // ----- IConvFlags/Output -----
+
+#[test]
+方法 icf_ctable_error() {
+    设 args = ["conv=ascii,ebcdic,ibm"];
+    断言!(Parser::新建().parse(args).is_err());
+}
+
+#[test]
+方法 icf_case_error() {
+    设 args = ["conv=ucase,lcase"];
+    断言!(Parser::新建().parse(args).is_err());
+}
+
+#[test]
+方法 icf_block_error() {
+    设 args = ["conv=block,unblock"];
+    断言!(Parser::新建().parse(args).is_err());
+}
+
+#[test]
+方法 icf_creat_error() {
+    设 args = ["conv=excl,nocreat"];
+    断言!(Parser::新建().parse(args).is_err());
+}
+
+#[test]
+方法 parse_icf_token_ibm() {
+    设 args = ["conv=ibm"];
+    设 settings = Parser::新建().parse(args).解包();
+
+    相等断言!(
+        settings.iconv,
+        IConvFlags {
+            mode: 一些(ConversionMode::ConvertOnly(&ASCII_TO_IBM)),
+            ..默认协议::默认()
+        }
+    );
+}
+
+#[test]
+方法 parse_icf_tokens_elu() {
+    设 args = ["conv=ebcdic,lcase"];
+    设 settings = Parser::新建().parse(args).解包();
+
+    相等断言!(
+        settings.iconv,
+        IConvFlags {
+            mode: 一些(ConversionMode::ConvertOnly(&ASCII_TO_EBCDIC_UCASE_TO_LCASE)),
+            ..默认协议::默认()
+        }
+    );
+}
+
+#[test]
+方法 parse_icf_tokens_remaining() {
+    设 args = [
+        "conv=ascii,ucase,block,sparse,swab,sync,noerror,excl,nocreat,notrunc,noerror,fdatasync,fsync",
+    ];
+    相等断言!(
+        Parser::新建().读锁定(args),
+        好的(Parser {
+            conv: ConvFlags {
+                ascii: 真,
+                ucase: 真,
+                block: 真,
+                sparse: 真,
+                swab: 真,
+                同步: 真,
+                noerror: 真,
+                excl: 真,
+                nocreat: 真,
+                notrunc: 真,
+                fdatasync: 真,
+                fsync: 真,
+                ..默认协议::默认()
+            },
+            is_conv_specified: 真,
+            ..默认协议::默认()
+        })
+    );
+}
+
+#[test]
+方法 parse_iflag_tokens() {
+    设 args = ["iflag=fullblock,count_bytes,skip_bytes"];
+    相等断言!(
+        Parser::新建().读锁定(args),
+        好的(Parser {
+            iflag: IFlags {
+                fullblock: 真,
+                count_bytes: 真,
+                skip_bytes: 真,
+                ..默认协议::默认()
+            },
+            ..默认协议::默认()
+        })
+    );
+}
+
+#[test]
+方法 parse_oflag_tokens() {
+    设 args = ["oflag=append,seek_bytes"];
+    相等断言!(
+        Parser::新建().读锁定(args),
+        好的(Parser {
+            oflag: OFlags {
+                append: 真,
+                seek_bytes: 真,
+                ..默认协议::默认()
+            },
+            ..默认协议::默认()
+        })
+    );
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+#[test]
+方法 parse_iflag_tokens_linux() {
+    设 args = ["iflag=direct,directory,dsync,sync,nonblock,noatime,noctty,nofollow"];
+    相等断言!(
+        Parser::新建().读锁定(args),
+        好的(Parser {
+            iflag: IFlags {
+                direct: 真,
+                directory: 真,
+                dsync: 真,
+                同步: 真,
+                nonblock: 真,
+                noatime: 真,
+                noctty: 真,
+                nofollow: 真,
+                ..默认协议::默认()
+            },
+            ..默认协议::默认()
+        })
+    );
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+#[test]
+方法 parse_oflag_tokens_linux() {
+    设 args = ["oflag=direct,directory,dsync,sync,nonblock,noatime,noctty,nofollow"];
+    相等断言!(
+        Parser::新建().读锁定(args),
+        好的(Parser {
+            oflag: OFlags {
+                direct: 真,
+                directory: 真,
+                dsync: 真,
+                同步: 真,
+                nonblock: 真,
+                noatime: 真,
+                noctty: 真,
+                nofollow: 真,
+                ..默认协议::默认()
+            },
+            ..默认协议::默认()
+        })
+    );
+}
+
+// ----- Multiplier Strings etc. -----
+macro_rules! test_byte_parser (
+    ( $test_name:ident, $bs_str:expr, $bs:expr ) =>
+    {
+        #[allow(non_snake_case)]
+        #[test]
+        方法 $test_name()
+        {
+            // let bs_str = String::from($bs_str);
+            相等断言!($bs, parse_bytes_with_opt_multiplier($bs_str).解包())
+        }
+    }
+);
+
+test_byte_parser!(test_bytes_n, "765", 765);
+test_byte_parser!(test_bytes_c, "13c", 13);
+
+test_byte_parser!(test_bytes_w, "1w", 2);
+
+test_byte_parser!(test_bytes_b, "1b", 512);
+
+test_byte_parser!(test_bytes_k, "1kB", 1000);
+test_byte_parser!(test_bytes_K, "1K", 1024);
+test_byte_parser!(test_bytes_Ki, "1KiB", 1024);
+
+test_byte_parser!(test_bytes_MB, "2MB", 2 * 1000 * 1000);
+test_byte_parser!(test_bytes_M, "2M", 2 * 1024 * 1024);
+test_byte_parser!(test_bytes_Mi, "2MiB", 2 * 1024 * 1024);
+
+test_byte_parser!(test_bytes_GB, "3GB", 3 * 1000 * 1000 * 1000);
+test_byte_parser!(test_bytes_G, "3G", 3 * 1024 * 1024 * 1024);
+test_byte_parser!(test_bytes_Gi, "3GiB", 3 * 1024 * 1024 * 1024);
+
+#[cfg(target_pointer_width = "64")]
+#[cfg(test)]
+模组 test_64bit_arch {
+    使用 超级::*;
+
+    test_byte_parser!(test_bytes_TB, "4TB", 4 * 1000 * 1000 * 1000 * 1000);
+    test_byte_parser!(test_bytes_T, "4T", 4 * 1024 * 1024 * 1024 * 1024);
+    test_byte_parser!(test_bytes_Ti, "4TiB", 4 * 1024 * 1024 * 1024 * 1024);
+
+    test_byte_parser!(test_bytes_PB, "5PB", 5 * 1000 * 1000 * 1000 * 1000 * 1000);
+    test_byte_parser!(test_bytes_P, "5P", 5 * 1024 * 1024 * 1024 * 1024 * 1024);
+    test_byte_parser!(test_bytes_Pi, "5PiB", 5 * 1024 * 1024 * 1024 * 1024 * 1024);
+
+    test_byte_parser!(
+        test_bytes_EB,
+        "6EB",
+        6 * 1000 * 1000 * 1000 * 1000 * 1000 * 1000
+    );
+    test_byte_parser!(
+        test_bytes_E,
+        "6E",
+        6 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024
+    );
+    test_byte_parser!(
+        test_bytes_Ei,
+        "6EiB",
+        6 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+#[should_panic]
+方法 test_neg_panic() {
+    设 bs_str = 格式化!("{}", -1);
+
+    parse_bytes_with_opt_multiplier(&bs_str).解包();
+}

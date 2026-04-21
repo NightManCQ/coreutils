@@ -1,0 +1,781 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (strings) anychar combinator Alnum Punct Xdigit alnum punct xdigit cntrl
+
+使用 箱::unicode_table;
+使用 nom::{
+    IResult, Parser,
+    branch::alt,
+    bytes::complete::{tag, take, take_till, take_until},
+    character::complete::one_of,
+    combinator::{映射, map_opt, peek, recognize, value},
+    multi::{many_m_n, many0},
+    sequence::{delimited, preceded, separated_pair, terminated},
+};
+使用 标准库::{
+    字符,
+    错误::错误协议,
+    格式化::{调试协议, 显示协议},
+    输入输出::{BufRead, Write},
+};
+使用 uucore::错误::{FromIo, UError, UResult};
+使用 uucore::translate;
+
+使用 uucore::show_warning;
+
+/// Common trait for operations that can process chunks of data
+公有 协议 ChunkProcessor {
+    方法 process_chunk(&自身, input: &[正8], output: &可变 向量<正8>);
+}
+
+#[derive(调试协议, 克隆协议)]
+公有 枚举 BadSequence {
+    MissingCharClassName,
+    InvalidCharClass(字符串),
+    MissingEquivalentClassChar,
+    MultipleCharRepeatInSet2,
+    CharRepeatInSet1,
+    InvalidRepeatCount(字符串),
+    EmptySet2WhenNotTruncatingSet1,
+    ClassExceptLowerUpperInSet2,
+    ClassInSet2NotMatchedBySet1,
+    Set1LongerSet2EndsInClass,
+    ComplementMoreThanOneUniqueInSet2,
+    BackwardsRange { end: 正32, start: 正32 },
+    MultipleCharInEquivalence(字符串),
+}
+
+实现 显示协议 循环 BadSequence {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::MissingCharClassName => {
+                write!(f, "{}", translate!("tr-error-missing-char-class-name"))
+            }
+            自身类型::InvalidCharClass(class) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-invalid-char-class", "class" => 格式化!("'{}'", class))
+                )
+            }
+            自身类型::MissingEquivalentClassChar => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-missing-equivalence-class-char")
+                )
+            }
+            自身类型::MultipleCharRepeatInSet2 => {
+                write!(f, "{}", translate!("tr-error-multiple-char-repeat-in-set2"))
+            }
+            自身类型::CharRepeatInSet1 => {
+                write!(f, "{}", translate!("tr-error-char-repeat-in-set1"))
+            }
+            自身类型::InvalidRepeatCount(计数) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-invalid-repeat-count", "count" => 格式化!("'{count}'"))
+                )
+            }
+            自身类型::EmptySet2WhenNotTruncatingSet1 => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-empty-set2-when-not-truncating")
+                )
+            }
+            自身类型::ClassExceptLowerUpperInSet2 => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-class-except-lower-upper-in-set2")
+                )
+            }
+            自身类型::ClassInSet2NotMatchedBySet1 => {
+                write!(f, "{}", translate!("tr-error-class-in-set2-not-matched"))
+            }
+            自身类型::Set1LongerSet2EndsInClass => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-set1-longer-set2-ends-in-class")
+                )
+            }
+            自身类型::ComplementMoreThanOneUniqueInSet2 => {
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-complement-more-than-one-unique")
+                )
+            }
+            自身类型::BackwardsRange { end, start } => {
+                方法 end_or_start_to_string(ut: 正32) -> 字符串 {
+                    匹配 字符::from_u32(ut) {
+                        一些(ch @ '\x20'..='\x7E') => ch.escape_default().to_string(),
+                        _ => {
+                            格式化!("\\{ut:03o}")
+                        }
+                    }
+                }
+                write!(
+                    f,
+                    "{}",
+                    translate!("tr-error-backwards-range", "start" => end_or_start_to_string(*start), "end" => end_or_start_to_string(*end))
+                )
+            }
+            自身类型::MultipleCharInEquivalence(s) => write!(
+                f,
+                "{}",
+                translate!("tr-error-multiple-char-in-equivalence", "chars" => s.克隆())
+            ),
+        }
+    }
+}
+
+实现 错误协议 循环 BadSequence {}
+实现 UError 循环 BadSequence {}
+
+#[derive(调试协议, 克隆协议, 复制协议)]
+公有 枚举 Class {
+    Alnum,
+    Alpha,
+    Blank,
+    Control,
+    Digit,
+    Graph,
+    Lower,
+    Print,
+    Punct,
+    Space,
+    Upper,
+    Xdigit,
+}
+
+#[derive(调试协议, 克隆协议, 复制协议)]
+公有 枚举 Sequence {
+    Char(正8),
+    CharRange(正8, 正8),
+    CharStar(正8),
+    CharRepeat(正8, 正整数大小),
+    Class(Class),
+}
+
+实现 Sequence {
+    公有 方法 flatten(&自身) -> 盒子<动态 迭代器协议<Item = 正8>> {
+        匹配 自身 {
+            自身类型::Char(c) => 盒子::新建(标准库::迭代::once(*c)),
+            自身类型::CharRange(l, r) => 盒子::新建(*l..=*r),
+            自身类型::CharStar(c) => 盒子::新建(标准库::迭代::repeat(*c)),
+            自身类型::CharRepeat(c, n) => 盒子::新建(标准库::迭代::repeat_n(*c, *n)),
+            自身类型::Class(class) => 匹配 class {
+                Class::Alnum => 盒子::新建((b'0'..=b'9').chain(b'A'..=b'Z').chain(b'a'..=b'z')),
+                Class::Alpha => 盒子::新建((b'A'..=b'Z').chain(b'a'..=b'z')),
+                Class::Blank => 盒子::新建(unicode_table::BLANK.迭代().copied()),
+                Class::Control => 盒子::新建((0..=31).chain(标准库::迭代::once(127))),
+                Class::Digit => 盒子::新建(b'0'..=b'9'),
+                Class::Graph => 盒子::新建(
+                    (48..=57) // digit
+                        .chain(65..=90) // uppercase
+                        .chain(97..=122) // lowercase
+                        // punctuations
+                        .chain(33..=47)
+                        .chain(58..=64)
+                        .chain(91..=96)
+                        .chain(123..=126),
+                ),
+                Class::Print => 盒子::新建(
+                    (48..=57) // digit
+                        .chain(65..=90) // uppercase
+                        .chain(97..=122) // lowercase
+                        // punctuations
+                        .chain(33..=47)
+                        .chain(58..=64)
+                        .chain(91..=96)
+                        .chain(123..=126)
+                        .chain(标准库::迭代::once(32)), // space
+                ),
+                Class::Punct => 盒子::新建((33..=47).chain(58..=64).chain(91..=96).chain(123..=126)),
+                Class::Space => 盒子::新建(unicode_table::SPACES.迭代().copied()),
+                Class::Xdigit => 盒子::新建((b'0'..=b'9').chain(b'A'..=b'F').chain(b'a'..=b'f')),
+                Class::Lower => 盒子::新建(b'a'..=b'z'),
+                Class::Upper => 盒子::新建(b'A'..=b'Z'),
+            },
+        }
+    }
+
+    // Hide all the nasty sh*t in here
+    公有 方法 solve_set_characters(
+        set1_str: &[正8],
+        set2_str: &[正8],
+        complement_flag: 布尔,
+        truncate_set1_flag: 布尔,
+        translating: 布尔,
+    ) -> 结果<(向量<正8>, 向量<正8>), BadSequence> {
+        设 is_char_star = |s: &&自身类型| -> 布尔 { matches!(s, 自身类型::CharStar(_)) };
+
+        设 set1 = 自身类型::from_str(set1_str)?;
+        如果 set1.迭代().过滤(is_char_star).计数() != 0 {
+            返回 坏的(BadSequence::CharRepeatInSet1);
+        }
+
+        设 可变 set2 = 自身类型::from_str(set2_str)?;
+        如果 set2.迭代().过滤(is_char_star).计数() > 1 {
+            返回 坏的(BadSequence::MultipleCharRepeatInSet2);
+        }
+
+        如果 translating
+            && set2.迭代().任意(|&x| {
+                matches!(x, 自身类型::Class(_))
+                    && !matches!(x, 自身类型::Class(Class::Upper | Class::Lower))
+            })
+        {
+            返回 坏的(BadSequence::ClassExceptLowerUpperInSet2);
+        }
+
+        设 可变 set1_solved: 向量<正8> = set1.迭代().flat_map(自身类型::flatten).收集();
+        如果 complement_flag {
+            set1_solved = (0..=正8::MAX).过滤(|x| !set1_solved.包含(x)).收集();
+        }
+        设 set1_len = set1_solved.长度();
+
+        设 set2_len = set2
+            .迭代()
+            .filter_map(|s| 匹配 s {
+                自身类型::CharStar(_) => 无,
+                r => 一些(r),
+            })
+            .flat_map(自身类型::flatten)
+            .计数();
+
+        设 star_compensate_len = set1_len.saturating_sub(set2_len);
+        //Replace CharStar with CharRepeat
+        set2 = set2
+            .迭代()
+            .filter_map(|s| 匹配 s {
+                自身类型::CharStar(0) => 无,
+                自身类型::CharStar(c) => 一些(自身类型::CharRepeat(*c, star_compensate_len)),
+                r => 一些(*r),
+            })
+            .收集();
+
+        // For every upper/lower in set2, there must be an upper/lower in set1 at the same position. The position is calculated by expanding everything before the upper/lower in both sets
+        循环 (set2_pos, set2_item) 在 set2.迭代().enumerate() {
+            如果 matches!(set2_item, 自身类型::Class(_)) {
+                设 可变 set2_part_solved_len = 0;
+                如果 set2_pos >= 1 {
+                    set2_part_solved_len =
+                        set2.迭代().take(set2_pos).flat_map(自身类型::flatten).计数();
+                }
+
+                设 可变 class_matches = 假;
+                循环 (set1_pos, set1_item) 在 set1.迭代().enumerate() {
+                    如果 matches!(set1_item, 自身类型::Class(_)) {
+                        设 可变 set1_part_solved_len = 0;
+                        如果 set1_pos >= 1 {
+                            set1_part_solved_len =
+                                set1.迭代().take(set1_pos).flat_map(自身类型::flatten).计数();
+                        }
+
+                        如果 set1_part_solved_len == set2_part_solved_len {
+                            class_matches = 真;
+                            中断;
+                        }
+                    }
+                }
+
+                如果 !class_matches {
+                    返回 坏的(BadSequence::ClassInSet2NotMatchedBySet1);
+                }
+            }
+        }
+
+        设 set2_solved: 向量<_> = set2.迭代().flat_map(自身类型::flatten).收集();
+
+        // Calculate the set of unique characters in set2
+        设 可变 set2_uniques = set2_solved.克隆();
+        set2_uniques.sort_unstable();
+        set2_uniques.dedup();
+
+        // If the complement flag is used in translate mode, only one unique
+        // character may appear in set2. Validate this with the set of uniques
+        // in set2 that we just generated.
+        // Also, set2 must not overgrow set1, otherwise the mapping can't be 1:1.
+        如果 set1.迭代().任意(|x| matches!(x, 自身类型::Class(_)))
+            && translating
+            && complement_flag
+            && (set2_uniques.长度() > 1 || set2_solved.长度() > set1_len)
+        {
+            返回 坏的(BadSequence::ComplementMoreThanOneUniqueInSet2);
+        }
+
+        如果 set2_solved.长度() < set1_solved.长度() {
+            如果 truncate_set1_flag {
+                set1_solved.truncate(set2_solved.长度());
+            } 否则 如果 matches!(
+                set2.最后().copied(),
+                一些(自身类型::Class(Class::Upper | Class::Lower))
+            ) {
+                返回 坏的(BadSequence::Set1LongerSet2EndsInClass);
+            }
+        }
+
+        好的((set1_solved, set2_solved))
+    }
+}
+
+实现 Sequence {
+    公有 方法 from_str(input: &[正8]) -> 结果<向量<自身类型>, BadSequence> {
+        many0(alt((
+            自身类型::parse_char_range,
+            自身类型::parse_char_star,
+            自身类型::parse_char_repeat,
+            自身类型::parse_class,
+            自身类型::parse_char_equal,
+            // NOTE: This must be the last one
+            映射(自身类型::parse_backslash_or_char_with_warning, |s| {
+                好的(自身类型::Char(s))
+            }),
+        )))
+        .parse(input)
+        .映射(|(_, r)| r)
+        .解包()
+        .into_iter()
+        .收集::<结果<向量<_>, _>>()
+    }
+
+    方法 parse_octal(input: &[正8]) -> IResult<&[正8], 正8> {
+        // For `parse_char_range`, `parse_char_star`, `parse_char_repeat`, `parse_char_equal`.
+        // Because in these patterns, there's no ambiguous cases.
+        preceded(tag("\\"), 自身类型::parse_octal_up_to_three_digits).parse(input)
+    }
+
+    方法 parse_octal_with_warning(input: &[正8]) -> IResult<&[正8], 正8> {
+        preceded(
+            tag("\\"),
+            alt((
+                自身类型::parse_octal_up_to_three_digits_with_warning,
+                // Fallback for if the three digit octal escape is greater than \377 (0xFF), and therefore can't be
+                // parsed as as a byte
+                // See test `test_multibyte_octal_sequence`
+                自身类型::parse_octal_two_digits,
+            )),
+        )
+        .parse(input)
+    }
+
+    方法 parse_octal_up_to_three_digits(input: &[正8]) -> IResult<&[正8], 正8> {
+        map_opt(
+            recognize(many_m_n(1, 3, one_of("01234567"))),
+            |out: &[正8]| {
+                设 str_to_parse = 标准库::字符串切片::from_utf8(out).解包();
+                正8::from_str_radix(str_to_parse, 8).ok()
+            },
+        )
+        .parse(input)
+    }
+
+    方法 parse_octal_up_to_three_digits_with_warning(input: &[正8]) -> IResult<&[正8], 正8> {
+        map_opt(
+            recognize(many_m_n(1, 3, one_of("01234567"))),
+            |out: &[正8]| {
+                设 str_to_parse = 标准库::字符串切片::from_utf8(out).解包();
+                设 result = 正8::from_str_radix(str_to_parse, 8).ok();
+                如果 result.is_none() {
+                    如果 设 好的(origin_octal) = 标准库::字符串切片::from_utf8(input) {
+                        设 actual_octal_tail: &字符串切片 = 标准库::字符串切片::from_utf8(&input[0..2]).解包();
+                        设 outstand_char: 字符 = 字符::from_u32(input[2] 转换 正32).解包();
+                        show_warning!(
+                            "{}",
+                            translate!("tr-warning-ambiguous-octal-escape", "origin_octal" => origin_octal, "actual_octal_tail" => actual_octal_tail, "outstand_char" => outstand_char)
+                        );
+                    } 否则 {
+                        show_warning!("{}", translate!("tr-warning-invalid-utf8"));
+                    }
+                }
+                result
+            },
+        )
+        .parse(input)
+    }
+
+    方法 parse_octal_two_digits(input: &[正8]) -> IResult<&[正8], 正8> {
+        map_opt(
+            recognize(many_m_n(2, 2, one_of("01234567"))),
+            |out: &[正8]| 正8::from_str_radix(标准库::字符串切片::from_utf8(out).解包(), 8).ok(),
+        )
+        .parse(input)
+    }
+
+    方法 parse_backslash(input: &[正8]) -> IResult<&[正8], 正8> {
+        preceded(tag("\\"), 自身类型::single_char)
+            .parse(input)
+            .映射(|(l, a)| {
+                设 c = 匹配 a {
+                    b'a' => unicode_table::BEL,
+                    b'b' => unicode_table::BS,
+                    b'f' => unicode_table::FF,
+                    b'n' => unicode_table::LF,
+                    b'r' => unicode_table::CR,
+                    b't' => unicode_table::HT,
+                    b'v' => unicode_table::VT,
+                    x => x,
+                };
+                (l, c)
+            })
+    }
+
+    方法 parse_backslash_or_char(input: &[正8]) -> IResult<&[正8], 正8> {
+        alt((自身类型::parse_octal, 自身类型::parse_backslash, 自身类型::single_char)).parse(input)
+    }
+
+    方法 parse_backslash_or_char_with_warning(input: &[正8]) -> IResult<&[正8], 正8> {
+        alt((
+            自身类型::parse_octal_with_warning,
+            自身类型::parse_backslash,
+            自身类型::single_char,
+        ))
+        .parse(input)
+    }
+
+    方法 single_char(input: &[正8]) -> IResult<&[正8], 正8> {
+        take(1正整数大小)(input).映射(|(l, a)| (l, a[0]))
+    }
+
+    方法 parse_char_range(input: &[正8]) -> IResult<&[正8], 结果<自身类型, BadSequence>> {
+        separated_pair(
+            自身类型::parse_backslash_or_char,
+            tag("-"),
+            自身类型::parse_backslash_or_char,
+        )
+        .parse(input)
+        .映射(|(l, (a, b))| {
+            (l, {
+                设 (start, end) = (正32::from(a), 正32::from(b));
+
+                设 range = start..=end;
+
+                如果 range.为空() {
+                    坏的(BadSequence::BackwardsRange { end, start })
+                } 否则 {
+                    好的(自身类型::CharRange(start 转换 正8, end 转换 正8))
+                }
+            })
+        })
+    }
+
+    方法 parse_char_star(input: &[正8]) -> IResult<&[正8], 结果<自身类型, BadSequence>> {
+        delimited(tag("["), 自身类型::parse_backslash_or_char, tag("*]"))
+            .parse(input)
+            .映射(|(l, a)| (l, 好的(自身类型::CharStar(a))))
+    }
+
+    方法 parse_char_repeat(input: &[正8]) -> IResult<&[正8], 结果<自身类型, BadSequence>> {
+        delimited(
+            tag("["),
+            separated_pair(
+                自身类型::parse_backslash_or_char,
+                tag("*"),
+                // TODO
+                // Why are the opening and closing tags not sufficient?
+                // Backslash check is a workaround for `check_against_gnu_tr_tests_repeat_bs_9`
+                take_till(|ue| matches!(ue, b']' | b'\\')),
+            ),
+            tag("]"),
+        )
+        .parse(input)
+        .映射(|(l, (c, cnt_str))| {
+            设 s = 字符串::from_utf8_lossy(cnt_str);
+            设 result = 如果 cnt_str.starts_with(b"0") {
+                匹配 正整数大小::from_str_radix(&s, 8) {
+                    好的(0) => 好的(自身类型::CharStar(c)),
+                    好的(计数) => 好的(自身类型::CharRepeat(c, 计数)),
+                    坏的(_) => 坏的(BadSequence::InvalidRepeatCount(s.to_string())),
+                }
+            } 否则 {
+                匹配 s.parse::<正整数大小>() {
+                    好的(0) => 好的(自身类型::CharStar(c)),
+                    好的(计数) => 好的(自身类型::CharRepeat(c, 计数)),
+                    坏的(_) => 坏的(BadSequence::InvalidRepeatCount(s.to_string())),
+                }
+            };
+            (l, result)
+        })
+    }
+
+    方法 parse_class(input: &[正8]) -> IResult<&[正8], 结果<自身类型, BadSequence>> {
+        preceded(tag("[:"), terminated(take_until(":]"), tag(":]")))
+            .parse(input)
+            .映射(|(l, class_name)| {
+                (
+                    l,
+                    匹配 class_name {
+                        b"" => 坏的(BadSequence::MissingCharClassName),
+                        b"alnum" => 好的(自身类型::Class(Class::Alnum)),
+                        b"alpha" => 好的(自身类型::Class(Class::Alpha)),
+                        b"blank" => 好的(自身类型::Class(Class::Blank)),
+                        b"cntrl" => 好的(自身类型::Class(Class::Control)),
+                        b"digit" => 好的(自身类型::Class(Class::Digit)),
+                        b"graph" => 好的(自身类型::Class(Class::Graph)),
+                        b"lower" => 好的(自身类型::Class(Class::Lower)),
+                        b"print" => 好的(自身类型::Class(Class::Print)),
+                        b"punct" => 好的(自身类型::Class(Class::Punct)),
+                        b"space" => 好的(自身类型::Class(Class::Space)),
+                        b"upper" => 好的(自身类型::Class(Class::Upper)),
+                        b"xdigit" => 好的(自身类型::Class(Class::Xdigit)),
+                        _ => 坏的(BadSequence::InvalidCharClass(格式化!(
+                            "[:{}:]",
+                            字符串::from_utf8_lossy(class_name)
+                        ))),
+                    },
+                )
+            })
+    }
+
+    方法 parse_char_equal(input: &[正8]) -> IResult<&[正8], 结果<自身类型, BadSequence>> {
+        preceded(
+            tag("[="),
+            (
+                alt((
+                    value(坏的(()), peek(tag("=]"))),
+                    映射(自身类型::parse_backslash_or_char, 好的),
+                )),
+                映射(terminated(take_until("=]"), tag("=]")), |v: &[正8]| {
+                    如果 v.为空() { 好的(()) } 否则 { 坏的(v) }
+                }),
+            ),
+        )
+        .parse(input)
+        .映射(|(l, (a, b))| {
+            (
+                l,
+                匹配 (a, b) {
+                    (坏的(()), _) => 坏的(BadSequence::MissingEquivalentClassChar),
+                    (好的(c), 好的(())) => 好的(自身类型::Char(c)),
+                    (好的(c), 坏的(v)) => 坏的(BadSequence::MultipleCharInEquivalence(格式化!(
+                        "{}{}",
+                        字符串::from_utf8_lossy(&[c]),
+                        字符串::from_utf8_lossy(v),
+                    ))),
+                },
+            )
+        })
+    }
+}
+
+公有 协议 SymbolTranslator {
+    方法 translate(&可变 自身, current: 正8) -> 选项<正8>;
+
+    /// Takes two [`SymbolTranslator`]s and creates a new [`SymbolTranslator`] over both in sequence.
+    ///
+    /// This behaves pretty much identical to [`Iterator::chain`].
+    方法 chain<T>(自身, other: T) -> ChainedSymbolTranslator<自身类型, T>
+    何处
+        自身类型: Sized,
+    {
+        ChainedSymbolTranslator::<自身类型, T> {
+            stage_a: 自身,
+            stage_b: other,
+        }
+    }
+}
+
+公有 结构 ChainedSymbolTranslator<A, B> {
+    stage_a: A,
+    stage_b: B,
+}
+
+实现<A: SymbolTranslator, B: SymbolTranslator> SymbolTranslator 循环 ChainedSymbolTranslator<A, B> {
+    方法 translate(&可变 自身, current: 正8) -> 选项<正8> {
+        自身.stage_a
+            .translate(current)
+            .and_then(|c| 自身.stage_b.translate(c))
+    }
+}
+
+/// Convert a set of bytes to a 256-element bitmap for O(1) lookup
+方法 set_to_bitmap(set: &[正8]) -> [布尔; 256] {
+    设 可变 bitmap = [假; 256];
+    循环 &byte 在 set {
+        bitmap[byte 转换 正整数大小] = 真;
+    }
+    bitmap
+}
+
+#[derive(调试协议)]
+公有 结构 DeleteOperation {
+    公有(箱) delete_table: [布尔; 256],
+}
+
+实现 DeleteOperation {
+    公有 方法 新建(set: 向量<正8>) -> 自身类型 {
+        自身类型 {
+            delete_table: set_to_bitmap(&set),
+        }
+    }
+}
+
+实现 SymbolTranslator 循环 DeleteOperation {
+    方法 translate(&可变 自身, current: 正8) -> 选项<正8> {
+        // keep if not present in the delete set
+        (!自身.delete_table[current 转换 正整数大小]).then_some(current)
+    }
+}
+
+实现 ChunkProcessor 循环 DeleteOperation {
+    方法 process_chunk(&自身, input: &[正8], output: &可变 向量<正8>) {
+        使用 箱::simd::{find_single_change, process_single_delete};
+
+        // Check if this is single character deletion
+        如果 设 一些((delete_char, _)) =
+            find_single_change(&自身.delete_table, |_, &should_delete| should_delete)
+        {
+            process_single_delete(input, output, delete_char);
+        } 否则 {
+            // Standard deletion
+            output.extend(
+                input
+                    .迭代()
+                    .过滤(|&&b| !自身.delete_table[b 转换 正整数大小])
+                    .copied(),
+            );
+        }
+    }
+}
+
+#[derive(调试协议)]
+公有 结构 TranslateOperation {
+    公有(箱) translation_table: [正8; 256],
+}
+
+实现 TranslateOperation {
+    公有 方法 新建(set1: 向量<正8>, set2: 向量<正8>) -> 结果<自身类型, BadSequence> {
+        // Initialize translation table with identity mapping
+        设 可变 translation_table = 标准库::数组::from_fn(|i| i 转换 正8);
+
+        如果 设 一些(fallback) = set2.最后().copied() {
+            // Apply translations from set1 to set2
+            循环 (from, to) 在 set1
+                .into_iter()
+                .zip(set2.into_iter().chain(标准库::迭代::repeat(fallback)))
+            {
+                translation_table[from 转换 正整数大小] = to;
+            }
+
+            好的(自身类型 { translation_table })
+        } 否则 如果 set1.为空() && set2.为空() {
+            // Identity mapping for empty sets
+            好的(自身类型 { translation_table })
+        } 否则 {
+            坏的(BadSequence::EmptySet2WhenNotTruncatingSet1)
+        }
+    }
+}
+
+实现 SymbolTranslator 循环 TranslateOperation {
+    方法 translate(&可变 自身, current: 正8) -> 选项<正8> {
+        一些(自身.translation_table[current 转换 正整数大小])
+    }
+}
+
+实现 ChunkProcessor 循环 TranslateOperation {
+    方法 process_chunk(&自身, input: &[正8], output: &可变 向量<正8>) {
+        使用 箱::simd::{find_single_change, process_single_char_replace};
+
+        // Check if this is a simple single-character translation
+        如果 设 一些((source, target)) =
+            find_single_change(&自身.translation_table, |i, &val| val != i 转换 正8)
+        {
+            // Use SIMD-optimized single character replacement
+            process_single_char_replace(input, output, source, target);
+        } 否则 {
+            // Standard translation using table lookup
+            output.extend(input.迭代().映射(|&b| 自身.translation_table[b 转换 正整数大小]));
+        }
+    }
+}
+
+#[derive(调试协议, 克隆协议)]
+公有 结构 SqueezeOperation {
+    squeeze_table: [布尔; 256],
+    previous: 选项<正8>,
+}
+
+实现 SqueezeOperation {
+    公有 方法 新建(set1: 向量<正8>) -> 自身类型 {
+        自身类型 {
+            squeeze_table: set_to_bitmap(&set1),
+            previous: 无,
+        }
+    }
+}
+
+实现 SymbolTranslator 循环 SqueezeOperation {
+    方法 translate(&可变 自身, current: 正8) -> 选项<正8> {
+        设 next = 如果 自身.squeeze_table[current 转换 正整数大小] {
+            匹配 自身.previous {
+                一些(v) 如果 v == current => 无,
+                _ => 一些(current),
+            }
+        } 否则 {
+            一些(current)
+        };
+        自身.previous = 一些(current);
+        next
+    }
+}
+
+公有 方法 translate_input<T, R, W>(input: &可变 R, output: &可变 W, 可变 translator: T) -> UResult<()>
+何处
+    T: SymbolTranslator,
+    R: BufRead,
+    W: Write,
+{
+    常量 BUFFER_SIZE: 正整数大小 = 32768; // Large buffer for better throughput
+    设 可变 buf = [0; BUFFER_SIZE];
+    设 可变 output_buf = 向量::with_capacity(BUFFER_SIZE);
+
+    无限循环 {
+        设 length = 匹配 input.读锁定(&可变 buf[..]) {
+            好的(0) => 中断, // EOF reached
+            好的(长度) => 长度,
+            坏的(e) 如果 e.kind() == 标准库::输入输出::ErrorKind::Interrupted => 继续,
+            坏的(e) => 返回 坏的(e.map_err_context(|| translate!("tr-error-read-error"))),
+        };
+
+        // Process the buffer and collect translated chars to output
+        output_buf.clear();
+        循环 &byte 在 &buf[..length] {
+            如果 设 一些(translated) = translator.translate(byte) {
+                output_buf.压入(translated);
+            }
+        }
+
+        如果 !output_buf.为空() {
+            箱::simd::write_output(output, &output_buf)?;
+        }
+    }
+
+    好的(())
+}
+
+/// Platform-specific flush operation
+#[inline]
+公有 方法 flush_output<W: Write>(output: &可变 W) -> UResult<()> {
+    #[cfg(not(target_os = "windows"))]
+    返回 output
+        .flush()
+        .map_err_context(|| translate!("tr-error-write-error"));
+
+    #[cfg(target_os = "windows")]
+    匹配 output.flush() {
+        好的(()) => 好的(()),
+        坏的(err) 如果 err.kind() == 标准库::输入输出::ErrorKind::BrokenPipe => {
+            标准库::进程::exit(13);
+        }
+        坏的(err) => 坏的(err.map_err_context(|| translate!("tr-error-write-error"))),
+    }
+}

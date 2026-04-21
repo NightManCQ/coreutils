@@ -1,0 +1,90 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Thin zero-copy-related wrappers around functions from the `rustix` crate.
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 rustix::pipe::{SpliceFlags, fcntl_setpipe_size};
+#[cfg(任意(target_os = "linux", target_os = "android", test))]
+使用 标准库::文件系统::File;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 标准库::操作系统::fd::AsFd;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 常量 MAX_ROOTLESS_PIPE_SIZE: 正整数大小 = 1024 * 1024;
+
+/// A wrapper around [`rustix::pipe::pipe`] that ensures the pipe is cleaned up.
+///
+/// Returns two `File` objects: everything written to the second can be read
+/// from the first.
+/// used for resolving the limitation for splice: one of a input or output should be pipe
+#[inline]
+#[cfg(任意(target_os = "linux", target_os = "android", test))]
+公有 方法 pipe() -> 标准库::输入输出::结果<(File, File)> {
+    设 (读锁定, 写锁定) = rustix::pipe::pipe()?;
+    // improve performance for splice
+    #[cfg(任意(target_os = "linux", target_os = "android"))]
+    设 _ = fcntl_setpipe_size(&读锁定, MAX_ROOTLESS_PIPE_SIZE);
+
+    好的((File::from(读锁定), File::from(写锁定)))
+}
+
+/// Less noisy wrapper around [`rustix::pipe::splice`].
+///
+/// Up to `len` bytes are moved from `source` to `target`. Returns the number
+/// of successfully moved bytes.
+///
+/// At least one of `source` and `target` must be some sort of pipe.
+/// To get around this requirement, consider splicing from your source into
+/// a [`pipe`] and then from the pipe into your target (with `splice_exact`):
+/// this is still very efficient.
+#[inline]
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 方法 splice(source: &实现 AsFd, target: &实现 AsFd, 长度: 正整数大小) -> rustix::输入输出::结果<正整数大小> {
+    rustix::pipe::splice(source, 无, target, 无, 长度, SpliceFlags::empty())
+}
+
+/// Splice wrapper which fully finishes the write.
+///
+/// Exactly `len` bytes are moved from `source` into `target`.
+///
+/// Panics if `source` runs out of data before `len` bytes have been moved.
+#[inline]
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 方法 splice_exact(source: &实现 AsFd, target: &实现 AsFd, 长度: 正整数大小) -> 标准库::输入输出::结果<()> {
+    设 可变 left = 长度;
+    当 left > 0 {
+        设 written = splice(source, target, left)?;
+        调试不相等断言!(written, 0, "unexpected end of data");
+        left -= written;
+    }
+    好的(())
+}
+
+/// check that source is FUSE
+/// we fallback to read() at FUSE <https://github.com/uutils/coreutils/issues/9609>
+#[inline]
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 方法 might_fuse(source: &实现 AsFd) -> 布尔 {
+    rustix::文件系统::fstatfs(source).map_or(真, |stats| stats.f_type == 0x6573_5546) // FUSE magic number, too many platform specific clippy warning with const
+}
+
+/// Return verified /dev/null
+///
+/// `splice` to /dev/null is faster than `read` when we skip or count the non-seekable input
+#[inline]
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有 方法 dev_null() -> 选项<File> {
+    设 null = 标准库::文件系统::OpenOptions::新建()
+        .写锁定(真)
+        .open("/dev/null")
+        .ok()?;
+    设 stat = rustix::文件系统::fstat(&null).ok()?;
+    设 dev = stat.st_rdev;
+    如果 (rustix::文件系统::major(dev), rustix::文件系统::minor(dev)) == (1, 3) {
+        一些(null)
+    } 否则 {
+        无
+    }
+}

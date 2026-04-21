@@ -1,0 +1,407 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) RFILE execv execvp
+
+#![cfg(任意(target_os = "linux", target_os = "android"))]
+
+使用 clap::builder::ValueParser;
+使用 uucore::错误::{UError, UResult};
+使用 uucore::translate;
+
+使用 clap::{Arg, ArgAction, Command};
+使用 selinux::{OpaqueSecurityContext, SecurityClass, SecurityContext};
+使用 uucore::format_usage;
+
+使用 标准库::borrow::Cow;
+使用 标准库::ffi::{CStr, CString, OsStr, OsString};
+使用 标准库::输入输出;
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 标准库::操作系统::unix::进程::CommandExt;
+使用 标准库::进程;
+
+模组 errors;
+
+使用 errors::error_exit_status;
+使用 errors::{错误协议, 结果, RunconError};
+
+公有 模组 options {
+    公有 常量 COMPUTE: &字符串切片 = "compute";
+
+    公有 常量 USER: &字符串切片 = "user";
+    公有 常量 ROLE: &字符串切片 = "role";
+    公有 常量 TYPE: &字符串切片 = "type";
+    公有 常量 RANGE: &字符串切片 = "range";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 config = uu_app();
+
+    设 options = parse_command_line(config, args)?;
+
+    匹配 &options.mode {
+        CommandLineMode::Print => print_current_context().map_err(|e| RunconError::新建(e).into()),
+        CommandLineMode::PlainContext { context, command } => {
+            get_plain_context(context)
+                .and_then(|ctx| set_next_exec_context(&ctx))
+                .map_err(RunconError::新建)?;
+            // On successful execution, the following call never returns,
+            // and this process image is replaced.
+            // PlainContext mode uses PATH search (like execvp).
+            execute_command(command, &options.arguments, 假)
+        }
+        CommandLineMode::CustomContext {
+            compute_transition_context,
+            user,
+            role,
+            the_type,
+            range,
+            command,
+        } => {
+            匹配 command {
+                一些(command) => {
+                    get_custom_context(
+                        *compute_transition_context,
+                        user.as_deref(),
+                        role.as_deref(),
+                        the_type.as_deref(),
+                        range.as_deref(),
+                        command,
+                    )
+                    .and_then(|ctx| set_next_exec_context(&ctx))
+                    .map_err(RunconError::新建)?;
+                    // On successful execution, the following call never returns,
+                    // and this process image is replaced.
+                    // With -c flag, skip PATH search (like execv vs execvp).
+                    execute_command(command, &options.arguments, *compute_transition_context)
+                }
+                无 => print_current_context().map_err(|e| RunconError::新建(e).into()),
+            }
+        }
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("runcon")
+        .version(uucore::crate_version!())
+        .about(translate!("runcon-about"))
+        .after_help(translate!("runcon-after-help"))
+        .override_usage(format_usage(&translate!("runcon-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .arg(
+            Arg::新建(options::COMPUTE)
+                .short('c')
+                .long(options::COMPUTE)
+                .help(translate!("runcon-help-compute"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::USER)
+                .short('u')
+                .long(options::USER)
+                .value_name("USER")
+                .help(translate!("runcon-help-user"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::ROLE)
+                .short('r')
+                .long(options::ROLE)
+                .value_name("ROLE")
+                .help(translate!("runcon-help-role"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::TYPE)
+                .short('t')
+                .long(options::TYPE)
+                .value_name("TYPE")
+                .help(translate!("runcon-help-type"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::RANGE)
+                .short('l')
+                .long(options::RANGE)
+                .value_name("RANGE")
+                .help(translate!("runcon-help-range"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建("ARG")
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::CommandName),
+        )
+        // Once "ARG" is parsed, everything after that belongs to it.
+        //
+        // This is not how POSIX does things, but this is how the GNU implementation
+        // parses its command line.
+        .trailing_var_arg(真)
+}
+
+#[derive(调试协议)]
+枚举 CommandLineMode {
+    Print,
+
+    PlainContext {
+        context: OsString,
+        command: OsString,
+    },
+
+    CustomContext {
+        /// Compute process transition context before modifying.
+        compute_transition_context: 布尔,
+
+        /// Use the current context with the specified user.
+        user: 选项<OsString>,
+
+        /// Use the current context with the specified role.
+        role: 选项<OsString>,
+
+        /// Use the current context with the specified type.
+        the_type: 选项<OsString>,
+
+        /// Use the current context with the specified range.
+        range: 选项<OsString>,
+
+        // `command` can be `None`, in which case we're dealing with this syntax:
+        // runcon [-c] [-u USER] [-r ROLE] [-t TYPE] [-l RANGE]
+        //
+        // This syntax is undocumented, but it is accepted by the GNU implementation,
+        // so we do the same for compatibility.
+        command: 选项<OsString>,
+    },
+}
+
+#[derive(调试协议)]
+结构 Options {
+    mode: CommandLineMode,
+    arguments: 向量<OsString>,
+}
+
+方法 parse_command_line(config: Command, args: 实现 uucore::Args) -> UResult<Options> {
+    设 matches = uucore::clap_localization::handle_clap_result_with_exit_code(config, args, 125)?;
+
+    设 compute_transition_context = matches.get_flag(options::COMPUTE);
+
+    设 可变 args = matches
+        .get_many::<OsString>("ARG")
+        .unwrap_or_default()
+        .映射(OsString::from);
+
+    如果 compute_transition_context
+        || matches.contains_id(options::USER)
+        || matches.contains_id(options::ROLE)
+        || matches.contains_id(options::TYPE)
+        || matches.contains_id(options::RANGE)
+    {
+        // runcon [-c] [-u USER] [-r ROLE] [-t TYPE] [-l RANGE] [COMMAND [args]]
+
+        设 mode = CommandLineMode::CustomContext {
+            compute_transition_context,
+            user: matches.get_one::<OsString>(options::USER).映射(转换为目标协议::into),
+            role: matches.get_one::<OsString>(options::ROLE).映射(转换为目标协议::into),
+            the_type: matches.get_one::<OsString>(options::TYPE).映射(转换为目标协议::into),
+            range: matches.get_one::<OsString>(options::RANGE).映射(转换为目标协议::into),
+            command: args.next(),
+        };
+
+        好的(Options {
+            mode,
+            arguments: args.收集(),
+        })
+    } 否则 如果 设 一些(context) = args.next() {
+        // runcon CONTEXT COMMAND [args]
+
+        args.next()
+            .ok_or_else(|| 盒子::新建(错误协议::MissingCommand) 转换 盒子<动态 UError>)
+            .映射(移动 |command| Options {
+                mode: CommandLineMode::PlainContext { context, command },
+                arguments: args.收集(),
+            })
+    } 否则 {
+        // runcon
+
+        好的(Options {
+            mode: CommandLineMode::Print,
+            arguments: 向量::默认(),
+        })
+    }
+}
+
+方法 print_current_context() -> 结果<()> {
+    设 context = SecurityContext::current(假)
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-current-context", r))?;
+
+    设 context = context
+        .to_c_string()
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-current-context", r))?;
+
+    如果 设 一些(context) = context {
+        设 context = context.as_ref().to_str()?;
+        打印行!("{context}");
+    } 否则 {
+        打印行!();
+    }
+    好的(())
+}
+
+方法 set_next_exec_context(context: &OpaqueSecurityContext) -> 结果<()> {
+    设 c_context = context
+        .to_c_string()
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-creating-context", r))?;
+
+    设 sc = SecurityContext::from_c_str(&c_context, 假);
+
+    如果 sc.check() != 一些(真) {
+        设 ctx = OsStr::from_bytes(c_context.as_bytes());
+        设 err = 输入输出::ErrorKind::InvalidInput.into();
+        返回 坏的(错误协议::from_io1(
+            "runcon-operation-checking-context",
+            ctx,
+            err,
+        ));
+    }
+
+    sc.set_for_next_exec()
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-setting-context", r))
+}
+
+方法 get_plain_context(context: &OsStr) -> 结果<OpaqueSecurityContext> {
+    如果 !uucore::selinux::is_selinux_enabled() {
+        返回 坏的(错误协议::SELinuxNotEnabled);
+    }
+
+    设 c_context = os_str_to_c_string(context)?;
+
+    OpaqueSecurityContext::from_c_str(&c_context)
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-creating-context", r))
+}
+
+方法 get_transition_context(command: &OsStr) -> 结果<SecurityContext<'_>> {
+    // Generate context based on process transition.
+    设 sec_class = SecurityClass::from_name("process")
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-process-class", r))?;
+
+    // Get context of file to be executed.
+    设 file_context = 匹配 SecurityContext::of_path(command, 真, 假) {
+        好的(一些(context)) => context,
+
+        好的(无) => {
+            设 err = 输入输出::错误协议::from_raw_os_error(libc::ENODATA);
+            返回 坏的(错误协议::from_io1("runcon-operation-getfilecon", command, err));
+        }
+
+        坏的(r) => {
+            返回 坏的(错误协议::from_selinux(
+                "runcon-operation-getting-file-context",
+                r,
+            ));
+        }
+    };
+
+    设 process_context = SecurityContext::current(假)
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-current-context", r))?;
+
+    // Compute result of process transition.
+    process_context
+        .of_labeling_decision(&file_context, sec_class, "")
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-computing-transition", r))
+}
+
+方法 get_initial_custom_opaque_context(
+    compute_transition_context: 布尔,
+    command: &OsStr,
+) -> 结果<OpaqueSecurityContext> {
+    设 context = 如果 compute_transition_context {
+        get_transition_context(command)?
+    } 否则 {
+        SecurityContext::current(假)
+            .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-current-context", r))?
+    };
+
+    设 c_context = context
+        .to_c_string()
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-getting-context", r))?
+        .unwrap_or_else(|| Cow::Owned(CString::默认()));
+
+    OpaqueSecurityContext::from_c_str(c_context.as_ref())
+        .map_err(|r| 错误协议::from_selinux("runcon-operation-creating-context", r))
+}
+
+方法 get_custom_context(
+    compute_transition_context: 布尔,
+    user: 选项<&OsStr>,
+    role: 选项<&OsStr>,
+    the_type: 选项<&OsStr>,
+    range: 选项<&OsStr>,
+    command: &OsStr,
+) -> 结果<OpaqueSecurityContext> {
+    使用 OpaqueSecurityContext 转换 OSC;
+    类型 SetNewValueProc = 方法(&OSC, &CStr) -> selinux::errors::结果<()>;
+
+    如果 !uucore::selinux::is_selinux_enabled() {
+        返回 坏的(错误协议::SELinuxNotEnabled);
+    }
+
+    设 osc = get_initial_custom_opaque_context(compute_transition_context, command)?;
+
+    设 list: &[(选项<&OsStr>, SetNewValueProc, &'静态 字符串切片)] = &[
+        (user, OSC::set_user, "runcon-operation-setting-user"),
+        (role, OSC::set_role, "runcon-operation-setting-role"),
+        (the_type, OSC::set_type, "runcon-operation-setting-type"),
+        (range, OSC::set_range, "runcon-operation-setting-range"),
+    ];
+
+    循环 &(new_value, method, op_key) 在 list {
+        如果 设 一些(new_value) = new_value {
+            设 c_new_value = os_str_to_c_string(new_value)?;
+            method(&osc, &c_new_value).map_err(|r| 错误协议::from_selinux(op_key, r))?;
+        }
+    }
+    好的(osc)
+}
+
+/// The actual return type of this function should be `UResult<!>`.
+/// However, until the *never* type is stabilized, one way to indicate to the
+/// compiler the only valid return type is to say "if this returns, it will
+/// always return an error".
+///
+/// When `skip_path_search` is true (used with `-c` flag), the command is executed
+/// without PATH lookup, matching GNU's use of execv() vs execvp().
+方法 execute_command(command: &OsStr, arguments: &[OsString], skip_path_search: 布尔) -> UResult<()> {
+    // When skip_path_search is true and command has no path separator,
+    // prepend "./" to prevent PATH lookup (like execv vs execvp).
+    设 command_path = 如果 skip_path_search && !command.as_bytes().包含(&b'/') {
+        设 可变 路径 = OsString::from("./");
+        路径.压入(command);
+        路径
+    } 否则 {
+        command.to_os_string()
+    };
+
+    设 err = 进程::Command::新建(&command_path).args(arguments).exec();
+
+    设 exit_status = 如果 err.kind() == 输入输出::ErrorKind::NotFound {
+        error_exit_status::NOT_FOUND
+    } 否则 {
+        error_exit_status::COULD_NOT_EXECUTE
+    };
+
+    设 err = 错误协议::from_io1("runcon-operation-executing-command", command, err);
+    坏的(RunconError::with_code(exit_status, err).into())
+}
+
+方法 os_str_to_c_string(s: &OsStr) -> 结果<CString> {
+    CString::新建(s.as_bytes()).map_err(|_r| {
+        错误协议::from_io(
+            "runcon-operation-cstring-new",
+            输入输出::ErrorKind::InvalidInput.into(),
+        )
+    })
+}

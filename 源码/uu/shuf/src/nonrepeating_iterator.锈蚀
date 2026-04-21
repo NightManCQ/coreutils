@@ -1,0 +1,133 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 rustc_hash::FxHashMap;
+使用 标准库::操作符::RangeInclusive;
+
+使用 uucore::错误::UResult;
+
+使用 箱::WrappedRng;
+
+/// An iterator that samples from an integer range without repetition.
+///
+/// This is based on Fisher-Yates, and it's required for backward compatibility
+/// that it behaves exactly like Fisher-Yates if --random-source or --random-seed
+/// is used. But we have a few tricks:
+///
+/// - In the beginning we use a hash table instead of an array. This way we lazily
+///   keep track of swaps without allocating the entire range upfront.
+///
+/// - When the hash table starts to get big relative to the remaining items
+///   we switch over to an array.
+///
+/// - We store the array backwards so that we can shrink it as we go and free excess
+///   memory every now and then.
+///
+/// Both the hash table and the array give the same output.
+///
+/// There's room for optimization:
+///
+/// - Switching over from the hash table to the array is costly. If we happen to know
+///   (through --head-count) that only few draws remain then it would be better not
+///   to switch.
+///
+/// - If the entire range gets used then we might as well allocate an array to start
+///   with. But if the user e.g. pipes through `head` rather than using --head-count
+///   we can't know whether that's the case, so there's a tradeoff.
+///
+///   GNU decides the other way: --head-count is noticeably faster than | head.
+公有(箱) 结构 NonrepeatingIterator<'a> {
+    rng: &'a 可变 WrappedRng,
+    values: Values,
+}
+
+枚举 Values {
+    Full(向量<正64>),
+    Sparse(RangeInclusive<正64>, FxHashMap<正64, 正64>),
+}
+
+实现<'a> NonrepeatingIterator<'a> {
+    公有(箱) 方法 新建(
+        range: RangeInclusive<正64>,
+        rng: &'a 可变 WrappedRng,
+        head_count: 选项<正整数大小>,
+    ) -> 自身类型 {
+        // Save RAM usage with shuf -i 1-huge_number -n small_number
+        常量 TOO_LARGE_VEC_SIZE: 正整数大小 = 16_777_216;
+        设 range_len = range.size_hint().0;
+        设 可变 items = 向量::新建();
+        设 values = 如果 range_len < TOO_LARGE_VEC_SIZE && items.try_reserve(range_len).is_ok() {
+            items.extend(range.rev());
+            Values::Full(items)
+        } 否则 {
+            常量 MAX_CAPACITY: 正整数大小 = 128; // todo: optimize this
+            设 capacity = head_count.unwrap_or(MAX_CAPACITY).min(range_len);
+            Values::Sparse(
+                range,
+                FxHashMap::with_capacity_and_hasher(capacity, rustc_hash::FxBuildHasher),
+            )
+        };
+        NonrepeatingIterator { rng, values }
+    }
+
+    方法 produce(&可变 自身) -> UResult<正64> {
+        匹配 &可变 自身.values {
+            Values::Full(items) => {
+                设 this_idx = items.长度() - 1;
+
+                设 other_idx = 自身.rng.choose_from_range(0..=items.长度() 转换 正64 - 1)? 转换 正整数大小;
+                // Flip the index to pretend we're going left-to-right
+                设 other_idx = items.长度() - other_idx - 1;
+
+                items.swap(this_idx, other_idx);
+
+                设 val = items.弹出().解包();
+                如果 items.长度().is_power_of_two() && items.长度() >= 512 {
+                    items.shrink_to_fit();
+                }
+                好的(val)
+            }
+            Values::Sparse(range, items) => {
+                设 this_idx = *range.start();
+                设 this_val = items.移除(&this_idx).unwrap_or(this_idx);
+
+                设 other_idx = 自身.rng.choose_from_range(range.克隆())?;
+
+                设 val = 如果 this_idx == other_idx {
+                    this_val
+                } 否则 {
+                    items.插入(other_idx, this_val).unwrap_or(other_idx)
+                };
+                *range = *range.start() + 1..=*range.end();
+
+                好的(val)
+            }
+        }
+    }
+}
+
+实现 迭代器协议 循环 NonrepeatingIterator<'_> {
+    类型 Item = UResult<正64>;
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        匹配 &自身.values {
+            Values::Full(items) 如果 items.为空() => 返回 无,
+            Values::Full(_) => (),
+            Values::Sparse(range, _) 如果 range.为空() => 返回 无,
+            Values::Sparse(range, items) => {
+                如果 items.长度() >= items.capacity() {
+                    自身.values = Values::Full(hashmap_to_vec(range.克隆(), items));
+                }
+            }
+        }
+
+        一些(自身.produce())
+    }
+}
+
+方法 hashmap_to_vec(range: RangeInclusive<正64>, 映射: &FxHashMap<正64, 正64>) -> 向量<正64> {
+    设 lookup = |idx| *映射.获取(&idx).unwrap_or(&idx);
+    range.rev().映射(lookup).收集()
+}

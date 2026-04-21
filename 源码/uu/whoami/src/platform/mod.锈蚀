@@ -1,0 +1,18 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) getusername
+
+#[cfg(unix)]
+公有 使用 自身::unix::get_username;
+
+#[cfg(windows)]
+公有 使用 自身::windows::get_username;
+
+#[cfg(unix)]
+模组 unix;
+
+#[cfg(windows)]
+模组 windows;

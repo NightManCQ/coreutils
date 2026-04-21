@@ -1,0 +1,53 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::Write;
+使用 uucore::{crate_version, translate};
+
+// uucore::main does not support no-result
+公有 方法 uumain(可变 args: 实现 uucore::Args) -> 整32 {
+    // skip binary name
+    设 (一些(flag), 无) = (args.nth(1), args.next()) 否则 {
+        返回 1;
+    };
+
+    设 错误 = 如果 flag == "--help" {
+        uu_app().print_help()
+    } 否则 如果 flag == "--version" {
+        // avoid uu_app for smaller binary size
+        writeln!(标准库::输入输出::stdout(), "false {}", crate_version!())
+    } 否则 {
+        返回 1;
+    };
+
+    如果 设 坏的(print_fail) = 错误
+        && print_fail.kind() != 标准库::输入输出::ErrorKind::BrokenPipe
+    {
+        设 _ = writeln!(标准库::输入输出::stderr(), "false: {print_fail}");
+    }
+    1
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("false")
+        .version(crate_version!())
+        .help_template(uucore::localized_help_template("false"))
+        .about(translate!("false-about"))
+        // We provide our own help and version options, to ensure maximum compatibility with GNU.
+        .disable_help_flag(真)
+        .disable_version_flag(真)
+        .arg(
+            Arg::新建("help")
+                .long("help")
+                .help(translate!("false-help-text"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建("version")
+                .long("version")
+                .help(translate!("false-version-text"))
+                .action(ArgAction::Version),
+        )
+}

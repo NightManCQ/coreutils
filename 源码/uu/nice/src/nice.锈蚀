@@ -1,0 +1,200 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) getpriority setpriority nstr PRIO
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{ErrorKind, Write, stdout};
+使用 标准库::数字::IntErrorKind;
+使用 标准库::操作系统::unix::进程::CommandExt;
+使用 标准库::进程;
+
+使用 uucore::translate;
+使用 uucore::{
+    错误::{UResult, USimpleError, UUsageError, set_exit_code},
+    format_usage, show_error,
+};
+
+公有 模组 options {
+    公有 静态 ADJUSTMENT: &字符串切片 = "adjustment";
+    公有 静态 COMMAND: &字符串切片 = "COMMAND";
+}
+
+常量 NICE_BOUND_NO_OVERFLOW: 整32 = 50;
+
+方法 is_prefix_of(maybe_prefix: &字符串切片, target: &字符串切片, min_match: 正整数大小) -> 布尔 {
+    如果 maybe_prefix.长度() < min_match || maybe_prefix.长度() > target.长度() {
+        返回 假;
+    }
+
+    &target[0..maybe_prefix.长度()] == maybe_prefix
+}
+
+/// Transform legacy arguments into a standardized form.
+///
+/// The following are all legal argument sequences to GNU nice:
+/// - "-1"
+/// - "-n1"
+/// - "-+1"
+/// - "--1"
+/// - "-n -1"
+///
+/// It looks initially like we could add handling for "-{i}", "--{i}"
+/// and "-+{i}" for integers {i} and process them normally using clap.
+/// However, the meaning of "-1", for example, changes depending on
+/// its context with legacy argument parsing. clap will not prioritize
+/// hyphenated values to previous arguments over matching a known
+/// argument.  So "-n" "-1" in this case is picked up as two
+/// arguments, not one argument with a value.
+///
+/// Given this context dependency, and the deep hole we end up digging
+/// with clap in this case, it's much simpler to just normalize the
+/// arguments to nice before clap starts work. Here, we insert a
+/// prefix of "-n" onto all arguments of the form "-{i}", "--{i}" and
+/// "-+{i}" which are not already preceded by "-n".
+方法 standardize_nice_args(可变 args: 实现 uucore::Args) -> 实现 uucore::Args {
+    设 可变 v = 向量::<OsString>::新建();
+    设 可变 saw_n = 假;
+    设 可变 saw_command = 假;
+    如果 设 一些(cmd) = args.next() {
+        v.压入(cmd);
+    }
+    循环 s 在 args {
+        如果 saw_command {
+            v.压入(s);
+        } 否则 如果 saw_n {
+            设 可变 new_arg: OsString = "-n".into();
+            new_arg.压入(s);
+            v.压入(new_arg);
+            saw_n = 假;
+        } 否则 如果 s.to_str() == 一些("-n")
+            || s.to_str()
+                .is_some_and(|s| is_prefix_of(s, "--adjustment", "--a".长度()))
+        {
+            saw_n = 真;
+        } 否则 如果 设 好的(s) = s.克隆().into_string() {
+            如果 设 一些(stripped) = s.strip_prefix('-') {
+                匹配 stripped.parse::<整64>() {
+                    好的(ix) => {
+                        设 可变 new_arg: OsString = "-n".into();
+                        new_arg.压入(ix.to_string());
+                        v.压入(new_arg);
+                    }
+                    坏的(_) => {
+                        v.压入(s.into());
+                    }
+                }
+            } 否则 {
+                saw_command = 真;
+                v.压入(s.into());
+            }
+        } 否则 {
+            saw_command = 真;
+            v.压入(s);
+        }
+    }
+    如果 saw_n {
+        v.压入("-n".into());
+    }
+    v.into_iter()
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args = standardize_nice_args(args);
+
+    设 matches =
+        uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 125)?;
+
+    设 可变 niceness = 匹配 rustix::进程::getpriority_process(无) {
+        好的(p) => p,
+        坏的(e) => {
+            返回 坏的(USimpleError::新建(125, 格式化!("getpriority: {e}")));
+        }
+    };
+
+    设 adjustment = 如果 设 一些(nstr) = matches.get_one::<字符串>(options::ADJUSTMENT) {
+        如果 !matches.contains_id(options::COMMAND) {
+            返回 坏的(UUsageError::新建(
+                125,
+                translate!("nice-error-command-required-with-adjustment"),
+            ));
+        }
+        匹配 nstr.parse::<整32>() {
+            好的(数字) => 数字,
+            坏的(e) => 匹配 e.kind() {
+                IntErrorKind::PosOverflow => NICE_BOUND_NO_OVERFLOW,
+                IntErrorKind::NegOverflow => -NICE_BOUND_NO_OVERFLOW,
+                _ => {
+                    返回 坏的(USimpleError::新建(
+                        125,
+                        translate!("nice-error-invalid-number", "value" => nstr.克隆(), "error" => e),
+                    ));
+                }
+            },
+        }
+    } 否则 {
+        如果 !matches.contains_id(options::COMMAND) {
+            writeln!(stdout(), "{niceness}")?;
+            返回 好的(());
+        }
+        10_i32
+    };
+
+    niceness += adjustment;
+    // We can't use `show_warning` because that will panic if stderr
+    // isn't writable. The GNU test suite checks specifically that the
+    // exit code when failing to write the advisory is 125, but Rust
+    // will produce an exit code of 101 when it panics.
+    如果 设 坏的(e) = rustix::进程::setpriority_process(无, niceness) {
+        设 warning_msg = translate!("nice-warning-setpriority", "util_name" => "nice", "error" => e.to_string() );
+
+        如果 write!(标准库::输入输出::stderr(), "{warning_msg}").is_err() {
+            set_exit_code(125);
+            返回 好的(());
+        }
+    }
+
+    设 可变 cmd_iter = matches.get_many::<字符串>(options::COMMAND).解包();
+    设 cmd = cmd_iter.next().解包();
+    设 args: 向量<&字符串> = cmd_iter.收集();
+
+    设 err = 进程::Command::新建(cmd).args(args).exec();
+
+    show_error!("{cmd}: {err}");
+
+    设 exit_code = 如果 err.kind() == ErrorKind::NotFound {
+        127
+    } 否则 {
+        126
+    };
+    set_exit_code(exit_code);
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("nice")
+        .about(translate!("nice-about"))
+        .override_usage(format_usage(&translate!("nice-usage")))
+        .trailing_var_arg(真)
+        .infer_long_args(真)
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("nice"))
+        .arg(
+            Arg::新建(options::ADJUSTMENT)
+                .short('n')
+                .long(options::ADJUSTMENT)
+                .help(translate!("nice-help-adjustment"))
+                .action(ArgAction::Set)
+                .overrides_with(options::ADJUSTMENT)
+                .allow_hyphen_values(真),
+        )
+        .arg(
+            Arg::新建(options::COMMAND)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::CommandName),
+        )
+}

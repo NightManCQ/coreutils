@@ -1,0 +1,206 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore wstat towrite cdefg bufferedoutput
+//! Buffer partial output blocks until they are completed.
+//!
+//! Use the [`BufferedOutput`] struct to create a buffered form of the
+//! [`Output`] writer.
+使用 箱::{Output, WriteStat};
+
+/// Buffer partial output blocks until they are completed.
+///
+/// Complete blocks are written immediately to the inner [`Output`],
+/// but partial blocks are stored in an internal buffer until they are
+/// completed.
+公有(箱) 结构 BufferedOutput<'a> {
+    /// The unbuffered inner block writer.
+    inner: Output<'a>,
+
+    /// The internal buffer that stores a partial block.
+    ///
+    /// The size of this buffer is always less than the output block
+    /// size (that is, the value of the `obs` command-line option).
+    buf: 向量<正8>,
+}
+
+实现<'a> BufferedOutput<'a> {
+    /// Add partial block buffering to the given block writer.
+    ///
+    /// The internal buffer size is at most the value of `obs` as
+    /// defined in `inner`.
+    公有(箱) 方法 新建(inner: Output<'a>) -> 自身类型 {
+        设 obs = inner.settings.obs;
+        自身类型 {
+            inner,
+            buf: 向量::with_capacity(obs),
+        }
+    }
+
+    公有(箱) 方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) {
+        自身.inner.discard_cache(offset, 长度);
+    }
+
+    /// Flush the partial block stored in the internal buffer.
+    公有(箱) 方法 flush(&可变 自身) -> 标准库::输入输出::结果<WriteStat> {
+        设 wstat = 自身.inner.write_blocks(&自身.buf)?;
+        设 n = wstat.bytes_total.try_into().解包();
+        自身.buf.清空(0..n);
+        好的(wstat)
+    }
+
+    /// Synchronize the inner block writer.
+    公有(箱) 方法 同步(&可变 自身) -> 标准库::输入输出::结果<()> {
+        自身.inner.同步()
+    }
+
+    /// Truncate the underlying file to the current stream position, if possible.
+    公有(箱) 方法 truncate(&可变 自身) -> 标准库::输入输出::结果<()> {
+        自身.inner.dst.truncate()
+    }
+
+    /// Write the given bytes one block at a time.
+    ///
+    /// Only complete blocks will be written. Partial blocks will be
+    /// buffered until enough bytes have been provided to complete a
+    /// block. The returned [`WriteStat`] object will include the
+    /// number of blocks written during execution of this function.
+    公有(箱) 方法 write_blocks(&可变 自身, buf: &[正8]) -> 标准库::输入输出::结果<WriteStat> {
+        // Split the incoming buffer into two parts: the bytes to write
+        // and the bytes to buffer for next time.
+        //
+        // If `buf` does not include enough bytes to form a full block,
+        // just buffer the whole thing and write zero blocks.
+        设 n = 自身.buf.长度() + buf.长度();
+        设 rem = n % 自身.inner.settings.obs;
+        设 i = buf.长度().saturating_sub(rem);
+        设 (to_write, to_buffer) = buf.split_at(i);
+
+        // Concatenate the old partial block with the new bytes to form
+        // some number of complete blocks.
+        自身.buf.extend_from_slice(to_write);
+
+        // Write all complete blocks to the inner block writer.
+        //
+        // For example, if the output block size were 3, the buffered
+        // partial block were `b"ab"` and the new incoming bytes were
+        // `b"cdefg"`, then we would write blocks `b"abc"` and
+        // b`"def"` to the inner block writer.
+        设 wstat = 自身.inner.write_blocks(&自身.buf)?;
+
+        // Buffer any remaining bytes as a partial block.
+        //
+        // Continuing the example above, the last byte `b"g"` would be
+        // buffered as a partial block until the next call to
+        // `write_blocks()`.
+        自身.buf.clear();
+        自身.buf.extend_from_slice(to_buffer);
+
+        好的(wstat)
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+模组 tests {
+    使用 箱::bufferedoutput::BufferedOutput;
+    使用 箱::{Dest, Output, Settings};
+
+    #[test]
+    方法 test_buffered_output_write_blocks_empty() {
+        设 settings = Settings {
+            obs: 3,
+            ..默认协议::默认()
+        };
+        设 inner = Output {
+            dst: Dest::Sink,
+            settings: &settings,
+        };
+        设 可变 output = BufferedOutput::新建(inner);
+        设 wstat = output.write_blocks(&[]).解包();
+        相等断言!(wstat.writes_complete, 0);
+        相等断言!(wstat.writes_partial, 0);
+        相等断言!(wstat.bytes_total, 0);
+        相等断言!(output.buf, 向量![]);
+    }
+
+    #[test]
+    方法 test_buffered_output_write_blocks_partial() {
+        设 settings = Settings {
+            obs: 3,
+            ..默认协议::默认()
+        };
+        设 inner = Output {
+            dst: Dest::Sink,
+            settings: &settings,
+        };
+        设 可变 output = BufferedOutput::新建(inner);
+        设 wstat = output.write_blocks(b"ab").解包();
+        相等断言!(wstat.writes_complete, 0);
+        相等断言!(wstat.writes_partial, 0);
+        相等断言!(wstat.bytes_total, 0);
+        相等断言!(output.buf, b"ab");
+    }
+
+    #[test]
+    方法 test_buffered_output_write_blocks_complete() {
+        设 settings = Settings {
+            obs: 3,
+            ..默认协议::默认()
+        };
+        设 inner = Output {
+            dst: Dest::Sink,
+            settings: &settings,
+        };
+        设 可变 output = BufferedOutput::新建(inner);
+        设 wstat = output.write_blocks(b"abcd").解包();
+        相等断言!(wstat.writes_complete, 1);
+        相等断言!(wstat.writes_partial, 0);
+        相等断言!(wstat.bytes_total, 3);
+        相等断言!(output.buf, b"d");
+    }
+
+    #[test]
+    方法 test_buffered_output_write_blocks_append() {
+        设 settings = Settings {
+            obs: 3,
+            ..默认协议::默认()
+        };
+        设 inner = Output {
+            dst: Dest::Sink,
+            settings: &settings,
+        };
+        设 可变 output = BufferedOutput {
+            inner,
+            buf: b"ab".to_vec(),
+        };
+        设 wstat = output.write_blocks(b"cdefg").解包();
+        相等断言!(wstat.writes_complete, 2);
+        相等断言!(wstat.writes_partial, 0);
+        相等断言!(wstat.bytes_total, 6);
+        相等断言!(output.buf, b"g");
+    }
+
+    #[test]
+    方法 test_buffered_output_flush() {
+        设 settings = Settings {
+            obs: 10,
+            ..默认协议::默认()
+        };
+        设 inner = Output {
+            dst: Dest::Sink,
+            settings: &settings,
+        };
+        设 可变 output = BufferedOutput {
+            inner,
+            buf: b"abc".to_vec(),
+        };
+        设 wstat = output.flush().解包();
+        相等断言!(wstat.writes_complete, 0);
+        相等断言!(wstat.writes_partial, 1);
+        相等断言!(wstat.bytes_total, 3);
+        相等断言!(output.buf, 向量![]);
+    }
+}

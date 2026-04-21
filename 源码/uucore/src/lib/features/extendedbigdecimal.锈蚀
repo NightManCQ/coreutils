@@ -1,0 +1,292 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore bigdecimal extendedbigdecimal biguint
+//! An arbitrary precision float that can also represent infinity, NaN, etc.
+//!
+//! The finite values are stored as [`BigDecimal`] instances. Because
+//! the `bigdecimal` library does not represent infinity, NaN, etc., we
+//! need to represent them explicitly ourselves. The
+//! [`ExtendedBigDecimal`] enumeration does that.
+//!
+//! # Examples
+//!
+//! Addition works for [`ExtendedBigDecimal`] as it does for floats. For
+//! example, adding infinity to any finite value results in infinity:
+//!
+//! ```rust,ignore
+//! let summand1 = ExtendedBigDecimal::BigDecimal(BigDecimal::zero());
+//! let summand2 = ExtendedBigDecimal::Infinity;
+//! assert_eq!(summand1 + summand2, ExtendedBigDecimal::Infinity);
+//! ```
+使用 标准库::比较::排序顺序;
+使用 标准库::操作符::Add;
+使用 标准库::操作符::Neg;
+
+使用 bigdecimal::BigDecimal;
+使用 bigdecimal::num_bigint::BigUint;
+使用 num_traits::FromPrimitive;
+使用 num_traits::Signed;
+使用 num_traits::Zero;
+
+#[derive(调试协议, 克隆协议)]
+公有 枚举 ExtendedBigDecimal {
+    /// Arbitrary precision floating point number.
+    BigDecimal(BigDecimal),
+
+    /// Floating point positive infinity.
+    ///
+    /// This is represented as its own enumeration member instead of as
+    /// a [`BigDecimal`] because the `bigdecimal` library does not
+    /// support infinity, see [here][0].
+    ///
+    /// [0]: https://github.com/akubera/bigdecimal-rs/issues/67
+    Infinity,
+
+    /// Floating point negative infinity.
+    ///
+    /// This is represented as its own enumeration member instead of as
+    /// a [`BigDecimal`] because the `bigdecimal` library does not
+    /// support infinity, see [here][0].
+    ///
+    /// [0]: https://github.com/akubera/bigdecimal-rs/issues/67
+    MinusInfinity,
+
+    /// Floating point negative zero.
+    ///
+    /// This is represented as its own enumeration member instead of as
+    /// a [`BigDecimal`] because the `bigdecimal` library does not
+    /// support negative zero.
+    MinusZero,
+
+    /// Floating point NaN.
+    ///
+    /// This is represented as its own enumeration member instead of as
+    /// a [`BigDecimal`] because the `bigdecimal` library does not
+    /// support NaN, see [here][0].
+    ///
+    /// [0]: https://github.com/akubera/bigdecimal-rs/issues/67
+    Nan,
+
+    /// Floating point negative NaN.
+    ///
+    /// This is represented as its own enumeration member instead of as
+    /// a [`BigDecimal`] because the `bigdecimal` library does not
+    /// support NaN, see [here][0].
+    ///
+    /// [0]: https://github.com/akubera/bigdecimal-rs/issues/67
+    MinusNan,
+}
+
+实现 转换协议<点64> 循环 ExtendedBigDecimal {
+    方法 from(val: 点64) -> 自身类型 {
+        如果 val.is_nan() {
+            如果 val.is_sign_negative() {
+                自身类型::MinusNan
+            } 否则 {
+                自身类型::Nan
+            }
+        } 否则 如果 val.is_infinite() {
+            如果 val.is_sign_negative() {
+                自身类型::MinusInfinity
+            } 否则 {
+                自身类型::Infinity
+            }
+        } 否则 如果 val.is_zero() && val.is_sign_negative() {
+            自身类型::MinusZero
+        } 否则 {
+            自身类型::BigDecimal(BigDecimal::from_f64(val).解包())
+        }
+    }
+}
+
+实现 转换协议<正8> 循环 ExtendedBigDecimal {
+    方法 from(val: 正8) -> 自身类型 {
+        自身类型::BigDecimal(val.into())
+    }
+}
+
+实现 转换协议<正32> 循环 ExtendedBigDecimal {
+    方法 from(val: 正32) -> 自身类型 {
+        自身类型::BigDecimal(val.into())
+    }
+}
+
+实现 ExtendedBigDecimal {
+    公有 方法 zero() -> 自身类型 {
+        自身类型::BigDecimal(0.into())
+    }
+
+    公有 方法 one() -> 自身类型 {
+        自身类型::BigDecimal(1.into())
+    }
+
+    公有 方法 to_biguint(&自身) -> 选项<BigUint> {
+        匹配 自身 {
+            自身类型::BigDecimal(big_decimal) => {
+                设 (bi, scale) = big_decimal.as_bigint_and_scale();
+                如果 bi.is_negative() || scale > 0 || scale < -(正32::MAX 转换 整64) {
+                    返回 无;
+                }
+                bi.to_biguint()
+                    .映射(|bi| bi * BigUint::from(10正32).pow(-scale 转换 正32))
+            }
+            _ => 无,
+        }
+    }
+}
+
+实现 Zero 循环 ExtendedBigDecimal {
+    方法 zero() -> 自身类型 {
+        自身类型::BigDecimal(BigDecimal::zero())
+    }
+    方法 is_zero(&自身) -> 布尔 {
+        匹配 自身 {
+            自身类型::BigDecimal(n) => n.is_zero(),
+            自身类型::MinusZero => 真,
+            _ => 假,
+        }
+    }
+}
+
+实现 默认协议 循环 ExtendedBigDecimal {
+    方法 默认() -> 自身类型 {
+        自身类型::zero()
+    }
+}
+
+实现 Add 循环 ExtendedBigDecimal {
+    类型 Output = 自身类型;
+
+    方法 add(自身, other: 自身类型) -> 自身类型 {
+        匹配 (自身, other) {
+            (自身类型::BigDecimal(m), 自身类型::BigDecimal(n)) => 自身类型::BigDecimal(m.add(n)),
+            (自身类型::BigDecimal(_), 自身类型::MinusInfinity) => 自身类型::MinusInfinity,
+            (自身类型::BigDecimal(_), 自身类型::Infinity) => 自身类型::Infinity,
+            (自身类型::BigDecimal(m), 自身类型::MinusZero) => 自身类型::BigDecimal(m),
+            (自身类型::Infinity, 自身类型::BigDecimal(_)) => 自身类型::Infinity,
+            (自身类型::Infinity, 自身类型::Infinity) => 自身类型::Infinity,
+            (自身类型::Infinity, 自身类型::MinusZero) => 自身类型::Infinity,
+            (自身类型::Infinity, 自身类型::MinusInfinity) => 自身类型::Nan,
+            (自身类型::MinusInfinity, 自身类型::BigDecimal(_)) => 自身类型::MinusInfinity,
+            (自身类型::MinusInfinity, 自身类型::MinusInfinity) => 自身类型::MinusInfinity,
+            (自身类型::MinusInfinity, 自身类型::MinusZero) => 自身类型::MinusInfinity,
+            (自身类型::MinusInfinity, 自身类型::Infinity) => 自身类型::Nan,
+            (自身类型::Nan, _) => 自身类型::Nan,
+            (_, 自身类型::Nan) => 自身类型::Nan,
+            (自身类型::MinusNan, _) => 自身类型::MinusNan,
+            (_, 自身类型::MinusNan) => 自身类型::MinusNan,
+            (自身类型::MinusZero, other) => other,
+        }
+    }
+}
+
+实现 偏等比较协议 循环 ExtendedBigDecimal {
+    方法 eq(&自身, other: &自身类型) -> 布尔 {
+        匹配 (自身, other) {
+            (自身类型::BigDecimal(m), 自身类型::BigDecimal(n)) => m.eq(n),
+            (自身类型::BigDecimal(_), 自身类型::MinusInfinity) => 假,
+            (自身类型::BigDecimal(_), 自身类型::Infinity) => 假,
+            (自身类型::BigDecimal(_), 自身类型::MinusZero) => 假,
+            (自身类型::Infinity, 自身类型::BigDecimal(_)) => 假,
+            (自身类型::Infinity, 自身类型::Infinity) => 真,
+            (自身类型::Infinity, 自身类型::MinusZero) => 假,
+            (自身类型::Infinity, 自身类型::MinusInfinity) => 假,
+            (自身类型::MinusInfinity, 自身类型::BigDecimal(_)) => 假,
+            (自身类型::MinusInfinity, 自身类型::Infinity) => 假,
+            (自身类型::MinusInfinity, 自身类型::MinusZero) => 假,
+            (自身类型::MinusInfinity, 自身类型::MinusInfinity) => 真,
+            (自身类型::MinusZero, 自身类型::BigDecimal(_)) => 假,
+            (自身类型::MinusZero, 自身类型::Infinity) => 假,
+            (自身类型::MinusZero, 自身类型::MinusZero) => 真,
+            (自身类型::MinusZero, 自身类型::MinusInfinity) => 假,
+            (自身类型::Nan, _) => 假,
+            (自身类型::MinusNan, _) => 假,
+            (_, 自身类型::Nan) => 假,
+            (_, 自身类型::MinusNan) => 假,
+        }
+    }
+}
+
+实现 偏序比较协议 循环 ExtendedBigDecimal {
+    方法 partial_cmp(&自身, other: &自身类型) -> 选项<排序顺序> {
+        匹配 (自身, other) {
+            (自身类型::BigDecimal(m), 自身类型::BigDecimal(n)) => m.partial_cmp(n),
+            (自身类型::BigDecimal(_), 自身类型::MinusInfinity) => 一些(排序顺序::Greater),
+            (自身类型::BigDecimal(_), 自身类型::Infinity) => 一些(排序顺序::Less),
+            (自身类型::BigDecimal(m), 自身类型::MinusZero) => m.partial_cmp(&BigDecimal::zero()),
+            (自身类型::Infinity, 自身类型::BigDecimal(_)) => 一些(排序顺序::Greater),
+            (自身类型::Infinity, 自身类型::Infinity) => 一些(排序顺序::Equal),
+            (自身类型::Infinity, 自身类型::MinusZero) => 一些(排序顺序::Greater),
+            (自身类型::Infinity, 自身类型::MinusInfinity) => 一些(排序顺序::Greater),
+            (自身类型::MinusInfinity, 自身类型::BigDecimal(_)) => 一些(排序顺序::Less),
+            (自身类型::MinusInfinity, 自身类型::Infinity) => 一些(排序顺序::Less),
+            (自身类型::MinusInfinity, 自身类型::MinusZero) => 一些(排序顺序::Less),
+            (自身类型::MinusInfinity, 自身类型::MinusInfinity) => 一些(排序顺序::Equal),
+            (自身类型::MinusZero, 自身类型::BigDecimal(n)) => BigDecimal::zero().partial_cmp(n),
+            (自身类型::MinusZero, 自身类型::Infinity) => 一些(排序顺序::Less),
+            (自身类型::MinusZero, 自身类型::MinusZero) => 一些(排序顺序::Equal),
+            (自身类型::MinusZero, 自身类型::MinusInfinity) => 一些(排序顺序::Greater),
+            (自身类型::Nan, _) => 无,
+            (自身类型::MinusNan, _) => 无,
+            (_, 自身类型::Nan) => 无,
+            (_, 自身类型::MinusNan) => 无,
+        }
+    }
+}
+
+实现 Neg 循环 ExtendedBigDecimal {
+    类型 Output = 自身类型;
+
+    方法 neg(自身) -> 自身类型::Output {
+        匹配 自身 {
+            自身类型::BigDecimal(bd) => {
+                如果 bd.is_zero() {
+                    自身类型::MinusZero
+                } 否则 {
+                    自身类型::BigDecimal(bd.neg())
+                }
+            }
+            自身类型::MinusZero => 自身类型::BigDecimal(BigDecimal::zero()),
+            自身类型::Infinity => 自身类型::MinusInfinity,
+            自身类型::MinusInfinity => 自身类型::Infinity,
+            自身类型::Nan => 自身类型::MinusNan,
+            自身类型::MinusNan => 自身类型::Nan,
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 bigdecimal::BigDecimal;
+    使用 num_traits::Zero;
+
+    使用 箱::extendedbigdecimal::ExtendedBigDecimal;
+
+    #[test]
+    方法 test_addition_infinity() {
+        设 summand1 = ExtendedBigDecimal::BigDecimal(BigDecimal::zero());
+        设 summand2 = ExtendedBigDecimal::Infinity;
+        相等断言!(summand1 + summand2, ExtendedBigDecimal::Infinity);
+    }
+
+    #[test]
+    方法 test_addition_minus_infinity() {
+        设 summand1 = ExtendedBigDecimal::BigDecimal(BigDecimal::zero());
+        设 summand2 = ExtendedBigDecimal::MinusInfinity;
+        相等断言!(summand1 + summand2, ExtendedBigDecimal::MinusInfinity);
+    }
+
+    #[test]
+    方法 test_addition_nan() {
+        设 summand1 = ExtendedBigDecimal::BigDecimal(BigDecimal::zero());
+        设 summand2 = ExtendedBigDecimal::Nan;
+        设 求和 = summand1 + summand2;
+        匹配 求和 {
+            ExtendedBigDecimal::Nan => (),
+            _ => 无法到达!(),
+        }
+    }
+}

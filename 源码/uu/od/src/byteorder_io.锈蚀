@@ -1,0 +1,57 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (ToDO) byteorder
+
+// workaround until https://github.com/BurntSushi/byteorder/issues/41 has been fixed
+// based on: https://github.com/netvl/immeta/blob/4460ee/src/utils.rs#L76
+
+使用 byteorder::ByteOrder 转换 ByteOrderTrait;
+使用 byteorder::{BigEndian, LittleEndian, NativeEndian};
+
+#[derive(复制协议, 克隆协议, 调试协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 ByteOrder {
+    Little,
+    Big,
+    Native,
+}
+
+macro_rules! gen_byte_order_ops {
+    ($($read_name:ident, $write_name:ident -> $tpe:ty),+) => {
+        实现 ByteOrder {
+            $(
+            #[allow(dead_code)]
+            #[inline]
+            公有 方法 $read_name(自身, source: &[正8]) -> $tpe {
+                匹配 自身 {
+                    ByteOrder::Little => LittleEndian::$read_name(source),
+                    ByteOrder::Big => BigEndian::$read_name(source),
+                    ByteOrder::Native => NativeEndian::$read_name(source),
+                }
+            }
+
+            #[allow(dead_code)]
+            公有 方法 $write_name(自身, target: &可变 [正8], n: $tpe) {
+                匹配 自身 {
+                    ByteOrder::Little => LittleEndian::$write_name(target, n),
+                    ByteOrder::Big => BigEndian::$write_name(target, n),
+                    ByteOrder::Native => NativeEndian::$write_name(target, n),
+                }
+            }
+            )+
+        }
+    }
+}
+
+gen_byte_order_ops! {
+    read_u16, write_u16 -> 正16,
+    read_u32, write_u32 -> 正32,
+    read_u64, write_u64 -> 正64,
+    read_i16, write_i16 -> 整16,
+    read_i32, write_i32 -> 整32,
+    read_i64, write_i64 -> 整64,
+    read_f32, write_f32 -> 点32,
+    read_f64, write_f64 -> 点64,
+    read_u128, write_u128 -> 正128
+}

@@ -1,0 +1,37 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::操作系统::windows::ffi::{OsStrExt, OsStringExt};
+公有 协议 ToWide {
+    方法 to_wide(&自身) -> 向量<正16>;
+    方法 to_wide_null(&自身) -> 向量<正16>;
+}
+实现<T> ToWide 循环 T
+何处
+    T: 作为引用协议<OsStr>,
+{
+    方法 to_wide(&自身) -> 向量<正16> {
+        自身.as_ref().encode_wide().收集()
+    }
+    方法 to_wide_null(&自身) -> 向量<正16> {
+        自身.as_ref().encode_wide().chain(一些(0)).收集()
+    }
+}
+公有 协议 FromWide {
+    方法 from_wide(wide: &[正16]) -> 自身类型;
+    方法 from_wide_null(wide: &[正16]) -> 自身类型;
+}
+实现 FromWide 循环 字符串 {
+    方法 from_wide(wide: &[正16]) -> 自身类型 {
+        OsString::from_wide(wide).to_string_lossy().into_owned()
+    }
+    方法 from_wide_null(wide: &[正16]) -> 自身类型 {
+        设 长度 = wide.迭代().take_while(|&&c| c != 0).计数();
+        OsString::from_wide(&wide[..长度])
+            .to_string_lossy()
+            .into_owned()
+    }
+}

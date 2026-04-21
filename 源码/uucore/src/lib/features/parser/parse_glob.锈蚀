@@ -1,0 +1,126 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//! Parsing a glob Pattern from a string.
+//!
+//! Use the [`from_str`] function to parse a [`Pattern`] from a string.
+
+// cSpell:words fnmatch
+
+使用 glob::{Pattern, PatternError};
+
+方法 fix_negation(glob: &字符串切片) -> 字符串 {
+    设 可变 chars = glob.chars().收集::<向量<_>>();
+
+    设 可变 i = 0;
+    // Add 3 to prevent out of bounds in loop
+    当 i + 3 < chars.长度() {
+        如果 chars[i] == '[' && chars[i + 1] == '^' {
+            匹配 chars[i + 3..].迭代().position(|x| *x == ']') {
+                无 => {
+                    // if closing square bracket not found, stop looking for it
+                    // again
+                    中断;
+                }
+                一些(j) => {
+                    chars[i + 1] = '!';
+                    i += j + 4;
+                    继续;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    chars.into_iter().收集::<字符串>()
+}
+
+/// Parse a glob Pattern from a string.
+///
+/// This function amends the input string to replace any caret or circumflex
+/// character (^) used to negate a set of characters with an exclamation mark
+/// (!), which adapts rust's glob matching to function the way the GNU utils'
+/// fnmatch does.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use uucore::parser::parse_glob::from_str;
+/// assert!(!from_str("[^abc]").unwrap().matches("a"));
+/// assert!(from_str("[^abc]").unwrap().matches("x"));
+/// ```
+公有 方法 from_str(glob: &字符串切片) -> 结果<Pattern, PatternError> {
+    Pattern::新建(&fix_negation(glob))
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 超级::*;
+
+    #[test]
+    方法 test_from_str() {
+        相等断言!(from_str("[^abc]").解包(), Pattern::新建("[!abc]").解包());
+    }
+
+    #[test]
+    方法 test_fix_negation() {
+        // Happy/Simple case
+        相等断言!(fix_negation("[^abc]"), "[!abc]");
+
+        // Should fix negations in a long regex
+        相等断言!(fix_negation("foo[abc]  bar[^def]"), "foo[abc]  bar[!def]");
+
+        // Should fix multiple negations in a regex
+        相等断言!(fix_negation("foo[^abc]bar[^def]"), "foo[!abc]bar[!def]");
+
+        // Should fix negation of the single character ]
+        相等断言!(fix_negation("[^]]"), "[!]]");
+
+        // Should fix negation of the single character ^
+        相等断言!(fix_negation("[^^]"), "[!^]");
+
+        // Should fix negation of the space character
+        相等断言!(fix_negation("[^ ]"), "[! ]");
+
+        // Complicated patterns
+        相等断言!(fix_negation("[^][]"), "[!][]");
+        相等断言!(fix_negation("[^[]]"), "[![]]");
+
+        // More complex patterns that should be replaced
+        相等断言!(fix_negation("[[]] [^a]"), "[[]] [!a]");
+        相等断言!(fix_negation("[[] [^a]"), "[[] [!a]");
+        相等断言!(fix_negation("[]] [^a]"), "[]] [!a]");
+
+        // test that we don't look for closing square brackets unnecessarily
+        // Verifies issue #5584
+        设 chars = "^[".repeat(174_571);
+        相等断言!(fix_negation(chars.as_str()), chars);
+    }
+
+    #[test]
+    方法 test_fix_negation_should_not_amend() {
+        相等断言!(fix_negation("abc"), "abc");
+
+        // Regex specifically matches either [ or ^
+        相等断言!(fix_negation("[[^]"), "[[^]");
+
+        // Regex that specifically matches either space or ^
+        相等断言!(fix_negation("[ ^]"), "[ ^]");
+
+        // Regex that specifically matches either [, space or ^
+        相等断言!(fix_negation("[[ ^]"), "[[ ^]");
+        相等断言!(fix_negation("[ [^]"), "[ [^]");
+
+        // Invalid globs (according to rust's glob implementation) will remain unamended
+        相等断言!(fix_negation("[^]"), "[^]");
+        相等断言!(fix_negation("[^"), "[^");
+        相等断言!(fix_negation("[][^]"), "[][^]");
+
+        // Issue #4479
+        相等断言!(fix_negation("ààà[^"), "ààà[^");
+    }
+}

@@ -1,0 +1,76 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) ttyname filedesc
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::{IsTerminal, Write};
+使用 uucore::display::OsWrite;
+使用 uucore::错误::{UResult, set_exit_code};
+使用 uucore::format_usage;
+
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 SILENT: &字符串切片 = "silent";
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 2)?;
+
+    // Disable SIGPIPE so we can handle broken pipe errors gracefully
+    // and exit with code 3 instead of being killed by the signal.
+    #[cfg(unix)]
+    设 _ = uucore::signals::disable_pipe_errors();
+
+    设 silent = matches.get_flag(options::SILENT);
+
+    // If silent, we don't need the name, only whether or not stdin is a tty.
+    如果 silent {
+        返回 如果 标准库::输入输出::stdin().is_terminal() {
+            好的(())
+        } 否则 {
+            坏的(1.into())
+        };
+    }
+
+    设 可变 stdout = 标准库::输入输出::stdout();
+
+    设 name = rustix::termios::ttyname(标准库::输入输出::stdin(), 向量::with_capacity(8));
+
+    设 write_result = 如果 设 好的(name) = name {
+        使用 标准库::操作系统::unix::ffi::OsStrExt;
+        设 os_name = 标准库::ffi::OsStr::from_bytes(name.as_bytes());
+        stdout.write_all_os(os_name)
+    } 否则 {
+        set_exit_code(1);
+        writeln!(stdout, "{}", translate!("tty-not-a-tty"))
+    };
+
+    如果 write_result.is_err() || stdout.flush().is_err() {
+        // Don't return to prevent a panic later when another flush is attempted
+        // because the `uucore_procs::main` macro inserts a flush after execution for every utility.
+        标准库::进程::exit(3);
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("tty")
+        .version(uucore::crate_version!())
+        .about(translate!("tty-about"))
+        .override_usage(format_usage(&translate!("tty-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd).arg(
+        Arg::新建(options::SILENT)
+            .long(options::SILENT)
+            .visible_alias("quiet")
+            .short('s')
+            .help(translate!("tty-help-silent"))
+            .action(ArgAction::SetTrue),
+    )
+}

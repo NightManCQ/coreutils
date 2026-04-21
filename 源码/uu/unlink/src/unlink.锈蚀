@@ -1,0 +1,43 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::remove_file;
+使用 标准库::路径::Path;
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, Command};
+
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+静态 OPT_PATH: &字符串切片 = "FILE";
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 路径: &Path = matches.get_one::<OsString>(OPT_PATH).解包().as_ref();
+
+    remove_file(路径)
+        .map_err_context(|| translate!("unlink-error-cannot-unlink", "path" => 路径.quote()))
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("unlink")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("unlink"))
+        .about(translate!("unlink-about"))
+        .override_usage(format_usage(&translate!("unlink-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_PATH)
+                .required(真)
+                .hide(真)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}

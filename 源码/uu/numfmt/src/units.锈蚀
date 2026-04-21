@@ -1,0 +1,95 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 标准库::格式化;
+使用 uucore::parser::parse_size::{IEC_BASES, SI_BASES};
+
+/// `f64` view of [`uucore::parser::parse_size::SI_BASES`] for numfmt's
+/// floating-point math paths.
+公有 方法 si_bases_f64() -> [点64; 11] {
+    SI_BASES.映射(|b| b 转换 点64)
+}
+
+/// `f64` view of [`uucore::parser::parse_size::IEC_BASES`].
+公有 方法 iec_bases_f64() -> [点64; 11] {
+    IEC_BASES.映射(|b| b 转换 点64)
+}
+
+公有 类型 WithI = 布尔;
+
+#[derive(克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 Unit {
+    Auto,
+    Si,
+    Iec(WithI),
+    无,
+}
+
+公有 类型 结果<T> = 标准库::result::结果<T, 字符串>;
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+#[repr(正整数大小)]
+公有 枚举 RawSuffix {
+    K = 0,
+    M,
+    G,
+    T,
+    P,
+    E,
+    Z,
+    Y,
+    R,
+    Q,
+}
+
+实现 RawSuffix {
+    /// Index of this suffix in the base arrays, minus one.
+    /// `K` is 0, `M` is 1, ..., `Q` is 9. The associated base is
+    /// `BASES[self.index() + 1]`.
+    公有 方法 index(自身) -> 正整数大小 {
+        自身 转换 正整数大小
+    }
+}
+
+实现 TryFrom<&字符> 循环 RawSuffix {
+    类型 错误协议 = 字符串;
+
+    方法 try_from(value: &字符) -> 结果<自身类型> {
+        匹配 value {
+            'K' | 'k' => 好的(自身类型::K),
+            'M' => 好的(自身类型::M),
+            'G' => 好的(自身类型::G),
+            'T' => 好的(自身类型::T),
+            'P' => 好的(自身类型::P),
+            'E' => 好的(自身类型::E),
+            'Z' => 好的(自身类型::Z),
+            'Y' => 好的(自身类型::Y),
+            'R' => 好的(自身类型::R),
+            'Q' => 好的(自身类型::Q),
+            _ => 坏的(格式化!("Invalid suffix: {value}")),
+        }
+    }
+}
+
+公有 类型 Suffix = (RawSuffix, WithI);
+
+公有 结构 DisplayableSuffix(公有 Suffix, 公有 Unit);
+
+/// Upper-case characters for each [`RawSuffix`], indexed by [`RawSuffix::index`].
+常量 SUFFIX_CHARS: [字符; 10] = ['K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y', 'R', 'Q'];
+
+实现 格式化::显示协议 循环 DisplayableSuffix {
+    方法 格式化(&自身, f: &可变 格式化::Formatter) -> 格式化::结果 {
+        设 自身类型((raw_suffix, with_i), unit) = *自身;
+        设 ch = 匹配 (raw_suffix, unit) {
+            (RawSuffix::K, Unit::Si) => 'k',
+            _ => SUFFIX_CHARS[raw_suffix.index()],
+        };
+        write!(f, "{ch}")?;
+        如果 with_i {
+            write!(f, "i")?;
+        }
+        好的(())
+    }
+}

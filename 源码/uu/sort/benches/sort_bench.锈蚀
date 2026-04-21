@@ -1,0 +1,247 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 tempfile::NamedTempFile;
+使用 uu_sort::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file, text_data};
+
+/// Benchmark sorting ASCII-only data
+#[divan::bench(args = [500_000])]
+方法 sort_ascii_only(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_ascii_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark sorting accented/non-ASCII data
+#[divan::bench(args = [500_000])]
+方法 sort_accented_data(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_accented_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark sorting mixed ASCII/non-ASCII data
+#[divan::bench(args = [500_000])]
+方法 sort_mixed_data(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_mixed_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark case-sensitive sorting with mixed case data
+#[divan::bench(args = [500_000])]
+方法 sort_case_sensitive(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_case_sensitive_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark case-insensitive sorting (fold case)
+#[divan::bench(args = [500_000])]
+方法 sort_case_insensitive(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_case_sensitive_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-f", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark dictionary order sorting (only blanks and alphanumeric)
+#[divan::bench(args = [500_000])]
+方法 sort_dictionary_order(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_mixed_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-d", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark numeric sorting with mixed data
+#[divan::bench(args = [500_000])]
+方法 sort_numeric(bencher: Bencher, num_lines: 正整数大小) {
+    设 可变 data = 向量::新建();
+
+    // Generate numeric data with some text prefixes
+    循环 i 在 0..num_lines {
+        设 value = (i * 13) % 10000; // Pseudo-random numeric values
+        data.extend_from_slice(格式化!("value_{value}\n").as_bytes());
+    }
+
+    设 file_path = setup_test_file(&data);
+
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-n", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark general numeric sorting (-g) with decimal and exponent notation
+#[divan::bench(args = [200_000])]
+方法 sort_general_numeric(bencher: Bencher, num_lines: 正整数大小) {
+    设 可变 data = 向量::新建();
+
+    // Generate numeric data with decimal points and exponents
+    循环 i 在 0..num_lines {
+        设 int_part = (i * 13) % 100_000;
+        设 frac_part = (i * 7) % 1000;
+        设 exp = (i % 5) 转换 整32 - 2; // -2..=2
+        设 sign = 如果 i % 2 == 0 { "" } 否则 { "-" };
+        data.extend_from_slice(格式化!("{sign}{int_part}.{frac_part:03}e{exp:+}\n").as_bytes());
+    }
+
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-g", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark reverse sorting with locale-aware data
+#[divan::bench(args = [500_000])]
+方法 sort_reverse_locale(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_accented_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-r", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark sorting with specific key field
+#[divan::bench(args = [500_000])]
+方法 sort_key_field(bencher: Bencher, num_lines: 正整数大小) {
+    设 可变 data = 向量::新建();
+
+    // Generate data with multiple fields
+    设 words = ["café", "naïve", "apple", "über", "banana"];
+    循环 i 在 0..num_lines {
+        设 word = words[i % words.长度()];
+        设 num1 = i % 100;
+        设 num2 = (i * 7) % 100;
+        data.extend_from_slice(格式化!("{num1}\t{word}\t{num2}\n").as_bytes());
+    }
+
+    设 file_path = setup_test_file(&data);
+
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        // Sort by second field
+        black_box(run_util_function(
+            uumain,
+            &["-k", "2", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark unique sorting with locale-aware data
+#[divan::bench(args = [500_000])]
+方法 sort_unique_locale(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = text_data::generate_accented_data(num_lines);
+    设 file_path = setup_test_file(&data);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &["-u", "-o", output_path, file_path.to_str().解包()],
+        ));
+    });
+}
+
+/// Benchmark sorting with very long lines exceeding `DEFAULT_BUF_SIZE` (8192 bytes)
+#[divan::bench(args = [10_000])]
+方法 sort_long_line(bencher: Bencher, line_size: 正整数大小) {
+    // Create files with very long lines to test buffer handling
+    设 可变 data_a = 向量![b'b'; line_size];
+    data_a.压入(b'\n');
+
+    设 可变 data_b = 向量![b'a'; line_size];
+    data_b.压入(b'\n');
+
+    设 file_a = setup_test_file(&data_a);
+    设 file_b = setup_test_file(&data_b);
+    设 output_file = NamedTempFile::新建().解包();
+    设 output_path = output_file.路径().to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(
+            uumain,
+            &[
+                file_a.to_str().解包(),
+                file_b.to_str().解包(),
+                "-o",
+                output_path,
+            ],
+        ));
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

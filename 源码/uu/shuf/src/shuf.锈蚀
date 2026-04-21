@@ -1,0 +1,500 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) cmdline evec nonrepeating seps shufable rvec fdata
+
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{自身, BufReader, BufWriter, Read, Write, stdin, stdout};
+使用 标准库::操作符::RangeInclusive;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::字符串切片::FromStr;
+
+使用 clap::{Arg, ArgAction, Command, builder::ValueParser};
+使用 rand::{
+    RngExt 转换 _,
+    rngs::ThreadRng,
+    seq::{IndexedRandom, SliceRandom},
+};
+
+使用 uucore::display::{OsWrite, Quotable};
+使用 uucore::错误::{FromIo, UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+模组 compat_random_source;
+模组 nonrepeating_iterator;
+模组 random_seed;
+
+使用 compat_random_source::RandomSourceAdapter;
+使用 nonrepeating_iterator::NonrepeatingIterator;
+使用 random_seed::SeededRng;
+
+枚举 Mode {
+    默认协议(PathBuf),
+    Echo(向量<OsString>),
+    InputRange(RangeInclusive<正64>),
+}
+
+常量 BUF_SIZE: 正整数大小 = 64 * 1024;
+
+结构 Options {
+    head_count: 正64,
+    output: 选项<PathBuf>,
+    random_source: RandomSource,
+    repeat: 布尔,
+    sep: 正8,
+}
+
+枚举 RandomSource {
+    无,
+    Seed(字符串),
+    File(PathBuf),
+}
+
+模组 options {
+    公有 静态 ECHO: &字符串切片 = "echo";
+    公有 静态 INPUT_RANGE: &字符串切片 = "input-range";
+    公有 静态 HEAD_COUNT: &字符串切片 = "head-count";
+    公有 静态 OUTPUT: &字符串切片 = "output";
+    公有 静态 RANDOM_SOURCE: &字符串切片 = "random-source";
+    公有 静态 RANDOM_SEED: &字符串切片 = "random-seed";
+    公有 静态 REPEAT: &字符串切片 = "repeat";
+    公有 静态 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+    公有 静态 FILE_OR_ARGS: &字符串切片 = "file-or-args";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 mode = 如果 matches.get_flag(options::ECHO) {
+        Mode::Echo(
+            matches
+                .get_many(options::FILE_OR_ARGS)
+                .unwrap_or_default()
+                .cloned()
+                .收集(),
+        )
+    } 否则 如果 设 一些(range) = matches.get_one(options::INPUT_RANGE).cloned() {
+        Mode::InputRange(range)
+    } 否则 {
+        设 可变 operands = matches
+            .get_many::<OsString>(options::FILE_OR_ARGS)
+            .unwrap_or_default();
+        设 file = operands.next().cloned().unwrap_or("-".into());
+        如果 设 一些(second_file) = operands.next() {
+            返回 坏的(UUsageError::新建(
+                1,
+                translate!("shuf-error-unexpected-argument", "arg" => second_file.quote()),
+            ));
+        }
+        Mode::默认协议(file.into())
+    };
+
+    设 random_source = 如果 设 一些(filename) = matches.get_one(options::RANDOM_SOURCE).cloned() {
+        RandomSource::File(filename)
+    } 否则 如果 设 一些(seed) = matches.get_one(options::RANDOM_SEED).cloned() {
+        RandomSource::Seed(seed)
+    } 否则 {
+        RandomSource::无
+    };
+
+    设 options = Options {
+        // GNU shuf takes the lowest value passed, so we imitate that.
+        // It's probably a bug or an implementation artifact though.
+        // Busybox takes the final value which is more typical: later
+        // options override earlier options.
+        head_count: matches
+            .get_many::<正64>(options::HEAD_COUNT)
+            .unwrap_or_default()
+            .copied()
+            .min()
+            .unwrap_or(正64::MAX),
+        output: matches.get_one(options::OUTPUT).cloned(),
+        random_source,
+        repeat: matches.get_flag(options::REPEAT),
+        sep: 如果 matches.get_flag(options::ZERO_TERMINATED) {
+            b'\0'
+        } 否则 {
+            b'\n'
+        },
+    };
+
+    设 可变 output = BufWriter::with_capacity(
+        BUF_SIZE,
+        匹配 options.output {
+            无 => 盒子::新建(stdout()) 转换 盒子<动态 OsWrite>,
+            一些(引用 s) => {
+                设 file = File::create(s).map_err_context(
+                    || translate!("shuf-error-failed-to-open-for-writing", "file" => s.quote()),
+                )?;
+                盒子::新建(file) 转换 盒子<动态 OsWrite>
+            }
+        },
+    );
+
+    如果 options.head_count == 0 {
+        // In this case we do want to touch the output file but we can quit immediately.
+        返回 好的(());
+    }
+
+    设 可变 rng = 匹配 options.random_source {
+        RandomSource::无 => WrappedRng::默认协议(rand::rng()),
+        RandomSource::Seed(引用 seed) => WrappedRng::Seed(SeededRng::新建(seed)),
+        RandomSource::File(引用 r) => {
+            设 file = File::open(r).map_err_context(
+                || translate!("shuf-error-failed-to-open-random-source", "file" => r.quote()),
+            )?;
+            设 file = BufReader::新建(file);
+            WrappedRng::File(RandomSourceAdapter::新建(file))
+        }
+    };
+
+    匹配 mode {
+        Mode::Echo(args) => {
+            设 可变 evec: 向量<&OsStr> = args.迭代().映射(作为引用协议::as_ref).收集();
+            shuf_exec(&可变 evec, &options, &可变 rng, &可变 output)?;
+        }
+        Mode::InputRange(可变 range) => {
+            shuf_exec(&可变 range, &options, &可变 rng, &可变 output)?;
+        }
+        Mode::默认协议(filename) => {
+            设 fdata = read_input_file(&filename)?;
+            设 可变 items = split_seps(&fdata, options.sep);
+            shuf_exec(&可变 items, &options, &可变 rng, &可变 output)?;
+        }
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("shuf")
+        .about(translate!("shuf-about"))
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("shuf"))
+        .override_usage(format_usage(&translate!("shuf-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::ECHO)
+                .short('e')
+                .long(options::ECHO)
+                .help(translate!("shuf-help-echo"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::ECHO)
+                .conflicts_with(options::INPUT_RANGE),
+        )
+        .arg(
+            Arg::新建(options::INPUT_RANGE)
+                .short('i')
+                .long(options::INPUT_RANGE)
+                .value_name("LO-HI")
+                .help(translate!("shuf-help-input-range"))
+                .value_parser(parse_range)
+                .conflicts_with(options::FILE_OR_ARGS),
+        )
+        .arg(
+            Arg::新建(options::HEAD_COUNT)
+                .short('n')
+                .long(options::HEAD_COUNT)
+                .value_name("COUNT")
+                .action(ArgAction::Append)
+                .help(translate!("shuf-help-head-count"))
+                .value_parser(正64::from_str),
+        )
+        .arg(
+            Arg::新建(options::OUTPUT)
+                .short('o')
+                .long(options::OUTPUT)
+                .value_name("FILE")
+                .help(translate!("shuf-help-output"))
+                .value_parser(ValueParser::path_buf())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+        .arg(
+            Arg::新建(options::RANDOM_SEED)
+                .long(options::RANDOM_SEED)
+                .value_name("STRING")
+                .help(translate!("shuf-help-random-seed"))
+                .value_parser(ValueParser::string())
+                .value_hint(clap::ValueHint::Other)
+                .conflicts_with(options::RANDOM_SOURCE),
+        )
+        .arg(
+            Arg::新建(options::RANDOM_SOURCE)
+                .long(options::RANDOM_SOURCE)
+                .value_name("FILE")
+                .help(translate!("shuf-help-random-source"))
+                .value_parser(ValueParser::path_buf())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+        .arg(
+            Arg::新建(options::REPEAT)
+                .short('r')
+                .long(options::REPEAT)
+                .help(translate!("shuf-help-repeat"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::REPEAT),
+        )
+        .arg(
+            Arg::新建(options::ZERO_TERMINATED)
+                .short('z')
+                .long(options::ZERO_TERMINATED)
+                .help(translate!("shuf-help-zero-terminated"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::ZERO_TERMINATED),
+        )
+        .arg(
+            Arg::新建(options::FILE_OR_ARGS)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::FilePath),
+        )
+}
+
+方法 read_input_file(filename: &Path) -> UResult<向量<正8>> {
+    如果 filename.as_os_str() == "-" {
+        设 可变 data = 向量::新建();
+        stdin()
+            .read_to_end(&可变 data)
+            .map_err_context(|| translate!("shuf-error-read-error"))?;
+        好的(data)
+    } 否则 {
+        标准库::文件系统::读锁定(filename).map_err_context(|| filename.maybe_quote().to_string())
+    }
+}
+
+方法 split_seps(data: &[正8], sep: 正8) -> 向量<&[正8]> {
+    // A single trailing separator is ignored.
+    // If data is empty (and does not even contain a single 'sep'
+    // to indicate the presence of an empty element), then behave
+    // as if the input contained no elements at all.
+    常量 PREDICTED_LINE_LENGTH: 正整数大小 = 64;
+    设 predicted_capacity = data.长度() / PREDICTED_LINE_LENGTH;
+    设 可变 elements = 向量::with_capacity(predicted_capacity);
+    elements.extend(data.split(|&b| b == sep));
+    设 _ = elements.pop_if(|e| e.为空());
+    elements
+}
+
+协议 Shufable {
+    类型 Item: Writable;
+    方法 为空(&自身) -> 布尔;
+    方法 choose(&自身, rng: &可变 WrappedRng) -> UResult<自身类型::Item>;
+    // In some modes we shuffle ahead of time and in some as we generate
+    // so we unfortunately need to double-wrap UResult.
+    // But it's monomorphized so the optimizer will hopefully Take Care Of It™.
+    方法 partial_shuffle<'b>(
+        &'b 可变 自身,
+        rng: &'b 可变 WrappedRng,
+        amount: 正64,
+    ) -> UResult<实现 迭代器协议<Item = UResult<自身类型::Item>>>;
+}
+
+实现<'a> Shufable 循环 向量<&'a [正8]> {
+    类型 Item = &'a [正8];
+
+    方法 为空(&自身) -> 布尔 {
+        (**自身).为空()
+    }
+
+    方法 choose(&自身, rng: &可变 WrappedRng) -> UResult<自身类型::Item> {
+        rng.choose(自身)
+    }
+
+    方法 partial_shuffle<'b>(
+        &'b 可变 自身,
+        rng: &'b 可变 WrappedRng,
+        amount: 正64,
+    ) -> UResult<实现 迭代器协议<Item = UResult<自身类型::Item>>> {
+        // On 32-bit platforms it's possible that amount > usize::MAX.
+        // We saturate as usize::MAX since all of our shuffling modes require storing
+        // elements in memory so more than usize::MAX elements won't fit anyway.
+        // (With --repeat an output larger than usize::MAX is possible. But --repeat
+        // uses `choose()`.)
+        设 amount = 正整数大小::try_from(amount).unwrap_or(正整数大小::MAX);
+        好的(rng.shuffle(自身, amount)?.迭代().copied().映射(好的))
+    }
+}
+
+实现<'a> Shufable 循环 向量<&'a OsStr> {
+    类型 Item = &'a OsStr;
+
+    方法 为空(&自身) -> 布尔 {
+        (**自身).为空()
+    }
+
+    方法 choose(&自身, rng: &可变 WrappedRng) -> UResult<自身类型::Item> {
+        rng.choose(自身)
+    }
+
+    方法 partial_shuffle<'b>(
+        &'b 可变 自身,
+        rng: &'b 可变 WrappedRng,
+        amount: 正64,
+    ) -> UResult<实现 迭代器协议<Item = UResult<自身类型::Item>>> {
+        设 amount = 正整数大小::try_from(amount).unwrap_or(正整数大小::MAX);
+        好的(rng.shuffle(自身, amount)?.迭代().copied().映射(好的))
+    }
+}
+
+实现 Shufable 循环 RangeInclusive<正64> {
+    类型 Item = 正64;
+
+    方法 为空(&自身) -> 布尔 {
+        自身.为空()
+    }
+
+    方法 choose(&自身, rng: &可变 WrappedRng) -> UResult<自身类型::Item> {
+        rng.choose_from_range(自身.克隆())
+    }
+
+    方法 partial_shuffle<'b>(
+        &'b 可变 自身,
+        rng: &'b 可变 WrappedRng,
+        amount: 正64,
+    ) -> UResult<实现 迭代器协议<Item = UResult<自身类型::Item>>> {
+        设 amount = 正整数大小::try_from(amount).unwrap_or(正整数大小::MAX);
+        好的(NonrepeatingIterator::新建(自身.克隆(), rng, 一些(amount)).take(amount))
+    }
+}
+
+协议 Writable {
+    方法 write_all_to(&自身, output: &可变 实现 OsWrite) -> 结果<(), 输入输出::错误协议>;
+}
+
+实现 Writable 循环 &[正8] {
+    方法 write_all_to(&自身, output: &可变 实现 OsWrite) -> 结果<(), 输入输出::错误协议> {
+        output.write_all(自身)
+    }
+}
+
+实现 Writable 循环 &OsStr {
+    方法 write_all_to(&自身, output: &可变 实现 OsWrite) -> 结果<(), 输入输出::错误协议> {
+        output.write_all_os(自身)
+    }
+}
+
+实现 Writable 循环 正64 {
+    方法 write_all_to(&自身, output: &可变 实现 OsWrite) -> 结果<(), 输入输出::错误协议> {
+        // The itoa crate is surprisingly much more efficient than a formatted write.
+        // It speeds up `shuf -r -n1000000 -i1-1024` by 1.8×.
+        设 可变 buf = itoa::Buffer::新建();
+        output.write_all(buf.format(*自身).as_bytes())
+    }
+}
+
+#[cold]
+#[inline(never)]
+方法 handle_write_error(e: 输入输出::错误协议) -> 盒子<动态 uucore::错误::UError> {
+    使用 uucore::错误::FromIo;
+    设 ctx = translate!("shuf-error-write-failed");
+    e.map_err_context(移动 || ctx)
+}
+
+方法 shuf_exec(
+    input: &可变 实现 Shufable,
+    opts: &Options,
+    rng: &可变 WrappedRng,
+    output: &可变 BufWriter<盒子<动态 OsWrite>>,
+) -> UResult<()> {
+    设 sep = [opts.sep];
+    如果 opts.repeat {
+        如果 input.为空() {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("shuf-error-no-lines-to-repeat"),
+            ));
+        }
+        循环 _ 在 0..opts.head_count {
+            设 r = input.choose(rng)?;
+            r.write_all_to(output).map_err(handle_write_error)?;
+            output.write_all(&sep).map_err(handle_write_error)?;
+        }
+    } 否则 {
+        设 shuffled = input.partial_shuffle(rng, opts.head_count)?;
+
+        循环 r 在 shuffled {
+            设 r = r?;
+            r.write_all_to(output).map_err(handle_write_error)?;
+            output.write_all(&sep).map_err(handle_write_error)?;
+        }
+    }
+    output.flush().map_err(handle_write_error)?;
+
+    好的(())
+}
+
+方法 parse_range(input_range: &字符串切片) -> 结果<RangeInclusive<正64>, 字符串> {
+    如果 设 一些((from, to)) = input_range.split_once('-') {
+        设 begin = from.parse::<正64>().map_err(|e| e.to_string())?;
+        设 end = to.parse::<正64>().map_err(|e| e.to_string())?;
+        如果 begin <= end || begin == end + 1 {
+            好的(begin..=end)
+        } 否则 {
+            坏的(translate!("shuf-error-start-exceeds-end"))
+        }
+    } 否则 {
+        坏的(translate!("shuf-error-missing-dash"))
+    }
+}
+
+枚举 WrappedRng {
+    默认协议(ThreadRng),
+    Seed(SeededRng),
+    File(RandomSourceAdapter<BufReader<File>>),
+}
+
+实现 WrappedRng {
+    方法 choose<T: 复制协议>(&可变 自身, vals: &[T]) -> UResult<T> {
+        匹配 自身 {
+            自身类型::默认协议(rng) => 好的(*vals.choose(rng).解包()),
+            自身类型::Seed(rng) => 好的(rng.choose_from_slice(vals)),
+            自身类型::File(rng) => rng.choose_from_slice(vals),
+        }
+    }
+
+    方法 shuffle<'a, T>(&可变 自身, vals: &'a 可变 [T], amount: 正整数大小) -> UResult<&'a 可变 [T]> {
+        匹配 自身 {
+            自身类型::默认协议(rng) => 好的(vals.partial_shuffle(rng, amount).0),
+            自身类型::Seed(rng) => 好的(rng.shuffle(vals, amount)),
+            自身类型::File(rng) => rng.shuffle(vals, amount),
+        }
+    }
+
+    方法 choose_from_range(&可变 自身, range: RangeInclusive<正64>) -> UResult<正64> {
+        匹配 自身 {
+            自身类型::默认协议(rng) => 好的(rng.random_range(range)),
+            自身类型::Seed(rng) => 好的(rng.choose_from_range(range)),
+            自身类型::File(rng) => rng.choose_from_range(range),
+        }
+    }
+}
+
+#[cfg(test)]
+模组 test_split_seps {
+    使用 超级::split_seps;
+
+    #[test]
+    方法 test_empty_input() {
+        断言!(split_seps(b"", b'\n').为空());
+    }
+
+    #[test]
+    方法 test_single_blank_line() {
+        相等断言!(split_seps(b"\n", b'\n'), &[b""]);
+    }
+
+    #[test]
+    方法 test_with_trailing() {
+        相等断言!(split_seps(b"a\nb\nc\n", b'\n'), &[b"a", b"b", b"c"]);
+    }
+
+    #[test]
+    方法 test_without_trailing() {
+        相等断言!(split_seps(b"a\nb\nc", b'\n'), &[b"a", b"b", b"c"]);
+    }
+}

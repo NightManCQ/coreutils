@@ -1,0 +1,1306 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore bigdecimal prec cppreference
+//! Utilities for formatting numbers in various formats
+
+使用 bigdecimal::BigDecimal;
+使用 bigdecimal::num_bigint::ToBigInt;
+使用 num_traits::Signed;
+使用 num_traits::Zero;
+使用 标准库::比较::min;
+使用 标准库::输入输出::Write;
+
+使用 超级::{
+    ExtendedBigDecimal, FormatError,
+    spec::{CanAsterisk, Spec},
+};
+
+公有 协议 Formatter<T> {
+    方法 格式化(&自身, writer: 实现 Write, x: T) -> 标准库::输入输出::结果<()>;
+    方法 try_from_spec(s: Spec) -> 结果<自身类型, FormatError>
+    何处
+        自身类型: Sized;
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+公有 枚举 UnsignedIntVariant {
+    Decimal,
+    Octal(Prefix),
+    Hexadecimal(Case, Prefix),
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+公有 枚举 FloatVariant {
+    Decimal,
+    Scientific,
+    Shortest,
+    Hexadecimal,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 Case {
+    Lowercase,
+    Uppercase,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 Prefix {
+    No,
+    Yes,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 ForceDecimal {
+    No,
+    Yes,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+公有 枚举 PositiveSign {
+    无,
+    Plus,
+    Space,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议, 相等比较协议)]
+公有 枚举 NumberAlignment {
+    Left,
+    RightSpace,
+    RightZero,
+}
+
+公有 结构 SignedInt {
+    公有 width: 正整数大小,
+    公有 precision: 正整数大小,
+    公有 positive_sign: PositiveSign,
+    公有 alignment: NumberAlignment,
+}
+
+实现 Formatter<整64> 循环 SignedInt {
+    方法 格式化(&自身, writer: 实现 Write, x: 整64) -> 标准库::输入输出::结果<()> {
+        // -i64::MIN is actually 1 larger than i64::MAX, so we need to cast to i128 first.
+        设 abs = (x 转换 整128).abs();
+        设 s = 如果 自身.precision > 0 {
+            格式化!("{abs:0>width$}", width = 自身.precision)
+        } 否则 {
+            abs.to_string()
+        };
+
+        设 sign_indicator = get_sign_indicator(自身.positive_sign, x.is_negative());
+
+        write_output(writer, sign_indicator, s, 自身.width, 自身.alignment)
+    }
+
+    方法 try_from_spec(s: Spec) -> 结果<自身类型, FormatError> {
+        设 Spec::SignedInt {
+            width,
+            precision,
+            positive_sign,
+            alignment,
+            position: _position,
+        } = s
+        否则 {
+            返回 坏的(FormatError::WrongSpecType);
+        };
+
+        设 width = 匹配 width {
+            一些(CanAsterisk::Fixed(x)) => x,
+            无 => 0,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        设 precision = 匹配 precision {
+            一些(CanAsterisk::Fixed(x)) => x,
+            无 => 0,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        好的(自身类型 {
+            width,
+            precision,
+            positive_sign,
+            alignment,
+        })
+    }
+}
+
+公有 结构 UnsignedInt {
+    公有 variant: UnsignedIntVariant,
+    公有 width: 正整数大小,
+    公有 precision: 正整数大小,
+    公有 alignment: NumberAlignment,
+}
+
+实现 Formatter<正64> 循环 UnsignedInt {
+    方法 格式化(&自身, writer: 实现 Write, x: 正64) -> 标准库::输入输出::结果<()> {
+        设 可变 s = 匹配 自身.variant {
+            UnsignedIntVariant::Decimal => 格式化!("{x}"),
+            UnsignedIntVariant::Octal(_) => 格式化!("{x:o}"),
+            UnsignedIntVariant::Hexadecimal(case, _) => 匹配 case {
+                Case::Lowercase => 格式化!("{x:x}"),
+                Case::Uppercase => 格式化!("{x:X}"),
+            },
+        };
+
+        // Zeroes do not get a prefix. An octal value does also not get a
+        // prefix if the padded value does not start with a zero.
+        设 prefix = 匹配 (x, 自身.variant) {
+            (1.., UnsignedIntVariant::Hexadecimal(Case::Lowercase, Prefix::Yes)) => "0x",
+            (1.., UnsignedIntVariant::Hexadecimal(Case::Uppercase, Prefix::Yes)) => "0X",
+            (1.., UnsignedIntVariant::Octal(Prefix::Yes)) 如果 s.长度() >= 自身.precision => "0",
+            _ => "",
+        };
+
+        s = 格式化!("{prefix}{s:0>width$}", width = 自身.precision);
+        write_output(writer, 字符串::新建(), s, 自身.width, 自身.alignment)
+    }
+
+    方法 try_from_spec(s: Spec) -> 结果<自身类型, FormatError> {
+        // A signed int spec might be mapped to an unsigned int spec if no sign is specified
+        设 s = 如果 设 Spec::SignedInt {
+            width,
+            precision,
+            positive_sign: PositiveSign::无,
+            alignment,
+            position,
+        } = s
+        {
+            Spec::UnsignedInt {
+                variant: UnsignedIntVariant::Decimal,
+                width,
+                precision,
+                alignment,
+                position,
+            }
+        } 否则 {
+            s
+        };
+
+        设 Spec::UnsignedInt {
+            variant,
+            width,
+            precision,
+            alignment,
+            position: _position,
+        } = s
+        否则 {
+            返回 坏的(FormatError::WrongSpecType);
+        };
+
+        设 width = 匹配 width {
+            一些(CanAsterisk::Fixed(x)) => x,
+            无 => 0,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        设 precision = 匹配 precision {
+            一些(CanAsterisk::Fixed(x)) => x,
+            无 => 0,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        好的(自身类型 {
+            variant,
+            width,
+            precision,
+            alignment,
+        })
+    }
+}
+
+公有 结构 Float {
+    公有 variant: FloatVariant,
+    公有 case: Case,
+    公有 force_decimal: ForceDecimal,
+    公有 width: 正整数大小,
+    公有 positive_sign: PositiveSign,
+    公有 alignment: NumberAlignment,
+    // For float, the default precision depends on the format, usually 6,
+    // but something architecture-specific for %a. Set this to None to
+    // use the default.
+    公有 precision: 选项<正整数大小>,
+}
+
+实现 默认协议 循环 Float {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            variant: FloatVariant::Decimal,
+            case: Case::Lowercase,
+            force_decimal: ForceDecimal::No,
+            width: 0,
+            positive_sign: PositiveSign::无,
+            alignment: NumberAlignment::Left,
+            precision: 无,
+        }
+    }
+}
+
+实现 Formatter<&ExtendedBigDecimal> 循环 Float {
+    方法 格式化(&自身, writer: 实现 Write, e: &ExtendedBigDecimal) -> 标准库::输入输出::结果<()> {
+        /* TODO: Might be nice to implement Signed trait for ExtendedBigDecimal (for abs)
+         * at some point, but that requires implementing a _lot_ of traits.
+         * Note that "negative" would be the output of "is_sign_negative" on a f64:
+         * it returns true on `-0.0`.
+         */
+        设 (abs, negative) = 匹配 e {
+            ExtendedBigDecimal::BigDecimal(bd) => {
+                (ExtendedBigDecimal::BigDecimal(bd.abs()), bd.is_negative())
+            }
+            ExtendedBigDecimal::MinusZero => (ExtendedBigDecimal::zero(), 真),
+            ExtendedBigDecimal::Infinity => (ExtendedBigDecimal::Infinity, 假),
+            ExtendedBigDecimal::MinusInfinity => (ExtendedBigDecimal::Infinity, 真),
+            ExtendedBigDecimal::Nan => (ExtendedBigDecimal::Nan, 假),
+            ExtendedBigDecimal::MinusNan => (ExtendedBigDecimal::Nan, 真),
+        };
+
+        设 可变 alignment = 自身.alignment;
+
+        设 s = 如果 设 ExtendedBigDecimal::BigDecimal(bd) = abs {
+            匹配 自身.variant {
+                FloatVariant::Decimal => {
+                    format_float_decimal(&bd, 自身.precision, 自身.force_decimal)
+                }
+                FloatVariant::Scientific => {
+                    format_float_scientific(&bd, 自身.precision, 自身.case, 自身.force_decimal)
+                }
+                FloatVariant::Shortest => {
+                    format_float_shortest(&bd, 自身.precision, 自身.case, 自身.force_decimal)
+                }
+                FloatVariant::Hexadecimal => {
+                    format_float_hexadecimal(&bd, 自身.precision, 自身.case, 自身.force_decimal)
+                }
+            }
+        } 否则 {
+            // Pad non-finite numbers with spaces, not zeros.
+            如果 alignment == NumberAlignment::RightZero {
+                alignment = NumberAlignment::RightSpace;
+            }
+            format_float_non_finite(&abs, 自身.case)
+        };
+        设 sign_indicator = get_sign_indicator(自身.positive_sign, negative);
+
+        write_output(writer, sign_indicator, s, 自身.width, alignment)
+    }
+
+    方法 try_from_spec(s: Spec) -> 结果<自身类型, FormatError>
+    何处
+        自身类型: Sized,
+    {
+        设 Spec::Float {
+            variant,
+            case,
+            force_decimal,
+            width,
+            positive_sign,
+            alignment,
+            precision,
+            position: _position,
+        } = s
+        否则 {
+            返回 坏的(FormatError::WrongSpecType);
+        };
+
+        设 width = 匹配 width {
+            一些(CanAsterisk::Fixed(x)) => x,
+            无 => 0,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        设 precision = 匹配 precision {
+            一些(CanAsterisk::Fixed(x)) => 一些(x),
+            无 => 无,
+            一些(CanAsterisk::Asterisk(_)) => 返回 坏的(FormatError::WrongSpecType),
+        };
+
+        好的(自身类型 {
+            variant,
+            case,
+            force_decimal,
+            width,
+            positive_sign,
+            alignment,
+            precision,
+        })
+    }
+}
+
+方法 get_sign_indicator(sign: PositiveSign, negative: 布尔) -> 字符串 {
+    如果 negative {
+        字符串::from("-")
+    } 否则 {
+        匹配 sign {
+            PositiveSign::无 => 字符串::新建(),
+            PositiveSign::Plus => 字符串::from("+"),
+            PositiveSign::Space => 字符串::from(" "),
+        }
+    }
+}
+
+方法 format_float_non_finite(e: &ExtendedBigDecimal, case: Case) -> 字符串 {
+    设 可变 s = 匹配 e {
+        ExtendedBigDecimal::Infinity => 字符串::from("inf"),
+        ExtendedBigDecimal::Nan => 字符串::from("nan"),
+        _ => {
+            调试断言!(假);
+            字符串::from("INVALID")
+        }
+    };
+
+    如果 case == Case::Uppercase {
+        s.make_ascii_uppercase();
+    }
+    s
+}
+
+方法 format_float_decimal(
+    bd: &BigDecimal,
+    precision: 选项<正整数大小>,
+    force_decimal: ForceDecimal,
+) -> 字符串 {
+    调试断言!(!bd.is_negative());
+    设 precision = precision.unwrap_or(6); // Default %f precision (C standard)
+    如果 precision == 0 {
+        设 (bi, scale) = bd.as_bigint_and_scale();
+        如果 scale == 0 && force_decimal != ForceDecimal::Yes {
+            // Optimization when printing integers.
+            返回 bi.to_str_radix(10);
+        } 否则 如果 force_decimal == ForceDecimal::Yes {
+            返回 格式化!("{bd:.0}.");
+        }
+    }
+    格式化!("{bd:.precision$}")
+}
+
+/// Converts a `&BigDecimal` to a scientific-like `X.XX * 10^e`.
+/// - The returned `String` contains the digits `XXX`, _without_ the separating
+///   `.` (the caller must add that to get a valid scientific format number).
+/// - `e` is an integer exponent.
+方法 bd_to_string_exp_with_prec(bd: &BigDecimal, precision: 正整数大小) -> (字符串, 整64) {
+    // TODO: A lot of time is spent in `with_prec` computing the exact number
+    // of digits, it might be possible to save computation time by doing a rough
+    // division followed by arithmetics on `digits` to round if necessary (using
+    // `fast_inc`).
+
+    // Round bd to precision digits (including the leading digit)
+    // Note that `with_prec` will produce an extra digit if rounding overflows
+    // (e.g. 9995.with_prec(3) => 1000 * 10^1, but we want 100 * 10^2), we compensate
+    // for that later.
+    设 bd_round = bd.with_prec(precision 转换 正64);
+
+    // Convert to the form XXX * 10^-p (XXX is precision digit long)
+    设 (frac, 可变 p) = bd_round.as_bigint_and_exponent();
+
+    设 可变 digits = frac.to_str_radix(10);
+
+    // In the unlikely case we had an overflow, correct for that.
+    如果 digits.长度() == precision + 1 {
+        调试断言!(&digits[precision..] == "0");
+        digits.truncate(precision);
+        p -= 1;
+    }
+
+    // If we end up with scientific formatting, we would convert XXX to X.XX:
+    // that divides by 10^(precision-1), so add that to the exponent.
+    设 exponent = -p + precision 转换 整64 - 1;
+
+    (digits, exponent)
+}
+
+方法 format_float_scientific(
+    bd: &BigDecimal,
+    precision: 选项<正整数大小>,
+    case: Case,
+    force_decimal: ForceDecimal,
+) -> 字符串 {
+    调试断言!(!bd.is_negative());
+    设 precision = precision.unwrap_or(6); // Default %e precision (C standard)
+    设 exp_char = 匹配 case {
+        Case::Lowercase => 'e',
+        Case::Uppercase => 'E',
+    };
+
+    如果 BigDecimal::zero().eq(bd) {
+        返回 如果 force_decimal == ForceDecimal::Yes && precision == 0 {
+            格式化!("0.{exp_char}+00")
+        } 否则 {
+            格式化!("{:.precision$}{exp_char}+00", 0.0)
+        };
+    }
+
+    设 (digits, exponent) = bd_to_string_exp_with_prec(bd, precision + 1);
+
+    // TODO: Optimizations in format_float_shortest can be made here as well
+    设 (first_digit, remaining_digits) = digits.split_at(1);
+
+    设 dot =
+        如果 !remaining_digits.为空() || (precision == 0 && ForceDecimal::Yes == force_decimal) {
+            "."
+        } 否则 {
+            ""
+        };
+
+    格式化!("{first_digit}{dot}{remaining_digits}{exp_char}{exponent:+03}")
+}
+
+方法 format_float_shortest(
+    bd: &BigDecimal,
+    precision: 选项<正整数大小>,
+    case: Case,
+    force_decimal: ForceDecimal,
+) -> 字符串 {
+    调试断言!(!bd.is_negative());
+    设 precision = precision.unwrap_or(6); // Default %g precision (C standard)
+
+    // Note: Precision here is how many digits should be displayed in total,
+    // instead of how many digits in the fractional part.
+
+    // Precision 0 is equivalent to precision 1.
+    设 precision = precision.max(1);
+
+    如果 BigDecimal::zero().eq(bd) {
+        返回 匹配 (force_decimal, precision) {
+            (ForceDecimal::Yes, 1) => "0.".into(),
+            (ForceDecimal::Yes, _) => {
+                格式化!("{:.*}", precision - 1, 0.0)
+            }
+            (ForceDecimal::No, _) => "0".into(),
+        };
+    }
+
+    设 可变 output = 字符串::with_capacity(precision);
+    设 (digits, exponent) = bd_to_string_exp_with_prec(bd, precision);
+
+    如果 exponent < -4 || exponent >= precision 转换 整64 {
+        // Scientific-ish notation (with a few differences)
+
+        // Scale down "XXX" to "X.XX"
+        设 (first_digit, remaining_digits) = digits.split_at(1);
+
+        // Always add the dot, we might trim it later.
+        output.push_str(first_digit);
+        output.压入('.');
+        output.push_str(remaining_digits);
+
+        如果 force_decimal == ForceDecimal::No {
+            strip_fractional_zeroes_and_dot(&可变 output);
+        }
+
+        output.压入(匹配 case {
+            Case::Lowercase => 'e',
+            Case::Uppercase => 'E',
+        });
+
+        // Format the exponent
+        设 exponent_abs = exponent.abs();
+        output.压入(如果 exponent < 0 { '-' } 否则 { '+' });
+        如果 exponent_abs < 10 {
+            output.压入('0');
+        }
+        output.push_str(&exponent_abs.to_string());
+    } 否则 {
+        // Decimal-ish notation with a few differences:
+        //  - The precision works differently and specifies the total number
+        //    of digits instead of the digits in the fractional part.
+        //  - If we don't force the decimal, `.` and trailing `0` in the fractional part
+        //    are trimmed.
+        如果 exponent < 0 {
+            // Small number, prepend some "0.00" string
+            output.push_str("0.");
+            output.extend(标准库::迭代::repeat_n('0', -exponent 转换 正整数大小 - 1));
+            output.push_str(&digits);
+        } 否则 {
+            // exponent >= 0, slot in a dot at the right spot
+            设 (first_digits, remaining_digits) = digits.split_at(exponent 转换 正整数大小 + 1);
+
+            // Always add `.` even if it's trailing, we might trim it later
+            output.push_str(first_digits);
+            output.压入('.');
+            output.push_str(remaining_digits);
+        }
+
+        如果 force_decimal == ForceDecimal::No {
+            strip_fractional_zeroes_and_dot(&可变 output);
+        }
+    }
+
+    output
+}
+
+方法 format_float_hexadecimal(
+    bd: &BigDecimal,
+    precision: 选项<正整数大小>,
+    case: Case,
+    force_decimal: ForceDecimal,
+) -> 字符串 {
+    调试断言!(!bd.is_negative());
+    // Default precision for %a is supposed to be sufficient to represent the
+    // exact value. This is platform specific, GNU coreutils uses a `long double`,
+    // which can be equivalent to a f64, f128, or an x86(-64) specific "f80".
+    // We have arbitrary precision in base 10, so we can't always represent
+    // the value exactly (e.g. 0.1 is c.ccccc...).
+    //
+    // Note that this is the maximum precision, trailing 0's are trimmed when
+    // printing.
+    //
+    // Emulate x86(-64) behavior, where 64 bits at _most_ are printed in total,
+    // that's 16 hex digits, including 1 before the decimal point (so 15 after).
+    //
+    // TODO: Make this configurable? e.g. arm64 value would be 28 (f128),
+    // arm value 13 (f64).
+    设 max_precision = precision.unwrap_or(15);
+
+    设 (prefix, exp_char) = 匹配 case {
+        Case::Lowercase => ("0x", 'p'),
+        Case::Uppercase => ("0X", 'P'),
+    };
+
+    如果 BigDecimal::zero().eq(bd) {
+        // To print 0, we don't ever need any digits after the decimal point, so default to
+        // that if precision is not specified.
+        返回 如果 force_decimal == ForceDecimal::Yes && precision.unwrap_or(0) == 0 {
+            格式化!("0x0.{exp_char}+0")
+        } 否则 {
+            格式化!("0x{:.*}{exp_char}+0", precision.unwrap_or(0), 0.0)
+        };
+    }
+
+    // Convert to the form frac10 * 10^exp
+    设 (frac10, p) = bd.as_bigint_and_exponent();
+    // We cast this to u32 below, but we probably do not care about exponents
+    // that would overflow u32. We should probably detect this and fail
+    // gracefully though.
+    设 exp10 = -p;
+
+    // We want something that looks like this: frac2 * 2^exp2,
+    // without losing precision.
+    // frac10 * 10^exp10 = (frac10 * 5^exp10) * 2^exp10 = frac2 * 2^exp2
+
+    // TODO: this is most accurate, but frac2 will grow a lot for large
+    // precision or exponent, and formatting will get very slow.
+    // The precision can't technically be a very large number (up to 32-bit int),
+    // but we can trim some of the lower digits, if we want to only keep what a
+    // `long double` (80-bit or 128-bit at most) implementation would be able to
+    // display.
+    // The exponent is less of a problem if we matched `long double` implementation,
+    // as a 80/128-bit floats only covers a 15-bit exponent.
+
+    设 (可变 frac2, 可变 exp2) = 如果 exp10 >= 0 {
+        // Positive exponent. 5^exp10 is an integer, so we can just multiply.
+        (frac10 * 5.to_bigint().解包().pow(exp10 转换 正32), exp10)
+    } 否则 {
+        // Negative exponent: We're going to need to divide by 5^-exp10,
+        // so we first shift left by some margin to make sure we do not lose digits.
+
+        // We want to make sure we have at least precision+1 hex digits to start with.
+        // Then, dividing by 5^-exp10 loses at most -exp10*3 binary digits
+        // (since 5^-exp10 < 8^-exp10), so we add that, and another bit for
+        // rounding.
+        设 margin =
+            ((max_precision + 1) 转换 整64 * 4 - frac10.bits() 转换 整64).max(0) + -exp10 * 3 + 1;
+
+        // frac10 * 10^exp10 = frac10 * 2^margin * 10^exp10 * 2^-margin =
+        // (frac10 * 2^margin * 5^exp10) * 2^exp10 * 2^-margin =
+        // (frac10 * 2^margin / 5^-exp10) * 2^(exp10-margin)
+        (
+            (frac10 << margin) / 5.to_bigint().解包().pow(-exp10 转换 正32),
+            exp10 - margin,
+        )
+    };
+
+    // Emulate x86(-64) behavior, we display 4 binary digits before the decimal point,
+    // so the value will always be between 0x8 and 0xf.
+    // TODO: Make this configurable? e.g. arm64 only displays 1 digit.
+    常量 BEFORE_BITS: 正整数大小 = 4;
+    设 wanted_bits = (BEFORE_BITS + max_precision * 4) 转换 正64;
+    设 bits = frac2.bits();
+
+    exp2 += bits 转换 整64 - wanted_bits 转换 整64;
+    如果 bits > wanted_bits {
+        // Shift almost all the way, round up if needed, then finish shifting.
+        frac2 >>= bits - wanted_bits - 1;
+        设 add = frac2.bit(0);
+        frac2 >>= 1;
+
+        如果 add {
+            frac2 += 0x1;
+            如果 frac2.bits() > wanted_bits {
+                // We overflowed, drop one more hex digit.
+                // Note: Yes, the leading hex digit will now contain only 1 binary digit,
+                // but that emulates coreutils behavior on x86(-64).
+                frac2 >>= 4;
+                exp2 += 4;
+            }
+        }
+    } 否则 {
+        frac2 <<= wanted_bits - bits;
+    }
+
+    // Convert "XXX" to "X.XX": that divides by 16^precision = 2^(4*precision), so add that to the exponent.
+    设 可变 digits = frac2.to_str_radix(16);
+    如果 case == Case::Uppercase {
+        digits.make_ascii_uppercase();
+    }
+    设 (first_digit, remaining_digits) = digits.split_at(1);
+    设 exponent = exp2 + (4 * max_precision) 转换 整64;
+
+    设 可变 remaining_digits = remaining_digits.to_string();
+    如果 precision.is_none() {
+        // Trim trailing zeros
+        strip_fractional_zeroes(&可变 remaining_digits);
+    }
+
+    设 dot = 如果 !remaining_digits.为空()
+        || (precision.unwrap_or(0) == 0 && ForceDecimal::Yes == force_decimal)
+    {
+        "."
+    } 否则 {
+        ""
+    };
+
+    格式化!("{prefix}{first_digit}{dot}{remaining_digits}{exp_char}{exponent:+}")
+}
+
+方法 strip_fractional_zeroes(s: &可变 字符串) {
+    设 可变 trim_to = s.长度();
+    循环 (pos, c) 在 s.char_indices().rev() {
+        如果 pos + c.len_utf8() == trim_to {
+            如果 c == '0' {
+                trim_to = pos;
+            } 否则 {
+                中断;
+            }
+        }
+    }
+    s.truncate(trim_to);
+}
+
+方法 strip_fractional_zeroes_and_dot(s: &可变 字符串) {
+    设 可变 trim_to = s.长度();
+    循环 (pos, c) 在 s.char_indices().rev() {
+        如果 pos + c.len_utf8() == trim_to && (c == '0' || c == '.') {
+            trim_to = pos;
+        }
+        如果 c == '.' {
+            s.truncate(trim_to);
+            中断;
+        }
+    }
+}
+
+方法 write_output(
+    可变 writer: 实现 Write,
+    sign_indicator: 字符串,
+    s: 字符串,
+    width: 正整数大小,
+    alignment: NumberAlignment,
+) -> 标准库::输入输出::结果<()> {
+    如果 width == 0 {
+        writer.write_all(sign_indicator.as_bytes())?;
+        writer.write_all(s.as_bytes())?;
+        返回 好的(());
+    }
+    // Take length of `sign_indicator`, which could be 0 or 1, into consideration when padding
+    // by storing remaining_width indicating the actual width needed.
+    // Using min() because self.width could be 0, 0usize - 1usize should be avoided
+    设 remaining_width = width - min(width, sign_indicator.长度());
+
+    // Check if the width is too large for formatting
+    超级::check_width(remaining_width)?;
+
+    匹配 alignment {
+        NumberAlignment::Left => write!(writer, "{sign_indicator}{s:<remaining_width$}"),
+        NumberAlignment::RightSpace => {
+            设 is_sign = sign_indicator.starts_with('-') || sign_indicator.starts_with('+'); // When sign_indicator is in ['-', '+']
+            如果 is_sign && remaining_width > 0 {
+                // Make sure sign_indicator is just next to number, e.g. "% +5.1f" 1 ==> $ +1.0
+                设 s = sign_indicator + s.as_str();
+                write!(writer, "{s:>width$}", width = remaining_width + 1) // Since we now add sign_indicator and s together, plus 1
+            } 否则 {
+                write!(writer, "{sign_indicator}{s:>remaining_width$}")
+            }
+        }
+        NumberAlignment::RightZero => {
+            // Add the padding after "0x" for hexadecimals
+            设 (prefix, rest) = 如果 s.长度() >= 2 && s[..2].eq_ignore_ascii_case("0x") {
+                (&s[..2], &s[2..])
+            } 否则 {
+                ("", s.as_str())
+            };
+            设 remaining_width = remaining_width.saturating_sub(prefix.长度());
+            write!(writer, "{sign_indicator}{prefix}{rest:0>remaining_width$}")
+        }
+    }
+}
+
+#[cfg(test)]
+模组 test {
+    使用 bigdecimal::BigDecimal;
+    使用 num_traits::FromPrimitive;
+    使用 标准库::字符串切片::FromStr;
+
+    使用 箱::format::{
+        ExtendedBigDecimal, Format,
+        num_format::{Case, Float, ForceDecimal, UnsignedInt},
+    };
+
+    使用 超级::{Formatter, SignedInt};
+
+    #[test]
+    方法 unsigned_octal() {
+        使用 超级::{Formatter, NumberAlignment, Prefix, UnsignedInt, UnsignedIntVariant};
+        设 f = |x| {
+            设 可变 s = 向量::新建();
+            UnsignedInt {
+                variant: UnsignedIntVariant::Octal(Prefix::Yes),
+                width: 0,
+                precision: 0,
+                alignment: NumberAlignment::Left,
+            }
+            .格式化(&可变 s, x)
+            .解包();
+            字符串::from_utf8(s).解包()
+        };
+
+        相等断言!(f(0), "0");
+        相等断言!(f(5), "05");
+        相等断言!(f(8), "010");
+    }
+
+    #[test]
+    方法 non_finite_float() {
+        使用 超级::format_float_non_finite;
+        设 f = |x| format_float_non_finite(x, Case::Lowercase);
+        相等断言!(f(&ExtendedBigDecimal::Nan), "nan");
+        相等断言!(f(&ExtendedBigDecimal::Infinity), "inf");
+
+        设 f = |x| format_float_non_finite(x, Case::Uppercase);
+        相等断言!(f(&ExtendedBigDecimal::Nan), "NAN");
+        相等断言!(f(&ExtendedBigDecimal::Infinity), "INF");
+    }
+
+    #[test]
+    方法 decimal_float() {
+        使用 超级::format_float_decimal;
+        设 f =
+            |x| format_float_decimal(&BigDecimal::from_f64(x).解包(), 一些(6), ForceDecimal::No);
+        相等断言!(f(0.0), "0.000000");
+        相等断言!(f(1.0), "1.000000");
+        相等断言!(f(100.0), "100.000000");
+        相等断言!(f(123_456.789), "123456.789000");
+        相等断言!(f(12.345_678_9), "12.345679");
+        相等断言!(f(1_000_000.0), "1000000.000000");
+        相等断言!(f(99_999_999.0), "99999999.000000");
+        相等断言!(f(1.999_999_5), "1.999999");
+        相等断言!(f(1.999_999_6), "2.000000");
+
+        设 f = |x| {
+            format_float_decimal(
+                &BigDecimal::from_f64(x).解包(),
+                一些(0),
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f(100.0), "100.");
+
+        // Test arbitrary precision: long inputs that would not fit in a f64, print 24 digits after decimal point.
+        设 f = |x| {
+            format_float_decimal(
+                &BigDecimal::from_str(x).解包(),
+                一些(24),
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f("0.12345678901234567890"), "0.123456789012345678900000");
+        相等断言!(
+            f("1234567890.12345678901234567890"),
+            "1234567890.123456789012345678900000"
+        );
+    }
+
+    #[test]
+    方法 decimal_float_zero() {
+        使用 超级::format_float_decimal;
+        设 f = |digits, scale| {
+            format_float_decimal(
+                &BigDecimal::from_bigint(digits, scale),
+                一些(6),
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.into(), 0), "0.000000");
+        相等断言!(f(0.into(), -10), "0.000000");
+        相等断言!(f(0.into(), 10), "0.000000");
+    }
+
+    #[test]
+    方法 scientific_float() {
+        使用 超级::format_float_scientific;
+        设 f = |x| {
+            format_float_scientific(
+                &BigDecimal::from_f64(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.0), "0.000000e+00");
+        相等断言!(f(1.0), "1.000000e+00");
+        相等断言!(f(100.0), "1.000000e+02");
+        相等断言!(f(123_456.789), "1.234568e+05");
+        相等断言!(f(12.345_678_9), "1.234568e+01");
+        相等断言!(f(1_000_000.0), "1.000000e+06");
+        相等断言!(f(99_999_999.0), "1.000000e+08");
+
+        设 f = |x| {
+            format_float_scientific(
+                &BigDecimal::from_f64(x).解包(),
+                一些(6),
+                Case::Uppercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.0), "0.000000E+00");
+        相等断言!(f(123_456.789), "1.234568E+05");
+
+        // Test "0e10"/"0e-10". From cppreference.com: "If the value is ​0​, the exponent is also ​0​."
+        设 f = |digits, scale| {
+            format_float_scientific(
+                &BigDecimal::from_bigint(digits, scale),
+                一些(6),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.into(), 0), "0.000000e+00");
+        相等断言!(f(0.into(), -10), "0.000000e+00");
+        相等断言!(f(0.into(), 10), "0.000000e+00");
+    }
+
+    #[test]
+    方法 scientific_float_zero_precision() {
+        使用 超级::format_float_scientific;
+
+        设 f = |x| {
+            format_float_scientific(
+                &BigDecimal::from_f64(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.0), "0e+00");
+        相等断言!(f(1.0), "1e+00");
+        相等断言!(f(100.0), "1e+02");
+        相等断言!(f(123_456.789), "1e+05");
+        相等断言!(f(12.345_678_9), "1e+01");
+        相等断言!(f(1_000_000.0), "1e+06");
+        相等断言!(f(99_999_999.0), "1e+08");
+
+        设 f = |x| {
+            format_float_scientific(
+                &BigDecimal::from_f64(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f(0.0), "0.e+00");
+        相等断言!(f(1.0), "1.e+00");
+        相等断言!(f(100.0), "1.e+02");
+        相等断言!(f(123_456.789), "1.e+05");
+        相等断言!(f(12.345_678_9), "1.e+01");
+        相等断言!(f(1_000_000.0), "1.e+06");
+        相等断言!(f(99_999_999.0), "1.e+08");
+    }
+
+    #[test]
+    方法 shortest_float() {
+        使用 超级::format_float_shortest;
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.0), "0");
+        相等断言!(f(0.00001), "1e-05");
+        相等断言!(f(0.0001), "0.0001");
+        相等断言!(f(1.0), "1");
+        相等断言!(f(100.0), "100");
+        相等断言!(f(123_456.789), "123457");
+        相等断言!(f(12.345_678_9), "12.3457");
+        相等断言!(f(1_000_000.0), "1e+06");
+        相等断言!(f(99_999_999.0), "1e+08");
+    }
+
+    #[test]
+    方法 shortest_float_force_decimal() {
+        使用 超级::format_float_shortest;
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f(0.0), "0.00000");
+        相等断言!(f(0.00001), "1.00000e-05");
+        相等断言!(f(0.0001), "0.000100000");
+        相等断言!(f(1.0), "1.00000");
+        相等断言!(f(100.0), "100.000");
+        相等断言!(f(123_456.789), "123457.");
+        相等断言!(f(12.345_678_9), "12.3457");
+        相等断言!(f(1_000_000.0), "1.00000e+06");
+        相等断言!(f(99_999_999.0), "1.00000e+08");
+    }
+
+    #[test]
+    方法 shortest_float_force_decimal_zero_precision() {
+        使用 超级::format_float_shortest;
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.0), "0");
+        相等断言!(f(0.00001), "1e-05");
+        相等断言!(f(0.0001), "0.0001");
+        相等断言!(f(1.0), "1");
+        相等断言!(f(10.0), "1e+01");
+        相等断言!(f(100.0), "1e+02");
+        相等断言!(f(123_456.789), "1e+05");
+        相等断言!(f(12.345_678_9), "1e+01");
+        相等断言!(f(1_000_000.0), "1e+06");
+        相等断言!(f(99_999_999.0), "1e+08");
+
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f(0.0), "0.");
+        相等断言!(f(0.00001), "1.e-05");
+        相等断言!(f(0.0001), "0.0001");
+        相等断言!(f(1.0), "1.");
+        相等断言!(f(10.0), "1.e+01");
+        相等断言!(f(100.0), "1.e+02");
+        相等断言!(f(123_456.789), "1.e+05");
+        相等断言!(f(12.345_678_9), "1.e+01");
+        相等断言!(f(1_000_000.0), "1.e+06");
+        相等断言!(f(99_999_999.0), "1.e+08");
+    }
+
+    #[test]
+    方法 hexadecimal_float() {
+        // It's important to create the BigDecimal from a string: going through a f64
+        // will lose some precision.
+
+        使用 超级::format_float_hexadecimal;
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                一些(6),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f("0"), "0x0.000000p+0");
+        相等断言!(f("0.00001"), "0xa.7c5ac4p-20");
+        相等断言!(f("0.125"), "0x8.000000p-6");
+        相等断言!(f("256.0"), "0x8.000000p+5");
+        相等断言!(f("65536.0"), "0x8.000000p+13");
+        相等断言!(f("1.9999999999"), "0x1.000000p+1"); // Corner case: leading hex digit only contains 1 binary digit
+
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f("0"), "0x0p+0");
+        相等断言!(f("0.125"), "0x8p-6");
+        相等断言!(f("256.0"), "0x8p+5");
+
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                一些(0),
+                Case::Lowercase,
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f("0"), "0x0.p+0");
+        相等断言!(f("0.125"), "0x8.p-6");
+        相等断言!(f("256.0"), "0x8.p+5");
+
+        // Default precision, maximum 13 digits (x86-64 behavior)
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f("0"), "0x0p+0");
+        相等断言!(f("0.00001"), "0xa.7c5ac471b478423p-20");
+        相等断言!(f("0.125"), "0x8p-6");
+        相等断言!(f("4.25"), "0x8.8p-1");
+        相等断言!(f("17.203125"), "0x8.9ap+1");
+        相等断言!(f("256.0"), "0x8p+5");
+        相等断言!(f("1000.01"), "0xf.a00a3d70a3d70a4p+6");
+        相等断言!(f("65536.0"), "0x8p+13");
+
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::Yes,
+            )
+        };
+        相等断言!(f("0"), "0x0.p+0");
+        相等断言!(f("0.125"), "0x8.p-6");
+        相等断言!(f("4.25"), "0x8.8p-1");
+        相等断言!(f("256.0"), "0x8.p+5");
+
+        设 f = |x| {
+            format_float_hexadecimal(
+                &BigDecimal::from_str(x).解包(),
+                一些(6),
+                Case::Uppercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f("0.00001"), "0XA.7C5AC4P-20");
+        相等断言!(f("0.125"), "0X8.000000P-6");
+
+        // Test "0e10"/"0e-10". From cppreference.com: "If the value is ​0​, the exponent is also ​0​."
+        设 f = |digits, scale| {
+            format_float_hexadecimal(
+                &BigDecimal::from_bigint(digits, scale),
+                一些(6),
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.into(), 0), "0x0.000000p+0");
+        相等断言!(f(0.into(), -10), "0x0.000000p+0");
+        相等断言!(f(0.into(), 10), "0x0.000000p+0");
+    }
+
+    #[test]
+    方法 strip_insignificant_end() {
+        使用 超级::strip_fractional_zeroes_and_dot;
+        设 f = |s| {
+            设 可变 s = 字符串::from(s);
+            strip_fractional_zeroes_and_dot(&可变 s);
+            s
+        };
+        相等断言!(&f("1000"), "1000");
+        相等断言!(&f("1000."), "1000");
+        相等断言!(&f("1000.02030"), "1000.0203");
+        相等断言!(&f("1000.00000"), "1000");
+    }
+
+    #[test]
+    方法 shortest_float_abs_value_less_than_one() {
+        使用 超级::format_float_shortest;
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.117_187_5), "0.117188");
+        相等断言!(f(0.011_718_75), "0.0117188");
+        相等断言!(f(0.001_171_875), "0.00117187");
+        相等断言!(f(0.000_117_187_5), "0.000117187");
+        相等断言!(f(0.001_171_875_001), "0.00117188");
+    }
+
+    #[test]
+    方法 shortest_float_switch_decimal_scientific() {
+        使用 超级::format_float_shortest;
+        设 f = |x| {
+            format_float_shortest(
+                &BigDecimal::from_f64(x).解包(),
+                无,
+                Case::Lowercase,
+                ForceDecimal::No,
+            )
+        };
+        相等断言!(f(0.001), "0.001");
+        相等断言!(f(0.0001), "0.0001");
+        相等断言!(f(0.00001), "1e-05");
+        相等断言!(f(0.000_001), "1e-06");
+    }
+
+    /// Wrapper function to get a string out of Format.fmt()
+    方法 格式化<U, T>(format: &Format<U, T>, n: T) -> 字符串
+    何处
+        U: Formatter<T>,
+    {
+        设 可变 v = 向量::<正8>::新建();
+        format.格式化(&可变 v, n).解包();
+        字符串::from_utf8_lossy(&v).to_string()
+    }
+
+    // Some end-to-end tests, `printf` will also test some of those but it's easier to add more
+    // tests here. We mostly focus on padding, negative numbers, and format specifiers that are not
+    // covered above.
+    #[test]
+    方法 format_signed_int() {
+        设 format = Format::<SignedInt, 整64>::parse("%d").解包();
+        相等断言!(格式化(&format, 123整64), "123");
+        相等断言!(格式化(&format, -123整64), "-123");
+        相等断言!(格式化(&format, 整64::MAX), "9223372036854775807");
+        相等断言!(格式化(&format, 整64::MIN), "-9223372036854775808");
+
+        设 format = Format::<SignedInt, 整64>::parse("%i").解包();
+        相等断言!(格式化(&format, 123整64), "123");
+        相等断言!(格式化(&format, -123整64), "-123");
+
+        设 format = Format::<SignedInt, 整64>::parse("%6d").解包();
+        相等断言!(格式化(&format, 123整64), "   123");
+        相等断言!(格式化(&format, -123整64), "  -123");
+
+        设 format = Format::<SignedInt, 整64>::parse("%06d").解包();
+        相等断言!(格式化(&format, 123整64), "000123");
+        相等断言!(格式化(&format, -123整64), "-00123");
+
+        设 format = Format::<SignedInt, 整64>::parse("%+6d").解包();
+        相等断言!(格式化(&format, 123整64), "  +123");
+        相等断言!(格式化(&format, -123整64), "  -123");
+
+        设 format = Format::<SignedInt, 整64>::parse("% d").解包();
+        相等断言!(格式化(&format, 123整64), " 123");
+        相等断言!(格式化(&format, -123整64), "-123");
+    }
+
+    #[test]
+    #[ignore = "Need issue #7509 to be fixed"]
+    方法 format_signed_int_precision_zero() {
+        设 format = Format::<SignedInt, 整64>::parse("%.0d").解包();
+        相等断言!(格式化(&format, 123整64), "123");
+        // From cppreference.com: "If both the converted value and the precision are ​0​ the conversion results in no characters."
+        相等断言!(格式化(&format, 0整64), "");
+    }
+
+    #[test]
+    方法 format_unsigned_int() {
+        设 f = |fmt_str: &字符串切片, n: 正64| {
+            设 format = Format::<UnsignedInt, 正64>::parse(fmt_str).解包();
+            格式化(&format, n)
+        };
+
+        相等断言!(f("%u", 123正64), "123");
+        相等断言!(f("%o", 123正64), "173");
+        相等断言!(f("%#o", 123正64), "0173");
+        相等断言!(f("%6x", 123正64), "    7b");
+        相等断言!(f("%#6x", 123正64), "  0x7b");
+        相等断言!(f("%06X", 123正64), "00007B");
+        相等断言!(f("%+6u", 123正64), "   123"); // '+' is ignored for unsigned numbers.
+        相等断言!(f("% u", 123正64), "123"); // ' ' is ignored for unsigned numbers.
+        相等断言!(f("%#x", 0), "0"); // No prefix for 0
+    }
+
+    #[test]
+    #[ignore = "Need issues #7509 and #7510 to be fixed"]
+    方法 format_unsigned_int_broken() {
+        // TODO: Merge this back into format_unsigned_int.
+        设 f = |fmt_str: &字符串切片, n: 正64| {
+            设 format = Format::<UnsignedInt, 正64>::parse(fmt_str).解包();
+            格式化(&format, n)
+        };
+
+        // #7509
+        相等断言!(f("%.0o", 0), "");
+        相等断言!(f("%#0o", 0), "0"); // Already correct, but probably an accident.
+        相等断言!(f("%.0x", 0), "");
+        // #7510
+        相等断言!(f("%#06x", 123正64), "0x007b");
+    }
+
+    #[test]
+    方法 format_float_decimal() {
+        设 format = Format::<Float, &ExtendedBigDecimal>::parse("%f").解包();
+        相等断言!(格式化(&format, &123.0.into()), "123.000000");
+        相等断言!(格式化(&format, &(-123.0).into()), "-123.000000");
+        相等断言!(格式化(&format, &123.15e-8.into()), "0.000001");
+        相等断言!(格式化(&format, &(-123.15e8).into()), "-12315000000.000000");
+        设 zero_exp = |exp| ExtendedBigDecimal::BigDecimal(BigDecimal::from_bigint(0.into(), exp));
+        // We've had issues with "0e10"/"0e-10" formatting, and our current workaround is in Format.fmt function.
+        相等断言!(格式化(&format, &zero_exp(0)), "0.000000");
+        相等断言!(格式化(&format, &zero_exp(10)), "0.000000");
+        相等断言!(格式化(&format, &zero_exp(-10)), "0.000000");
+
+        设 format = Format::<Float, &ExtendedBigDecimal>::parse("%12f").解包();
+        相等断言!(格式化(&format, &123.0.into()), "  123.000000");
+        相等断言!(格式化(&format, &(-123.0).into()), " -123.000000");
+        相等断言!(格式化(&format, &123.15e-8.into()), "    0.000001");
+        相等断言!(格式化(&format, &(-123.15e8).into()), "-12315000000.000000");
+        相等断言!(
+            格式化(&format, &(ExtendedBigDecimal::Infinity)),
+            "         inf"
+        );
+        相等断言!(
+            格式化(&format, &(ExtendedBigDecimal::MinusInfinity)),
+            "        -inf"
+        );
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::Nan)), "         nan");
+        相等断言!(
+            格式化(&format, &(ExtendedBigDecimal::MinusNan)),
+            "        -nan"
+        );
+
+        设 format = Format::<Float, &ExtendedBigDecimal>::parse("%+#.0f").解包();
+        相等断言!(格式化(&format, &123.0.into()), "+123.");
+        相等断言!(格式化(&format, &(-123.0).into()), "-123.");
+        相等断言!(格式化(&format, &123.15e-8.into()), "+0.");
+        相等断言!(格式化(&format, &(-123.15e8).into()), "-12315000000.");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::Infinity)), "+inf");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::Nan)), "+nan");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::MinusZero)), "-0.");
+
+        设 format = Format::<Float, &ExtendedBigDecimal>::parse("%#06.0f").解包();
+        相等断言!(格式化(&format, &123.0.into()), "00123.");
+        相等断言!(格式化(&format, &(-123.0).into()), "-0123.");
+        相等断言!(格式化(&format, &123.15e-8.into()), "00000.");
+        相等断言!(格式化(&format, &(-123.15e8).into()), "-12315000000.");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::Infinity)), "   inf");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::MinusInfinity)), "  -inf");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::Nan)), "   nan");
+        相等断言!(格式化(&format, &(ExtendedBigDecimal::MinusNan)), "  -nan");
+    }
+
+    #[test]
+    方法 format_float_others() {
+        设 f = |fmt_str: &字符串切片, n: &ExtendedBigDecimal| {
+            设 format = Format::<Float, &ExtendedBigDecimal>::parse(fmt_str).解包();
+            格式化(&format, n)
+        };
+
+        相等断言!(f("%e", &(-123.0).into()), "-1.230000e+02");
+        相等断言!(f("%#09.e", &(-100.0).into()), "-001.e+02");
+        相等断言!(f("%# 9.E", &100.0.into()), "   1.E+02");
+        相等断言!(f("% 12.2A", &(-100.0).into()), "  -0XC.80P+3");
+        相等断言!(f("%012.2a", &(-100.0).into()), "-0x00c.80p+3");
+        相等断言!(f("%012.2A", &(-100.0).into()), "-0X00C.80P+3");
+    }
+}

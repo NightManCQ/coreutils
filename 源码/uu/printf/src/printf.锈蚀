@@ -1,0 +1,112 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::stdout;
+使用 标准库::操作符::ControlFlow;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, UUsageError};
+使用 uucore::format::{FormatArgument, FormatArguments, FormatItem, parse_spec_and_escape};
+使用 uucore::translate;
+使用 uucore::{format_usage, os_str_as_bytes, show_warning};
+
+常量 VERSION: &字符串切片 = "version";
+常量 HELP: &字符串切片 = "help";
+
+模组 options {
+    公有 常量 FORMAT: &字符串切片 = "FORMAT";
+    公有 常量 ARGUMENT: &字符串切片 = "ARGUMENT";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 format = matches
+        .get_one::<OsString>(options::FORMAT)
+        .ok_or_else(|| UUsageError::新建(1, translate!("printf-error-missing-operand")))?;
+    设 format = os_str_as_bytes(format)?;
+
+    设 values: 向量<_> = 匹配 matches.get_many::<OsString>(options::ARGUMENT) {
+        一些(s) => s
+            .映射(|os_string| FormatArgument::Unparsed(os_string.to_owned()))
+            .收集(),
+        无 => 向量![],
+    };
+
+    设 可变 format_seen = 假;
+    // Parse and process the format string
+    设 可变 args = FormatArguments::新建(&values);
+    循环 item 在 parse_spec_and_escape(format) {
+        如果 设 好的(FormatItem::Spec(_)) = item {
+            format_seen = 真;
+        }
+        匹配 item?.写锁定(stdout(), &可变 args)? {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(()) => 返回 好的(()),
+        }
+    }
+    args.start_next_batch();
+
+    // Without format specs in the string, the iter would not consume any args,
+    // leading to an infinite loop. Thus, we exit early.
+    如果 !format_seen {
+        如果 !args.is_exhausted() {
+            设 一些(FormatArgument::Unparsed(arg_str)) = args.peek_arg() 否则 {
+                无法到达!("All args are transformed to Unparsed")
+            };
+            show_warning!(
+                "{}",
+                translate!(
+                    "printf-warning-ignoring-excess-arguments",
+                    "arg" => arg_str.quote()
+                )
+            );
+        }
+        返回 好的(());
+    }
+
+    当 !args.is_exhausted() {
+        循环 item 在 parse_spec_and_escape(format) {
+            匹配 item?.写锁定(stdout(), &可变 args)? {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(()) => 返回 好的(()),
+            }
+        }
+        args.start_next_batch();
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("printf")
+        .allow_hyphen_values(真)
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("printf-about"))
+        .after_help(translate!("printf-after-help"))
+        .override_usage(format_usage(&translate!("printf-usage")))
+        .disable_help_flag(真)
+        .disable_version_flag(真)
+        .arg(
+            Arg::新建(HELP)
+                .long(HELP)
+                .help(translate!("printf-help-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(VERSION)
+                .long(VERSION)
+                .help(translate!("printf-help-version"))
+                .action(ArgAction::Version),
+        )
+        .arg(Arg::新建(options::FORMAT).value_parser(clap::value_parser!(OsString)))
+        .arg(
+            Arg::新建(options::ARGUMENT)
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}

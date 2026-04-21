@@ -1,0 +1,237 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Parsing of escape sequences
+
+使用 箱::format::FormatError;
+
+#[derive(调试协议)]
+公有 枚举 EscapedChar {
+    /// A single byte
+    Byte(正8),
+    /// A unicode character
+    Char(字符),
+    /// A character prefixed with a backslash (i.e. an invalid escape sequence)
+    Backslash(正8),
+    /// Specifies that the string should stop (`\c`)
+    End,
+}
+
+#[derive(克隆协议, 复制协议, 默认协议)]
+公有 枚举 OctalParsing {
+    #[默认]
+    TwoDigits = 2,
+    ThreeDigits = 3,
+}
+
+#[derive(克隆协议, 复制协议)]
+枚举 Base {
+    Oct(OctalParsing),
+    Hex,
+}
+
+实现 Base {
+    方法 as_base(自身) -> 正8 {
+        匹配 自身 {
+            自身类型::Oct(_) => 8,
+            自身类型::Hex => 16,
+        }
+    }
+
+    方法 max_digits(自身) -> 正8 {
+        匹配 自身 {
+            自身类型::Oct(parsing) => parsing 转换 正8,
+            自身类型::Hex => 2,
+        }
+    }
+
+    方法 convert_digit(自身, c: 正8) -> 选项<正8> {
+        匹配 自身 {
+            自身类型::Oct(_) => {
+                如果 matches!(c, b'0'..=b'7') {
+                    一些(c - b'0')
+                } 否则 {
+                    无
+                }
+            }
+            自身类型::Hex => 匹配 c {
+                b'0'..=b'9' => 一些(c - b'0'),
+                b'A'..=b'F' => 一些(c - b'A' + 10),
+                b'a'..=b'f' => 一些(c - b'a' + 10),
+                _ => 无,
+            },
+        }
+    }
+}
+
+/// Parse the numeric part of the `\xHHH` and `\0NNN` escape sequences
+方法 parse_code(input: &可变 &[正8], base: Base) -> 选项<正8> {
+    // All arithmetic on `ret` needs to be wrapping, because octal input can
+    // take 3 digits, which is 9 bits, and therefore more than what fits in a
+    // `u8`. GNU just seems to wrap these values.
+    // Note that if we instead make `ret` a `u32` and use `char::from_u32` will
+    // yield incorrect results because it will interpret values larger than
+    // `u8::MAX` as unicode.
+    设 [c, rest @ ..] = input 否则 { 返回 无 };
+    设 可变 ret = base.convert_digit(*c)?;
+    *input = rest;
+
+    循环 _ 在 1..base.max_digits() {
+        设 [c, rest @ ..] = input 否则 { 中断 };
+        设 一些(n) = base.convert_digit(*c) 否则 {
+            中断;
+        };
+        ret = ret.wrapping_mul(base.as_base()).wrapping_add(n);
+        *input = rest;
+    }
+
+    一些(ret)
+}
+
+// spell-checker:disable-next
+/// Parse `\uHHHH` and `\UHHHHHHHH`
+方法 parse_unicode(input: &可变 &[正8], digits: 正8) -> 结果<字符, EscapeError> {
+    如果 设 一些((new_digits, rest)) = input.split_at_checked(digits 转换 正整数大小) {
+        *input = rest;
+        设 ret = new_digits
+            .迭代()
+            .映射(|c| Base::Hex.convert_digit(*c))
+            .收集::<选项<向量<正8>>>()
+            .ok_or(EscapeError::MissingHexadecimalNumber)?
+            .迭代()
+            .映射(|n| *n 转换 正32)
+            .reduce(|ret, n| ret.wrapping_mul(Base::Hex.as_base() 转换 正32).wrapping_add(n))
+            .期望("must have multiple digits in unicode string");
+        字符::from_u32(ret).ok_or_else(|| EscapeError::InvalidCharacters(new_digits.to_vec()))
+    } 否则 {
+        坏的(EscapeError::MissingHexadecimalNumber)
+    }
+}
+
+/// Represents an invalid escape sequence.
+#[derive(调试协议, 偏等比较协议)]
+公有 枚举 EscapeError {
+    InvalidCharacters(向量<正8>),
+    MissingHexadecimalNumber,
+}
+
+/// Parse an escape sequence, like `\n` or `\xff`, etc.
+公有 方法 parse_escape_code(
+    rest: &可变 &[正8],
+    zero_octal_parsing: OctalParsing,
+) -> 结果<EscapedChar, FormatError> {
+    如果 设 [c, new_rest @ ..] = rest {
+        // This is for the \NNN syntax for octal sequences.
+        // Note that '0' is intentionally omitted because that
+        // would be the \0NNN syntax.
+        如果 设 b'1'..=b'7' = c {
+            如果 设 一些(parsed) = parse_code(rest, Base::Oct(OctalParsing::ThreeDigits)) {
+                返回 好的(EscapedChar::Byte(parsed));
+            }
+        }
+
+        *rest = new_rest;
+        匹配 c {
+            b'\\' => 好的(EscapedChar::Byte(b'\\')),
+            b'"' => 好的(EscapedChar::Byte(b'"')),
+            b'a' => 好的(EscapedChar::Byte(b'\x07')),
+            b'b' => 好的(EscapedChar::Byte(b'\x08')),
+            b'c' => 好的(EscapedChar::End),
+            b'e' => 好的(EscapedChar::Byte(b'\x1b')),
+            b'f' => 好的(EscapedChar::Byte(b'\x0c')),
+            b'n' => 好的(EscapedChar::Byte(b'\n')),
+            b'r' => 好的(EscapedChar::Byte(b'\r')),
+            b't' => 好的(EscapedChar::Byte(b'\t')),
+            b'v' => 好的(EscapedChar::Byte(b'\x0b')),
+            b'x' => {
+                如果 设 一些(c) = parse_code(rest, Base::Hex) {
+                    好的(EscapedChar::Byte(c))
+                } 否则 {
+                    坏的(FormatError::MissingHex)
+                }
+            }
+            b'0' => 好的(EscapedChar::Byte(
+                parse_code(rest, Base::Oct(zero_octal_parsing)).unwrap_or(b'\0'),
+            )),
+            b'u' => 匹配 parse_unicode(rest, 4) {
+                好的(c) => 好的(EscapedChar::Char(c)),
+                坏的(EscapeError::MissingHexadecimalNumber) => 坏的(FormatError::MissingHex),
+                坏的(EscapeError::InvalidCharacters(chars)) => {
+                    坏的(FormatError::InvalidCharacter('u', chars))
+                }
+            },
+            b'U' => 匹配 parse_unicode(rest, 8) {
+                好的(c) => 好的(EscapedChar::Char(c)),
+                坏的(EscapeError::MissingHexadecimalNumber) => 坏的(FormatError::MissingHex),
+                坏的(EscapeError::InvalidCharacters(chars)) => {
+                    坏的(FormatError::InvalidCharacter('U', chars))
+                }
+            },
+            c => 好的(EscapedChar::Backslash(*c)),
+        }
+    } 否则 {
+        好的(EscapedChar::Byte(b'\\'))
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    模组 parse_unicode {
+        使用 超级::*;
+
+        #[test]
+        方法 parse_ascii() {
+            设 input = b"2a";
+            相等断言!(parse_unicode(&可变 &input[..], 2), 好的('*'));
+
+            设 input = b"002A";
+            相等断言!(parse_unicode(&可变 &input[..], 4), 好的('*'));
+        }
+
+        #[test]
+        方法 parse_emoji_codepoint() {
+            设 input = b"0001F60A";
+            相等断言!(parse_unicode(&可变 &input[..], 8), 好的('😊'));
+        }
+
+        #[test]
+        方法 no_characters() {
+            设 input = b"";
+            相等断言!(
+                parse_unicode(&可变 &input[..], 8),
+                坏的(EscapeError::MissingHexadecimalNumber)
+            );
+        }
+
+        #[test]
+        方法 incomplete_hexadecimal_number() {
+            设 input = b"123";
+            相等断言!(
+                parse_unicode(&可变 &input[..], 4),
+                坏的(EscapeError::MissingHexadecimalNumber)
+            );
+        }
+
+        #[test]
+        方法 invalid_hex() {
+            设 input = b"duck";
+            相等断言!(
+                parse_unicode(&可变 &input[..], 4),
+                坏的(EscapeError::MissingHexadecimalNumber)
+            );
+        }
+
+        #[test]
+        方法 surrogate_code_point() {
+            设 input = b"d800";
+            相等断言!(
+                parse_unicode(&可变 &input[..], 4),
+                坏的(EscapeError::InvalidCharacters(向量::from(b"d800")))
+            );
+        }
+    }
+}

@@ -1,0 +1,194 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) errno
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::环境;
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统;
+使用 标准库::输入输出::{Write, stdout};
+使用 标准库::路径::{Path, PathBuf};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, UUsageError};
+使用 uucore::文件系统::{MissingHandling, ResolveMode, canonicalize};
+使用 uucore::libc::EINVAL;
+使用 uucore::line_ending::LineEnding;
+使用 uucore::translate;
+使用 uucore::{format_usage, show_error};
+
+常量 OPT_CANONICALIZE: &字符串切片 = "canonicalize";
+常量 OPT_CANONICALIZE_MISSING: &字符串切片 = "canonicalize-missing";
+常量 OPT_CANONICALIZE_EXISTING: &字符串切片 = "canonicalize-existing";
+常量 OPT_NO_NEWLINE: &字符串切片 = "no-newline";
+常量 OPT_QUIET: &字符串切片 = "quiet";
+常量 OPT_SILENT: &字符串切片 = "silent";
+常量 OPT_VERBOSE: &字符串切片 = "verbose";
+常量 OPT_ZERO: &字符串切片 = "zero";
+
+常量 ARG_FILES: &字符串切片 = "files";
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 可变 no_trailing_delimiter = matches.get_flag(OPT_NO_NEWLINE);
+    设 use_zero = matches.get_flag(OPT_ZERO);
+    设 verbose = matches.get_flag(OPT_VERBOSE) || 环境::var("POSIXLY_CORRECT").is_ok();
+
+    // GNU readlink -f/-e/-m follows symlinks first and then applies `..` (physical resolution).
+    // ResolveMode::Logical collapses `..` before following links, which yields the opposite order,
+    // so we choose Physical here for GNU compatibility.
+    设 res_mode = 如果 matches.get_flag(OPT_CANONICALIZE)
+        || matches.get_flag(OPT_CANONICALIZE_EXISTING)
+        || matches.get_flag(OPT_CANONICALIZE_MISSING)
+    {
+        ResolveMode::Physical
+    } 否则 {
+        ResolveMode::无
+    };
+
+    设 can_mode = 如果 matches.get_flag(OPT_CANONICALIZE_EXISTING) {
+        MissingHandling::Existing
+    } 否则 如果 matches.get_flag(OPT_CANONICALIZE_MISSING) {
+        MissingHandling::Missing
+    } 否则 {
+        MissingHandling::Normal
+    };
+
+    设 files: 向量<PathBuf> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .映射(|v| v.映射(PathBuf::from).收集())
+        .unwrap_or_default();
+
+    如果 files.为空() {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("readlink-error-missing-operand"),
+        ));
+    }
+
+    如果 no_trailing_delimiter && files.长度() > 1 {
+        show_error!("{}", translate!("readlink-error-ignoring-no-newline"));
+        no_trailing_delimiter = 假;
+    }
+
+    设 line_ending = 如果 no_trailing_delimiter {
+        无
+    } 否则 {
+        一些(LineEnding::from_zero_flag(use_zero))
+    };
+
+    循环 p 在 &files {
+        设 path_result = 如果 res_mode == ResolveMode::无 {
+            文件系统::read_link(p)
+        } 否则 {
+            canonicalize(p, can_mode, res_mode)
+        };
+
+        匹配 path_result {
+            好的(路径) => {
+                show(&路径, line_ending).map_err_context(字符串::新建)?;
+            }
+            坏的(err) => {
+                如果 !verbose {
+                    返回 坏的(1.into());
+                }
+
+                设 message = 如果 err.raw_os_error() == 一些(EINVAL) {
+                    translate!("readlink-error-invalid-argument", "path" => p.maybe_quote())
+                } 否则 {
+                    err.map_err_context(|| p.maybe_quote().to_string())
+                        .to_string()
+                };
+                show_error!("{message}");
+                返回 坏的(1.into());
+            }
+        }
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("readlink")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("readlink"))
+        .about(translate!("readlink-about"))
+        .override_usage(format_usage(&translate!("readlink-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_CANONICALIZE)
+                .short('f')
+                .long(OPT_CANONICALIZE)
+                .help(translate!("readlink-help-canonicalize"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CANONICALIZE_EXISTING)
+                .short('e')
+                .long("canonicalize-existing")
+                .help(translate!("readlink-help-canonicalize-existing"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CANONICALIZE_MISSING)
+                .short('m')
+                .long(OPT_CANONICALIZE_MISSING)
+                .help(translate!("readlink-help-canonicalize-missing"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_NO_NEWLINE)
+                .short('n')
+                .long(OPT_NO_NEWLINE)
+                .help(translate!("readlink-help-no-newline"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_QUIET)
+                .short('q')
+                .long(OPT_QUIET)
+                .help(translate!("readlink-help-quiet"))
+                .overrides_with_all([OPT_QUIET, OPT_SILENT, OPT_VERBOSE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SILENT)
+                .short('s')
+                .long(OPT_SILENT)
+                .help(translate!("readlink-help-silent"))
+                .overrides_with_all([OPT_QUIET, OPT_SILENT, OPT_VERBOSE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .short('v')
+                .long(OPT_VERBOSE)
+                .help(translate!("readlink-help-verbose"))
+                .overrides_with_all([OPT_QUIET, OPT_SILENT, OPT_VERBOSE])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_ZERO)
+                .short('z')
+                .long(OPT_ZERO)
+                .help(translate!("readlink-help-zero"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(OsString))
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+方法 show(路径: &Path, line_ending: 选项<LineEnding>) -> 标准库::输入输出::结果<()> {
+    uucore::display::print_verbatim(路径)?;
+    如果 设 一些(line_ending) = line_ending {
+        write!(stdout(), "{line_ending}")?;
+    }
+    stdout().flush()
+}

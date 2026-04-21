@@ -1,0 +1,280 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+#![allow(unused_must_use)] // because we of writeln!
+
+// spell-checker:ignore (ToDO) lstat
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统;
+使用 标准库::输入输出::{ErrorKind, Write};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, UUsageError, set_exit_code};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+// operating mode
+枚举 Mode {
+    默认协议, // use filesystem to determine information and limits
+    Basic,   // check basic compatibility with POSIX
+    Extra,   // check for leading dashes and empty names
+    Both,    // a combination of `Basic` and `Extra`
+}
+
+模组 options {
+    公有 常量 POSIX: &字符串切片 = "posix";
+    公有 常量 POSIX_SPECIAL: &字符串切片 = "posix-special";
+    公有 常量 PORTABILITY: &字符串切片 = "portability";
+    公有 常量 PATH: &字符串切片 = "path";
+}
+
+// a few global constants as used in the GNU implementation
+常量 POSIX_PATH_MAX: 正整数大小 = 256;
+常量 POSIX_NAME_MAX: 正整数大小 = 14;
+
+#[cfg(全部(unix, not(target_os = "redox")))]
+常量 PATH_MAX: 正整数大小 = libc::PATH_MAX 转换 正整数大小;
+#[cfg(全部(unix, not(target_os = "redox")))]
+常量 FILENAME_MAX: 正整数大小 = libc::FILENAME_MAX 转换 正整数大小;
+#[cfg(target_os = "redox")]
+常量 PATH_MAX: 正整数大小 = 4096;
+#[cfg(target_os = "redox")]
+常量 FILENAME_MAX: 正整数大小 = 255;
+// for Windows. But don't deny wasm
+#[cfg(not(unix))]
+常量 PATH_MAX: 正整数大小 = 260;
+#[cfg(not(unix))]
+常量 FILENAME_MAX: 正整数大小 = 255;
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    // set working mode
+    设 is_posix = matches.get_flag(options::POSIX);
+    设 is_posix_special = matches.get_flag(options::POSIX_SPECIAL);
+    设 is_portability = matches.get_flag(options::PORTABILITY);
+
+    设 mode = 如果 (is_posix && is_posix_special) || is_portability {
+        Mode::Both
+    } 否则 如果 is_posix {
+        Mode::Basic
+    } 否则 如果 is_posix_special {
+        Mode::Extra
+    } 否则 {
+        Mode::默认协议
+    };
+
+    // take necessary actions
+    设 paths = matches.get_many::<OsString>(options::PATH);
+    如果 paths.is_none() {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("pathchk-error-missing-operand"),
+        ));
+    }
+
+    // free strings are path operands
+    // FIXME: TCS, seems inefficient and overly verbose (?)
+    设 可变 res = 真;
+    循环 p 在 paths.解包() {
+        设 path_str = p.to_string_lossy();
+        设 可变 路径 = 向量::新建();
+        循环 path_segment 在 path_str.split('/') {
+            路径.压入(path_segment.to_string());
+        }
+        res &= check_path(&mode, &路径);
+    }
+
+    // determine error code
+    如果 !res {
+        set_exit_code(1);
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("pathchk")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("pathchk"))
+        .about(translate!("pathchk-about"))
+        .override_usage(format_usage(&translate!("pathchk-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::POSIX)
+                .short('p')
+                .help(translate!("pathchk-help-posix"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::POSIX_SPECIAL)
+                .short('P')
+                .help(translate!("pathchk-help-posix-special"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PORTABILITY)
+                .long(options::PORTABILITY)
+                .help(translate!("pathchk-help-portability"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PATH)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}
+
+/// check a path, given as a slice of it's components and an operating mode
+方法 check_path(mode: &Mode, 路径: &[字符串]) -> 布尔 {
+    匹配 *mode {
+        Mode::Basic => check_basic(路径),
+        Mode::Extra => check_default(路径) && check_extra(路径),
+        Mode::Both => check_basic(路径) && check_extra(路径),
+        Mode::默认协议 => check_default(路径),
+    }
+}
+
+/// check a path in basic compatibility mode
+方法 check_basic(路径: &[字符串]) -> 布尔 {
+    设 joined_path = 路径.加入("/");
+    设 total_len = joined_path.长度();
+    // path length
+    如果 total_len > POSIX_PATH_MAX {
+        writeln!(
+            标准库::输入输出::stderr(),
+            "{}",
+            translate!("pathchk-error-posix-path-length-exceeded", "limit" => POSIX_PATH_MAX, "length" => total_len, "path" => joined_path)
+        );
+        返回 假;
+    } 否则 如果 total_len == 0 {
+        writeln!(
+            标准库::输入输出::stderr(),
+            "{}",
+            translate!("pathchk-error-empty-file-name")
+        );
+        返回 假;
+    }
+    // components: character portability and length
+    循环 p 在 路径 {
+        设 component_len = p.长度();
+        如果 component_len > POSIX_NAME_MAX {
+            writeln!(
+                标准库::输入输出::stderr(),
+                "{}",
+                translate!("pathchk-error-posix-name-length-exceeded", "limit" => POSIX_NAME_MAX, "length" => component_len, "component" => p.quote())
+            );
+            返回 假;
+        }
+        如果 !check_portable_chars(p) {
+            返回 假;
+        }
+    }
+    // permission checks
+    check_searchable(&joined_path)
+}
+
+/// check a path in extra compatibility mode
+方法 check_extra(路径: &[字符串]) -> 布尔 {
+    // components: leading hyphens
+    循环 p 在 路径 {
+        如果 p.starts_with('-') {
+            writeln!(
+                标准库::输入输出::stderr(),
+                "{}",
+                translate!("pathchk-error-leading-hyphen", "component" => p.quote())
+            );
+            返回 假;
+        }
+    }
+    // path length
+    如果 路径.加入("/").为空() {
+        writeln!(
+            标准库::输入输出::stderr(),
+            "{}",
+            translate!("pathchk-error-empty-file-name")
+        );
+        返回 假;
+    }
+    真
+}
+
+/// check a path in default mode (using the file system)
+方法 check_default(路径: &[字符串]) -> 布尔 {
+    设 joined_path = 路径.加入("/");
+    设 total_len = joined_path.长度();
+    // path length
+    如果 total_len > PATH_MAX {
+        writeln!(
+            标准库::输入输出::stderr(),
+            "{}",
+            translate!("pathchk-error-path-length-exceeded", "limit" => PATH_MAX, "length" => total_len, "path" => joined_path.quote())
+        );
+        返回 假;
+    }
+    如果 total_len == 0 {
+        // Check whether a file name component is in a directory that is not searchable,
+        // or has some other serious problem. POSIX does not allow "" as a file name,
+        // but some non-POSIX hosts do (as an alias for "."),
+        // so allow "" if `symlink_metadata` (corresponds to `lstat`) does.
+        如果 文件系统::symlink_metadata(&joined_path).is_err() {
+            writeln!(
+                标准库::输入输出::stderr(),
+                "{}",
+                translate!("pathchk-error-empty-path-not-found")
+            );
+            返回 假;
+        }
+    }
+
+    // components: length
+    循环 p 在 路径 {
+        设 component_len = p.长度();
+        如果 component_len > FILENAME_MAX {
+            writeln!(
+                标准库::输入输出::stderr(),
+                "{}",
+                translate!("pathchk-error-name-length-exceeded", "limit" => FILENAME_MAX, "length" => component_len, "component" => p.quote())
+            );
+            返回 假;
+        }
+    }
+    // permission checks
+    check_searchable(&joined_path)
+}
+
+/// check whether a path is or if other problems arise
+方法 check_searchable(路径: &字符串切片) -> 布尔 {
+    // we use lstat, just like the original implementation
+    匹配 文件系统::symlink_metadata(路径) {
+        好的(_) => 真,
+        坏的(e) => {
+            如果 e.kind() == ErrorKind::NotFound {
+                真
+            } 否则 {
+                writeln!(标准库::输入输出::stderr(), "{e}");
+                假
+            }
+        }
+    }
+}
+
+/// check whether a path segment contains only valid (read: portable) characters
+方法 check_portable_chars(path_segment: &字符串切片) -> 布尔 {
+    常量 VALID_CHARS: &[正8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+    循环 (i, ch) 在 path_segment.as_bytes().迭代().enumerate() {
+        如果 !VALID_CHARS.包含(ch) {
+            设 invalid = path_segment[i..].chars().next().解包();
+            writeln!(
+                标准库::输入输出::stderr(),
+                "{}",
+                translate!("pathchk-error-nonportable-character", "character" => invalid, "component" => path_segment.quote())
+            );
+            返回 假;
+        }
+    }
+    真
+}

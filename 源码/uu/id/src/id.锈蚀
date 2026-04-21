@@ -1,0 +1,772 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) asid auditid auditinfo auid cstr egid rgid emod euid getaudit getlogin gflag nflag pline rflag termid uflag gsflag zflag cflag
+
+// README:
+// This was originally based on BSD's `id`
+// (noticeable in functionality, usage text, options text, etc.)
+// and synced with:
+//  http://ftp-archive.freebsd.org/mirror/FreeBSD-Archive/old-releases/i386/1.0-RELEASE/ports/shellutils/src/id.c
+//  http://www.opensource.apple.com/source/shell_cmds/shell_cmds-118/id/id.c
+//
+// * This was partially rewritten in order for stdout/stderr/exit_code
+//   to be conform with GNU coreutils (8.32) test suite for `id`.
+//
+// * This supports multiple users (a feature that was introduced in coreutils 8.31)
+//
+// * This passes GNU's coreutils Test suite (8.32)
+//   for "tests/id/uid.sh" and "tests/id/zero/sh".
+//
+// * Option '--zero' does not exist for BSD's `id`, therefore '--zero' is only
+//   allowed together with other options that are available on GNU's `id`.
+//
+// * Help text based on BSD's `id` manpage and GNU's `id` manpage.
+//
+// * This passes GNU's coreutils Test suite (8.32) for "tests/id/context.sh" if compiled with
+//   `--features feat_selinux`. It should also pass "tests/id/no-context.sh", but that depends on
+//   `uu_ls -Z` being implemented and therefore fails at the moment
+//
+
+#![allow(non_camel_case_types)]
+#![allow(dead_code)]
+
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::CStr;
+使用 标准库::输入输出::{自身, Write};
+使用 uucore::display::Quotable;
+使用 uucore::entries::{自身, Group, Locate, Passwd};
+使用 uucore::错误::UResult;
+使用 uucore::错误::{USimpleError, set_exit_code};
+公有 使用 uucore::libc;
+使用 uucore::libc::{getlogin, uid_t};
+使用 uucore::line_ending::LineEnding;
+使用 uucore::translate;
+
+使用 uucore::进程::{getegid, geteuid, getgid, getuid};
+使用 uucore::{format_usage, show_error};
+
+macro_rules! cstr2cow {
+    ($v:expr) => {
+        不安全 {
+            设 指针 = $v;
+            // Must be not null to call cstr2cow
+            如果 指针.is_null() {
+                无
+            } 否则 {
+                一些({ CStr::from_ptr(指针) }.to_string_lossy())
+            }
+        }
+    };
+}
+
+方法 get_context_help_text() -> 字符串 {
+    #[cfg(not(任意(feature = "selinux", feature = "smack")))]
+    返回 translate!("id-context-help-disabled");
+    #[cfg(任意(feature = "selinux", feature = "smack"))]
+    返回 translate!("id-context-help-enabled");
+}
+
+模组 options {
+    公有 常量 OPT_IGNORE: &字符串切片 = "ignore";
+    公有 常量 OPT_AUDIT: &字符串切片 = "audit"; // GNU's id does not have this
+    公有 常量 OPT_CONTEXT: &字符串切片 = "context";
+    公有 常量 OPT_EFFECTIVE_USER: &字符串切片 = "user";
+    公有 常量 OPT_GROUP: &字符串切片 = "group";
+    公有 常量 OPT_GROUPS: &字符串切片 = "groups";
+    公有 常量 OPT_HUMAN_READABLE: &字符串切片 = "human-readable"; // GNU's id does not have this
+    公有 常量 OPT_NAME: &字符串切片 = "name";
+    公有 常量 OPT_PASSWORD: &字符串切片 = "password"; // GNU's id does not have this
+    公有 常量 OPT_REAL_ID: &字符串切片 = "real";
+    公有 常量 OPT_ZERO: &字符串切片 = "zero"; // BSD's id does not have this
+    公有 常量 ARG_USERS: &字符串切片 = "USER";
+}
+
+结构 Ids {
+    uid: 正32,  // user id
+    gid: 正32,  // group id
+    euid: 正32, // effective uid
+    egid: 正32, // effective gid
+}
+
+结构 State {
+    nflag: 布尔,  // --name
+    uflag: 布尔,  // --user
+    gflag: 布尔,  // --group
+    gsflag: 布尔, // --groups
+    rflag: 布尔,  // --real
+    zflag: 布尔,  // --zero
+    cflag: 布尔,  // --context
+    #[cfg(feature = "selinux")]
+    selinux_supported: 布尔,
+    #[cfg(feature = "smack")]
+    smack_supported: 布尔,
+    ids: 选项<Ids>,
+    // The behavior for calling GNU's `id` and calling GNU's `id $USER` is similar but different.
+    // * The SELinux context is only displayed without a specified user.
+    // * The `getgroups` system call is only used without a specified user, this causes
+    //   the order of the displayed groups to be different between `id` and `id $USER`.
+    //
+    // Example:
+    // $ strace -e getgroups id -G $USER
+    // 1000 10 975 968
+    // +++ exited with 0 +++
+    // $ strace -e getgroups id -G
+    // getgroups(0, NULL)                      = 4
+    // getgroups(4, [10, 968, 975, 1000])      = 4
+    // 1000 10 968 975
+    // +++ exited with 0 +++
+    user_specified: 布尔,
+}
+
+#[uucore::主函数(no_signals)]
+#[allow(clippy::cognitive_complexity)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 可变 锁定 = 输入输出::stdout().锁定();
+
+    设 users: 向量<字符串> = matches
+        .get_many::<字符串>(options::ARG_USERS)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    设 可变 state = State {
+        nflag: matches.get_flag(options::OPT_NAME),
+        uflag: matches.get_flag(options::OPT_EFFECTIVE_USER),
+        gflag: matches.get_flag(options::OPT_GROUP),
+        gsflag: matches.get_flag(options::OPT_GROUPS),
+        rflag: matches.get_flag(options::OPT_REAL_ID),
+        zflag: matches.get_flag(options::OPT_ZERO),
+        cflag: matches.get_flag(options::OPT_CONTEXT),
+
+        #[cfg(feature = "selinux")]
+        selinux_supported: uucore::selinux::is_selinux_enabled(),
+        #[cfg(feature = "smack")]
+        smack_supported: uucore::smack::is_smack_enabled(),
+        user_specified: !users.为空(),
+        ids: 无,
+    };
+
+    设 default_format = {
+        // "default format" is when none of '-ugG' was used
+        !(state.uflag || state.gflag || state.gsflag)
+    };
+
+    如果 (state.nflag || state.rflag) && default_format && !state.cflag {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("id-error-names-real-ids-require-flags"),
+        ));
+    }
+    如果 state.zflag && default_format && !state.cflag {
+        // NOTE: GNU test suite "id/zero.sh" needs this stderr output:
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("id-error-zero-not-permitted-default"),
+        ));
+    }
+    如果 state.user_specified && state.cflag {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("id-error-cannot-print-context-with-user"),
+        ));
+    }
+
+    设 delimiter = 如果 state.zflag { "\0" } 否则 { " " };
+    设 line_ending = LineEnding::from_zero_flag(state.zflag);
+
+    如果 state.cflag {
+        // SELinux context
+        #[cfg(feature = "selinux")]
+        如果 state.selinux_supported {
+            如果 设 好的(context) = selinux::SecurityContext::current(假) {
+                设 bytes = context.as_bytes();
+                write!(锁定, "{}{line_ending}", 字符串::from_utf8_lossy(bytes))?;
+                返回 好的(());
+            }
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("id-error-cannot-get-context"),
+            ));
+        }
+
+        // SMACK label
+        #[cfg(feature = "smack")]
+        如果 state.smack_supported {
+            匹配 uucore::smack::get_smack_label_for_self() {
+                好的(label) => {
+                    write!(锁定, "{label}{line_ending}")?;
+                    返回 好的(());
+                }
+                坏的(_) => {
+                    返回 坏的(USimpleError::新建(
+                        1,
+                        translate!("id-error-cannot-get-context"),
+                    ));
+                }
+            }
+        }
+
+        // Neither SELinux nor SMACK supported
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("id-error-context-security-only"),
+        ));
+    }
+
+    循环 i 在 0..=users.长度() {
+        设 possible_pw = 如果 state.user_specified {
+            如果 设 好的(p) = Passwd::locate(users[i].as_str()) {
+                一些(p)
+            } 否则 {
+                show_error!(
+                    "{}",
+                    translate!("id-error-no-such-user", "user" => users[i].quote())
+                );
+                set_exit_code(1);
+                如果 i + 1 >= users.长度() {
+                    中断;
+                }
+
+                继续;
+            }
+        } 否则 {
+            无
+        };
+
+        // GNU's `id` does not support the flags: -p/-P/-A.
+        如果 matches.get_flag(options::OPT_PASSWORD) {
+            // BSD's `id` ignores all but the first specified user
+            pline(possible_pw.as_ref().映射(|v| v.uid))?;
+            返回 好的(());
+        }
+        如果 matches.get_flag(options::OPT_HUMAN_READABLE) {
+            // BSD's `id` ignores all but the first specified user
+            pretty(possible_pw)?;
+            返回 好的(());
+        }
+        如果 matches.get_flag(options::OPT_AUDIT) {
+            // BSD's `id` ignores specified users
+            auditid()?;
+            返回 好的(());
+        }
+
+        设 (uid, gid) = possible_pw.as_ref().map_or(
+            {
+                设 use_effective = !state.rflag && (state.uflag || state.gflag || state.gsflag);
+                如果 use_effective {
+                    (geteuid(), getegid())
+                } 否则 {
+                    (getuid(), getgid())
+                }
+            },
+            |p| (p.uid, p.gid),
+        );
+        state.ids = 一些(Ids {
+            uid,
+            gid,
+            euid: geteuid(),
+            egid: getegid(),
+        });
+
+        如果 state.gflag {
+            write!(
+                锁定,
+                "{}",
+                如果 state.nflag {
+                    entries::gid2grp(gid).unwrap_or_else(|_| {
+                        show_error!(
+                            "{}",
+                            translate!("id-error-cannot-find-group-name", "gid" => gid)
+                        );
+                        set_exit_code(1);
+                        gid.to_string()
+                    })
+                } 否则 {
+                    gid.to_string()
+                }
+            )?;
+        }
+
+        如果 state.uflag {
+            write!(
+                锁定,
+                "{}",
+                如果 state.nflag {
+                    entries::uid2usr(uid).unwrap_or_else(|_| {
+                        show_error!(
+                            "{}",
+                            translate!("id-error-cannot-find-user-name", "uid" => uid)
+                        );
+                        set_exit_code(1);
+                        uid.to_string()
+                    })
+                } 否则 {
+                    uid.to_string()
+                }
+            )?;
+        }
+
+        设 groups = entries::get_groups_gnu(一些(gid))?;
+        设 groups = 如果 state.user_specified {
+            possible_pw.as_ref().映射(Passwd::belongs_to).解包()
+        } 否则 {
+            groups.克隆()
+        };
+
+        如果 state.gsflag {
+            write!(
+                锁定,
+                "{}{}",
+                groups
+                    .迭代()
+                    .映射(|&id| {
+                        如果 state.nflag {
+                            entries::gid2grp(id).unwrap_or_else(|_| {
+                                show_error!(
+                                    "{}",
+                                    translate!("id-error-cannot-find-group-name", "gid" => id)
+                                );
+                                set_exit_code(1);
+                                id.to_string()
+                            })
+                        } 否则 {
+                            id.to_string()
+                        }
+                    })
+                    .收集::<向量<_>>()
+                    .加入(delimiter),
+                // NOTE: this is necessary to pass GNU's "tests/id/zero.sh":
+                如果 state.zflag && state.user_specified && users.长度() > 1 {
+                    "\0"
+                } 否则 {
+                    ""
+                }
+            )?;
+        }
+
+        如果 default_format {
+            id_print(&state, &groups)?;
+        }
+        write!(锁定, "{line_ending}")?;
+
+        如果 i + 1 >= users.长度() {
+            中断;
+        }
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("id")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("id"))
+        .about(translate!("id-about"))
+        .override_usage(format_usage(&translate!("id-usage")))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .after_help(translate!("id-after-help"))
+        .arg(
+            Arg::新建(options::OPT_IGNORE)
+                .short('a')
+                .long(options::OPT_IGNORE)
+                .help(translate!("id-help-ignore"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_AUDIT)
+                .short('A')
+                .conflicts_with_all([
+                    options::OPT_GROUP,
+                    options::OPT_EFFECTIVE_USER,
+                    options::OPT_HUMAN_READABLE,
+                    options::OPT_PASSWORD,
+                    options::OPT_GROUPS,
+                    options::OPT_ZERO,
+                ])
+                .help(translate!("id-help-audit"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_EFFECTIVE_USER)
+                .short('u')
+                .long(options::OPT_EFFECTIVE_USER)
+                .conflicts_with(options::OPT_GROUP)
+                .help(translate!("id-help-user"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_GROUP)
+                .short('g')
+                .long(options::OPT_GROUP)
+                .conflicts_with(options::OPT_EFFECTIVE_USER)
+                .help(translate!("id-help-group"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_GROUPS)
+                .short('G')
+                .long(options::OPT_GROUPS)
+                .conflicts_with_all([
+                    options::OPT_GROUP,
+                    options::OPT_EFFECTIVE_USER,
+                    options::OPT_CONTEXT,
+                    options::OPT_HUMAN_READABLE,
+                    options::OPT_PASSWORD,
+                    options::OPT_AUDIT,
+                ])
+                .help(translate!("id-help-groups"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_HUMAN_READABLE)
+                .short('p')
+                .help(translate!("id-help-human-readable"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_NAME)
+                .short('n')
+                .long(options::OPT_NAME)
+                .help(translate!("id-help-name"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_PASSWORD)
+                .short('P')
+                .help(translate!("id-help-password"))
+                .conflicts_with(options::OPT_HUMAN_READABLE)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_REAL_ID)
+                .short('r')
+                .long(options::OPT_REAL_ID)
+                .help(translate!("id-help-real"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_ZERO)
+                .short('z')
+                .long(options::OPT_ZERO)
+                .help(translate!("id-help-zero"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OPT_CONTEXT)
+                .short('Z')
+                .long(options::OPT_CONTEXT)
+                .conflicts_with_all([options::OPT_GROUP, options::OPT_EFFECTIVE_USER])
+                .help(get_context_help_text())
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ARG_USERS)
+                .action(ArgAction::Append)
+                .value_name(options::ARG_USERS)
+                .value_hint(clap::ValueHint::Username),
+        )
+}
+
+方法 pretty(possible_pw: 选项<Passwd>) -> 输入输出::结果<()> {
+    设 可变 锁定 = 输入输出::stdout().锁定();
+
+    如果 设 一些(p) = possible_pw {
+        writeln!(
+            锁定,
+            "{}\t{}\n{}\t",
+            translate!("id-output-uid"),
+            p.name,
+            translate!("id-output-groups")
+        )?;
+        writeln!(
+            锁定,
+            "{}",
+            p.belongs_to()
+                .迭代()
+                .映射(|&gr| entries::gid2grp(gr).unwrap_or_else(|_| gr.to_string()))
+                .收集::<向量<_>>()
+                .加入(" ")
+        )?;
+    } 否则 {
+        设 login = cstr2cow!(getlogin().cast_const());
+        设 uid = getuid();
+        如果 设 好的(p) = Passwd::locate(uid) {
+            如果 设 一些(user_name) = login {
+                writeln!(锁定, "{}\t{user_name}", translate!("id-output-login"))?;
+            }
+            writeln!(锁定, "{}\t{}", translate!("id-output-uid"), p.name)?;
+        } 否则 {
+            writeln!(锁定, "{}\t{uid}", translate!("id-output-uid"))?;
+        }
+
+        设 euid = geteuid();
+        如果 euid != uid {
+            如果 设 好的(p) = Passwd::locate(euid) {
+                writeln!(锁定, "{}\t{}", translate!("id-output-euid"), p.name)?;
+            } 否则 {
+                writeln!(锁定, "{}\t{euid}", translate!("id-output-euid"))?;
+            }
+        }
+
+        设 rgid = getgid();
+        设 egid = getegid();
+        如果 egid != rgid {
+            如果 设 好的(g) = Group::locate(rgid) {
+                writeln!(锁定, "{}\t{}", translate!("id-output-rgid"), g.name)?;
+            } 否则 {
+                writeln!(锁定, "{}\t{rgid}", translate!("id-output-rgid"))?;
+            }
+        }
+
+        writeln!(
+            锁定,
+            "{}\t{}",
+            translate!("id-output-groups"),
+            entries::get_groups_gnu(无)?
+                .迭代()
+                .映射(|&gr| entries::gid2grp(gr).unwrap_or_else(|_| gr.to_string()))
+                .收集::<向量<_>>()
+                .加入(" ")
+        )?;
+    }
+
+    好的(())
+}
+
+#[cfg(任意(target_vendor = "apple", target_os = "freebsd"))]
+方法 pline(possible_uid: 选项<uid_t>) -> 输入输出::结果<()> {
+    设 uid = possible_uid.unwrap_or_else(getuid);
+    设 pw = Passwd::locate(uid)?;
+
+    writeln!(
+        输入输出::stdout().锁定(),
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        pw.name,
+        pw.user_passwd.unwrap_or_default(),
+        pw.uid,
+        pw.gid,
+        pw.user_access_class.unwrap_or_default(),
+        pw.passwd_change_time,
+        pw.expiration,
+        pw.user_info.unwrap_or_default(),
+        pw.user_dir.unwrap_or_default(),
+        pw.user_shell.unwrap_or_default()
+    )
+}
+
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "netbsd"
+))]
+方法 pline(possible_uid: 选项<uid_t>) -> 输入输出::结果<()> {
+    设 uid = possible_uid.unwrap_or_else(getuid);
+    设 pw = Passwd::locate(uid)?;
+
+    writeln!(
+        输入输出::stdout().锁定(),
+        "{}:{}:{}:{}:{}:{}:{}",
+        pw.name,
+        pw.user_passwd.unwrap_or_default(),
+        pw.uid,
+        pw.gid,
+        pw.user_info.unwrap_or_default(),
+        pw.user_dir.unwrap_or_default(),
+        pw.user_shell.unwrap_or_default()
+    )?;
+    好的(())
+}
+
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "netbsd"
+))]
+#[allow(clippy::unnecessary_wraps)]
+方法 auditid() -> 输入输出::结果<()> {
+    好的(())
+}
+
+#[cfg(not(任意(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "openbsd",
+    target_os = "cygwin",
+    target_os = "netbsd"
+)))]
+方法 auditid() -> 输入输出::结果<()> {
+    使用 标准库::内存::MaybeUninit;
+    设 可变 锁定 = 输入输出::stdout().锁定();
+
+    设 可变 auditinfo: MaybeUninit<audit::c_auditinfo_addr_t> = MaybeUninit::uninit();
+    设 address = auditinfo.as_mut_ptr();
+    如果 不安全 { audit::getaudit(address) } < 0 {
+        writeln!(锁定, "{}", translate!("id-error-audit-retrieve"))?;
+        返回 好的(());
+    }
+
+    // SAFETY: getaudit wrote a valid struct to auditinfo
+    设 auditinfo = 不安全 { auditinfo.assume_init() };
+
+    writeln!(锁定, "auid={}", auditinfo.ai_auid)?;
+    writeln!(锁定, "mask.success=0x{:x}", auditinfo.ai_mask.am_success)?;
+    writeln!(锁定, "mask.failure=0x{:x}", auditinfo.ai_mask.am_failure)?;
+    writeln!(锁定, "termid.port=0x{:x}", auditinfo.ai_termid.port)?;
+    writeln!(锁定, "asid={}", auditinfo.ai_asid)?;
+    好的(())
+}
+
+方法 id_print(state: &State, groups: &[正32]) -> 输入输出::结果<()> {
+    设 uid = state.ids.as_ref().解包().uid;
+    设 gid = state.ids.as_ref().解包().gid;
+    设 euid = state.ids.as_ref().解包().euid;
+    设 egid = state.ids.as_ref().解包().egid;
+
+    设 可变 锁定 = 输入输出::stdout().锁定();
+
+    write!(
+        锁定,
+        "uid={uid}({})",
+        entries::uid2usr(uid).unwrap_or_else(|_| {
+            show_error!(
+                "{}",
+                translate!("id-error-cannot-find-user-name", "uid" => uid)
+            );
+            set_exit_code(1);
+            uid.to_string()
+        })
+    )?;
+    write!(
+        锁定,
+        " gid={gid}({})",
+        entries::gid2grp(gid).unwrap_or_else(|_| {
+            show_error!(
+                "{}",
+                translate!("id-error-cannot-find-group-name", "gid" => gid)
+            );
+            set_exit_code(1);
+            gid.to_string()
+        })
+    )?;
+    如果 !state.user_specified && (euid != uid) {
+        write!(
+            锁定,
+            " euid={euid}({})",
+            entries::uid2usr(euid).unwrap_or_else(|_| {
+                show_error!(
+                    "{}",
+                    translate!("id-error-cannot-find-user-name", "uid" => euid)
+                );
+                set_exit_code(1);
+                euid.to_string()
+            })
+        )?;
+    }
+    如果 !state.user_specified && (egid != gid) {
+        // BUG?  printing egid={euid} ?
+        write!(
+            锁定,
+            " egid={egid}({})",
+            entries::gid2grp(egid).unwrap_or_else(|_| {
+                show_error!(
+                    "{}",
+                    translate!("id-error-cannot-find-group-name", "gid" => egid)
+                );
+                set_exit_code(1);
+                egid.to_string()
+            })
+        )?;
+    }
+    write!(
+        锁定,
+        " groups={}",
+        groups
+            .迭代()
+            .映射(|&gr| 格式化!(
+                "{gr}({})",
+                entries::gid2grp(gr).unwrap_or_else(|_| {
+                    show_error!(
+                        "{}",
+                        translate!("id-error-cannot-find-group-name", "gid" => gr)
+                    );
+                    set_exit_code(1);
+                    gr.to_string()
+                })
+            ))
+            .收集::<向量<_>>()
+            .加入(",")
+    )?;
+
+    #[cfg(feature = "selinux")]
+    如果 state.selinux_supported
+        && !state.user_specified
+        && 标准库::环境::var_os("POSIXLY_CORRECT").is_none()
+    {
+        // print SElinux context (does not depend on "-Z")
+        如果 设 好的(context) = selinux::SecurityContext::current(假) {
+            设 bytes = context.as_bytes();
+            write!(锁定, " context={}", 字符串::from_utf8_lossy(bytes))?;
+        }
+    }
+
+    #[cfg(feature = "smack")]
+    如果 state.smack_supported
+        && !state.user_specified
+        && 标准库::环境::var_os("POSIXLY_CORRECT").is_none()
+    {
+        // print SMACK label (does not depend on "-Z")
+        如果 设 好的(label) = uucore::smack::get_smack_label_for_self() {
+            write!(锁定, " context={label}")?;
+        }
+    }
+
+    好的(())
+}
+
+#[cfg(not(任意(target_os = "linux", target_os = "android", target_os = "openbsd")))]
+模组 audit {
+    使用 超级::libc::{c_int, c_uint, dev_t, pid_t, uid_t};
+
+    公有 类型 au_id_t = uid_t;
+    公有 类型 au_asid_t = pid_t;
+    公有 类型 au_event_t = c_uint;
+    公有 类型 au_emod_t = c_uint;
+    公有 类型 au_class_t = c_int;
+    公有 类型 au_flag_t = 正64;
+
+    #[repr(C)]
+    公有 结构 au_mask {
+        公有 am_success: c_uint,
+        公有 am_failure: c_uint,
+    }
+    公有 类型 au_mask_t = au_mask;
+
+    #[repr(C)]
+    公有 结构 au_tid_addr {
+        公有 port: dev_t,
+    }
+    公有 类型 au_tid_addr_t = au_tid_addr;
+
+    #[repr(C)]
+    #[期望(clippy::struct_field_names)]
+    公有 结构 c_auditinfo_addr {
+        公有 ai_auid: au_id_t,         // Audit user ID
+        公有 ai_mask: au_mask_t,       // Audit masks.
+        公有 ai_termid: au_tid_addr_t, // Terminal ID.
+        公有 ai_asid: au_asid_t,       // Audit session ID.
+        公有 ai_flags: au_flag_t,      // Audit session flags
+    }
+    公有 类型 c_auditinfo_addr_t = c_auditinfo_addr;
+
+    不安全 外部 "C" {
+        公有 方法 getaudit(auditinfo_addr: *可变 c_auditinfo_addr_t) -> c_int;
+    }
+}

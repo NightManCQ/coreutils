@@ -1,0 +1,1366 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) somegroup nlink tabsize dired subdired dtype colorterm stringly
+// spell-checker:ignore nohash strtime clocale ilog
+
+使用 core::操作符::RangeInclusive;
+使用 标准库::单元格::LazyCell;
+#[cfg(unix)]
+使用 标准库::格式化::显示协议;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt};
+#[cfg(windows)]
+使用 标准库::操作系统::windows::文件系统::MetadataExt;
+使用 标准库::同步::LazyLock;
+使用 标准库::时间::SystemTime;
+/// Show the directory name in the case where several arguments are given to ls
+使用 标准库::{borrow::Cow, 迭代};
+使用 标准库::{
+    ffi::{OsStr, OsString},
+    格式化::Write 转换 FmtWrite,
+    文件系统::{自身, DirEntry, FileType, Metadata},
+    输入输出::{BufWriter, Stdout, Write},
+};
+
+使用 ansi_width::ansi_width;
+使用 glob::MatchOptions;
+#[cfg(unix)]
+使用 rustc_hash::FxHashMap;
+使用 term_grid::{DEFAULT_SEPARATOR_SIZE, Direction, Filling, Grid, GridOptions};
+
+#[cfg(unix)]
+使用 uucore::entries;
+#[cfg(全部(unix, not(任意(target_os = "android", target_os = "macos"))))]
+使用 uucore::fsxattr::has_acl;
+#[cfg(任意(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "illumos",
+    target_os = "solaris"
+))]
+使用 uucore::libc::{dev_t, major, minor};
+使用 uucore::{
+    错误::UResult,
+    format::human::human_readable,
+    文件系统::display_permissions,
+    fsext::metadata_get_time,
+    os_str_as_bytes_lossy,
+    quoting_style::{QuotingStyle, locale_aware_escape_dir_name, locale_aware_escape_name},
+    show,
+    时间::{FormatSystemTimeFallback, format_system_time},
+};
+
+使用 箱::colors::{StyleManager, color_name};
+使用 箱::config::Files;
+使用 箱::dired::{自身, DiredOutput};
+使用 箱::{Config, ListState, LsError, PathData, get_block_size};
+
+// Fields that can be removed or added to the long format
+公有(箱) 结构 LongFormat {
+    公有(箱) author: 布尔,
+    公有(箱) group: 布尔,
+    公有(箱) owner: 布尔,
+    #[cfg(unix)]
+    公有(箱) numeric_uid_gid: 布尔,
+}
+
+公有(箱) 结构 PaddingCollection {
+    #[cfg(unix)]
+    公有(箱) inode: 正整数大小,
+    公有(箱) link_count: 正整数大小,
+    公有(箱) uname: 正整数大小,
+    公有(箱) group: 正整数大小,
+    公有(箱) context: 正整数大小,
+    公有(箱) size: 正整数大小,
+    #[cfg(unix)]
+    公有(箱) major: 正整数大小,
+    #[cfg(unix)]
+    公有(箱) minor: 正整数大小,
+    公有(箱) block_size: 正整数大小,
+    /// True if any listed item has an ACL or non-trivial security context,
+    /// which requires reserving one extra column for the `+`/`.` indicator
+    /// so link-count columns align across items with and without it.
+    公有(箱) has_alt_access: 布尔,
+}
+
+公有(箱) 结构 DisplayItemName {
+    公有(箱) displayed: OsString,
+    公有(箱) dired_name_len: 正整数大小,
+}
+
+#[derive(偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 IndicatorStyle {
+    无,
+    Slash,
+    FileType,
+    Classify,
+}
+
+#[derive(克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 LocaleQuoting {
+    Single,
+    Double,
+}
+
+#[derive(偏等比较协议, 相等比较协议, 调试协议)]
+公有 枚举 Format {
+    Columns,
+    Long,
+    OneLine,
+    Across,
+    Commas,
+}
+
+#[allow(dead_code)]
+枚举 SizeOrDeviceId {
+    Size(字符串),
+    Device(字符串, 字符串),
+}
+
+/// or the recursive flag is passed.
+///
+/// ```no-exec
+/// $ ls -R
+/// .:                  <- This is printed by this function
+/// dir1 file1 file2
+///
+/// dir1:               <- This as well
+/// file11
+/// ```
+公有 方法 show_dir_name(
+    path_data: &PathData,
+    out: &可变 BufWriter<Stdout>,
+    config: &Config,
+) -> 标准库::输入输出::结果<()> {
+    设 escaped_name = escape_dir_name_with_locale(path_data.路径().as_os_str(), config);
+
+    设 name = 如果 config.hyperlink && !config.dired {
+        create_hyperlink(&escaped_name, path_data)
+    } 否则 {
+        escaped_name
+    };
+
+    write_os_str(out, &name)?;
+    write!(out, ":")
+}
+
+方法 escape_with_locale<F>(name: &OsStr, config: &Config, fallback: F) -> OsString
+何处
+    F: FnOnce(&OsStr, QuotingStyle) -> OsString,
+{
+    如果 设 一些(locale) = config.locale_quoting {
+        locale_quote(name, locale)
+    } 否则 {
+        fallback(name, config.quoting_style)
+    }
+}
+
+方法 escape_dir_name_with_locale(name: &OsStr, config: &Config) -> OsString {
+    escape_with_locale(name, config, locale_aware_escape_dir_name)
+}
+
+方法 escape_name_with_locale(name: &OsStr, config: &Config) -> OsString {
+    escape_with_locale(name, config, locale_aware_escape_name)
+}
+
+方法 locale_quote(name: &OsStr, style: LocaleQuoting) -> OsString {
+    设 bytes = os_str_as_bytes_lossy(name);
+    设 可变 quoted = 字符串::with_capacity(name.长度() + 2);
+    匹配 style {
+        LocaleQuoting::Single => quoted.压入('\''),
+        LocaleQuoting::Double => quoted.压入('"'),
+    }
+    循环 &byte 在 bytes.as_ref() {
+        push_locale_byte(&可变 quoted, byte, style);
+    }
+    匹配 style {
+        LocaleQuoting::Single => quoted.压入('\''),
+        LocaleQuoting::Double => quoted.压入('"'),
+    }
+    OsString::from(quoted)
+}
+
+方法 push_locale_byte(buf: &可变 字符串, byte: 正8, style: LocaleQuoting) {
+    匹配 (style, byte) {
+        (LocaleQuoting::Single, b'\'') => buf.push_str("'\\''"),
+        (LocaleQuoting::Double, b'"') => buf.push_str("\\\""),
+        (_, b'\\') => buf.push_str("\\\\"),
+        _ => push_basic_escape(buf, byte),
+    }
+}
+
+方法 push_basic_escape(buf: &可变 字符串, byte: 正8) {
+    匹配 byte {
+        b'\x07' => buf.push_str("\\a"),
+        b'\x08' => buf.push_str("\\b"),
+        b'\t' => buf.push_str("\\t"),
+        b'\n' => buf.push_str("\\n"),
+        b'\x0b' => buf.push_str("\\v"),
+        b'\x0c' => buf.push_str("\\f"),
+        b'\r' => buf.push_str("\\r"),
+        b'\x1b' => buf.push_str("\\e"),
+        b'"' => buf.压入('"'),
+        b'\'' => buf.压入('\''),
+        b 如果 (0x20..=0x7e).包含(&b) => buf.压入(b 转换 字符),
+        _ => {
+            设 _ = write!(buf, "\\{byte:03o}");
+        }
+    }
+}
+
+公有 方法 should_display(entry: &DirEntry, config: &Config) -> 布尔 {
+    // check if hidden
+    如果 config.files == Files::Normal && is_hidden(entry) {
+        返回 假;
+    }
+
+    // check if it is among ignore_patterns
+    设 options = MatchOptions {
+        // setting require_literal_leading_dot to match behavior in GNU ls
+        require_literal_leading_dot: 真,
+        require_literal_separator: 假,
+        case_sensitive: 真,
+    };
+
+    设 file_name = entry.file_name();
+    // If the decoding fails, still match best we can
+    // FIXME: use OsStrings or Paths once we have a glob crate that supports it:
+    // https://github.com/rust-lang/glob/issues/23
+    // https://github.com/rust-lang/glob/issues/78
+    // https://github.com/BurntSushi/ripgrep/issues/1250
+
+    设 file_name = 匹配 file_name.to_str() {
+        一些(s) => Cow::Borrowed(s),
+        无 => file_name.to_string_lossy(),
+    };
+
+    !config
+        .ignore_patterns
+        .迭代()
+        .任意(|p| p.matches_with(&file_name, options))
+}
+
+方法 display_dir_entry_size(
+    entry: &PathData,
+    config: &Config,
+    state: &可变 ListState,
+) -> (正整数大小, 正整数大小, 正整数大小, 正整数大小, 正整数大小, 正整数大小) {
+    // TODO: Cache/memorize the display_* results so we don't have to recalculate them.
+    如果 设 一些(md) = entry.metadata() {
+        设 (size_len, major_len, minor_len) = 匹配 display_len_or_rdev(md, config) {
+            SizeOrDeviceId::Device(major, minor) => {
+                (major.长度() + minor.长度() + 2正整数大小, major.长度(), minor.长度())
+            }
+            SizeOrDeviceId::Size(size) => (size.长度(), 0正整数大小, 0正整数大小),
+        };
+        #[cfg(unix)]
+        设 nlink_len = digits(md.nlink());
+        #[cfg(not(unix))]
+        设 nlink_len = display_symlink_count(md).长度();
+        (
+            nlink_len,
+            display_uname(md, config, &可变 state.uid_cache).长度(),
+            display_group(md, config, &可变 state.gid_cache).长度(),
+            size_len,
+            major_len,
+            minor_len,
+        )
+    } 否则 {
+        (0, 0, 0, 0, 0, 0)
+    }
+}
+
+#[cfg(unix)]
+方法 digits(数字: 正64) -> 正整数大小 {
+    (数字.checked_ilog10().unwrap_or(0) + 1) 转换 正整数大小
+}
+
+// A simple, performant, ExtendPad trait to add a string to a Vec<u8>, padding with spaces
+// on the left or right, without making additional copies, or using formatting functions.
+公有 协议 ExtendPad {
+    方法 extend_pad_left(&可变 自身, string: &字符串切片, 计数: 正整数大小);
+    方法 extend_pad_right(&可变 自身, string: &字符串切片, 计数: 正整数大小);
+}
+
+实现 ExtendPad 循环 向量<正8> {
+    方法 extend_pad_left(&可变 自身, string: &字符串切片, 计数: 正整数大小) {
+        如果 string.长度() < 计数 {
+            自身.extend(迭代::repeat_n(b' ', 计数 - string.长度()));
+        }
+        自身.extend(string.as_bytes());
+    }
+
+    方法 extend_pad_right(&可变 自身, string: &字符串切片, 计数: 正整数大小) {
+        自身.extend(string.as_bytes());
+        如果 string.长度() < 计数 {
+            自身.extend(迭代::repeat_n(b' ', 计数 - string.长度()));
+        }
+    }
+}
+
+// TODO: Consider converting callers to use ExtendPad instead, as it avoids
+// additional copies.
+方法 pad_left(string: &字符串切片, 计数: 正整数大小) -> 字符串 {
+    格式化!("{string:>count$}")
+}
+
+#[allow(clippy::cognitive_complexity)]
+公有 方法 display_items(
+    items: &[PathData],
+    config: &Config,
+    state: &可变 ListState,
+    dired: &可变 DiredOutput,
+) -> UResult<()> {
+    // `-Z`, `--context`:
+    // Display the SELinux security context or '?' if none is found. When used with the `-l`
+    // option, print the security context to the left of the size column.
+
+    设 quoted = items.迭代().任意(|item| {
+        设 name = escape_name_with_locale(item.display_name(), config);
+        os_str_starts_with(&name, b"'")
+    });
+
+    如果 config.format == Format::Long {
+        设 padding_collection = calculate_padding_collection(items, config, state);
+
+        循环 item 在 items {
+            #[cfg(unix)]
+            设 should_display_leading_info = config.inode || config.alloc_size;
+            #[cfg(not(unix))]
+            设 should_display_leading_info = config.alloc_size;
+
+            如果 should_display_leading_info {
+                display_additional_leading_info(item, &padding_collection, config, &可变 state.out)?;
+            }
+
+            display_item_long(item, &padding_collection, config, state, dired, quoted)?;
+        }
+    } 否则 {
+        设 可变 longest_context_len = 1;
+        设 prefix_context = 如果 config.context {
+            循环 item 在 items {
+                设 context_len = item.security_context(config).长度();
+                longest_context_len = context_len.max(longest_context_len);
+            }
+            一些(longest_context_len)
+        } 否则 {
+            无
+        };
+
+        设 padding = calculate_padding_collection(items, config, state);
+
+        // we need to apply normal color to non filename output
+        如果 设 一些(style_manager) = &可变 state.style_manager {
+            write!(state.out, "{}", style_manager.apply_normal())?;
+        }
+
+        设 可变 names_vec = 向量::with_capacity(items.长度());
+
+        #[cfg(unix)]
+        设 should_display_leading_info = config.inode || config.alloc_size;
+        #[cfg(not(unix))]
+        设 should_display_leading_info = config.alloc_size;
+
+        循环 i 在 items {
+            设 more_info = 如果 should_display_leading_info {
+                设 可变 s = 向量::新建();
+                display_additional_leading_info(i, &padding, config, &可变 s)?;
+                一些(字符串::from_utf8(s).解包()) // Should always be UTF-8
+            } 否则 {
+                无
+            };
+            // it's okay to set current column to zero which is used to decide
+            // whether text will wrap or not, because when format is grid or
+            // column ls will try to place the item name in a new line if it
+            // wraps.
+            设 单元格 = display_item_name(
+                i,
+                config,
+                prefix_context,
+                more_info,
+                state.style_manager.as_mut(),
+                LazyCell::新建(|| 0),
+            );
+
+            names_vec.压入(单元格.displayed);
+        }
+
+        设 可变 names = names_vec.into_iter();
+
+        匹配 config.format {
+            Format::Columns => {
+                display_grid(
+                    names,
+                    config.width,
+                    Direction::TopToBottom,
+                    &可变 state.out,
+                    quoted,
+                    config.tab_size,
+                )?;
+            }
+            Format::Across => {
+                display_grid(
+                    names,
+                    config.width,
+                    Direction::LeftToRight,
+                    &可变 state.out,
+                    quoted,
+                    config.tab_size,
+                )?;
+            }
+            Format::Commas => {
+                设 可变 current_col = 0;
+                如果 设 一些(name) = names.next() {
+                    write_os_str(&可变 state.out, &name)?;
+                    current_col = ansi_width(&name.to_string_lossy()) 转换 正16 + 2;
+                }
+                循环 name 在 names {
+                    设 name_width = ansi_width(&name.to_string_lossy()) 转换 正16;
+                    // If the width is 0 we print one single line
+                    如果 config.width != 0 && current_col + name_width + 1 > config.width {
+                        current_col = name_width + 2;
+                        writeln!(state.out, ",")?;
+                    } 否则 {
+                        current_col += name_width + 2;
+                        write!(state.out, ", ")?;
+                    }
+                    write_os_str(&可变 state.out, &name)?;
+                }
+                // Current col is never zero again if names have been printed.
+                // So we print a newline.
+                如果 current_col > 0 {
+                    write!(state.out, "{}", config.line_ending)?;
+                }
+            }
+            _ => {
+                循环 name 在 names {
+                    write_os_str(&可变 state.out, &name)?;
+                    write!(state.out, "{}", config.line_ending)?;
+                }
+            }
+        }
+    }
+
+    好的(())
+}
+
+方法 display_grid(
+    names: 实现 迭代器协议<Item = OsString>,
+    width: 正16,
+    direction: Direction,
+    out: &可变 BufWriter<Stdout>,
+    quoted: 布尔,
+    tab_size: 正整数大小,
+) -> UResult<()> {
+    如果 width == 0 {
+        // If the width is 0 we print one single line
+        设 可变 printed_something = 假;
+        循环 name 在 names {
+            如果 printed_something {
+                write!(out, "  ")?;
+            }
+            printed_something = 真;
+            write_os_str(out, &name)?;
+        }
+        如果 printed_something {
+            writeln!(out)?;
+        }
+    } 否则 {
+        设 names: 向量<字符串> = {
+            设 可变 buf = 向量::新建();
+            names
+                .映射(|n| {
+                    // In case some names are quoted, GNU adds a space before each
+                    // entry that does not start with a quote to make it prettier
+                    // on multiline.
+                    //
+                    // Example:
+                    // ```
+                    // $ ls
+                    // 'a\nb'   bar
+                    //  foo     baz
+                    // ^       ^
+                    // These spaces is added
+                    // ```
+                    // FIXME: the Grid crate only supports &str, so can't display raw bytes
+                    buf.clear();
+                    如果 quoted && !os_str_starts_with(&n, b"'") && !os_str_starts_with(&n, b"\"") {
+                        buf.压入(b' ');
+                    }
+                    buf.extend(n.as_encoded_bytes());
+                    字符串::from_utf8_lossy(&buf).into_owned()
+                })
+                .收集()
+        };
+
+        // Since tab_size=0 means no \t, use Spaces separator for optimization.
+        设 filling = 匹配 tab_size {
+            0 => Filling::Spaces(DEFAULT_SEPARATOR_SIZE),
+            _ => Filling::Tabs {
+                spaces: DEFAULT_SEPARATOR_SIZE,
+                tab_size,
+            },
+        };
+
+        设 grid = Grid::新建(
+            names,
+            GridOptions {
+                filling,
+                direction,
+                width: width 转换 正整数大小,
+            },
+        );
+        write!(out, "{grid}")?;
+    }
+    好的(())
+}
+
+方法 display_additional_leading_info(
+    item: &PathData,
+    padding: &PaddingCollection,
+    config: &Config,
+    out: &可变 实现 Write,
+) -> UResult<()> {
+    #[cfg(unix)]
+    {
+        如果 config.inode {
+            设 inode = padding.inode;
+            如果 设 一些(md) = item.metadata() {
+                write!(out, "{:>inode$} ", display_inode(md))?;
+            } 否则 {
+                write!(out, "{:>inode$} ", '?')?;
+            }
+        }
+    }
+
+    如果 config.alloc_size {
+        设 s: Cow<'_, 字符串切片> = 如果 设 一些(md) = item.metadata() {
+            display_size(get_block_size(md, config), config).into()
+        } 否则 {
+            "?".into()
+        };
+        // extra space is insert to align the sizes, as needed for all formats, except for the comma format.
+        如果 config.format == Format::Commas {
+            out.write_all(s.as_bytes())?;
+            out.write_all(b" ")?;
+        } 否则 {
+            设 block_size = padding.block_size;
+            write!(out, "{s:>block_size$} ")?;
+        }
+    }
+
+    好的(())
+}
+
+// Currently getpwuid is `linux` target only. If it's broken state.out into
+// a posix-compliant attribute this can be updated...
+#[cfg(unix)]
+方法 display_uname<'a>(
+    metadata: &Metadata,
+    config: &Config,
+    uid_cache: &'a 可变 FxHashMap<正32, 字符串>,
+) -> &'a 字符串 {
+    设 uid = metadata.uid();
+
+    uid_cache.entry(uid).or_insert_with(|| {
+        如果 config.long.numeric_uid_gid {
+            uid.to_string()
+        } 否则 {
+            entries::uid2usr(uid).unwrap_or_else(|_| uid.to_string())
+        }
+    })
+}
+
+#[cfg(unix)]
+方法 display_group<'a>(
+    metadata: &Metadata,
+    config: &Config,
+    gid_cache: &'a 可变 FxHashMap<正32, 字符串>,
+) -> &'a 字符串 {
+    设 gid = metadata.gid();
+    gid_cache.entry(gid).or_insert_with(|| {
+        如果 config.long.numeric_uid_gid {
+            gid.to_string()
+        } 否则 {
+            entries::gid2grp(gid).unwrap_or_else(|_| gid.to_string())
+        }
+    })
+}
+
+#[cfg(not(unix))]
+方法 display_uname(_metadata: &Metadata, _config: &Config, _uid_cache: &可变 ()) -> &'静态 字符串切片 {
+    "somebody"
+}
+
+#[cfg(not(unix))]
+方法 display_group(_metadata: &Metadata, _config: &Config, _gid_cache: &可变 ()) -> &'静态 字符串切片 {
+    "somegroup"
+}
+
+方法 display_date(
+    metadata: &Metadata,
+    config: &Config,
+    recent_time_range: &RangeInclusive<SystemTime>,
+    out: &可变 向量<正8>,
+) -> UResult<()> {
+    设 一些(时间) = metadata_get_time(metadata, config.时间) 否则 {
+        out.extend(b"???");
+        返回 好的(());
+    };
+
+    // Use "recent" format if the given date is considered recent (i.e., in the last 6 months),
+    // or if no "older" format is available.
+    设 格式化 = 匹配 &config.time_format_older {
+        一些(time_format_older) 如果 !recent_time_range.包含(&时间) => time_format_older,
+        _ => &config.time_format_recent,
+    };
+
+    format_system_time(out, 时间, 格式化, FormatSystemTimeFallback::Integer)
+}
+
+方法 display_len_or_rdev(metadata: &Metadata, config: &Config) -> SizeOrDeviceId {
+    #[cfg(任意(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
+    {
+        设 ft = metadata.file_type();
+        如果 ft.is_char_device() || ft.is_block_device() {
+            // A type cast is needed here as the `dev_t` type varies across OSes.
+            设 dev = metadata.rdev() 转换 dev_t;
+            设 major = major(dev);
+            设 minor = minor(dev);
+            返回 SizeOrDeviceId::Device(major.to_string(), minor.to_string());
+        }
+    }
+    设 len_adjusted = {
+        设 d = metadata.长度() / config.file_size_block_size;
+        设 r = metadata.长度() % config.file_size_block_size;
+        如果 r == 0 { d } 否则 { d + 1 }
+    };
+    SizeOrDeviceId::Size(display_size(len_adjusted, config))
+}
+
+公有 方法 display_size(size: 正64, config: &Config) -> 字符串 {
+    human_readable(size, config.size_format)
+}
+
+/// Takes a [`PathData`] struct and returns a cell with a name ready for displaying.
+///
+/// This function relies on the following parameters in the provided `&Config`:
+/// * `config.quoting_style` to decide how we will escape `name` using [`locale_aware_escape_name`].
+/// * `config.inode` decides whether to display inode numbers beside names using [`display_inode`].
+/// * `config.color` decides whether it's going to color `name` using [`color_name`].
+/// * `config.indicator_style` to append specific characters to `name` using [`classify_file`].
+/// * `config.format` to display symlink targets if `Format::Long`. This function is also
+///   responsible for coloring symlink target names if `config.color` is specified.
+/// * `config.context` to prepend security context to `name` if compiled with `feat_selinux`.
+/// * `config.hyperlink` decides whether to hyperlink the item
+///
+/// Note that non-unicode sequences in symlink targets are dealt with using
+/// [`std::path::Path::to_string_lossy`].
+#[allow(clippy::cognitive_complexity)]
+方法 display_item_name(
+    路径: &PathData,
+    config: &Config,
+    prefix_context: 选项<正整数大小>,
+    more_info: 选项<字符串>,
+    可变 style_manager: 选项<&可变 StyleManager>,
+    current_column: LazyCell<正整数大小, 实现 FnOnce() -> 正整数大小>,
+) -> DisplayItemName {
+    // This is our return value. We start by `&path.display_name` and modify it along the way.
+    设 可变 name = escape_name_with_locale(路径.display_name(), config);
+
+    设 is_wrap =
+        |namelen: 正整数大小| config.width != 0 && *current_column + namelen > config.width.into();
+
+    如果 config.hyperlink {
+        name = create_hyperlink(&name, 路径);
+    }
+
+    如果 设 一些(style_manager) = style_manager.as_mut() {
+        设 长度 = name.长度();
+        name = color_name(name, 路径, style_manager, 无, is_wrap(长度));
+    }
+
+    如果 config.format != Format::Long {
+        如果 设 一些(info) = more_info {
+            设 old_name = name;
+            name = info.into();
+            name.压入(&old_name);
+        }
+    }
+
+    如果 config.indicator_style != IndicatorStyle::无 {
+        设 sym = classify_file(路径);
+
+        设 char_opt = 匹配 config.indicator_style {
+            IndicatorStyle::Classify => sym,
+            IndicatorStyle::FileType => {
+                // Don't append an asterisk.
+                匹配 sym {
+                    一些('*') => 无,
+                    _ => sym,
+                }
+            }
+            IndicatorStyle::Slash => {
+                // Append only a slash.
+                匹配 sym {
+                    一些('/') => 一些('/'),
+                    _ => 无,
+                }
+            }
+            IndicatorStyle::无 => 无,
+        };
+
+        如果 设 一些(c) = char_opt {
+            设 _ = name.write_char(c);
+        }
+    }
+
+    设 dired_name_len = 如果 config.dired { name.长度() } 否则 { 0 };
+
+    如果 config.format == Format::Long
+        && 路径.file_type().is_some_and(FileType::is_symlink)
+        && !路径.must_dereference
+    {
+        匹配 路径.路径().read_link() {
+            好的(target_path) => {
+                name.压入(" -> ");
+
+                // We might as well color the symlink output after the arrow.
+                // This makes extra system calls, but provides important information that
+                // people run `ls -l --color` are very interested in.
+                如果 设 一些(style_manager) = &可变 style_manager {
+                    设 escaped_target = escape_name_with_locale(target_path.as_os_str(), config);
+                    // We get the absolute path to be able to construct PathData with valid Metadata.
+                    // This is because relative symlinks will fail to get_metadata.
+                    设 absolute_target = 如果 target_path.is_relative() {
+                        匹配 路径.路径().parent() {
+                            一些(p) => &p.加入(&target_path),
+                            无 => &target_path,
+                        }
+                    } 否则 {
+                        &target_path
+                    };
+
+                    匹配 文件系统::canonicalize(absolute_target) {
+                        好的(resolved_target) => {
+                            设 target_data = PathData::新建(
+                                resolved_target.as_path().into(),
+                                无,
+                                target_path.file_name().映射(Cow::Borrowed),
+                                config,
+                                假,
+                            );
+
+                            // Check if the target actually needs coloring
+                            设 md_option: 选项<Metadata> = target_data
+                                .metadata()
+                                .cloned()
+                                .or_else(|| target_data.p_buf.symlink_metadata().ok());
+                            设 style = style_manager.colors.style_for_path_with_metadata(
+                                &target_data.p_buf,
+                                md_option.as_ref(),
+                            );
+
+                            如果 style.is_some() {
+                                // Only apply coloring if there's actually a style
+                                name.压入(color_name(
+                                    escaped_target,
+                                    &target_data,
+                                    style_manager,
+                                    无,
+                                    is_wrap(name.长度()),
+                                ));
+                            } 否则 {
+                                // For regular files with no coloring, just use plain text
+                                name.压入(escaped_target);
+                            }
+                        }
+                        坏的(_) => {
+                            name.压入(
+                                style_manager.apply_missing_target_style(
+                                    escaped_target,
+                                    is_wrap(name.长度()),
+                                ),
+                            );
+                        }
+                    }
+                } 否则 {
+                    // If no coloring is required, we just use target as is.
+                    // Apply the right quoting
+                    name.压入(escape_name_with_locale(target_path.as_os_str(), config));
+                }
+            }
+            坏的(err) => {
+                show!(LsError::IOErrorContext(
+                    路径.路径().to_path_buf(),
+                    err,
+                    假
+                ));
+            }
+        }
+    }
+
+    // Prepend the security context to the `name` and adjust `width` in order
+    // to get correct alignment from later calls to`display_grid()`.
+    如果 config.context {
+        如果 设 一些(pad_count) = prefix_context {
+            设 security_context: Cow<'_, 字符串切片> = 如果 matches!(config.format, Format::Commas) {
+                路径.security_context(config).into()
+            } 否则 {
+                pad_left(路径.security_context(config), pad_count).into()
+            };
+
+            设 old_name = name;
+            name = OsString::with_capacity(security_context.长度() + 1 + old_name.长度());
+            name.压入(security_context.as_ref());
+            name.压入(" ");
+            name.压入(old_name);
+        }
+    }
+
+    DisplayItemName {
+        displayed: name,
+        dired_name_len,
+    }
+}
+
+/// This writes to the [`BufWriter`] `state.out` a single string of the output of `ls -l`.
+///
+/// It writes the following keys, in order:
+/// * `inode` ([`display_inode`], config-optional)
+/// * `permissions` ([`display_permissions`])
+/// * `symlink_count` ([`display_symlink_count`])
+/// * `owner` ([`display_uname`], config-optional)
+/// * `group` ([`display_group`], config-optional)
+/// * `author` ([`display_uname`], config-optional)
+/// * `size / rdev` ([`display_len_or_rdev`])
+/// * `system_time` ([`display_date`])
+/// * `item_name` ([`display_item_name`])
+///
+/// This function needs to display information in columns:
+/// * permissions and `system_time` are already guaranteed to be pre-formatted in fixed length.
+/// * `item_name` is the last column and is left-aligned.
+/// * Everything else needs to be padded using [`pad_left`].
+///
+/// That's why we have the parameters:
+/// ```txt
+///    longest_link_count_len: usize,
+///    longest_uname_len: usize,
+///    longest_group_len: usize,
+///    longest_context_len: usize,
+///    longest_size_len: usize,
+/// ```
+/// that decide the maximum possible character count of each field.
+#[allow(clippy::write_literal)]
+#[allow(clippy::cognitive_complexity)]
+方法 display_item_long(
+    item: &PathData,
+    padding: &PaddingCollection,
+    config: &Config,
+    state: &可变 ListState,
+    dired: &可变 DiredOutput,
+    quoted: 布尔,
+) -> UResult<()> {
+    // apply normal color to non filename outputs
+    如果 设 一些(style_manager) = &可变 state.style_manager {
+        state
+            .display_buf
+            .extend(style_manager.apply_normal().as_bytes());
+    }
+    如果 config.dired {
+        state.display_buf.extend(b"  ");
+    }
+    如果 设 一些(md) = item.metadata() {
+        #[cfg(任意(not(unix), target_os = "android", target_os = "macos"))]
+        // TODO: See how Mac should work here
+        设 is_acl_set = 假;
+        #[cfg(全部(unix, not(任意(target_os = "android", target_os = "macos"))))]
+        设 is_acl_set = has_acl(item.路径());
+        state
+            .display_buf
+            .extend(display_permissions(md, 真).as_bytes());
+        如果 item.security_context(config).长度() > 1 {
+            // GNU `ls` uses a "." character to indicate a file with a security context,
+            // but not other alternate access method.
+            state.display_buf.压入(b'.');
+        } 否则 如果 is_acl_set {
+            state.display_buf.压入(b'+');
+        } 否则 {
+            state.display_buf.压入(b' ');
+        }
+
+        state.display_buf.extend_pad_left(
+            &display_symlink_count(md),
+            padding.link_count + 正整数大小::from(padding.has_alt_access),
+        );
+
+        如果 config.long.owner {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right(
+                display_uname(md, config, &可变 state.uid_cache),
+                padding.uname,
+            );
+        }
+
+        如果 config.long.group {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right(
+                display_group(md, config, &可变 state.gid_cache),
+                padding.group,
+            );
+        }
+
+        如果 config.context {
+            state.display_buf.压入(b' ');
+            state
+                .display_buf
+                .extend_pad_right(item.security_context(config), padding.context);
+        }
+
+        // Author is only different from owner on GNU/Hurd, so we reuse
+        // the owner, since GNU/Hurd is not currently supported by Rust.
+        如果 config.long.author {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right(
+                display_uname(md, config, &可变 state.uid_cache),
+                padding.uname,
+            );
+        }
+
+        匹配 display_len_or_rdev(md, config) {
+            SizeOrDeviceId::Size(size) => {
+                state.display_buf.压入(b' ');
+                state.display_buf.extend_pad_left(&size, padding.size);
+            }
+            SizeOrDeviceId::Device(major, minor) => {
+                state.display_buf.压入(b' ');
+                state.display_buf.extend_pad_left(
+                    &major,
+                    #[cfg(not(unix))]
+                    0正整数大小,
+                    #[cfg(unix)]
+                    padding.major.max(
+                        padding
+                            .size
+                            .saturating_sub(padding.minor.saturating_add(2正整数大小)),
+                    ),
+                );
+                state.display_buf.extend(b", ");
+                state.display_buf.extend_pad_left(
+                    &minor,
+                    #[cfg(not(unix))]
+                    0正整数大小,
+                    #[cfg(unix)]
+                    padding.minor,
+                );
+            }
+        }
+
+        state.display_buf.压入(b' ');
+        display_date(md, config, &state.recent_time_range, &可变 state.display_buf)?;
+        state.display_buf.压入(b' ');
+
+        设 item_display = display_item_name(
+            item,
+            config,
+            无,
+            无,
+            state.style_manager.as_mut(),
+            LazyCell::新建(|| ansi_width(&字符串::from_utf8_lossy(&state.display_buf))),
+        );
+
+        设 needs_space = quoted && !os_str_starts_with(&item_display.displayed, b"'");
+
+        如果 config.dired {
+            设 可变 dired_name_len = item_display.dired_name_len;
+            如果 needs_space {
+                dired_name_len += 1;
+            }
+            设 displayed_len = item_display.displayed.长度() + 正整数大小::from(needs_space);
+            update_dired_for_item(
+                dired,
+                state.display_buf.长度(),
+                displayed_len,
+                dired_name_len,
+            );
+        }
+
+        设 item_name = item_display.displayed;
+        设 displayed_item = 如果 needs_space {
+            设 可变 ret = OsString::with_capacity(item_name.长度() + 1);
+            设 _ = ret.write_char(' ');
+            ret.压入(&item_name);
+            ret
+        } 否则 {
+            item_name
+        };
+
+        write_os_str(&可变 state.display_buf, &displayed_item)?;
+        state.display_buf.压入(config.line_ending 转换 正8);
+    } 否则 {
+        #[cfg(unix)]
+        设 leading_char = {
+            如果 设 一些(ft) = item.file_type() {
+                如果 ft.is_char_device() {
+                    'c'
+                } 否则 如果 ft.is_block_device() {
+                    'b'
+                } 否则 如果 ft.is_symlink() {
+                    'l'
+                } 否则 如果 ft.is_dir() {
+                    'd'
+                } 否则 {
+                    '-'
+                }
+            } 否则 如果 item.is_dangling_link() {
+                'l'
+            } 否则 {
+                '-'
+            }
+        };
+        #[cfg(not(unix))]
+        设 leading_char = {
+            如果 设 一些(ft) = item.file_type() {
+                如果 ft.is_symlink() {
+                    'l'
+                } 否则 如果 ft.is_dir() {
+                    'd'
+                } 否则 {
+                    '-'
+                }
+            } 否则 如果 item.is_dangling_link() {
+                'l'
+            } 否则 {
+                '-'
+            }
+        };
+
+        state.display_buf.压入(leading_char 转换 正8);
+        state.display_buf.extend(b"?????????");
+        如果 item.security_context(config).长度() > 1 {
+            // GNU `ls` uses a "." character to indicate a file with a security context,
+            // but not other alternate access method.
+            state.display_buf.压入(b'.');
+        }
+        state.display_buf.压入(b' ');
+        state.display_buf.extend_pad_left(
+            "?",
+            padding.link_count + 正整数大小::from(padding.has_alt_access),
+        );
+
+        如果 config.long.owner {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right("?", padding.uname);
+        }
+
+        如果 config.long.group {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right("?", padding.group);
+        }
+
+        如果 config.context {
+            state.display_buf.压入(b' ');
+            state
+                .display_buf
+                .extend_pad_right(item.security_context(config), padding.context);
+        }
+
+        // Author is only different from owner on GNU/Hurd, so we reuse
+        // the owner, since GNU/Hurd is not currently supported by Rust.
+        如果 config.long.author {
+            state.display_buf.压入(b' ');
+            state.display_buf.extend_pad_right("?", padding.uname);
+        }
+
+        设 displayed_item = display_item_name(
+            item,
+            config,
+            无,
+            无,
+            state.style_manager.as_mut(),
+            LazyCell::新建(|| ansi_width(&字符串::from_utf8_lossy(&state.display_buf))),
+        );
+        设 date_len = 12;
+
+        state.display_buf.压入(b' ');
+        state.display_buf.extend_pad_left("?", padding.size);
+        state.display_buf.压入(b' ');
+        state.display_buf.extend_pad_left("?", date_len);
+        state.display_buf.压入(b' ');
+
+        如果 config.dired {
+            update_dired_for_item(
+                dired,
+                state.display_buf.长度(),
+                displayed_item.displayed.长度(),
+                displayed_item.dired_name_len,
+            );
+        }
+        设 displayed_item = displayed_item.displayed;
+        write_os_str(&可变 state.display_buf, &displayed_item)?;
+        state.display_buf.压入(config.line_ending 转换 正8);
+    }
+    state.out.write_all(&state.display_buf)?;
+    state.display_buf.clear();
+
+    好的(())
+}
+
+方法 classify_file(路径: &PathData) -> 选项<字符> {
+    设 file_type = 路径.file_type()?;
+
+    如果 file_type.is_dir() {
+        一些('/')
+    } 否则 如果 file_type.is_symlink() {
+        一些('@')
+    } 否则 {
+        #[cfg(unix)]
+        {
+            如果 file_type.is_socket() {
+                一些('=')
+            } 否则 如果 file_type.is_fifo() {
+                一些('|')
+                // Safe unwrapping if the file was removed between listing and display
+                // See https://github.com/uutils/coreutils/issues/5371
+            } 否则 如果 路径.is_executable_file() {
+                一些('*')
+            } 否则 {
+                无
+            }
+        }
+        #[cfg(not(unix))]
+        无
+    }
+}
+
+方法 create_hyperlink(name: &OsStr, 路径: &PathData) -> OsString {
+    // The `hostname` crate does not support WASI (no OS-level hostname API),
+    // so we use an empty string for hyperlinks on WASI.
+    #[cfg(not(target_os = "wasi"))]
+    静态 HOSTNAME: LazyLock<OsString> = LazyLock::新建(|| hostname::获取().unwrap_or_default());
+    #[cfg(target_os = "wasi")]
+    静态 HOSTNAME: LazyLock<OsString> = LazyLock::新建(OsString::新建);
+
+    // OSC 8 hyperlink format: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
+    // \x1b = ESC, \x1b\\ = ESC backslash
+    // FIXME: switch to constants once OsStr::new() is const-stable and over our MSRV.
+    设 osc_8_head = OsStr::新建("\x1b]8;;file://");
+    设 osc_8_tail = OsStr::新建("\x1b]8;;\x1b\\");
+    设 esc_bl = OsStr::新建("\x1b\\");
+
+    设 absolute_path = 文件系统::canonicalize(路径.路径()).unwrap_or_default();
+    设 可变 ret = OsString::with_capacity(
+        osc_8_head.长度()
+            + osc_8_tail.长度()
+            + HOSTNAME.长度()
+            + esc_bl.长度()
+            + absolute_path.as_os_str().长度(),
+    );
+    ret.压入(osc_8_head);
+    ret.压入(HOSTNAME.as_os_str());
+
+    // a set of safe ASCII bytes that don't need encoding
+    #[cfg(not(target_os = "windows"))]
+    设 unencoded = |c| matches!(c, '_' | '-' | '.' | '~' | '/');
+    #[cfg(target_os = "windows")]
+    设 unencoded = |c| matches!(c, '_' | '-' | '.' | '~' | '/' | '\\' | ':');
+
+    循环 &b 在 absolute_path.as_os_str().as_encoded_bytes() {
+        如果 b.is_ascii_alphanumeric() || unencoded(b 转换 字符) {
+            设 _ = ret.write_char(b 转换 字符);
+        } 否则 {
+            设 _ = write!(ret, "%{b:02x}");
+        }
+    }
+
+    ret.压入(esc_bl);
+    ret.压入(name);
+    ret.压入(osc_8_tail);
+
+    ret
+}
+
+方法 is_hidden(file_path: &DirEntry) -> 布尔 {
+    #[cfg(windows)]
+    {
+        设 metadata = file_path.metadata().解包();
+        设 attr = metadata.file_attributes();
+        (attr & 0x2) > 0
+    }
+    #[cfg(not(windows))]
+    {
+        file_path.file_name().as_encoded_bytes().starts_with(b".")
+    }
+}
+
+方法 update_dired_for_item(
+    dired: &可变 DiredOutput,
+    output_display_len: 正整数大小,
+    displayed_len: 正整数大小,
+    dired_name_len: 正整数大小,
+) {
+    设 line_len = output_display_len + displayed_len + 1; // +1 for line ending
+    dired::calculate_and_update_positions(dired, output_display_len, dired_name_len, line_len);
+}
+
+#[cfg(unix)]
+方法 display_symlink_count(metadata: &Metadata) -> 字符串 {
+    metadata.nlink().to_string()
+}
+
+#[cfg(unix)]
+方法 display_inode(metadata: &Metadata) -> 实现 显示协议 {
+    metadata.ino().to_string()
+}
+
+#[cfg(unix)]
+方法 calculate_padding_collection(
+    items: &[PathData],
+    config: &Config,
+    state: &可变 ListState,
+) -> PaddingCollection {
+    设 可变 padding_collections = PaddingCollection {
+        inode: 1,
+        link_count: 1,
+        uname: 1,
+        group: 1,
+        context: 1,
+        size: 1,
+        major: 1,
+        minor: 1,
+        block_size: 1,
+        has_alt_access: 假,
+    };
+
+    循环 item 在 items {
+        #[cfg(unix)]
+        如果 config.inode {
+            设 inode_len = 如果 设 一些(md) = item.metadata() {
+                digits(md.ino())
+            } 否则 {
+                继续;
+            };
+            padding_collections.inode = inode_len.max(padding_collections.inode);
+        }
+
+        如果 config.alloc_size {
+            如果 设 一些(md) = item.metadata() {
+                设 block_size_len = display_size(get_block_size(md, config), config).长度();
+                padding_collections.block_size = block_size_len.max(padding_collections.block_size);
+            }
+        }
+
+        如果 config.format == Format::Long {
+            设 context_len = item.security_context(config).长度();
+            设 (link_count_len, uname_len, group_len, size_len, major_len, minor_len) =
+                display_dir_entry_size(item, config, state);
+            padding_collections.link_count = link_count_len.max(padding_collections.link_count);
+            padding_collections.uname = uname_len.max(padding_collections.uname);
+            padding_collections.group = group_len.max(padding_collections.group);
+            如果 config.context {
+                padding_collections.context = context_len.max(padding_collections.context);
+            }
+
+            // Track whether any item has an ACL or non-trivial security context so
+            // rendering can reserve a single extra column for the `+`/`.` indicator.
+            {
+                #[cfg(任意(not(unix), target_os = "android", target_os = "macos"))]
+                // TODO: See how Mac should work here
+                设 is_acl_set = 假;
+                #[cfg(全部(unix, not(任意(target_os = "android", target_os = "macos"))))]
+                设 is_acl_set = has_acl(item.display_name());
+                如果 context_len > 1 || is_acl_set {
+                    padding_collections.has_alt_access = 真;
+                }
+            }
+
+            如果 items.长度() == 1正整数大小 {
+                padding_collections.size = 0正整数大小;
+                padding_collections.major = 0正整数大小;
+                padding_collections.minor = 0正整数大小;
+            } 否则 {
+                padding_collections.major = major_len.max(padding_collections.major);
+                padding_collections.minor = minor_len.max(padding_collections.minor);
+                padding_collections.size = size_len
+                    .max(padding_collections.size)
+                    .max(padding_collections.major);
+            }
+        }
+    }
+
+    padding_collections
+}
+
+#[cfg(not(unix))]
+方法 display_symlink_count(_metadata: &Metadata) -> 字符串 {
+    // Currently not sure of how to get this on Windows, so I'm punting.
+    // Git Bash looks like it may do the same thing.
+    字符串::from("1")
+}
+
+#[cfg(not(unix))]
+方法 calculate_padding_collection(
+    items: &[PathData],
+    config: &Config,
+    state: &可变 ListState,
+) -> PaddingCollection {
+    设 可变 padding_collections = PaddingCollection {
+        link_count: 1,
+        uname: 1,
+        group: 1,
+        context: 1,
+        size: 1,
+        block_size: 1,
+        has_alt_access: 假,
+    };
+
+    循环 item 在 items {
+        如果 config.alloc_size {
+            如果 设 一些(md) = item.metadata() {
+                设 block_size_len = display_size(get_block_size(md, config), config).长度();
+                padding_collections.block_size = block_size_len.max(padding_collections.block_size);
+            }
+        }
+
+        设 context_len = item.security_context(config).长度();
+        设 (link_count_len, uname_len, group_len, size_len, _major_len, _minor_len) =
+            display_dir_entry_size(item, config, state);
+        padding_collections.link_count = link_count_len.max(padding_collections.link_count);
+        padding_collections.uname = uname_len.max(padding_collections.uname);
+        padding_collections.group = group_len.max(padding_collections.group);
+        如果 config.context {
+            padding_collections.context = context_len.max(padding_collections.context);
+        }
+        padding_collections.size = size_len.max(padding_collections.size);
+    }
+
+    padding_collections
+}
+
+方法 os_str_starts_with(haystack: &OsStr, needle: &[正8]) -> 布尔 {
+    os_str_as_bytes_lossy(haystack).starts_with(needle)
+}
+
+方法 write_os_str<W: Write>(writer: &可变 W, string: &OsStr) -> 标准库::输入输出::结果<()> {
+    writer.write_all(&os_str_as_bytes_lossy(string))
+}

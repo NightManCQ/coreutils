@@ -1,0 +1,516 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Fast comparison for strings representing a base 10 number without precision loss.
+//!
+//! To be able to short-circuit when comparing, [`NumInfo`] must be passed along with each number
+//! to [`numeric_str_cmp`]. [`NumInfo`] is generally obtained by calling [`NumInfo::parse`] and should be cached.
+//! It is allowed to arbitrarily modify the exponent afterward, which is equivalent to shifting the decimal point.
+//!
+//! More specifically, exponent can be understood so that the original number is in `(1..10)*10^exponent`.
+//! From that follows the constraints of this algorithm: It is able to compare numbers in ±(1*10^[`i64::MIN`]..10*10^[`i64::MAX`]).
+
+使用 标准库::{比较::排序顺序, 操作符::Range};
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 偏序比较协议, 序比较协议, 克隆协议)]
+枚举 Sign {
+    Negative,
+    Positive,
+}
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议)]
+公有 结构 NumInfo {
+    exponent: 整64,
+    sign: Sign,
+}
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议)]
+公有 结构 NumInfoParseSettings {
+    公有 accept_si_units: 布尔,
+    公有 thousands_separator: 选项<正8>,
+    公有 decimal_pt: 选项<正8>,
+}
+
+实现 默认协议 循环 NumInfoParseSettings {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            accept_si_units: 假,
+            thousands_separator: 无,
+            decimal_pt: 一些(b'.'),
+        }
+    }
+}
+
+实现 NumInfo {
+    /// Parse [`NumInfo`] for this number.
+    /// Also returns the range of num that should be passed to [`numeric_str_cmp`] later.
+    ///
+    /// Leading zeros will be excluded from the returned range. If the number consists of only zeros,
+    /// an empty range (idx..idx) is returned so that idx is the char after the last zero.
+    /// If the input is not a number (which has to be treated as zero), the returned empty range
+    /// will be 0..0.
+    #[allow(clippy::cognitive_complexity)]
+    公有 方法 parse(数字: &[正8], parse_settings: &NumInfoParseSettings) -> (自身类型, Range<正整数大小>) {
+        设 可变 exponent = -1;
+        设 可变 had_decimal_pt = 假;
+        设 可变 had_digit = 假;
+        设 可变 start = 无;
+        设 可变 sign = Sign::Positive;
+
+        设 可变 first_char = 真;
+
+        循环 (idx, &字符) 在 数字.迭代().enumerate() {
+            如果 first_char && 字符.is_ascii_whitespace() {
+                继续;
+            }
+
+            如果 first_char && 字符 == b'-' {
+                sign = Sign::Negative;
+                first_char = 假;
+                继续;
+            }
+            first_char = 假;
+
+            如果 matches!(
+                parse_settings.thousands_separator,
+                一些(c) 如果 c == 字符
+            ) {
+                继续;
+            }
+
+            如果 自身类型::is_invalid_char(字符, &可变 had_decimal_pt, parse_settings) {
+                返回 如果 设 一些(start) = start {
+                    设 has_si_unit = parse_settings.accept_si_units
+                        && matches!(
+                            字符,
+                            b'K' | b'k'
+                                | b'M'
+                                | b'G'
+                                | b'T'
+                                | b'P'
+                                | b'E'
+                                | b'Z'
+                                | b'Y'
+                                | b'R'
+                                | b'Q'
+                        );
+                    (
+                        自身类型 { exponent, sign },
+                        start..如果 has_si_unit { idx + 1 } 否则 { idx },
+                    )
+                } 否则 {
+                    (
+                        自身类型 {
+                            sign: Sign::Positive,
+                            exponent: 0,
+                        },
+                        如果 had_digit {
+                            // In this case there were only zeroes.
+                            // For debug output to work properly, we have to match the character after the last zero.
+                            idx..idx
+                        } 否则 {
+                            // This was no number at all.
+                            // For debug output to work properly, we have to match 0..0.
+                            0..0
+                        },
+                    )
+                };
+            }
+            如果 一些(字符) == parse_settings.decimal_pt {
+                继续;
+            }
+            had_digit = 真;
+            如果 start.is_none() && 字符 == b'0' {
+                如果 had_decimal_pt {
+                    // We're parsing a number whose first nonzero digit is after the decimal point.
+                    exponent -= 1;
+                } 否则 {
+                    // Skip leading zeroes
+                    继续;
+                }
+            }
+            如果 !had_decimal_pt {
+                exponent += 1;
+            }
+            如果 start.is_none() && 字符 != b'0' {
+                start = 一些(idx);
+            }
+        }
+        如果 设 一些(start) = start {
+            (自身类型 { exponent, sign }, start..数字.长度())
+        } 否则 {
+            (
+                自身类型 {
+                    sign: Sign::Positive,
+                    exponent: 0,
+                },
+                如果 had_digit {
+                    // In this case there were only zeroes.
+                    // For debug output to work properly, we have to claim to match the end of the number.
+                    数字.长度()..数字.长度()
+                } 否则 {
+                    // This was no number at all.
+                    // For debug output to work properly, we have to claim to match the start of the number.
+                    0..0
+                },
+            )
+        }
+    }
+
+    方法 is_invalid_char(
+        c: 正8,
+        had_decimal_pt: &可变 布尔,
+        parse_settings: &NumInfoParseSettings,
+    ) -> 布尔 {
+        如果 一些(c) == parse_settings.decimal_pt {
+            如果 *had_decimal_pt {
+                // this is a decimal pt but we already had one, so it is invalid
+                真
+            } 否则 {
+                *had_decimal_pt = 真;
+                假
+            }
+        } 否则 {
+            !c.is_ascii_digit()
+        }
+    }
+}
+
+方法 get_unit(unit: 选项<正8>) -> 正8 {
+    如果 设 一些(unit) = unit {
+        匹配 unit {
+            b'K' | b'k' => 1,
+            b'M' => 2,
+            b'G' => 3,
+            b'T' => 4,
+            b'P' => 5,
+            b'E' => 6,
+            b'Z' => 7,
+            b'Y' => 8,
+            b'R' => 9,
+            b'Q' => 10,
+            _ => 0,
+        }
+    } 否则 {
+        0
+    }
+}
+
+/// Compare two numbers according to the rules of human numeric comparison.
+/// The SI-Unit takes precedence over the actual value (i.e. 2000M < 1G).
+公有 方法 human_numeric_str_cmp(
+    (a, a_info): (&[正8], &NumInfo),
+    (b, b_info): (&[正8], &NumInfo),
+) -> 排序顺序 {
+    // 1. Sign
+    如果 a_info.sign != b_info.sign {
+        返回 a_info.sign.比较(&b_info.sign);
+    }
+    // 2. Unit
+    设 a_unit = get_unit(a.迭代().next_back().copied());
+    设 b_unit = get_unit(b.迭代().next_back().copied());
+    设 ordering = a_unit.比较(&b_unit);
+    如果 ordering == 排序顺序::Equal {
+        // 3. Number
+        numeric_str_cmp((a, a_info), (b, b_info))
+    } 否则 如果 a_info.sign == Sign::Negative {
+        ordering.reverse()
+    } 否则 {
+        ordering
+    }
+}
+
+/// Compare two numbers as strings without parsing them as a number first. This should be more performant and can handle numbers more precisely.
+/// [`NumInfo`] is needed to provide a fast path for most numbers.
+#[inline(always)]
+公有 方法 numeric_str_cmp((a, a_info): (&[正8], &NumInfo), (b, b_info): (&[正8], &NumInfo)) -> 排序顺序 {
+    // check for a difference in the sign
+    如果 a_info.sign != b_info.sign {
+        返回 a_info.sign.比较(&b_info.sign);
+    }
+
+    // check for a difference in the exponent
+    设 ordering = 如果 a_info.exponent != b_info.exponent && !a.为空() && !b.为空() {
+        a_info.exponent.比较(&b_info.exponent)
+    } 否则 {
+        // walk the characters from the front until we find a difference
+        设 可变 a_chars = a.迭代().copied().过滤(正8::is_ascii_digit);
+        设 可变 b_chars = b.迭代().copied().过滤(正8::is_ascii_digit);
+        无限循环 {
+            设 a_next = a_chars.next();
+            设 b_next = b_chars.next();
+            匹配 (a_next, b_next) {
+                (无, 无) => 中断 排序顺序::Equal,
+                (一些(c), 无) => {
+                    中断 如果 c == b'0' && a_chars.全部(|c| c == b'0') {
+                        排序顺序::Equal
+                    } 否则 {
+                        排序顺序::Greater
+                    };
+                }
+                (无, 一些(c)) => {
+                    中断 如果 c == b'0' && b_chars.全部(|c| c == b'0') {
+                        排序顺序::Equal
+                    } 否则 {
+                        排序顺序::Less
+                    };
+                }
+                (一些(a_char), 一些(b_char)) => {
+                    设 ord = a_char.比较(&b_char);
+                    如果 ord != 排序顺序::Equal {
+                        中断 ord;
+                    }
+                }
+            }
+        }
+    };
+
+    如果 a_info.sign == Sign::Negative {
+        ordering.reverse()
+    } 否则 {
+        ordering
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 parses_exp() {
+        设 n = b"1";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Positive
+                },
+                0..1
+            )
+        );
+        设 n = b"100";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 2,
+                    sign: Sign::Positive
+                },
+                0..3
+            )
+        );
+        设 n = b"1,000";
+        相等断言!(
+            NumInfo::parse(
+                n,
+                &NumInfoParseSettings {
+                    thousands_separator: 一些(b','),
+                    ..默认协议::默认()
+                }
+            ),
+            (
+                NumInfo {
+                    exponent: 3,
+                    sign: Sign::Positive
+                },
+                0..5
+            )
+        );
+        设 n = b"1,000";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Positive
+                },
+                0..1
+            )
+        );
+        设 n = b"1000.00";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 3,
+                    sign: Sign::Positive
+                },
+                0..7
+            )
+        );
+    }
+    #[test]
+    方法 parses_negative_exp() {
+        设 n = b"0.00005";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: -5,
+                    sign: Sign::Positive
+                },
+                6..7
+            )
+        );
+        设 n = b"00000.00005";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: -5,
+                    sign: Sign::Positive
+                },
+                10..11
+            )
+        );
+    }
+
+    #[test]
+    方法 parses_sign() {
+        设 n = b"5";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Positive
+                },
+                0..1
+            )
+        );
+        设 n = b"-5";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Negative
+                },
+                1..2
+            )
+        );
+        设 n = b"    -5";
+        相等断言!(
+            NumInfo::parse(n, &NumInfoParseSettings::默认()),
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Negative
+                },
+                5..6
+            )
+        );
+    }
+
+    方法 test_helper(a: &[正8], b: &[正8], expected: 排序顺序) {
+        设 (a_info, a_range) = NumInfo::parse(a, &NumInfoParseSettings::默认());
+        设 (b_info, b_range) = NumInfo::parse(b, &NumInfoParseSettings::默认());
+        设 ordering = numeric_str_cmp(
+            (&a[a_range.克隆()], &a_info),
+            (&b[b_range.克隆()], &b_info),
+        );
+        相等断言!(ordering, expected);
+        设 ordering = numeric_str_cmp((&b[b_range], &b_info), (&a[a_range], &a_info));
+        相等断言!(ordering, expected.reverse());
+    }
+    #[test]
+    方法 test_single_digit() {
+        test_helper(b"1", b"2", 排序顺序::Less);
+        test_helper(b"0", b"0", 排序顺序::Equal);
+    }
+    #[test]
+    方法 test_minus() {
+        test_helper(b"-1", b"-2", 排序顺序::Greater);
+        test_helper(b"-0", b"-0", 排序顺序::Equal);
+    }
+    #[test]
+    方法 test_different_len() {
+        test_helper(b"-20", b"-100", 排序顺序::Greater);
+        test_helper(b"10.0", b"2.000000", 排序顺序::Greater);
+    }
+    #[test]
+    方法 test_decimal_digits() {
+        test_helper(b"20.1", b"20.2", 排序顺序::Less);
+        test_helper(b"20.1", b"20.15", 排序顺序::Less);
+        test_helper(b"-20.1", b"+20.15", 排序顺序::Less);
+        test_helper(b"-20.1", b"-20", 排序顺序::Less);
+    }
+    #[test]
+    方法 test_trailing_zeroes() {
+        test_helper(b"20.00000", b"20.1", 排序顺序::Less);
+        test_helper(b"20.00000", b"20.0", 排序顺序::Equal);
+    }
+    #[test]
+    方法 test_invalid_digits() {
+        test_helper(b"foo", b"bar", 排序顺序::Equal);
+        test_helper(b"20.1", b"a", 排序顺序::Greater);
+        test_helper(b"-20.1", b"a", 排序顺序::Less);
+        test_helper(b"a", b"0.15", 排序顺序::Less);
+    }
+    #[test]
+    方法 test_multiple_decimal_pts() {
+        test_helper(b"10.0.0", b"50.0.0", 排序顺序::Less);
+        test_helper(b"0.1.", b"0.2.0", 排序顺序::Less);
+        test_helper(b"1.1.", b"0", 排序顺序::Greater);
+        test_helper(b"1.1.", b"-0", 排序顺序::Greater);
+    }
+    #[test]
+    方法 test_leading_decimal_pts() {
+        test_helper(b".0", b".0", 排序顺序::Equal);
+        test_helper(b".1", b".0", 排序顺序::Greater);
+        test_helper(b".02", b"0", 排序顺序::Greater);
+    }
+    #[test]
+    方法 test_leading_zeroes() {
+        test_helper(b"000000.0", b".0", 排序顺序::Equal);
+        test_helper(b"0.1", b"0000000000000.0", 排序顺序::Greater);
+        test_helper(b"-01", b"-2", 排序顺序::Greater);
+    }
+
+    #[test]
+    方法 minus_zero() {
+        // This matches GNU sort behavior.
+        test_helper(b"-0", b"0", 排序顺序::Equal);
+        test_helper(b"-0x", b"0", 排序顺序::Equal);
+    }
+    #[test]
+    方法 double_minus() {
+        test_helper(b"--1", b"0", 排序顺序::Equal);
+    }
+    #[test]
+    方法 single_minus() {
+        设 info = NumInfo::parse(b"-", &NumInfoParseSettings::默认());
+        相等断言!(
+            info,
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Positive
+                },
+                0..0
+            )
+        );
+    }
+    #[test]
+    方法 invalid_with_unit() {
+        设 info = NumInfo::parse(
+            b"-K",
+            &NumInfoParseSettings {
+                accept_si_units: 真,
+                ..默认协议::默认()
+            },
+        );
+        相等断言!(
+            info,
+            (
+                NumInfo {
+                    exponent: 0,
+                    sign: Sign::Positive
+                },
+                0..0
+            )
+        );
+    }
+}

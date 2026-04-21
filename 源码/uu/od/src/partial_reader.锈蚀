@@ -1,0 +1,231 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore mockstream abcdefgh bcdefgh multifile
+
+使用 标准库::比较;
+使用 标准库::输入输出;
+使用 标准库::输入输出::Read;
+
+使用 箱::multifile_reader::HasError;
+使用 uucore::translate;
+
+/// When a large number of bytes must be skipped, it will be read into a
+/// dynamically allocated buffer. The buffer will be limited to this size.
+常量 MAX_SKIP_BUFFER: 正整数大小 = 16 * 1024;
+
+/// Wrapper for `std::io::Read` which can skip bytes at the beginning
+/// of the input, and it can limit the returned bytes to a particular
+/// number of bytes.
+公有 结构 PartialReader<R> {
+    inner: R,
+    skip: 正64,
+    limit: 选项<正64>,
+}
+
+实现<R> PartialReader<R> {
+    /// Create a new `PartialReader` wrapping `inner`, which will skip
+    /// `skip` bytes, and limits the output to `limit` bytes. Set `limit`
+    /// to `None` if there should be no limit.
+    公有 方法 新建(inner: R, skip: 正64, limit: 选项<正64>) -> 自身类型 {
+        自身类型 { inner, skip, limit }
+    }
+}
+
+实现<R: Read> Read 循环 PartialReader<R> {
+    方法 读锁定(&可变 自身, out: &可变 [正8]) -> 输入输出::结果<正整数大小> {
+        如果 自身.skip > 0 {
+            设 可变 bytes = [0; MAX_SKIP_BUFFER];
+
+            当 自身.skip > 0 {
+                设 skip_count: 正整数大小 = 比较::min(自身.skip 转换 正整数大小, MAX_SKIP_BUFFER);
+
+                无限循环 {
+                    匹配 自身.inner.读锁定(&可变 bytes[..skip_count]) {
+                        好的(0) => {
+                            // this is an error as we still have more to skip
+                            返回 坏的(输入输出::错误协议::新建(
+                                输入输出::ErrorKind::UnexpectedEof,
+                                translate!("od-error-skip-past-end"),
+                            ));
+                        }
+                        好的(n) => {
+                            自身.skip -= n 转换 正64;
+                            中断;
+                        }
+                        坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => {}
+                        坏的(e) => 返回 坏的(e),
+                    }
+                }
+            }
+        }
+
+        匹配 自身.limit {
+            无 => 无限循环 {
+                匹配 自身.inner.读锁定(out) {
+                    坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => {}
+                    result => 返回 result,
+                }
+            },
+            一些(0) => 好的(0),
+            一些(引用 可变 limit) => {
+                设 切片 = 如果 *limit > (out.长度() 转换 正64) {
+                    out
+                } 否则 {
+                    &可变 out[0..(*limit 转换 正整数大小)]
+                };
+                无限循环 {
+                    匹配 自身.inner.读锁定(切片) {
+                        好的(r) => {
+                            *limit -= r 转换 正64;
+                            返回 好的(r);
+                        }
+                        坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => {}
+                        坏的(e) => 返回 坏的(e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+实现<R: HasError> HasError 循环 PartialReader<R> {
+    方法 has_error(&自身) -> 布尔 {
+        自身.inner.has_error()
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 箱::mockstream::*;
+    使用 标准库::输入输出::{Cursor, ErrorKind, Read};
+
+    #[test]
+    方法 test_read_without_limits() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 0, 无);
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 8);
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0]);
+    }
+
+    #[test]
+    方法 test_read_without_limits_with_error() {
+        设 可变 v = [0; 10];
+        设 f = FailingMockStream::新建(ErrorKind::PermissionDenied, "No access", 3);
+        设 可变 sut = PartialReader::新建(f, 0, 无);
+
+        设 错误 = sut.读锁定(v.as_mut()).unwrap_err();
+        相等断言!(错误.kind(), ErrorKind::PermissionDenied);
+        相等断言!(错误.to_string(), "No access");
+    }
+
+    #[test]
+    方法 test_read_skipping_bytes() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 2, 无);
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 6);
+        相等断言!(v, [0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    方法 test_read_skipping_all() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 20, 无);
+
+        设 错误 = sut.读锁定(v.as_mut()).unwrap_err();
+        相等断言!(错误.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    方法 test_read_skipping_with_error() {
+        设 可变 v = [0; 10];
+        设 f = FailingMockStream::新建(ErrorKind::PermissionDenied, "No access", 3);
+        设 可变 sut = PartialReader::新建(f, 2, 无);
+
+        设 错误 = sut.读锁定(v.as_mut()).unwrap_err();
+        相等断言!(错误.kind(), ErrorKind::PermissionDenied);
+        相等断言!(错误.to_string(), "No access");
+    }
+
+    #[test]
+    方法 test_read_skipping_with_two_reads_during_skip() {
+        设 可变 v = [0; 10];
+        设 c = Cursor::新建(&b"a"[..]).chain(Cursor::新建(&b"bcdefgh"[..]));
+        设 可变 sut = PartialReader::新建(c, 2, 无);
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 6);
+        相等断言!(v, [0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    方法 test_read_skipping_huge_number() {
+        设 可变 v = [0; 10];
+        // test if it does not eat all memory....
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 正64::MAX, 无);
+
+        sut.读锁定(v.as_mut()).unwrap_err();
+    }
+
+    #[test]
+    方法 test_read_limiting_all() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 0, 一些(0));
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 0);
+    }
+
+    #[test]
+    方法 test_read_limiting() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 0, 一些(6));
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 6);
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    方法 test_read_limiting_with_error() {
+        设 可变 v = [0; 10];
+        设 f = FailingMockStream::新建(ErrorKind::PermissionDenied, "No access", 3);
+        设 可变 sut = PartialReader::新建(f, 0, 一些(6));
+
+        设 错误 = sut.读锁定(v.as_mut()).unwrap_err();
+        相等断言!(错误.kind(), ErrorKind::PermissionDenied);
+        相等断言!(错误.to_string(), "No access");
+    }
+
+    #[test]
+    方法 test_read_limiting_with_large_limit() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 0, 一些(20));
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 8);
+        相等断言!(v, [0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0, 0]);
+    }
+
+    #[test]
+    方法 test_read_limiting_with_multiple_reads() {
+        设 可变 v = [0; 3];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 0, 一些(6));
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 3);
+        相等断言!(v, [0x61, 0x62, 0x63]);
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 3);
+        相等断言!(v, [0x64, 0x65, 0x66]);
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 0);
+    }
+
+    #[test]
+    方法 test_read_skipping_and_limiting() {
+        设 可变 v = [0; 10];
+        设 可变 sut = PartialReader::新建(Cursor::新建(&b"abcdefgh"[..]), 2, 一些(4));
+
+        相等断言!(sut.读锁定(v.as_mut()).解包(), 4);
+        相等断言!(v, [0x63, 0x64, 0x65, 0x66, 0, 0, 0, 0, 0, 0]);
+    }
+}

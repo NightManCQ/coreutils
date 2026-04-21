@@ -1,0 +1,472 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) ttyname hostnames runlevel mesg wtmp statted boottime deadprocs initspawn clockchange curr pidstr exitstr hoststr
+
+使用 箱::options;
+使用 箱::uu_app;
+
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::libc::{S_IWGRP, STDIN_FILENO, ttyname};
+使用 uucore::translate;
+
+使用 uucore::utmpx::{自身, UtmpxRecord, 时间};
+
+使用 标准库::borrow::Cow;
+使用 标准库::ffi::CStr;
+使用 标准库::格式化::Write;
+使用 标准库::输入输出::{Write 转换 _, stdout};
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+使用 标准库::路径::PathBuf;
+
+方法 get_long_usage() -> 字符串 {
+    translate!("who-long-usage", "default_file" => utmpx::DEFAULT_FILE)
+}
+
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result(uu_app().after_help(get_long_usage()), args)?;
+
+    设 files: 向量<字符串> = matches
+        .get_many::<字符串>(options::FILE)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    // If true, attempt to canonicalize hostnames via a DNS lookup.
+    设 do_lookup = matches.get_flag(options::LOOKUP);
+
+    // If true, display only a list of usernames and count of
+    // the users logged on.
+    // Ignored for 'who am i'.
+    设 short_list = matches.get_flag(options::COUNT);
+
+    设 全部 = matches.get_flag(options::ALL);
+
+    // If true, display a line at the top describing each field.
+    设 include_heading = matches.get_flag(options::HEADING);
+
+    // If true, display a '+' for each user if mesg y, a '-' if mesg n,
+    // or a '?' if their tty cannot be statted.
+    设 include_mesg = 全部 || matches.get_flag(options::MESG);
+
+    // If true, display the last boot time.
+    设 need_boottime = 全部 || matches.get_flag(options::BOOT);
+
+    // If true, display dead processes.
+    设 need_deadprocs = 全部 || matches.get_flag(options::DEAD);
+
+    // If true, display processes waiting for user login.
+    设 need_login = 全部 || matches.get_flag(options::LOGIN);
+
+    // If true, display processes started by init.
+    设 need_initspawn = 全部 || matches.get_flag(options::PROCESS);
+
+    // If true, display the last clock change.
+    设 need_clockchange = 全部 || matches.get_flag(options::TIME);
+
+    // If true, display the current runlevel.
+    设 need_runlevel = 全部 || matches.get_flag(options::RUNLEVEL);
+
+    设 use_defaults = !(全部
+        || need_boottime
+        || need_deadprocs
+        || need_login
+        || need_initspawn
+        || need_runlevel
+        || need_clockchange
+        || matches.get_flag(options::USERS));
+
+    // If true, display user processes.
+    设 need_users = 全部 || matches.get_flag(options::USERS) || use_defaults;
+
+    // If true, display the hours:minutes since each user has touched
+    // the keyboard, or "." if within the last minute, or "old" if
+    // not within the last day.
+    设 include_idle = need_deadprocs || need_login || need_runlevel || need_users;
+
+    // If true, display process termination & exit status.
+    设 include_exit = need_deadprocs;
+
+    // If true, display only name, line, and time fields.
+    设 short_output = !include_exit && use_defaults;
+
+    // If true, display info only for the controlling tty.
+    设 my_line_only = matches.get_flag(options::ONLY_HOSTNAME_USER) || files.长度() == 2;
+
+    设 可变 who = Who {
+        do_lookup,
+        short_list,
+        short_output,
+        include_idle,
+        include_heading,
+        include_mesg,
+        include_exit,
+        need_boottime,
+        need_deadprocs,
+        need_login,
+        need_initspawn,
+        need_clockchange,
+        need_runlevel,
+        need_users,
+        my_line_only,
+        args: files,
+    };
+
+    who.exec()?;
+    好的(())
+}
+
+结构 Who {
+    do_lookup: 布尔,
+    short_list: 布尔,
+    short_output: 布尔,
+    include_idle: 布尔,
+    include_heading: 布尔,
+    include_mesg: 布尔,
+    include_exit: 布尔,
+    need_boottime: 布尔,
+    need_deadprocs: 布尔,
+    need_login: 布尔,
+    need_initspawn: 布尔,
+    need_clockchange: 布尔,
+    need_runlevel: 布尔,
+    need_users: 布尔,
+    my_line_only: 布尔,
+    args: 向量<字符串>,
+}
+
+方法 idle_string<'a>(when: 整64, boottime: 整64) -> Cow<'a, 字符串切片> {
+    thread_local! {
+        静态 NOW: 时间::OffsetDateTime = 时间::OffsetDateTime::now_local().解包();
+    }
+    NOW.with(|n| {
+        设 now = n.unix_timestamp();
+        如果 boottime < when && now - 24 * 3600 < when && when <= now {
+            设 seconds_idle = now - when;
+            如果 seconds_idle < 60 {
+                "  .  ".into()
+            } 否则 {
+                格式化!(
+                    "{:02}:{:02}",
+                    seconds_idle / 3600,
+                    (seconds_idle % 3600) / 60
+                )
+                .into()
+            }
+        } 否则 {
+            translate!("who-idle-old").into()
+        }
+    })
+}
+
+方法 time_string(ut: &UtmpxRecord) -> 字符串 {
+    设 time_format: 向量<时间::format_description::FormatItem> = 如果 ["LC_ALL", "LC_TIME", "LANG"]
+        .into_iter()
+        .find_map(标准库::环境::var_os)
+        .as_deref()
+        == 一些(标准库::ffi::OsStr::新建("C"))
+    {
+        // "%b %e %H:%M"
+        时间::format_description::parse("[month repr:short] [day padding:space] [hour]:[minute]")
+            .解包()
+    } 否则 {
+        // "%Y-%m-%d %H:%M"
+        时间::format_description::parse("[year]-[month]-[day] [hour]:[minute]").解包()
+    };
+    ut.login_time().format(&time_format).解包()
+}
+
+#[inline]
+方法 current_tty() -> 字符串 {
+    设 p = 不安全 { ttyname(STDIN_FILENO) };
+    如果 p.is_null() {
+        字符串::新建()
+    } 否则 {
+        不安全 { CStr::from_ptr(p) }
+            .to_string_lossy()
+            .trim_start_matches("/dev/")
+            .to_owned()
+    }
+}
+
+实现 Who {
+    #[allow(clippy::cognitive_complexity)]
+    方法 exec(&可变 自身) -> UResult<()> {
+        #[cfg(target_os = "linux")]
+        设 run_level_chk = |record: 整16| record == utmpx::RUN_LVL;
+        #[cfg(not(target_os = "linux"))]
+        设 run_level_chk = |_| 假;
+
+        设 f = 如果 自身.args.长度() == 1 {
+            自身.args[0].as_ref()
+        } 否则 {
+            utmpx::DEFAULT_FILE
+        };
+        如果 自身.short_list {
+            设 users = utmpx::Utmpx::iter_all_records_from(f)
+                .过滤(UtmpxRecord::is_user_process)
+                .映射(|ut| ut.user())
+                .收集::<向量<_>>();
+            打印行!("{}", users.加入(" "));
+            打印行!("{}", translate!("who-user-count", "count" => users.长度()));
+        } 否则 {
+            设 records = utmpx::Utmpx::iter_all_records_from(f);
+
+            如果 自身.include_heading {
+                自身.print_heading()?;
+            }
+            设 cur_tty = 如果 自身.my_line_only {
+                current_tty()
+            } 否则 {
+                字符串::新建()
+            };
+
+            循环 ut 在 records {
+                如果 !自身.my_line_only || cur_tty == ut.tty_device() {
+                    如果 自身.need_users && ut.is_user_process() {
+                        自身.print_user(&ut)?;
+                    } 否则 {
+                        匹配 ut.record_type() {
+                            rt 如果 自身.need_runlevel && run_level_chk(rt) => {
+                                如果 cfg!(target_os = "linux") {
+                                    自身.print_runlevel(&ut)?;
+                                }
+                            }
+                            x 如果 x == utmpx::BOOT_TIME && 自身.need_boottime => {
+                                自身.print_boottime(&ut)?;
+                            }
+                            x 如果 x == utmpx::NEW_TIME && 自身.need_clockchange => {
+                                自身.print_clockchange(&ut)?;
+                            }
+                            x 如果 x == utmpx::INIT_PROCESS && 自身.need_initspawn => {
+                                自身.print_initspawn(&ut)?;
+                            }
+                            x 如果 x == utmpx::LOGIN_PROCESS && 自身.need_login => {
+                                自身.print_login(&ut)?;
+                            }
+                            x 如果 x == utmpx::DEAD_PROCESS && 自身.need_deadprocs => {
+                                自身.print_deadprocs(&ut)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                如果 ut.record_type() == utmpx::BOOT_TIME {}
+            }
+        }
+        好的(())
+    }
+
+    #[inline]
+    方法 print_runlevel(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        设 最后 = (ut.pid() / 256) 转换 正8 转换 字符;
+        设 curr = (ut.pid() % 256) 转换 正8 转换 字符;
+        设 runlevel_line = translate!("who-runlevel", "level" => curr);
+        设 comment =
+            translate!("who-runlevel-last", "last" => (如果 最后 == 'N' { 'S' } 否则 { 'N' }));
+
+        自身.print_line(
+            "",
+            ' ',
+            &runlevel_line,
+            &time_string(ut),
+            "",
+            "",
+            如果 最后.is_control() { "" } 否则 { &comment },
+            "",
+        )?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_clockchange(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        自身.print_line(
+            "",
+            ' ',
+            &translate!("who-clock-change"),
+            &time_string(ut),
+            "",
+            "",
+            "",
+            "",
+        )?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_login(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        设 comment = translate!("who-login-id", "id" => ut.terminal_suffix());
+        设 pidstr = 格式化!("{}", ut.pid());
+        自身.print_line(
+            &translate!("who-login"),
+            ' ',
+            &ut.tty_device(),
+            &time_string(ut),
+            "",
+            &pidstr,
+            &comment,
+            "",
+        )?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_deadprocs(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        设 comment = translate!("who-login-id", "id" => ut.terminal_suffix());
+        设 pidstr = 格式化!("{}", ut.pid());
+        设 e = ut.exit_status();
+        设 exitstr = translate!("who-dead-exit-status", "term" => e.0, "exit" => e.1);
+        自身.print_line(
+            "",
+            ' ',
+            &ut.tty_device(),
+            &time_string(ut),
+            "",
+            &pidstr,
+            &comment,
+            &exitstr,
+        )?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_initspawn(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        设 comment = translate!("who-login-id", "id" => ut.terminal_suffix());
+        设 pidstr = 格式化!("{}", ut.pid());
+        自身.print_line(
+            "",
+            ' ',
+            &ut.tty_device(),
+            &time_string(ut),
+            "",
+            &pidstr,
+            &comment,
+            "",
+        )?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_boottime(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        自身.print_line(
+            "",
+            ' ',
+            &translate!("who-system-boot"),
+            &time_string(ut),
+            "",
+            "",
+            "",
+            "",
+        )?;
+        好的(())
+    }
+
+    方法 print_user(&自身, ut: &UtmpxRecord) -> UResult<()> {
+        设 可变 p = PathBuf::from("/dev");
+        p.压入(ut.tty_device().as_str());
+        设 mesg;
+        设 last_change;
+        如果 设 好的(meta) = p.metadata() {
+            #[cfg(全部(
+                not(target_os = "android"),
+                not(target_os = "freebsd"),
+                not(target_vendor = "apple")
+            ))]
+            设 iwgrp = S_IWGRP;
+            #[cfg(任意(target_os = "android", target_os = "freebsd", target_vendor = "apple"))]
+            设 iwgrp = S_IWGRP 转换 正32;
+            mesg = 如果 meta.mode() & iwgrp == 0 { '-' } 否则 { '+' };
+            last_change = meta.atime();
+        } 否则 {
+            mesg = '?';
+            last_change = 0;
+        }
+
+        设 idle = 如果 last_change == 0 {
+            "  ?".into()
+        } 否则 {
+            idle_string(last_change, 0)
+        };
+
+        设 s = 如果 自身.do_lookup {
+            ut.canon_host().map_err_context(|| {
+                设 host = ut.host();
+                translate!("who-canonicalize-error", "host" => host.split(':').next().unwrap_or(&host).quote())
+                .to_string()
+            })?
+        } 否则 {
+            ut.host()
+        };
+        设 hoststr = 如果 s.为空() { s } 否则 { 格式化!("({s})") };
+
+        自身.print_line(
+            ut.user().as_ref(),
+            mesg,
+            ut.tty_device().as_ref(),
+            time_string(ut).as_str(),
+            idle.as_ref(),
+            格式化!("{}", ut.pid()).as_str(),
+            hoststr.as_str(),
+            "",
+        )?;
+
+        好的(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    方法 print_line(
+        &自身,
+        user: &字符串切片,
+        state: 字符,
+        line: &字符串切片,
+        时间: &字符串切片,
+        idle: &字符串切片,
+        pid: &字符串切片,
+        comment: &字符串切片,
+        exit: &字符串切片,
+    ) -> UResult<()> {
+        设 可变 buf = 字符串::with_capacity(64);
+        设 msg = 向量![' ', state].into_iter().收集::<字符串>();
+
+        write!(buf, "{user:<8}").解包();
+        如果 自身.include_mesg {
+            buf.push_str(&msg);
+        }
+        write!(buf, " {line:<12}").解包();
+        // "%b %e %H:%M" (LC_ALL=C)
+        设 time_size = 3 + 2 + 2 + 1 + 2;
+        write!(buf, " {time:<time_size$}").解包();
+
+        如果 !自身.short_output {
+            如果 自身.include_idle {
+                write!(buf, " {idle:<6}").解包();
+            }
+            write!(buf, " {pid:>10}").解包();
+        }
+        write!(buf, " {comment:<8}").解包();
+        如果 自身.include_exit {
+            write!(buf, " {exit:<12}").解包();
+        }
+        writeln!(stdout(), "{}", buf.trim_end())?;
+        好的(())
+    }
+
+    #[inline]
+    方法 print_heading(&自身) -> UResult<()> {
+        自身.print_line(
+            &translate!("who-heading-name"),
+            ' ',
+            &translate!("who-heading-line"),
+            &translate!("who-heading-time"),
+            &translate!("who-heading-idle"),
+            &translate!("who-heading-pid"),
+            &translate!("who-heading-comment"),
+            &translate!("who-heading-exit"),
+        )?;
+        好的(())
+    }
+}

@@ -1,0 +1,659 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) tailable untailable stdlib kqueue Uncategorized unwatch
+
+使用 箱::args::{FollowMode, Settings};
+使用 箱::follow::files::{FileHandling, PathData};
+使用 箱::paths::{Input, InputKind, MetadataExtTail, PathExtTail};
+使用 箱::{platform, text};
+使用 notify::{RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
+使用 标准库::输入输出::BufRead;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::同步::mpsc::{自身, 接收器, 通道};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError, set_exit_code};
+#[cfg(target_os = "linux")]
+使用 uucore::signals::ensure_stdout_not_broken;
+使用 uucore::translate;
+
+使用 uucore::show_error;
+
+公有 结构 WatcherRx {
+    watcher: 盒子<动态 Watcher>,
+    receiver: 接收器<结果<notify::Event, notify::错误协议>>,
+}
+
+实现 WatcherRx {
+    方法 新建(
+        watcher: 盒子<动态 Watcher>,
+        receiver: 接收器<结果<notify::Event, notify::错误协议>>,
+    ) -> 自身类型 {
+        自身类型 { watcher, receiver }
+    }
+
+    /// Wrapper for `notify::Watcher::watch` to also add the parent directory of `path` if necessary.
+    方法 watch_with_parent(&可变 自身, 路径: &Path) -> UResult<()> {
+        设 可变 路径 = 路径.to_owned();
+        #[cfg(target_os = "linux")]
+        如果 路径.is_file() {
+            /*
+            NOTE: Using the parent directory instead of the file is a workaround.
+            This workaround follows the recommendation of the notify crate authors:
+            > On some platforms, if the `path` is renamed or removed while being watched, behavior may
+            > be unexpected. See discussions in [#165] and [#166]. If less surprising behavior is wanted
+            > one may non-recursively watch the _parent_ directory as well and manage related events.
+            NOTE: Adding both: file and parent results in duplicate/wrong events.
+            Tested for notify::InotifyWatcher and for notify::PollWatcher.
+            */
+            如果 设 一些(parent) = 路径.parent() {
+                如果 parent.is_dir() {
+                    路径 = parent.to_owned();
+                } 否则 {
+                    路径 = PathBuf::from(".");
+                }
+            } 否则 {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("tail-error-cannot-watch-parent-directory", "path" => 路径.quote()),
+                ));
+            }
+        }
+        如果 路径.is_relative() {
+            路径 = 路径.canonicalize()?;
+        }
+
+        // for syscalls: 2x "inotify_add_watch" ("filename" and ".") and 1x "inotify_rm_watch"
+        自身.watch(&路径, RecursiveMode::NonRecursive)?;
+        好的(())
+    }
+
+    方法 watch(&可变 自身, 路径: &Path, mode: RecursiveMode) -> UResult<()> {
+        自身.watcher
+            .watch(路径, mode)
+            .map_err(|err| USimpleError::新建(1, err.to_string()))
+    }
+
+    方法 unwatch(&可变 自身, 路径: &Path) -> UResult<()> {
+        自身.watcher
+            .unwatch(路径)
+            .map_err(|err| USimpleError::新建(1, err.to_string()))
+    }
+}
+
+公有 结构 Observer {
+    /// Whether --retry was given on the command line
+    公有 retry: 布尔,
+
+    /// The [`FollowMode`]
+    公有 follow: 选项<FollowMode>,
+
+    /// Indicates whether to use the fallback `polling` method instead of the
+    /// platform specific event driven method. Since `use_polling` is subject to
+    /// change during runtime it is moved out of [`Settings`].
+    公有 use_polling: 布尔,
+
+    公有 watcher_rx: 选项<WatcherRx>,
+    公有 orphans: 向量<PathBuf>,
+    公有 files: FileHandling,
+
+    公有 pid: platform::Pid,
+}
+
+实现 Observer {
+    公有 方法 新建(
+        retry: 布尔,
+        follow: 选项<FollowMode>,
+        use_polling: 布尔,
+        files: FileHandling,
+        pid: platform::Pid,
+    ) -> 自身类型 {
+        设 pid = 如果 platform::supports_pid_checks(pid) {
+            pid
+        } 否则 {
+            0
+        };
+
+        自身类型 {
+            retry,
+            follow,
+            use_polling,
+            watcher_rx: 无,
+            orphans: 向量::新建(),
+            files,
+            pid,
+        }
+    }
+
+    公有 方法 from(settings: &Settings) -> 自身类型 {
+        自身类型::新建(
+            settings.retry,
+            settings.follow,
+            settings.use_polling,
+            FileHandling::from(settings),
+            settings.pid,
+        )
+    }
+
+    公有 方法 add_path(
+        &可变 自身,
+        路径: &Path,
+        display_name: &字符串切片,
+        reader: 选项<盒子<动态 BufRead>>,
+        update_last: 布尔,
+    ) -> UResult<()> {
+        如果 自身.follow.is_some() {
+            设 路径 = 如果 路径.is_relative() {
+                标准库::环境::current_dir()?.加入(路径)
+            } 否则 {
+                路径.to_owned()
+            };
+            设 metadata = 路径.metadata().ok();
+            自身.files.插入(
+                &路径,
+                PathData::新建(reader, metadata, display_name),
+                update_last,
+            );
+        }
+
+        好的(())
+    }
+
+    公有 方法 add_bad_path(
+        &可变 自身,
+        路径: &Path,
+        display_name: &字符串切片,
+        update_last: 布尔,
+    ) -> UResult<()> {
+        如果 自身.retry && 自身.follow.is_some() {
+            返回 自身.add_path(路径, display_name, 无, update_last);
+        }
+
+        好的(())
+    }
+
+    公有 方法 start(&可变 自身, settings: &Settings) -> UResult<()> {
+        如果 settings.follow.is_none() {
+            返回 好的(());
+        }
+
+        设 (tx, rx) = 通道();
+
+        /*
+        Watcher is implemented per platform using the best implementation available on that
+        platform. In addition to such event driven implementations, a polling implementation
+        is also provided that should work on any platform.
+        Linux / Android: inotify
+        macOS: FSEvents / kqueue
+        Windows: ReadDirectoryChangesWatcher
+        FreeBSD / NetBSD / OpenBSD / DragonflyBSD: kqueue
+        Fallback: polling every n seconds
+
+        NOTE:
+        We force the use of kqueue with: features=["macos_kqueue"].
+        On macOS only `kqueue` is suitable for our use case because `FSEvents`
+        waits for file close util it delivers a modify event. See:
+        https://github.com/notify-rs/notify/issues/240
+        */
+
+        设 watcher: 盒子<动态 Watcher>;
+        设 watcher_config = notify::Config::默认()
+            .with_poll_interval(settings.sleep_sec)
+            /*
+            NOTE: By enabling compare_contents, performance will be significantly impacted
+            as all files will need to be read and hashed at each `poll_interval`.
+            However, this is necessary to pass: "gnu/tests/tail-2/F-vs-rename.sh"
+            */
+            .with_compare_contents(真);
+        如果 自身.use_polling || RecommendedWatcher::kind() == WatcherKind::PollWatcher {
+            自身.use_polling = 真; // We have to use polling because there's no supported backend
+            watcher = 盒子::新建(notify::PollWatcher::新建(tx, watcher_config).解包());
+        } 否则 {
+            设 tx_clone = tx.克隆();
+            匹配 RecommendedWatcher::新建(tx, notify::Config::默认()) {
+                好的(w) => watcher = 盒子::新建(w),
+                坏的(e) 如果 e.to_string().starts_with("Too many open files") => {
+                    /*
+                    NOTE: This ErrorKind is `Uncategorized`, but it is not recommended
+                    to match an error against `Uncategorized`
+                    NOTE: Could be tested with decreasing `max_user_instances`, e.g.:
+                    `sudo sysctl fs.inotify.max_user_instances=64`
+                    */
+                    show_error!(
+                        "{}",
+                        translate!("tail-error-backend-cannot-be-used-too-many-files", "backend" => text::BACKEND)
+                    );
+                    set_exit_code(1);
+                    自身.use_polling = 真;
+                    watcher = 盒子::新建(notify::PollWatcher::新建(tx_clone, watcher_config).解包());
+                }
+                坏的(e) => 返回 坏的(USimpleError::新建(1, e.to_string())),
+            }
+        }
+
+        自身.watcher_rx = 一些(WatcherRx::新建(watcher, rx));
+        自身.init_files(&settings.inputs)?;
+
+        好的(())
+    }
+
+    公有 方法 follow_descriptor(&自身) -> 布尔 {
+        自身.follow == 一些(FollowMode::Descriptor)
+    }
+
+    公有 方法 follow_name(&自身) -> 布尔 {
+        自身.follow == 一些(FollowMode::Name)
+    }
+
+    公有 方法 follow_descriptor_retry(&自身) -> 布尔 {
+        自身.follow_descriptor() && 自身.retry
+    }
+
+    公有 方法 follow_name_retry(&自身) -> 布尔 {
+        自身.follow_name() && 自身.retry
+    }
+
+    方法 init_files(&可变 自身, inputs: &向量<Input>) -> UResult<()> {
+        如果 设 一些(watcher_rx) = &可变 自身.watcher_rx {
+            循环 input 在 inputs {
+                匹配 input.kind() {
+                    InputKind::Stdin => (),
+                    InputKind::File(路径) => {
+                        #[cfg(全部(unix, not(target_os = "linux")))]
+                        如果 !路径.is_file() {
+                            继续;
+                        }
+                        设 可变 路径 = 路径.克隆();
+                        如果 路径.is_relative() {
+                            路径 = 标准库::环境::current_dir()?.加入(路径);
+                        }
+
+                        如果 路径.is_tailable() {
+                            // Add existing regular files to `Watcher` (InotifyWatcher).
+                            watcher_rx.watch_with_parent(&路径)?;
+                        } 否则 如果 !路径.is_orphan() {
+                            // If `path` is not a tailable file, add its parent to `Watcher`.
+                            watcher_rx
+                                .watch(路径.parent().解包(), RecursiveMode::NonRecursive)?;
+                            // Add symlinks to orphans for retry polling (target may not exist)
+                            如果 路径.is_symlink() {
+                                自身.orphans.压入(路径);
+                            }
+                        } 否则 {
+                            // If there is no parent, add `path` to `orphans`.
+                            自身.orphans.压入(路径);
+                        }
+                    }
+                }
+            }
+        }
+        好的(())
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    方法 handle_event(
+        &可变 自身,
+        event: &notify::Event,
+        settings: &Settings,
+    ) -> UResult<向量<PathBuf>> {
+        使用 notify::event::{
+            CreateKind, DataChange, EventKind, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+        };
+
+        设 event_path = event.paths.first().解包();
+        设 可变 paths: 向量<PathBuf> = 向量![];
+        设 display_name = 自身.files.获取(event_path).display_name.克隆();
+
+        匹配 event.kind {
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any | MetadataKind::WriteTime) | ModifyKind::Data(DataChange::Any) | ModifyKind::Name(RenameMode::To)) |
+            EventKind::Create(CreateKind::File | CreateKind::Folder | CreateKind::Any) => {
+                如果 设 好的(new_md) = event_path.metadata() {
+                    设 is_tailable = new_md.is_tailable();
+                    设 pd = 自身.files.获取(event_path);
+                    如果 设 一些(old_md) = &pd.metadata {
+                        如果 is_tailable {
+                            // We resume tracking from the start of the file,
+                            // assuming it has been truncated to 0. This mimics GNU's `tail`
+                            // behavior and is the usual truncation operation for log files.
+                            如果 !old_md.is_tailable() {
+                                show_error!(
+                                    "{}",
+                                    translate!("tail-status-has-become-accessible", "file" => display_name.quote())
+                                );
+                                自身.files.update_reader(event_path)?;
+                            } 否则 如果 pd.reader.is_none() {
+                                show_error!(
+                                    "{}",
+                                    translate!("tail-status-has-appeared-following-new-file", "file" => display_name.quote())
+                                );
+                                自身.files.update_reader(event_path)?;
+                            } 否则 如果 event.kind == EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                            || (自身.use_polling && !old_md.file_id_eq(&new_md)) {
+                                show_error!(
+                                    "{}",
+                                    translate!("tail-status-has-been-replaced-following-new-file", "file" => display_name.quote())
+                                );
+                                自身.files.update_reader(event_path)?;
+                            } 否则 如果 old_md.got_truncated(&new_md)? {
+                                show_error!(
+                                    "{}",
+                                    translate!("tail-status-file-truncated", "file" => display_name)
+                                );
+                                自身.files.update_reader(event_path)?;
+                            }
+                            paths.压入(event_path.克隆());
+                        } 否则 如果 !is_tailable && old_md.is_tailable() {
+                            如果 pd.reader.is_some() {
+                                自身.files.reset_reader(event_path);
+                            } 否则 {
+                                show_error!(
+                                    "{}",
+                                    translate!("tail-status-replaced-with-untailable-file", "file" => display_name.quote())
+                                );
+                            }
+                        }
+                    } 否则 如果 is_tailable {
+                        show_error!(
+                            "{}",
+                            translate!("tail-status-has-appeared-following-new-file", "file" => display_name.quote())
+                        );
+                        自身.files.update_reader(event_path)?;
+                        paths.压入(event_path.克隆());
+                    } 否则 如果 settings.retry {
+                        如果 自身.follow_descriptor() {
+                            show_error!(
+                                "{}",
+                                translate!("tail-status-replaced-with-untailable-file-giving-up", "file" => display_name.quote())
+                            );
+                            设 _ = 自身.watcher_rx.as_mut().解包().watcher.unwatch(event_path);
+                            自身.files.移除(event_path);
+                            如果 自身.files.no_files_remaining(settings) {
+                                返回 坏的(USimpleError::新建(1, translate!("tail-no-files-remaining")));
+                            }
+                        } 否则 {
+                            show_error!(
+                                "{}",
+                                translate!("tail-status-replaced-with-untailable-file", "file" => display_name.quote())
+                            );
+                        }
+                    }
+                    自身.files.update_metadata(event_path, 一些(new_md));
+                } 否则 如果 event_path.is_symlink() && settings.retry {
+                    自身.files.reset_reader(event_path);
+                    自身.orphans.压入(event_path.克隆());
+                }
+            }
+            EventKind::Remove(RemoveKind::File | RemoveKind::Any)
+
+                // | EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+                | EventKind::Modify(ModifyKind::Name(RenameMode::转换协议)) => {
+                如果 自身.follow_name() {
+                    如果 settings.retry {
+                        如果 设 一些(old_md) = 自身.files.get_mut_metadata(event_path) {
+                            如果 old_md.is_tailable() && 自身.files.获取(event_path).reader.is_some() {
+                                show_error!(
+                                    "{} {}: {}",
+                                    display_name.quote(),
+                                    translate!("tail-become-inaccessible"),
+                                    translate!("tail-no-such-file-or-directory")
+                                );
+                            }
+                        }
+                        如果 event_path.is_orphan() && !自身.orphans.包含(event_path) {
+                            show_error!("{}", translate!("tail-status-directory-containing-watched-file-removed"));
+                            show_error!(
+                                "{}",
+                                translate!("tail-status-backend-cannot-be-used-reverting-to-polling", "backend" => text::BACKEND)
+                            );
+                            自身.orphans.压入(event_path.克隆());
+                            设 _ = 自身.watcher_rx.as_mut().解包().unwatch(event_path);
+                        }
+                    } 否则 {
+                        show_error!(
+                            "{}: {}",
+                            display_name,
+                            translate!("tail-no-such-file-or-directory")
+                        );
+                        如果 !自身.files.files_remaining() && 自身.use_polling {
+                            // NOTE: GNU's tail exits here for `---disable-inotify`
+                            返回 坏的(USimpleError::新建(1, translate!("tail-no-files-remaining")));
+                        }
+                    }
+                    自身.files.reset_reader(event_path);
+                } 否则 如果 自身.follow_descriptor_retry() {
+                    // --retry only effective for the initial open
+                    设 _ = 自身.watcher_rx.as_mut().解包().unwatch(event_path);
+                    自身.files.移除(event_path);
+                } 否则 如果 自身.use_polling && event.kind == EventKind::Remove(RemoveKind::Any) {
+                    /*
+                    BUG: The watched file was removed. Since we're using Polling, this
+                    could be a rename. We can't tell because `notify::PollWatcher` doesn't
+                    recognize renames properly.
+                    Ideally we want to call seek to offset 0 on the file handle.
+                    But because we only have access to `PathData::reader` as `BufRead`,
+                    we cannot seek to 0 with `BufReader::seek_relative`.
+                    Also because we don't have the new name, we cannot work around this
+                    by simply reopening the file.
+                    */
+                }
+            }
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                /*
+                NOTE: For `tail -f a`, keep tracking additions to b after `mv a b`
+                (gnu/tests/tail-2/descriptor-vs-rename.sh)
+                NOTE: The File/BufReader doesn't need to be updated.
+                However, we need to update our `files.map`.
+                This can only be done for inotify, because this EventKind does not
+                trigger for the PollWatcher.
+                BUG: As a result, there's a bug if polling is used:
+                $ tail -f file_a ---disable-inotify
+                $ mv file_a file_b
+                $ echo A >> file_b
+                $ echo A >> file_a
+                The last append to file_a is printed, however this shouldn't be because
+                after the "mv" tail should only follow "file_b".
+                TODO: [2022-05; jhscheer] add test for this bug
+                */
+
+                如果 自身.follow_descriptor() => {
+                    设 new_path = event.paths.最后().解包();
+                    paths.压入(new_path.克隆());
+
+                    设 new_data = PathData::from_other_with_path(自身.files.移除(event_path), new_path);
+                    自身.files.插入(
+                        new_path,
+                        new_data,
+                        自身.files.get_last().解包() == event_path
+                    );
+
+                    // Unwatch old path and watch new path
+                    设 _ = 自身.watcher_rx.as_mut().解包().unwatch(event_path);
+                    自身.watcher_rx.as_mut().解包().watch_with_parent(new_path)?;
+                }
+            _ => {}
+        }
+        好的(paths)
+    }
+}
+
+#[allow(clippy::cognitive_complexity)]
+公有 方法 follow(可变 observer: Observer, settings: &Settings) -> UResult<()> {
+    如果 observer.files.no_files_remaining(settings) && !observer.files.only_stdin_remaining() {
+        返回 坏的(USimpleError::新建(1, translate!("tail-no-files-remaining")));
+    }
+
+    设 进程 = platform::ProcessChecker::新建(observer.pid);
+
+    设 可变 timeout_counter = 0;
+
+    // main follow loop
+    无限循环 {
+        设 可变 _read_some = 假;
+
+        // If `--pid=p`, tail checks whether process p
+        // is alive at least every `--sleep-interval=N` seconds
+        如果 settings.follow.is_some() && observer.pid != 0 && 进程.is_dead() {
+            // p is dead, tail will also terminate
+            中断;
+        }
+
+        // For `-F` we need to poll if an orphan path becomes available during runtime.
+        // If a path becomes an orphan during runtime, it will be added to orphans.
+        // To be able to differentiate between the cases of test_retry8 and test_retry9,
+        // here paths will not be removed from orphans if the path becomes available.
+        如果 observer.follow_name_retry() {
+            循环 new_path 在 &observer.orphans {
+                // Use metadata() directly instead of exists() + metadata().unwrap()
+                // to avoid a TOCTOU race where the file is removed between the two calls.
+                如果 设 好的(md) = new_path.metadata() {
+                    设 pd = observer.files.获取(new_path);
+                    如果 md.is_tailable() && pd.reader.is_none() {
+                        show_error!(
+                            "{}",
+                            translate!("tail-status-has-appeared-following-new-file", "file" => pd.display_name.quote())
+                        );
+                        observer.files.update_metadata(new_path, 一些(md));
+                        observer.files.update_reader(new_path)?;
+                        _read_some = observer.files.tail_file(new_path, settings.verbose)?;
+                        observer
+                            .watcher_rx
+                            .as_mut()
+                            .解包()
+                            .watch_with_parent(new_path)?;
+                    }
+                }
+            }
+        }
+
+        // With  -f, sleep for approximately N seconds (default 1.0) between iterations;
+        // We wake up if Notify sends an Event or if we wait more than `sleep_sec`.
+        设 rx_result = observer
+            .watcher_rx
+            .as_mut()
+            .解包()
+            .receiver
+            .接收超时(settings.sleep_sec);
+
+        如果 rx_result.is_ok() {
+            timeout_counter = 0;
+        }
+
+        设 可变 paths = 向量![]; // Paths worth checking for new content to print
+
+        // Helper closure to process a single event
+        设 process_event = |observer: &可变 Observer,
+                             event: notify::Event,
+                             settings: &Settings,
+                             paths: &可变 向量<PathBuf>|
+         -> UResult<()> {
+            如果 设 一些(event_path) = event.paths.first() {
+                如果 observer.files.contains_key(event_path) {
+                    // Handle Event if it is about a path that we are monitoring
+                    设 new_paths = observer.handle_event(&event, settings)?;
+                    循环 p 在 new_paths {
+                        如果 !paths.包含(&p) {
+                            paths.压入(p);
+                        }
+                    }
+                }
+            }
+            好的(())
+        };
+
+        匹配 rx_result {
+            好的(好的(event)) => {
+                process_event(&可变 observer, event, settings, &可变 paths)?;
+
+                // Drain any additional pending events to batch them together.
+                // This prevents redundant headers when multiple inotify events
+                // are queued (e.g., after resuming from SIGSTOP).
+                // Multiple iterations with spin_loop hints give the notify
+                // background thread chances to deliver pending events.
+                循环 _ 在 0..100 {
+                    当 设 好的(好的(event)) =
+                        observer.watcher_rx.as_mut().解包().receiver.try_recv()
+                    {
+                        process_event(&可变 observer, event, settings, &可变 paths)?;
+                    }
+                    // Use both yield and spin hint for broader CPU support
+                    标准库::线程::yield_now();
+                    标准库::hint::spin_loop();
+                }
+            }
+            好的(坏的(notify::错误协议 {
+                kind: notify::ErrorKind::Io(引用 e),
+                paths,
+            })) 如果 e.kind() == 标准库::输入输出::ErrorKind::NotFound => {
+                如果 设 一些(event_path) = paths.first() {
+                    如果 observer.files.contains_key(event_path) {
+                        设 _ = observer
+                            .watcher_rx
+                            .as_mut()
+                            .解包()
+                            .watcher
+                            .unwatch(event_path);
+                    }
+                }
+            }
+            好的(坏的(notify::错误协议 {
+                kind: notify::ErrorKind::MaxFilesWatch,
+                ..
+            })) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("tail-error-backend-resources-exhausted", "backend" => text::BACKEND),
+                ));
+            }
+            好的(坏的(e)) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("tail-error-notify-error", "error" => e),
+                ));
+            }
+            坏的(mpsc::RecvTimeoutError::Timeout) => {
+                timeout_counter += 1;
+                // Check if stdout pipe is still open
+                #[cfg(target_os = "linux")]
+                如果 设 好的(假) = ensure_stdout_not_broken() {
+                    返回 好的(());
+                }
+            }
+            坏的(e) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("tail-error-recv-timeout-error", "error" => e),
+                ));
+            }
+        }
+
+        如果 observer.use_polling && settings.follow.is_some() {
+            // Consider all files to potentially have new content.
+            // This is a workaround because `Notify::PollWatcher`
+            // does not recognize the "renaming" of files.
+            paths = observer.files.keys().cloned().收集::<向量<_>>();
+        }
+
+        // main print loop
+        循环 路径 在 &paths {
+            _read_some = observer.files.tail_file(路径, settings.verbose)?;
+        }
+
+        如果 timeout_counter == settings.max_unchanged_stats {
+            /*
+            TODO: [2021-10; jhscheer] implement timeout_counter for each file.
+            '--max-unchanged-stats=n'
+            When tailing a file by name, if there have been n (default n=5) consecutive iterations
+            for which the file has not changed, then open/fstat the file to determine if that file
+            name is still associated with the same device/inode-number pair as before. When
+            following a log file that is rotated, this is approximately the number of seconds
+            between when tail prints the last pre-rotation lines and when it prints the lines that
+            have accumulated in the new log file. This option is meaningful only when polling
+            (i.e., without inotify) and when following by name.
+            */
+        }
+    }
+
+    好的(())
+}

@@ -1,0 +1,1194 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::{
+    ffi::OsString,
+    文件系统::File,
+    输入输出::{BufRead, BufReader, Stdin, Stdout, Write, stdin, stdout},
+    恐慌::set_hook,
+    路径::{Path, PathBuf},
+    时间::持续时间,
+};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+使用 crossterm::{
+    ExecutableCommand,
+    QueueableCommand, // spell-checker:disable-line
+    cursor::{Hide, MoveTo, Show},
+    event::{自身, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    style::Attribute,
+    terminal::{自身, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    tty::IsTty,
+};
+
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::{display::Quotable, show};
+
+使用 uucore::translate;
+
+#[derive(调试协议)]
+枚举 MoreError {
+    IsDirectory(PathBuf),
+    CannotOpenNoSuchFile(PathBuf),
+    CannotOpenIOError(PathBuf, 标准库::输入输出::ErrorKind),
+    BadUsage,
+}
+
+实现 标准库::格式化::显示协议 循环 MoreError {
+    方法 格式化(&自身, f: &可变 标准库::格式化::Formatter<'_>) -> 标准库::格式化::结果 {
+        匹配 自身 {
+            自身类型::IsDirectory(路径) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!(
+                        "more-error-is-directory",
+                        "path" => 路径.quote()
+                    )
+                )
+            }
+            自身类型::CannotOpenNoSuchFile(路径) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!(
+                        "more-error-cannot-open-no-such-file",
+                        "path" => 路径.quote()
+                    )
+                )
+            }
+            自身类型::CannotOpenIOError(路径, 错误) => {
+                write!(
+                    f,
+                    "{}",
+                    translate!(
+                    "more-error-cannot-open-io-error",
+                    "path" => 路径.quote(),
+                    "error" => 错误
+                    )
+                )
+            }
+            自身类型::BadUsage => {
+                write!(f, "{}", translate!("more-error-bad-usage"))
+            }
+        }
+    }
+}
+
+实现 标准库::错误::错误协议 循环 MoreError {}
+
+常量 BELL: 字符 = '\x07'; // Printing this character will ring the bell
+
+// The prompt to be displayed at the top of the screen when viewing multiple files,
+// with the file name in the middle
+常量 MULTI_FILE_TOP_PROMPT: &字符串切片 = "\r::::::::::::::\n\r{}\n\r::::::::::::::\n";
+
+公有 模组 options {
+    公有 常量 SILENT: &字符串切片 = "silent";
+    公有 常量 LOGICAL: &字符串切片 = "logical";
+    公有 常量 EXIT_ON_EOF: &字符串切片 = "exit-on-eof";
+    公有 常量 NO_PAUSE: &字符串切片 = "no-pause";
+    公有 常量 PRINT_OVER: &字符串切片 = "print-over";
+    公有 常量 CLEAN_PRINT: &字符串切片 = "clean-print";
+    公有 常量 SQUEEZE: &字符串切片 = "squeeze";
+    公有 常量 PLAIN: &字符串切片 = "plain";
+    公有 常量 LINES: &字符串切片 = "lines";
+    公有 常量 NUMBER: &字符串切片 = "number";
+    公有 常量 PATTERN: &字符串切片 = "pattern";
+    公有 常量 FROM_LINE: &字符串切片 = "from-line";
+    公有 常量 FILES: &字符串切片 = "files";
+}
+
+结构 Options {
+    silent: 布尔,
+    _logical: 布尔,     // not implemented
+    _exit_on_eof: 布尔, // not implemented
+    _no_pause: 布尔,    // not implemented
+    print_over: 布尔,
+    clean_print: 布尔,
+    squeeze: 布尔,
+    lines: 选项<正16>,
+    from_line: 正整数大小,
+    pattern: 选项<字符串>,
+}
+
+实现 Options {
+    方法 from(matches: &ArgMatches) -> 自身类型 {
+        设 lines = 匹配 (
+            matches.get_one::<正16>(options::LINES).copied(),
+            matches.get_one::<正16>(options::NUMBER).copied(),
+        ) {
+            // We add 1 to the number of lines to display because the last line
+            // is used for the banner
+            (一些(n), _) | (无, 一些(n)) 如果 n > 0 => 一些(n + 1),
+            _ => 无, // Use terminal height
+        };
+        设 from_line = 匹配 matches.get_one::<正整数大小>(options::FROM_LINE).copied() {
+            一些(number) => number.saturating_sub(1),
+            _ => 0,
+        };
+        设 pattern = matches.get_one::<字符串>(options::PATTERN).cloned();
+        自身类型 {
+            silent: matches.get_flag(options::SILENT),
+            _logical: matches.get_flag(options::LOGICAL),
+            _exit_on_eof: matches.get_flag(options::EXIT_ON_EOF),
+            _no_pause: matches.get_flag(options::NO_PAUSE),
+            print_over: matches.get_flag(options::PRINT_OVER),
+            clean_print: matches.get_flag(options::CLEAN_PRINT),
+            squeeze: matches.get_flag(options::SQUEEZE),
+            lines,
+            from_line,
+            pattern,
+        }
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    set_hook(盒子::新建(|panic_info| {
+        打印!("\r");
+        打印行!("{panic_info}");
+    }));
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 可变 options = Options::from(&matches);
+    如果 设 一些(files) = matches.get_many::<OsString>(options::FILES) {
+        设 length = files.长度();
+
+        设 可变 files_iter = files.peekable();
+        当 设 (一些(file_os), next_file) = (files_iter.next(), files_iter.peek()) {
+            设 file = Path::新建(file_os);
+            如果 file.is_dir() {
+                show!(UUsageError::新建(
+                    0,
+                    MoreError::IsDirectory(file.into()).to_string(),
+                ));
+                继续;
+            }
+            如果 !file.exists() {
+                show!(USimpleError::新建(
+                    0,
+                    MoreError::CannotOpenNoSuchFile(file.into()).to_string(),
+                ));
+                继续;
+            }
+            设 opened_file = 匹配 File::open(file) {
+                坏的(why) => {
+                    show!(USimpleError::新建(
+                        0,
+                        MoreError::CannotOpenIOError(file.into(), why.kind()).to_string(),
+                    ));
+                    继续;
+                }
+                好的(opened_file) => opened_file,
+            };
+            设 next_file_str = next_file.映射(|f| f.to_string_lossy().into_owned());
+            more(
+                InputType::File(BufReader::新建(opened_file)),
+                length > 1,
+                一些(&file.to_string_lossy()),
+                next_file_str.as_deref(),
+                &可变 options,
+            )?;
+        }
+    } 否则 {
+        设 stdin = stdin();
+        如果 stdin.is_tty() {
+            // stdin is not a pipe
+            返回 坏的(UUsageError::新建(1, MoreError::BadUsage.to_string()));
+        }
+        more(InputType::Stdin(stdin), 假, 无, 无, &可变 options)?;
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("more")
+        .about(translate!("more-about"))
+        .override_usage(format_usage(&translate!("more-usage")))
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("more"))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::SILENT)
+                .short('d')
+                .long(options::SILENT)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-silent")),
+        )
+        .arg(
+            Arg::新建(options::LOGICAL)
+                .short('l')
+                .long(options::LOGICAL)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-logical")),
+        )
+        .arg(
+            Arg::新建(options::EXIT_ON_EOF)
+                .short('e')
+                .long(options::EXIT_ON_EOF)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-exit-on-eof")),
+        )
+        .arg(
+            Arg::新建(options::NO_PAUSE)
+                .short('f')
+                .long(options::NO_PAUSE)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-no-pause")),
+        )
+        .arg(
+            Arg::新建(options::PRINT_OVER)
+                .short('p')
+                .long(options::PRINT_OVER)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-print-over")),
+        )
+        .arg(
+            Arg::新建(options::CLEAN_PRINT)
+                .short('c')
+                .long(options::CLEAN_PRINT)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-clean-print")),
+        )
+        .arg(
+            Arg::新建(options::SQUEEZE)
+                .short('s')
+                .long(options::SQUEEZE)
+                .action(ArgAction::SetTrue)
+                .help(translate!("more-help-squeeze")),
+        )
+        .arg(
+            Arg::新建(options::PLAIN)
+                .short('u')
+                .long(options::PLAIN)
+                .action(ArgAction::SetTrue)
+                .hide(真)
+                .help(translate!("more-help-plain")),
+        )
+        .arg(
+            Arg::新建(options::LINES)
+                .short('n')
+                .long(options::LINES)
+                .value_name("number")
+                .num_args(1)
+                .value_parser(value_parser!(正16).range(0..))
+                .help(translate!("more-help-lines")),
+        )
+        .arg(
+            Arg::新建(options::NUMBER)
+                .long(options::NUMBER)
+                .num_args(1)
+                .value_parser(value_parser!(正16).range(0..))
+                .help(translate!("more-help-number")),
+        )
+        .arg(
+            Arg::新建(options::FROM_LINE)
+                .short('F')
+                .long(options::FROM_LINE)
+                .num_args(1)
+                .value_name("number")
+                .value_parser(value_parser!(正整数大小))
+                .help(translate!("more-help-from-line")),
+        )
+        .arg(
+            Arg::新建(options::PATTERN)
+                .short('P')
+                .long(options::PATTERN)
+                .allow_hyphen_values(真)
+                .required(假)
+                .value_name("pattern")
+                .help(translate!("more-help-pattern")),
+        )
+        .arg(
+            Arg::新建(options::FILES)
+                .required(假)
+                .action(ArgAction::Append)
+                .help(translate!("more-help-files"))
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}
+
+枚举 InputType {
+    File(BufReader<File>),
+    Stdin(Stdin),
+}
+
+实现 InputType {
+    方法 read_line(&可变 自身, buf: &可变 字符串) -> 标准库::输入输出::结果<正整数大小> {
+        匹配 自身 {
+            自身类型::File(reader) => reader.read_line(buf),
+            自身类型::Stdin(stdin) => stdin.read_line(buf),
+        }
+    }
+
+    方法 长度(&自身) -> 标准库::输入输出::结果<选项<正64>> {
+        设 长度 = 匹配 自身 {
+            自身类型::File(reader) => 一些(reader.get_ref().metadata()?.长度()),
+            自身类型::Stdin(_) => 无,
+        };
+        好的(长度)
+    }
+}
+
+枚举 OutputType {
+    Tty(Stdout),
+    Pipe(盒子<动态 Write>),
+    #[cfg(test)]
+    Test(向量<正8>),
+}
+
+实现 IsTty 循环 OutputType {
+    方法 is_tty(&自身) -> 布尔 {
+        matches!(自身, 自身类型::Tty(_))
+    }
+}
+
+实现 Write 循环 OutputType {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 标准库::输入输出::结果<正整数大小> {
+        匹配 自身 {
+            自身类型::Tty(stdout) => stdout.写锁定(buf),
+            自身类型::Pipe(writer) => writer.写锁定(buf),
+            #[cfg(test)]
+            自身类型::Test(vec) => vec.写锁定(buf),
+        }
+    }
+
+    方法 flush(&可变 自身) -> 标准库::输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::Tty(stdout) => stdout.flush(),
+            自身类型::Pipe(writer) => writer.flush(),
+            #[cfg(test)]
+            自身类型::Test(vec) => vec.flush(),
+        }
+    }
+}
+
+方法 setup_term() -> UResult<OutputType> {
+    设 可变 stdout = stdout();
+    如果 stdout.is_tty() {
+        terminal::enable_raw_mode()?;
+        stdout.execute(EnterAlternateScreen)?.execute(Hide)?;
+        好的(OutputType::Tty(stdout))
+    } 否则 {
+        好的(OutputType::Pipe(盒子::新建(stdout)))
+    }
+}
+
+#[cfg(target_os = "fuchsia")]
+#[inline(always)]
+方法 setup_term() -> UResult<OutputType> {
+    // no real stdout/tty on Fuchsia, just write into a pipe
+    好的(OutputType::Pipe(盒子::新建(stdout())))
+}
+
+方法 reset_term() -> UResult<()> {
+    设 可变 stdout = stdout();
+    如果 stdout.is_tty() {
+        stdout.queue(Show)?.queue(LeaveAlternateScreen)?;
+        terminal::disable_raw_mode()?;
+    } 否则 {
+        stdout.queue(Clear(ClearType::CurrentLine))?;
+        write!(stdout, "\r")?;
+    }
+    stdout.flush()?;
+    好的(())
+}
+
+#[cfg(target_os = "fuchsia")]
+#[inline(always)]
+方法 reset_term() -> UResult<()> {
+    好的(())
+}
+
+结构 TerminalGuard;
+
+实现 Drop 循环 TerminalGuard {
+    方法 drop(&可变 自身) {
+        // Ignore errors in destructor
+        设 _ = reset_term();
+    }
+}
+
+方法 more(
+    input: InputType,
+    multiple_file: 布尔,
+    file_name: 选项<&字符串切片>,
+    next_file: 选项<&字符串切片>,
+    options: &可变 Options,
+) -> UResult<()> {
+    // Initialize output
+    设 out = setup_term()?;
+    // Ensure raw mode is disabled on drop
+    设 _guard = TerminalGuard;
+    // Create pager
+    设 (_cols, 可变 rows) = terminal::size()?;
+    如果 设 一些(number) = options.lines {
+        rows = number;
+    }
+    设 可变 pager = Pager::新建(input, rows, file_name, next_file, options, out)?;
+    // Start from the specified line
+    pager.handle_from_line()?;
+    // Search for pattern
+    pager.handle_pattern_search()?;
+    // Handle multi-file display header if needed
+    如果 multiple_file {
+        pager.display_multi_file_header()?;
+    }
+    // Initial display
+    pager.draw(无)?;
+    // Reset multi-file settings after initial display
+    如果 multiple_file {
+        pager.reset_multi_file_header();
+        options.from_line = 0;
+    }
+    // Main event loop
+    pager.process_events(options)
+}
+
+结构 Pager<'a> {
+    /// Source of the content (file, stdin)
+    input: InputType,
+    /// Total size of the file in bytes (only available for file inputs)
+    file_size: 选项<正64>,
+    /// Storage for the lines read from the input
+    lines: 向量<字符串>,
+    /// Running total of byte sizes for each line, used for positioning
+    cumulative_line_sizes: 向量<正64>,
+    /// Index of the line currently displayed at the top of the screen
+    upper_mark: 正整数大小,
+    /// Number of rows that can be displayed on the screen at once
+    content_rows: 正整数大小,
+    /// Count of blank lines that have been condensed in the current view
+    lines_squeezed: 正整数大小,
+    pattern: 选项<字符串>,
+    file_name: 选项<&'a 字符串切片>,
+    next_file: 选项<&'a 字符串切片>,
+    eof_reached: 布尔,
+    silent: 布尔,
+    squeeze: 布尔,
+    stdout: OutputType,
+}
+
+实现<'a> Pager<'a> {
+    方法 新建(
+        input: InputType,
+        rows: 正16,
+        file_name: 选项<&'a 字符串切片>,
+        next_file: 选项<&'a 字符串切片>,
+        options: &Options,
+        stdout: OutputType,
+    ) -> UResult<自身类型> {
+        // Reserve one line for the status bar, ensuring at least one content row
+        设 content_rows = rows.saturating_sub(1).max(1) 转换 正整数大小;
+        设 file_size = input.长度()?;
+        设 pager = 自身类型 {
+            input,
+            file_size,
+            lines: 向量::with_capacity(content_rows),
+            cumulative_line_sizes: 向量::新建(),
+            upper_mark: options.from_line,
+            content_rows,
+            lines_squeezed: 0,
+            pattern: options.pattern.克隆(),
+            file_name,
+            next_file,
+            eof_reached: 假,
+            silent: options.silent,
+            squeeze: options.squeeze,
+            stdout,
+        };
+        好的(pager)
+    }
+
+    方法 handle_from_line(&可变 自身) -> UResult<()> {
+        如果 !自身.read_until_line(自身.upper_mark)? {
+            write!(
+                自身.stdout,
+                "\r{}{} ({}){}",
+                Attribute::Reverse,
+                translate!(
+                    "more-error-cannot-seek-to-line",
+                    "line" => (自身.upper_mark + 1)
+                ),
+                translate!("more-press-return"),
+                Attribute::Reset,
+            )?;
+            自身.stdout.flush()?;
+            自身.wait_for_enter_key()?;
+            自身.upper_mark = 0;
+        }
+        好的(())
+    }
+
+    方法 read_until_line(&可变 自身, target_line: 正整数大小) -> UResult<布尔> {
+        // Read lines until we reach the target line or EOF
+        设 可变 line = 字符串::新建();
+        当 自身.lines.长度() <= target_line {
+            设 bytes_read = 自身.input.read_line(&可变 line)?;
+            如果 bytes_read == 0 {
+                返回 好的(假); // EOF
+            }
+            // Track cumulative byte position
+            设 last_pos = 自身.cumulative_line_sizes.最后().copied().unwrap_or(0);
+            自身.cumulative_line_sizes
+                .压入(last_pos + bytes_read 转换 正64);
+            // Remove trailing whitespace
+            line = line.trim_end().to_string();
+            // Store the line (using mem::take to avoid clone)
+            自身.lines.压入(标准库::内存::take(&可变 line));
+        }
+        好的(真)
+    }
+
+    方法 wait_for_enter_key(&自身) -> UResult<()> {
+        如果 !自身.stdout.is_tty() {
+            返回 好的(());
+        }
+        无限循环 {
+            如果 event::poll(持续时间::from_millis(100))? {
+                如果 设 Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) = event::读锁定()?
+                {
+                    返回 好的(());
+                }
+            }
+        }
+    }
+
+    方法 handle_pattern_search(&可变 自身) -> UResult<()> {
+        如果 自身.pattern.is_none() {
+            返回 好的(());
+        }
+        如果 设 一些(line) = 自身.search_pattern_in_file() {
+            自身.upper_mark = line;
+        } 否则 {
+            自身.pattern = 无;
+            write!(
+                自身.stdout,
+                "\r{}{} ({}){}",
+                Attribute::Reverse,
+                translate!("more-error-pattern-not-found"),
+                translate!("more-press-return"),
+                Attribute::Reset,
+            )?;
+            自身.stdout.flush()?;
+            自身.wait_for_enter_key()?;
+        }
+        好的(())
+    }
+
+    方法 search_pattern_in_file(&可变 自身) -> 选项<正整数大小> {
+        设 pattern = 自身.pattern.克隆().期望("pattern should be set");
+        设 可变 line_num = 自身.upper_mark;
+        无限循环 {
+            匹配 自身.get_line(line_num) {
+                一些(line) 如果 line.包含(&pattern) => 返回 一些(line_num),
+                一些(_) => line_num += 1,
+                无 => 返回 无,
+            }
+        }
+    }
+
+    方法 get_line(&可变 自身, index: 正整数大小) -> 选项<&字符串> {
+        匹配 自身.read_until_line(index) {
+            好的(真) => 自身.lines.获取(index),
+            _ => 无,
+        }
+    }
+
+    方法 display_multi_file_header(&可变 自身) -> UResult<()> {
+        自身.stdout.queue(Clear(ClearType::CurrentLine))?;
+        自身.stdout.write_all(
+            MULTI_FILE_TOP_PROMPT
+                .replace("{}", 自身.file_name.unwrap_or_default())
+                .as_bytes(),
+        )?;
+        自身.content_rows = 自身
+            .content_rows
+            .saturating_sub(MULTI_FILE_TOP_PROMPT.lines().计数());
+        好的(())
+    }
+
+    方法 reset_multi_file_header(&可变 自身) {
+        自身.content_rows = 自身
+            .content_rows
+            .saturating_add(MULTI_FILE_TOP_PROMPT.lines().计数());
+    }
+
+    方法 update_display(&可变 自身, options: &Options) -> UResult<()> {
+        如果 options.print_over {
+            自身.stdout
+                .execute(MoveTo(0, 0))?
+                .execute(Clear(ClearType::FromCursorDown))?;
+        } 否则 如果 options.clean_print {
+            自身.stdout
+                .execute(Clear(ClearType::All))?
+                .execute(MoveTo(0, 0))?;
+        }
+        好的(())
+    }
+
+    /// Process user input events until exit
+    方法 process_events(&可变 自身, options: &Options) -> UResult<()> {
+        无限循环 {
+            如果 !event::poll(持续时间::from_millis(100))? {
+                继续;
+            }
+            设 可变 wrong_key = 无;
+            匹配 event::读锁定()? {
+                // --- Quit commands ---
+                Event::Key(
+                    KeyEvent {
+                        code: KeyCode::Char('q'),
+                        modifiers: KeyModifiers::NONE,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        kind: KeyEventKind::Press,
+                        ..
+                    },
+                ) => {
+                    reset_term()?;
+                    标准库::进程::exit(0);
+                }
+
+                // --- Forward Navigation ---
+                Event::Key(KeyEvent {
+                    code: KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' '),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    如果 自身.eof_reached {
+                        返回 好的(());
+                    }
+                    自身.page_down();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter | KeyCode::Char('j'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    如果 自身.eof_reached {
+                        返回 好的(());
+                    }
+                    自身.next_line();
+                }
+
+                // --- Backward Navigation ---
+                Event::Key(KeyEvent {
+                    code: KeyCode::Up | KeyCode::PageUp,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    自身.page_up();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('k'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    自身.prev_line();
+                }
+
+                // --- Terminal events ---
+                Event::Resize(col, row) => {
+                    自身.page_resize(col, row, options.lines);
+                }
+
+                // --- Skip key release events ---
+                Event::Key(KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..
+                }) => 继续,
+
+                // --- Handle unknown keys ---
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(k),
+                    ..
+                }) => wrong_key = 一些(k),
+
+                // --- Ignore other events ---
+                _ => 继续,
+            }
+            自身.update_display(options)?;
+            自身.draw(wrong_key)?;
+        }
+    }
+
+    方法 page_down(&可变 自身) {
+        // Move the viewing window down by the number of lines to display
+        自身.upper_mark = 自身.upper_mark.saturating_add(自身.content_rows);
+    }
+
+    方法 next_line(&可变 自身) {
+        // Move the viewing window down by one line
+        自身.upper_mark = 自身.upper_mark.saturating_add(1);
+    }
+
+    方法 page_up(&可变 自身) {
+        自身.eof_reached = 假;
+        // Move the viewing window up by the number of lines to display
+        自身.upper_mark = 自身
+            .upper_mark
+            .saturating_sub(自身.content_rows.saturating_add(自身.lines_squeezed));
+        如果 自身.squeeze {
+            // Move upper mark to the first non-empty line
+            当 自身.upper_mark > 0 {
+                设 line = 自身.lines.获取(自身.upper_mark).期望("line should exist");
+                如果 !line.trim().为空() {
+                    中断;
+                }
+                自身.upper_mark = 自身.upper_mark.saturating_sub(1);
+            }
+        }
+    }
+
+    方法 prev_line(&可变 自身) {
+        自身.eof_reached = 假;
+        // Move the viewing window up by one line
+        自身.upper_mark = 自身.upper_mark.saturating_sub(1);
+    }
+
+    // TODO: Deal with column size changes.
+    方法 page_resize(&可变 自身, _col: 正16, row: 正16, option_line: 选项<正16>) {
+        如果 option_line.is_none() {
+            自身.content_rows = row.saturating_sub(1) 转换 正整数大小;
+        }
+    }
+
+    方法 draw(&可变 自身, wrong_key: 选项<字符>) -> UResult<()> {
+        自身.draw_lines()?;
+        自身.draw_status_bar(wrong_key);
+        自身.stdout.flush()?;
+        好的(())
+    }
+
+    方法 draw_lines(&可变 自身) -> UResult<()> {
+        // Clear current prompt line
+        自身.stdout.queue(Clear(ClearType::CurrentLine))?;
+        // Reset squeezed lines counter
+        自身.lines_squeezed = 0;
+        // Display lines until we've filled the screen
+        设 可变 lines_printed = 0;
+        设 可变 index = 自身.upper_mark;
+        当 lines_printed < 自身.content_rows {
+            // Load the required line or stop at EOF
+            如果 !自身.read_until_line(index)? {
+                自身.eof_reached = 真;
+                自身.upper_mark = index.saturating_sub(自身.content_rows);
+                中断;
+            }
+            // Skip line if it should be squeezed
+            如果 自身.should_squeeze_line(index) {
+                自身.lines_squeezed += 1;
+                index += 1;
+                继续;
+            }
+            // Display the line
+            设 可变 line = 自身.lines[index].克隆();
+            如果 设 一些(pattern) = &自身.pattern {
+                // Highlight the pattern in the line
+                line = line.replace(
+                    pattern,
+                    &格式化!("{}{pattern}{}", Attribute::Reverse, Attribute::Reset),
+                );
+            }
+            自身.stdout.write_all(格式化!("\r{line}\n").as_bytes())?;
+            lines_printed += 1;
+            index += 1;
+        }
+        // Fill remaining lines with `~`
+        当 lines_printed < 自身.content_rows {
+            自身.stdout.write_all(b"\r~\n")?;
+            lines_printed += 1;
+        }
+        好的(())
+    }
+
+    方法 should_squeeze_line(&自身, index: 正整数大小) -> 布尔 {
+        // Only squeeze if enabled and not the first line
+        如果 !自身.squeeze || index == 0 {
+            返回 假;
+        }
+        // Squeeze only if both current and previous lines are empty
+        匹配 (自身.lines.获取(index), 自身.lines.获取(index - 1)) {
+            (一些(current), 一些(previous)) => current.为空() && previous.为空(),
+            _ => 假,
+        }
+    }
+
+    方法 draw_status_bar(&可变 自身, wrong_key: 选项<字符>) {
+        // Calculate the index of the last visible line
+        设 lower_mark =
+            (自身.upper_mark + 自身.content_rows).min(自身.lines.长度().saturating_sub(1));
+        // Determine progress information to display
+        // - Show next file name when at EOF and there is a next file
+        // - Otherwise show percentage of the file read (if available)
+        设 progress_info = 如果 自身.eof_reached {
+            自身.next_file
+                .as_ref()
+                .映射(|next_file| 格式化!(" (Next file: {next_file})"))
+                .unwrap_or_default()
+        } 否则 如果 设 一些(file_size) = 自身.file_size {
+            // For files, show percentage or END
+            设 position = 自身
+                .cumulative_line_sizes
+                .获取(lower_mark)
+                .copied()
+                .unwrap_or_default();
+            如果 file_size == 0 {
+                " (END)".to_string()
+            } 否则 {
+                设 percentage = (position 转换 点64 / file_size 转换 点64 * 100.0).round() 转换 正16;
+                如果 percentage >= 100 {
+                    " (END)".to_string()
+                } 否则 {
+                    格式化!(" ({percentage}%)")
+                }
+            }
+        } 否则 {
+            // For stdin, don't show percentage
+            字符串::新建()
+        };
+        // Base status message with progress info
+        设 file_name = 自身.file_name.unwrap_or(":");
+        设 status = 格式化!("{file_name}{progress_info}");
+        // Add appropriate user feedback based on silent mode and key input:
+        // - In silent mode: show help text or unknown key message
+        // - In normal mode: ring bell (BELL char) on wrong key or show basic prompt
+        设 banner = 匹配 (自身.silent, wrong_key) {
+            (真, 一些(key)) => 格式化!(
+                "{status}[{}]",
+                translate!(
+                    "more-error-unknown-key",
+                    "key" => key,
+                )
+            ),
+            (真, 无) => 格式化!("{status}{}", translate!("more-help-message")),
+            (假, 一些(_)) => 格式化!("{status}{BELL}"),
+            (假, 无) => status,
+        };
+        // Draw the status bar at the bottom of the screen
+        write!(
+            自身.stdout,
+            "\r{}{banner}{}",
+            Attribute::Reverse,
+            Attribute::Reset
+        )
+        .解包();
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 标准库::{
+        输入输出::Seek,
+        操作符::{Deref, DerefMut},
+    };
+
+    使用 超级::*;
+    使用 tempfile::tempfile;
+
+    实现 Deref 循环 OutputType {
+        类型 Target = 向量<正8>;
+        方法 deref(&自身) -> &向量<正8> {
+            匹配 自身 {
+                自身类型::Test(buf) => buf,
+                _ => 无法到达!(),
+            }
+        }
+    }
+
+    实现 DerefMut 循环 OutputType {
+        方法 deref_mut(&可变 自身) -> &可变 向量<正8> {
+            匹配 自身 {
+                自身类型::Test(buf) => buf,
+                _ => 无法到达!(),
+            }
+        }
+    }
+
+    结构 TestPagerBuilder {
+        content: 字符串,
+        options: Options,
+        rows: 正16,
+        next_file: 选项<&'静态 字符串切片>,
+    }
+
+    实现 默认协议 循环 TestPagerBuilder {
+        方法 默认() -> 自身类型 {
+            自身类型 {
+                content: 字符串::新建(),
+                options: Options {
+                    silent: 假,
+                    _logical: 假,
+                    _exit_on_eof: 假,
+                    _no_pause: 假,
+                    print_over: 假,
+                    clean_print: 假,
+                    squeeze: 假,
+                    lines: 无,
+                    from_line: 0,
+                    pattern: 无,
+                },
+                rows: 10,
+                next_file: 无,
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    实现 TestPagerBuilder {
+        方法 新建(content: &字符串切片) -> 自身类型 {
+            自身类型 {
+                content: content.to_string(),
+                ..默认协议::默认()
+            }
+        }
+
+        方法 build(可变 自身) -> Pager<'静态> {
+            设 可变 tmpfile = tempfile().解包();
+            tmpfile.write_all(自身.content.as_bytes()).解包();
+            tmpfile.rewind().解包();
+            设 out = OutputType::Test(向量::新建());
+            如果 设 一些(rows) = 自身.options.lines {
+                自身.rows = rows;
+            }
+            Pager::新建(
+                InputType::File(BufReader::新建(tmpfile)),
+                自身.rows,
+                无,
+                自身.next_file,
+                &自身.options,
+                out,
+            )
+            .解包()
+        }
+
+        方法 silent(可变 自身) -> 自身类型 {
+            自身.options.silent = 真;
+            自身
+        }
+
+        方法 print_over(可变 自身) -> 自身类型 {
+            自身.options.print_over = 真;
+            自身
+        }
+
+        方法 clean_print(可变 自身) -> 自身类型 {
+            自身.options.clean_print = 真;
+            自身
+        }
+
+        方法 squeeze(可变 自身) -> 自身类型 {
+            自身.options.squeeze = 真;
+            自身
+        }
+
+        方法 lines(可变 自身, lines: 正16) -> 自身类型 {
+            自身.options.lines = 一些(lines);
+            自身
+        }
+
+        #[allow(clippy::wrong_self_convention)]
+        方法 from_line(可变 自身, from_line: 正整数大小) -> 自身类型 {
+            自身.options.from_line = from_line;
+            自身
+        }
+
+        方法 pattern(可变 自身, pattern: &字符串切片) -> 自身类型 {
+            自身.options.pattern = 一些(pattern.to_owned());
+            自身
+        }
+
+        方法 rows(可变 自身, rows: 正16) -> 自身类型 {
+            自身.rows = rows;
+            自身
+        }
+
+        方法 next_file(可变 自身, next_file: &'静态 字符串切片) -> 自身类型 {
+            自身.next_file = 一些(next_file);
+            自身
+        }
+    }
+
+    #[test]
+    方法 test_get_line_and_len() {
+        设 content = "a\n\tb\nc\n";
+        设 可变 pager = TestPagerBuilder::新建(content).build();
+        相等断言!(pager.get_line(1).解包(), "\tb");
+        相等断言!(pager.cumulative_line_sizes.长度(), 2);
+        相等断言!(pager.cumulative_line_sizes[1], 5);
+    }
+
+    #[test]
+    方法 test_navigate_page() {
+        // create 10 lines "0\n".."9\n"
+        设 content = (0..10).映射(|i| i.to_string() + "\n").收集::<字符串>();
+
+        // content_rows = rows - 1 = 10 - 1 = 9
+        设 可变 pager = TestPagerBuilder::新建(&content).build();
+        相等断言!(pager.upper_mark, 0);
+
+        pager.page_down();
+        相等断言!(pager.upper_mark, pager.content_rows);
+        pager.draw(无).解包();
+        设 可变 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("9\n"));
+        断言!(!stdout.包含("8\n"));
+        相等断言!(pager.upper_mark, 1); // EOF reached: upper_mark = 10 - content_rows = 1
+
+        pager.page_up();
+        相等断言!(pager.upper_mark, 0);
+
+        pager.next_line();
+        相等断言!(pager.upper_mark, 1);
+
+        pager.prev_line();
+        相等断言!(pager.upper_mark, 0);
+        pager.stdout.clear();
+        pager.draw(无).解包();
+        stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("0\n"));
+        断言!(!stdout.包含("9\n")); // only lines 0 to 8 should be displayed
+    }
+
+    #[test]
+    方法 test_silent_mode() {
+        设 content = (0..5).映射(|i| i.to_string() + "\n").收集::<字符串>();
+        设 可变 pager = TestPagerBuilder::新建(&content)
+            .from_line(3)
+            .silent()
+            .build();
+        pager.draw_status_bar(无);
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含(&translate!("more-help-message")));
+    }
+
+    #[test]
+    方法 test_squeeze() {
+        设 content = "Line 0\n\n\n\nLine 4\n\n\nLine 7\n";
+        设 可变 pager = TestPagerBuilder::新建(content).lines(6).squeeze().build();
+        相等断言!(pager.content_rows, 5); // 1 line for the status bar
+
+        // load all lines
+        断言!(pager.read_until_line(7).解包());
+        //  back‑to‑back empty lines → should squeeze
+        断言!(pager.should_squeeze_line(2));
+        断言!(pager.should_squeeze_line(3));
+        断言!(pager.should_squeeze_line(6));
+        // non‑blank or first line should not be squeezed
+        断言!(!pager.should_squeeze_line(0));
+        断言!(!pager.should_squeeze_line(1));
+        断言!(!pager.should_squeeze_line(4));
+        断言!(!pager.should_squeeze_line(5));
+        断言!(!pager.should_squeeze_line(7));
+
+        pager.draw(无).解包();
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("Line 0"));
+        断言!(stdout.包含("Line 4"));
+        断言!(stdout.包含("Line 7"));
+    }
+
+    #[test]
+    方法 test_lines_option() {
+        设 content = (0..5).映射(|i| i.to_string() + "\n").收集::<字符串>();
+
+        // Output zero lines succeeds
+        设 可变 pager = TestPagerBuilder::新建(&content).lines(0).build();
+        pager.draw(无).解包();
+        设 可变 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(!stdout.为空());
+
+        // Output two lines
+        设 可变 pager = TestPagerBuilder::新建(&content).lines(3).build();
+        相等断言!(pager.content_rows, 3 - 1); // 1 line for the status bar
+        pager.draw(无).解包();
+        stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("0\n"));
+        断言!(stdout.包含("1\n"));
+        断言!(!stdout.包含("2\n"));
+    }
+
+    #[test]
+    方法 test_from_line_option() {
+        设 content = (0..5).映射(|i| i.to_string() + "\n").收集::<字符串>();
+
+        // Output from first line
+        设 可变 pager = TestPagerBuilder::新建(&content).from_line(0).build();
+        断言!(pager.handle_from_line().is_ok());
+        pager.draw(无).解包();
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("0\n"));
+
+        // Output from second line
+        pager = TestPagerBuilder::新建(&content).from_line(1).build();
+        断言!(pager.handle_from_line().is_ok());
+        pager.draw(无).解包();
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("1\n"));
+        断言!(!stdout.包含("0\n"));
+
+        // Output from out of range line
+        pager = TestPagerBuilder::新建(&content).from_line(99).build();
+        断言!(pager.handle_from_line().is_ok());
+        相等断言!(pager.upper_mark, 0);
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含(&translate!(
+            "more-error-cannot-seek-to-line",
+            "line" => "100"
+        )));
+    }
+
+    #[test]
+    方法 test_search_pattern_found() {
+        设 content = "foo\nbar\nbaz\n";
+        设 可变 pager = TestPagerBuilder::新建(content).pattern("bar").build();
+        断言!(pager.handle_pattern_search().is_ok());
+        相等断言!(pager.upper_mark, 1);
+        pager.draw(无).解包();
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含("bar"));
+        断言!(!stdout.包含("foo"));
+    }
+
+    #[test]
+    方法 test_search_pattern_not_found() {
+        设 content = "foo\nbar\nbaz\n";
+        设 可变 pager = TestPagerBuilder::新建(content).pattern("qux").build();
+        断言!(pager.handle_pattern_search().is_ok());
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含(&translate!("more-error-pattern-not-found")));
+        相等断言!(pager.pattern, 无);
+        相等断言!(pager.upper_mark, 0);
+    }
+
+    #[test]
+    方法 test_wrong_key() {
+        设 可变 pager = TestPagerBuilder::默认().silent().build();
+        pager.draw_status_bar(一些('x'));
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含(&translate!(
+            "more-error-unknown-key",
+            "key" => "x"
+        )));
+
+        pager = TestPagerBuilder::默认().build();
+        pager.draw_status_bar(一些('x'));
+        设 stdout = 字符串::from_utf8_lossy(&pager.stdout);
+        断言!(stdout.包含(&BELL.to_string()));
+    }
+}

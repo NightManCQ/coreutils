@@ -1,0 +1,1026 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore strtime Yhello
+
+//! GNU date format modifier support
+//!
+//! This module implements GNU-compatible format modifiers for date formatting.
+//! These modifiers extend standard strftime format specifiers with optional
+//! width and flag modifiers.
+//!
+//! ## Syntax
+//!
+//! Format: `%[flags][width]specifier`
+//!
+//! ### Flags
+//! - `-`: Do not pad the field
+//! - `_`: Pad with spaces instead of zeros
+//! - `0`: Pad with zeros (default for numeric fields)
+//! - `^`: Convert to uppercase
+//! - `#`: Use opposite case (uppercase becomes lowercase and vice versa)
+//! - `+`: Force display of sign (+ for positive, - for negative)
+//!
+//! ### Width
+//! - One or more digits specifying minimum field width
+//! - Field will be padded to this width using the padding character
+//!
+//! ### Examples
+//! - `%10Y`: Year padded to 10 digits with zeros (0000001999)
+//! - `%_10m`: Month padded to 10 digits with spaces (        06)
+//! - `%-d`: Day without padding (1 instead of 01)
+//! - `%^B`: Month name in uppercase (JUNE)
+//! - `%+4C`: Century with sign, padded to 4 characters (+019)
+
+使用 jiff::Zoned;
+使用 jiff::格式化::strtime::{BrokenDownTime, Config, PosixCustom};
+使用 标准库::格式化;
+使用 uucore::translate;
+
+/// Error type for format modifier operations
+#[derive(调试协议)]
+公有 枚举 FormatError {
+    /// Error from the underlying jiff library
+    JiffError(jiff::错误协议),
+    /// Field width calculation overflowed or required allocation failed
+    FieldWidthTooLarge { width: 正整数大小, specifier: 字符串 },
+}
+
+实现 格式化::显示协议 循环 FormatError {
+    方法 格式化(&自身, f: &可变 格式化::Formatter<'_>) -> 格式化::结果 {
+        匹配 自身 {
+            自身类型::JiffError(e) => write!(f, "{e}"),
+            自身类型::FieldWidthTooLarge { width, specifier } => write!(
+                f,
+                "{}",
+                translate!(
+                    "date-error-format-modifier-width-too-large",
+                    "width" => width,
+                    "specifier" => specifier
+                )
+            ),
+        }
+    }
+}
+
+实现 转换协议<jiff::错误协议> 循环 FormatError {
+    方法 from(e: jiff::错误协议) -> 自身类型 {
+        自身类型::JiffError(e)
+    }
+}
+
+/// A parsed `%`-format specifier: `%[flags][width][:colons]<letter>`.
+结构 ParsedSpec<'a> {
+    /// Flag characters from `[_0^#+-]`.
+    flags: &'a 字符串切片,
+    /// Explicit width, if present. `None` means no width was specified.
+    /// A value that overflows `usize` is represented as `Some(usize::MAX)` so
+    /// the downstream allocation check surfaces it as `FieldWidthTooLarge`.
+    width: 选项<正整数大小>,
+    /// The specifier itself, including any leading colons (e.g. `Y`, `:z`, `::z`).
+    spec: &'a 字符串切片,
+    /// Total byte length of the parsed sequence including the leading `%`.
+    长度: 正整数大小,
+}
+
+/// Try to parse a format spec at the start of `s`.
+///
+/// Implements the grammar `%[_0^#+-]*[0-9]*:*[a-zA-Z]` anchored at the
+/// beginning of `s`. Returns `None` if `s` does not start with `%` or no
+/// valid specifier follows.
+方法 parse_format_spec(s: &字符串切片) -> 选项<ParsedSpec<'_>> {
+    设 bytes = s.as_bytes();
+    如果 bytes.first() != 一些(&b'%') {
+        返回 无;
+    }
+
+    设 可变 pos = 1;
+
+    // Flags: any of [_0^#+-], zero or more.
+    设 flags_start = pos;
+    当 pos < bytes.长度() && matches!(bytes[pos], b'_' | b'0' | b'^' | b'#' | b'+' | b'-') {
+        pos += 1;
+    }
+    设 flags = &s[flags_start..pos];
+
+    // Width: zero or more ASCII digits.
+    设 width_start = pos;
+    当 pos < bytes.长度() && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    设 width = 如果 pos > width_start {
+        一些(s[width_start..pos].parse::<正整数大小>().unwrap_or(正整数大小::MAX))
+    } 否则 {
+        无
+    };
+
+    // Specifier: zero or more `:` followed by a single ASCII letter.
+    设 spec_start = pos;
+    当 pos < bytes.长度() && bytes[pos] == b':' {
+        pos += 1;
+    }
+    如果 pos >= bytes.长度() || !bytes[pos].is_ascii_alphabetic() {
+        返回 无;
+    }
+    pos += 1;
+    设 spec = &s[spec_start..pos];
+
+    一些(ParsedSpec {
+        flags,
+        width,
+        spec,
+        长度: pos,
+    })
+}
+
+/// Check if format string contains any GNU modifiers and format if present.
+///
+/// This function combines modifier detection and formatting in a single pass
+/// for better performance. If no modifiers are found, returns None and the
+/// caller should use standard formatting. If modifiers are found, returns
+/// the formatted string.
+公有 方法 format_with_modifiers_if_present(
+    date: &Zoned,
+    format_string: &字符串切片,
+    config: &Config<PosixCustom>,
+) -> 选项<结果<字符串, FormatError>> {
+    如果 !has_gnu_modifiers(format_string) {
+        返回 无;
+    }
+
+    // If we have modifiers, format the string
+    一些(format_with_modifiers(date, format_string, config))
+}
+
+/// Quick check: does the format string contain any GNU modifier
+/// (a flag or width) on a `%`-spec, ignoring `%%` literals?
+///
+/// Note that colon-prefixed specifiers without flags or width (e.g. `%:z`,
+/// `%::z`) are deliberately *not* considered modifiers: jiff's strftime can
+/// format them directly, so the caller can take the standard fast path.
+方法 has_gnu_modifiers(format_string: &字符串切片) -> 布尔 {
+    设 bytes = format_string.as_bytes();
+    设 可变 i = 0;
+    当 i < bytes.长度() {
+        如果 bytes[i] == b'%' {
+            // Skip %% literal
+            如果 bytes.获取(i + 1) == 一些(&b'%') {
+                i += 2;
+                继续;
+            }
+            如果 设 一些(parsed) = parse_format_spec(&format_string[i..]) {
+                如果 !parsed.flags.为空() || parsed.width.is_some() {
+                    返回 真;
+                }
+                i += parsed.长度;
+                继续;
+            }
+        }
+        i += 1;
+    }
+    假
+}
+
+/// Process a format string with GNU modifiers.
+///
+/// # Arguments
+/// * `date` - The date to format
+/// * `format_string` - Format string with GNU modifiers
+/// * `config` - Strftime configuration
+///
+/// # Returns
+/// Formatted string with modifiers applied
+///
+/// # Errors
+/// Returns `FormatError` if formatting fails
+方法 format_with_modifiers(
+    date: &Zoned,
+    format_string: &字符串切片,
+    config: &Config<PosixCustom>,
+) -> 结果<字符串, FormatError> {
+    设 可变 result = 字符串::新建();
+    设 broken_down = BrokenDownTime::from(date);
+
+    // Reused across iterations to avoid allocating a fresh `String` per spec.
+    // Holds the leading `%` plus the specifier itself (e.g. `%Y`, `%::z`),
+    // which is at most a handful of bytes.
+    设 可变 base_format = 字符串::with_capacity(8);
+
+    设 bytes = format_string.as_bytes();
+    设 可变 i = 0;
+    当 i < bytes.长度() {
+        如果 bytes[i] == b'%' {
+            // Handle %% literal: emit a single '%' and continue.
+            如果 bytes.获取(i + 1) == 一些(&b'%') {
+                result.压入('%');
+                i += 2;
+                继续;
+            }
+
+            如果 设 一些(parsed) = parse_format_spec(&format_string[i..]) {
+                // Format the base specifier first, reusing `base_format`.
+                base_format.clear();
+                base_format.压入('%');
+                base_format.push_str(parsed.spec);
+                设 formatted = broken_down.to_string_with_config(config, &base_format)?;
+
+                如果 !parsed.flags.为空() || parsed.width.is_some() {
+                    设 modified = apply_modifiers(&formatted, &parsed)?;
+                    result.push_str(&modified);
+                } 否则 {
+                    result.push_str(&formatted);
+                }
+
+                i += parsed.长度;
+                继续;
+            }
+        }
+
+        // Pass-through: copy a single UTF-8 code point unchanged.
+        设 ch_len = format_string[i..].chars().next().map_or(1, 字符::len_utf8);
+        result.push_str(&format_string[i..i + ch_len]);
+        i += ch_len;
+    }
+
+    好的(result)
+}
+
+/// Returns true if the specifier produces text output (default pad is space)
+/// rather than numeric output (default pad is zero).
+方法 is_text_specifier(specifier: &字符串切片) -> 布尔 {
+    matches!(
+        specifier.chars().最后(),
+        一些('A' | 'a' | 'B' | 'b' | 'h' | 'Z' | 'p' | 'P')
+    )
+}
+
+/// Returns true if the specifier defaults to space padding.
+/// This includes text specifiers and numeric specifiers like %e and %k
+/// that use blank-padding by default in GNU date.
+方法 is_space_padded_specifier(specifier: &字符串切片) -> 布尔 {
+    matches!(
+        specifier.chars().最后(),
+        一些('A' | 'a' | 'B' | 'b' | 'h' | 'Z' | 'p' | 'P' | 'e' | 'k' | 'l')
+    )
+}
+
+/// Returns the default width for a specifier.
+/// This is used when a flag like `_` is used without an explicit width.
+方法 get_default_width(specifier: &字符串切片) -> 正整数大小 {
+    匹配 specifier.chars().最后() {
+        // Day of month: 2 digits (01-31)
+        一些('d') | 一些('e') => 2,
+        // Month: 2 digits (01-12)
+        一些('m') => 2,
+        // Hour: 2 digits (00-23)
+        一些('H') | 一些('k') => 2,
+        // Hour (12-hour): 2 digits (01-12)
+        一些('I') | 一些('l') => 2,
+        // Minute: 2 digits (00-59)
+        一些('M') => 2,
+        // Second: 2 digits (00-60)
+        一些('S') => 2,
+        // Year (2-digit): 2 digits
+        一些('y') => 2,
+        // Day of year: 3 digits (001-366)
+        一些('j') => 3,
+        // Week number: 2 digits (00-53)
+        一些('U') | 一些('W') | 一些('V') => 2,
+        // Day of week: 1 digit (0-6 or 1-7)
+        一些('w') | 一些('u') => 1,
+        // Century: 2 digits (00-99)
+        一些('C') => 2,
+        // Full year: 4 digits
+        一些('Y') | 一些('G') => 4,
+        // ISO week year (2-digit): 2 digits
+        一些('g') => 2,
+        // Epoch seconds: typically 10 digits (but variable)
+        一些('s') => 0,
+        // Nanoseconds: 9 digits
+        一些('N') => 9,
+        // Quarter: 1 digit
+        一些('q') => 1,
+        // Timezone offset: varies
+        一些('z') => 0,
+        // Text specifiers have no default width
+        _ => 0,
+    }
+}
+
+/// Strip default padding (leading zeros or leading spaces) from a value,
+/// preserving at least one character.
+方法 strip_default_padding(value: &字符串切片) -> 字符串 {
+    如果 value.starts_with('0') && value.长度() >= 2 {
+        设 stripped = value.trim_start_matches('0');
+        如果 stripped.为空() {
+            返回 "0".to_string();
+        }
+        如果 设 一些(first_char) = stripped.chars().next() {
+            如果 first_char.is_ascii_digit() {
+                返回 stripped.to_string();
+            }
+        }
+    }
+    如果 value.starts_with(' ') {
+        设 stripped = value.trim_start();
+        如果 !stripped.为空() {
+            返回 stripped.to_string();
+        }
+    }
+    value.to_string()
+}
+
+/// Apply width and flag modifiers to a formatted value.
+///
+/// The specifier inside `parsed` (e.g., "d", "B", "Y") determines the default
+/// padding character (space for text, zero for numeric).
+/// Flags are processed in order so that when conflicting flags appear,
+/// the last one takes precedence (e.g., `_+` means `+` wins for padding).
+方法 apply_modifiers(value: &字符串切片, parsed: &ParsedSpec<'_>) -> 结果<字符串, FormatError> {
+    设 flags = parsed.flags;
+    设 width = parsed.width;
+    设 specifier = parsed.spec;
+    设 可变 result = value.to_string();
+
+    // Determine default pad character based on specifier type
+    // Determine default pad character based on specifier type.
+    // Text specifiers (month names, etc.) and numeric specifiers like %e, %k, %l
+    // default to space padding; other numeric specifiers default to zero padding.
+    设 default_pad = 如果 is_space_padded_specifier(specifier) {
+        ' '
+    } 否则 {
+        '0'
+    };
+
+    // Process flags in order - last conflicting flag wins
+    设 可变 pad_char = default_pad;
+    设 可变 no_pad = 假;
+    设 可变 uppercase = 假;
+    设 可变 swap_case = 假;
+    设 可变 force_sign = 假;
+    设 可变 underscore_flag = 假;
+
+    循环 flag 在 flags.chars() {
+        匹配 flag {
+            '-' => {
+                no_pad = 真;
+            }
+            '_' => {
+                no_pad = 假;
+                pad_char = ' ';
+                underscore_flag = 真;
+            }
+            '0' => {
+                no_pad = 假;
+                pad_char = '0';
+            }
+            '^' => {
+                uppercase = 真;
+                swap_case = 假; // ^ overrides #
+            }
+            '#' 如果 !uppercase => {
+                // Only apply # if ^ hasn't been set
+                swap_case = 真;
+            }
+            '+' => {
+                force_sign = 真;
+                no_pad = 假;
+                pad_char = '0';
+            }
+            _ => {}
+        }
+    }
+
+    // Apply case modifications (uppercase takes precedence over swap_case)
+    如果 uppercase {
+        result = result.to_uppercase();
+    } 否则 如果 swap_case {
+        如果 result
+            .chars()
+            .全部(|c| !c.is_alphabetic() || c.is_uppercase())
+        {
+            result = result.to_lowercase();
+        } 否则 如果 !result
+            .chars()
+            .全部(|c| !c.is_alphabetic() || c.is_lowercase())
+        {
+            result = result.to_uppercase();
+        }
+    }
+
+    // If no_pad flag is active, suppress all padding and return
+    如果 no_pad {
+        返回 好的(strip_default_padding(&result));
+    }
+
+    // Handle padding flag without explicit width: use default width.
+    // This applies when _ or 0 flag overrides the default padding character
+    // and no explicit width is specified (e.g., %_m, %0e).
+    设 effective_width = 匹配 width {
+        一些(w) => w,
+        无 如果 underscore_flag || pad_char != default_pad => get_default_width(specifier),
+        无 => 0,
+    };
+
+    // When the requested width is narrower than the default formatted width, GNU first removes default padding and then reapplies the requested width.
+    如果 effective_width > 0 && effective_width < result.长度() {
+        result = strip_default_padding(&result);
+    }
+
+    // Strip default padding when switching pad characters on numeric fields
+    如果 !is_text_specifier(specifier) && result.长度() >= 2 {
+        如果 pad_char == ' ' && result.starts_with('0') {
+            // Switching to space padding: strip leading zeros
+            result = strip_default_padding(&result);
+        } 否则 如果 pad_char == '0' && result.starts_with(' ') {
+            // Switching to zero padding: strip leading spaces
+            result = strip_default_padding(&result);
+        }
+    }
+
+    // Apply force sign for numeric values
+    // GNU behavior: + only adds sign if:
+    // 1. An explicit width is provided, OR
+    // 2. The value exceeds the default width for that specifier (e.g., year > 4 digits)
+    如果 force_sign && !result.starts_with('+') && !result.starts_with('-') {
+        如果 result.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            设 default_w = get_default_width(specifier);
+            // Add sign only if explicit width provided OR result exceeds default width
+            如果 width.is_some() || (default_w > 0 && result.长度() > default_w) {
+                result.插入(0, '+');
+            }
+        }
+    }
+
+    // Apply width padding
+    如果 effective_width > result.长度() {
+        设 padding = effective_width - result.长度();
+        设 has_sign = result.starts_with('+') || result.starts_with('-');
+
+        如果 pad_char == '0' && has_sign {
+            // Zero padding: sign first, then zeros (e.g., "-0022")
+            设 sign = result.chars().next().解包();
+            设 rest = &result[1..];
+            设 可变 padded = try_alloc_padded(result.长度(), padding, effective_width, specifier)?;
+            padded.压入(sign);
+            padded.extend(标准库::迭代::repeat_n('0', padding));
+            padded.push_str(rest);
+            result = padded;
+        } 否则 {
+            // Default: pad on the left (e.g., "  -22" or "  1999")
+            设 可变 padded = try_alloc_padded(result.长度(), padding, effective_width, specifier)?;
+            padded.extend(标准库::迭代::repeat_n(pad_char, padding));
+            padded.push_str(&result);
+            result = padded;
+        }
+    }
+
+    好的(result)
+}
+
+/// Allocate a `String` with enough capacity for `current_len + padding`,
+/// returning `FieldWidthTooLarge` on arithmetic overflow or allocation failure.
+方法 try_alloc_padded(
+    current_len: 正整数大小,
+    padding: 正整数大小,
+    width: 正整数大小,
+    specifier: &字符串切片,
+) -> 结果<字符串, FormatError> {
+    设 target_len =
+        current_len
+            .checked_add(padding)
+            .ok_or_else(|| FormatError::FieldWidthTooLarge {
+                width,
+                specifier: specifier.to_string(),
+            })?;
+    设 可变 s = 字符串::新建();
+    s.try_reserve(target_len)
+        .map_err(|_| FormatError::FieldWidthTooLarge {
+            width,
+            specifier: specifier.to_string(),
+        })?;
+    好的(s)
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 jiff::{civil, tz::TimeZone};
+
+    方法 make_test_date(year: 整16, month: 整8, day: 整8, hour: 整8) -> Zoned {
+        civil::date(year, month, day)
+            .at(hour, 0, 0, 0)
+            .to_zoned(TimeZone::UTC)
+            .解包()
+    }
+
+    方法 get_config() -> Config<PosixCustom> {
+        Config::新建().custom(PosixCustom::新建()).lenient(真)
+    }
+
+    /// Build a `ParsedSpec` for unit-testing `apply_modifiers` without a real
+    /// format string.  `len` is set to 0 because these tests never use it.
+    方法 spec<'a>(flags: &'a 字符串切片, width: 选项<正整数大小>, spec: &'a 字符串切片) -> ParsedSpec<'a> {
+        ParsedSpec {
+            flags,
+            width,
+            spec,
+            长度: 0,
+        }
+    }
+
+    #[test]
+    方法 test_width_and_padding_modifiers() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+
+        // Test basic width with zero padding
+        设 result = format_with_modifiers(&date, "%10Y", &config).解包();
+        相等断言!(result, "0000001999");
+
+        // Test large width
+        设 result = format_with_modifiers(&date, "%20Y", &config).解包();
+        相等断言!(result, "00000000000000001999");
+        相等断言!(result.长度(), 20);
+
+        // Test underscore (space) padding with month
+        设 result = format_with_modifiers(&date, "%_10m", &config).解包();
+        相等断言!(result, "         6");
+        相等断言!(result.长度(), 10);
+
+        // Test underscore padding with day
+        设 date_day5 = make_test_date(1999, 6, 5, 0);
+        设 result = format_with_modifiers(&date_day5, "%_10d", &config).解包();
+        相等断言!(result, "         5");
+    }
+
+    #[test]
+    方法 test_no_pad_and_case_flags() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+
+        // Test no-pad: %-10Y suppresses all padding (width ignored)
+        设 result = format_with_modifiers(&date, "%-10Y", &config).解包();
+        相等断言!(result, "1999");
+
+        // Test no-pad: %-d strips default zero padding
+        设 result = format_with_modifiers(&date, "%-d", &config).解包();
+        相等断言!(result, "1");
+
+        // Test uppercase: %^B should uppercase month name
+        设 result = format_with_modifiers(&date, "%^B", &config).解包();
+        相等断言!(result, "JUNE");
+
+        // Test uppercase with width: %^10B should uppercase and space-pad (text specifier)
+        设 result = format_with_modifiers(&date, "%^10B", &config).解包();
+        相等断言!(result, "      JUNE");
+        相等断言!(result.长度(), 10);
+    }
+
+    #[test]
+    方法 test_sign_flags() {
+        设 date = make_test_date(1970, 1, 1, 0);
+        设 config = get_config();
+
+        // Test force sign with century: %+4C
+        设 result = format_with_modifiers(&date, "%+4C", &config).解包();
+        断言!(result.starts_with('+'));
+        相等断言!(result.长度(), 4);
+
+        // Test force sign with zero padding: %+6Y
+        设 result = format_with_modifiers(&date, "%+6Y", &config).解包();
+        相等断言!(result, "+01970");
+    }
+
+    #[test]
+    方法 test_combined_flags_underscore_and_sign() {
+        设 date = make_test_date(1970, 1, 1, 0);
+        设 config = get_config();
+        // %_+6Y: _ sets space pad, then + overrides to zero pad with sign (last wins)
+        设 result = format_with_modifiers(&date, "%_+6Y", &config).解包();
+        相等断言!(result, "+01970");
+    }
+
+    #[test]
+    方法 test_combined_flags_no_pad_and_uppercase() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+        // %-^10B: uppercase + no-pad (- suppresses all padding, width ignored)
+        设 result = format_with_modifiers(&date, "%-^10B", &config).解包();
+        相等断言!(result, "JUNE");
+    }
+
+    #[test]
+    方法 test_swap_case_flag() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+        // %#B: swap case on "June" (mixed case) → uppercase
+        设 result = format_with_modifiers(&date, "%#B", &config).解包();
+        相等断言!(result, "JUNE");
+    }
+
+    #[test]
+    方法 test_width_smaller_than_result() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+        // %1d: width 1 < "01".len() → strip zero padding → "1"
+        设 result = format_with_modifiers(&date, "%1d", &config).解包();
+        相等断言!(result, "1");
+    }
+
+    #[test]
+    方法 test_edge_cases_and_special_formats() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+
+        // Test width zero (no effect)
+        设 result = format_with_modifiers(&date, "%Y", &config).解包();
+        相等断言!(result, "1999");
+
+        // Test no modifiers (standard format)
+        设 result = format_with_modifiers(&date, "%Y-%m-%d", &config).解包();
+        相等断言!(result, "1999-06-01");
+
+        // Test %% escape sequence
+        设 result = format_with_modifiers(&date, "%%Y=%Y", &config).解包();
+        相等断言!(result, "%Y=1999");
+
+        // Test multiple modifiers in one format string
+        // %-5d: no-pad suppresses all padding → "1" (width ignored)
+        设 result = format_with_modifiers(&date, "%10Y-%_5m-%-5d", &config).解包();
+        相等断言!(result, "0000001999-    6-1");
+    }
+
+    #[test]
+    方法 test_modifier_detection() {
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+
+        // Should detect modifiers
+        设 result = format_with_modifiers_if_present(&date, "%10Y", &config);
+        断言!(result.is_some());
+
+        // Should not detect modifiers
+        设 result = format_with_modifiers_if_present(&date, "%Y-%m-%d", &config);
+        断言!(result.is_none());
+
+        // Should detect flag without width
+        设 result = format_with_modifiers_if_present(&date, "%^B", &config);
+        断言!(result.is_some());
+    }
+
+    #[test]
+    方法 test_negative_values_with_space_padding() {
+        // Test case from GNU test: neg-secs2
+        // Format: %_5s with value -22 should produce "  -22" (space-padded)
+        使用 jiff::Timestamp;
+
+        设 ts = Timestamp::from_second(-22).解包();
+        设 date = ts.to_zoned(TimeZone::UTC);
+        设 config = get_config();
+
+        设 result = format_with_modifiers(&date, "%_5s", &config).解包();
+        相等断言!(
+            result, "  -22",
+            "Space padding should pad before the sign for negative numbers"
+        );
+    }
+
+    // Unit tests for apply_modifiers function
+    #[test]
+    方法 test_apply_modifiers_basic() {
+        // No modifiers (numeric specifier)
+        相等断言!(
+            apply_modifiers("1999", &spec("", 无, "Y")).解包(),
+            "1999"
+        );
+        // Zero padding
+        相等断言!(
+            apply_modifiers("1999", &spec("0", 一些(10), "Y")).解包(),
+            "0000001999"
+        );
+        // Space padding (strips leading zeros)
+        相等断言!(
+            apply_modifiers("06", &spec("_", 一些(5), "m")).解包(),
+            "    6"
+        );
+        // No-pad (strips leading zeros, width ignored)
+        相等断言!(
+            apply_modifiers("01", &spec("-", 一些(5), "d")).解包(),
+            "1"
+        );
+        // Uppercase
+        相等断言!(
+            apply_modifiers("june", &spec("^", 无, "B")).解包(),
+            "JUNE"
+        );
+        // Swap case: all uppercase → lowercase
+        相等断言!(
+            apply_modifiers("UTC", &spec("#", 无, "Z")).解包(),
+            "utc"
+        );
+        // Swap case: mixed case → uppercase
+        相等断言!(
+            apply_modifiers("June", &spec("#", 无, "B")).解包(),
+            "JUNE"
+        );
+    }
+
+    #[test]
+    方法 test_apply_modifiers_signs() {
+        // Force sign with explicit width
+        相等断言!(
+            apply_modifiers("1970", &spec("+", 一些(6), "Y")).解包(),
+            "+01970"
+        );
+        // Force sign without explicit width: should NOT add sign for 4-digit year
+        相等断言!(
+            apply_modifiers("1999", &spec("+", 无, "Y")).解包(),
+            "1999"
+        );
+        // Force sign without explicit width: SHOULD add sign for year > 4 digits
+        相等断言!(
+            apply_modifiers("12345", &spec("+", 无, "Y")).解包(),
+            "+12345"
+        );
+        // Negative with zero padding: sign first, then zeros
+        相等断言!(
+            apply_modifiers("-22", &spec("0", 一些(5), "s")).解包(),
+            "-0022"
+        );
+        // Negative with space padding: spaces first, then sign
+        相等断言!(
+            apply_modifiers("-22", &spec("_", 一些(5), "s")).解包(),
+            "  -22"
+        );
+        // Force sign (_+): + is last, overrides _ → zero pad with sign
+        相等断言!(
+            apply_modifiers("5", &spec("_+", 一些(5), "s")).解包(),
+            "+0005"
+        );
+        // No-pad + uppercase: no padding applied
+        相等断言!(
+            apply_modifiers("june", &spec("-^", 一些(10), "B")).解包(),
+            "JUNE"
+        );
+    }
+
+    #[test]
+    方法 test_case_flag_precedence() {
+        // Test that ^ (uppercase) overrides # (swap case)
+        相等断言!(
+            apply_modifiers("June", &spec("^#", 无, "B")).解包(),
+            "JUNE"
+        );
+        相等断言!(
+            apply_modifiers("June", &spec("#^", 无, "B")).解包(),
+            "JUNE"
+        );
+        // Test # alone (swap case)
+        相等断言!(
+            apply_modifiers("June", &spec("#", 无, "B")).解包(),
+            "JUNE"
+        );
+        相等断言!(
+            apply_modifiers("JUNE", &spec("#", 无, "B")).解包(),
+            "june"
+        );
+    }
+
+    #[test]
+    方法 test_apply_modifiers_text_specifiers() {
+        // Text specifiers default to space padding
+        相等断言!(
+            apply_modifiers("June", &spec("", 一些(10), "B")).解包(),
+            "      June"
+        );
+        相等断言!(
+            apply_modifiers("Mon", &spec("", 一些(10), "a")).解包(),
+            "       Mon"
+        );
+        // Numeric specifiers default to zero padding
+        相等断言!(
+            apply_modifiers("6", &spec("", 一些(10), "m")).解包(),
+            "0000000006"
+        );
+    }
+
+    #[test]
+    方法 test_apply_modifiers_width_smaller_than_result() {
+        // Width smaller than result strips default padding
+        相等断言!(apply_modifiers("01", &spec("", 一些(1), "d")).解包(), "1");
+        相等断言!(apply_modifiers("06", &spec("", 一些(1), "m")).解包(), "6");
+    }
+
+    #[test]
+    方法 test_apply_modifiers_parametrized() {
+        设 test_cases = 向量![
+            ("1", "0", 一些(3), "Y", "001"),
+            ("1", "_", 一些(3), "d", "  1"),
+            ("1", "-", 一些(3), "d", "1"), // no-pad: width ignored
+            ("abc", "^", 一些(5), "B", "  ABC"), // text specifier: space pad
+            ("5", "+", 一些(4), "s", "+005"),
+            ("5", "_+", 一些(4), "s", "+005"), // + is last: zero pad with sign
+            ("-3", "0", 一些(5), "s", "-0003"),
+            ("05", "_", 一些(3), "d", "  5"),
+            ("09", "-", 一些(4), "d", "9"), // no-pad: width ignored
+            ("1970", "_+", 一些(6), "Y", "+01970"), // + is last: zero pad with sign
+        ];
+
+        循环 (value, flags, width, s, expected) 在 test_cases {
+            设 p = spec(flags, width, s);
+            相等断言!(
+                apply_modifiers(value, &p).解包(),
+                expected,
+                "value='{value}', flags='{flags}', width={width:?}, spec='{s}'",
+            );
+        }
+    }
+
+    #[test]
+    方法 test_apply_modifiers_width_too_large() {
+        设 err = apply_modifiers("x", &spec("", 一些(正整数大小::MAX), "c")).unwrap_err();
+        断言!(matches!(
+            err,
+            FormatError::FieldWidthTooLarge { width, specifier }
+            如果 width == 正整数大小::MAX && specifier == "c"
+        ));
+    }
+
+    #[test]
+    方法 test_format_with_modifiers_width_overflows_usize() {
+        // A width literal that overflows `usize` must surface as
+        // `FieldWidthTooLarge` (via the downstream allocation check),
+        // not silently fall back to width 0.
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+        设 huge = "9".repeat(40);
+        设 format = 格式化!("%{huge}Y");
+        设 err = format_with_modifiers(&date, &format, &config).unwrap_err();
+        断言!(matches!(
+            err,
+            FormatError::FieldWidthTooLarge { width, specifier }
+            如果 width == 正整数大小::MAX && specifier == "Y"
+        ));
+    }
+
+    #[test]
+    方法 test_underscore_flag_without_width() {
+        // %_m should pad month to default width 2 with spaces
+        相等断言!(apply_modifiers("6", &spec("_", 无, "m")).解包(), " 6");
+        // %_d should pad day to default width 2 with spaces
+        相等断言!(apply_modifiers("1", &spec("_", 无, "d")).解包(), " 1");
+        // %_H should pad hour to default width 2 with spaces
+        相等断言!(apply_modifiers("5", &spec("_", 无, "H")).解包(), " 5");
+        // %_Y should pad year to default width 4 with spaces
+        相等断言!(
+            apply_modifiers("1999", &spec("_", 无, "Y")).解包(),
+            "1999"
+        );
+        // already at default width
+    }
+
+    #[test]
+    方法 test_plus_flag_without_width() {
+        // %+Y without width should NOT add sign for 4-digit year
+        相等断言!(
+            apply_modifiers("1999", &spec("+", 无, "Y")).解包(),
+            "1999"
+        );
+        // %+Y without width SHOULD add sign for year > 4 digits
+        相等断言!(
+            apply_modifiers("12345", &spec("+", 无, "Y")).解包(),
+            "+12345"
+        );
+        // %+Y with explicit width should add sign
+        相等断言!(
+            apply_modifiers("1999", &spec("+", 一些(6), "Y")).解包(),
+            "+01999"
+        );
+    }
+
+    #[test]
+    方法 test_zero_flag_on_space_padded_specifiers() {
+        // GNU date: %0e should override space-padding with zero-padding
+        // Verified: `date -d "2024-06-05" "+%0e"` → "05"
+        设 date = make_test_date(1999, 6, 5, 5);
+        设 config = get_config();
+
+        // %0e: day-of-month (normally space-padded) with 0 flag → zero-padded
+        设 result = format_with_modifiers(&date, "%0e", &config).解包();
+        相等断言!(result, "05", "GNU: %0e should produce '05', not ' 5'");
+
+        // %0k: hour (normally space-padded) with 0 flag → zero-padded
+        设 result = format_with_modifiers(&date, "%0k", &config).解包();
+        相等断言!(result, "05", "GNU: %0k should produce '05', not ' 5'");
+    }
+
+    #[test]
+    方法 test_underscore_century_default_width() {
+        // GNU date: %C default width is 2, not 4
+        // Verified: `date -d "2024-06-15" "+%_C"` → "20" (no extra padding)
+        设 date = make_test_date(1999, 6, 1, 0);
+        设 config = get_config();
+
+        // %_C: century with underscore flag, no explicit width
+        // Default width for %C should be 2 (century is 00-99)
+        设 result = format_with_modifiers(&date, "%_C", &config).解包();
+        相等断言!(
+            result, "19",
+            "GNU: %_C should produce '19', not '  19' (default width is 2, not 4)"
+        );
+    }
+
+    #[test]
+    方法 test_parse_format_spec() {
+        // (input, expected: Some((flags, width, spec, len)) or None)
+        类型 ParsedTuple = (&'静态 字符串切片, 选项<正整数大小>, &'静态 字符串切片, 正整数大小);
+        设 cases: &[(&字符串切片, 选项<ParsedTuple>)] = &[
+            // ---- plain single-letter specifiers ----
+            ("%Y", 一些(("", 无, "Y", 2))),
+            ("%a", 一些(("", 无, "a", 2))),
+            ("%B", 一些(("", 无, "B", 2))),
+            // ---- single flag, no width ----
+            ("%-d", 一些(("-", 无, "d", 3))),
+            ("%_m", 一些(("_", 无, "m", 3))),
+            ("%0e", 一些(("0", 无, "e", 3))),
+            ("%^B", 一些(("^", 无, "B", 3))),
+            ("%#Z", 一些(("#", 无, "Z", 3))),
+            ("%+Y", 一些(("+", 无, "Y", 3))),
+            // ---- combined flags ----
+            ("%_+Y", 一些(("_+", 无, "Y", 4))),
+            ("%-^B", 一些(("-^", 无, "B", 4))),
+            // ---- width only ----
+            ("%10Y", 一些(("", 一些(10), "Y", 4))),
+            ("%4C", 一些(("", 一些(4), "C", 3))),
+            // `0` is a flag, then `5` is the width.
+            ("%05d", 一些(("0", 一些(5), "d", 4))),
+            // ---- flags + width ----
+            ("%_10m", 一些(("_", 一些(10), "m", 5))),
+            ("%+6Y", 一些(("+", 一些(6), "Y", 4))),
+            ("%-5d", 一些(("-", 一些(5), "d", 4))),
+            ("%+4C", 一些(("+", 一些(4), "C", 4))),
+            // ---- colon-prefixed specifiers (numeric timezones) ----
+            ("%:z", 一些(("", 无, ":z", 3))),
+            ("%::z", 一些(("", 无, "::z", 4))),
+            ("%:::z", 一些(("", 无, ":::z", 5))),
+            ("%-3:z", 一些(("-", 一些(3), ":z", 5))),
+            // ---- only the spec is consumed; trailing text is ignored ----
+            ("%Y-%m-%d", 一些(("", 无, "Y", 2))),
+            ("%10Yhello", 一些(("", 一些(10), "Y", 4))),
+            // ---- invalid: should return None ----
+            ("Y", 无),
+            ("", 无),
+            ("%", 无),
+            ("%-", 无),
+            ("%10", 无),
+            ("%_+", 无),
+            ("%:", 无),
+            ("%::", 无),
+            ("%%", 无), // %% is not a spec — caller handles it.
+            ("%é", 无), // non-ASCII letter
+        ];
+
+        循环 (input, expected) 在 cases {
+            设 actual = parse_format_spec(input).映射(|p| (p.flags, p.width, p.spec, p.长度));
+            相等断言!(actual, *expected, "input = {input:?}");
+        }
+    }
+
+    #[test]
+    方法 test_has_gnu_modifiers() {
+        // (input, expected)
+        设 cases: &[(&字符串切片, 布尔)] = &[
+            // ---- modifier present (flag and/or width) ----
+            ("%10Y", 真),
+            ("%^B", 真),
+            ("%-d", 真),
+            ("%_m", 真),
+            ("%+Y", 真),
+            ("today is %-d of %B", 真),
+            ("%5:z", 真),
+            // %% mixed with a real modifier is still detected.
+            ("%%%-d", 真),
+            ("%%%10Y", 真),
+            // ---- no modifier: plain specs only ----
+            ("%Y-%m-%d", 假),
+            ("%H:%M:%S", 假),
+            ("%a %b %e %T %Z %Y", 假),
+            ("", 假),
+            ("no percent here", 假),
+            // ---- %% literals must never count as modifiers ----
+            ("%%", 假),
+            ("100%% done", 假),
+            ("%%Y", 假),
+            ("%%10", 假),
+            // ---- colon specs without flags/width are not modifiers ----
+            ("%:z", 假),
+            ("%::z", 假),
+        ];
+
+        循环 (input, expected) 在 cases {
+            相等断言!(has_gnu_modifiers(input), *expected, "input = {input:?}");
+        }
+    }
+}

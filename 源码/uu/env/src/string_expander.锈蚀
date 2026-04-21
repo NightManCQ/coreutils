@@ -1,0 +1,91 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::{
+    ffi::{OsStr, OsString},
+    内存,
+};
+
+使用 箱::{
+    native_int_str::{NativeCharInt, NativeIntStr, to_native_int_representation},
+    string_parser::{Chunk, 错误协议, StringParser},
+};
+
+/// This class makes parsing and word collection more convenient.
+///
+/// It manages an "output" buffer that is automatically filled.
+/// It provides `skip_one` and `take_one` that focus on
+/// working with ASCII separators. Thus, they will skip or take
+/// all consecutive non-ascii char sequences at once.
+公有 结构 StringExpander<'a> {
+    parser: StringParser<'a>,
+    output: 向量<NativeCharInt>,
+}
+
+实现<'a> StringExpander<'a> {
+    公有 方法 新建(input: &'a NativeIntStr) -> 自身类型 {
+        自身类型 {
+            parser: StringParser::新建(input),
+            output: 向量::默认(),
+        }
+    }
+
+    公有 方法 new_at(input: &'a NativeIntStr, pos: 正整数大小) -> 自身类型 {
+        自身类型 {
+            parser: StringParser::new_at(input, pos),
+            output: 向量::默认(),
+        }
+    }
+
+    公有 方法 get_parser(&自身) -> &StringParser<'a> {
+        &自身.parser
+    }
+
+    公有 方法 get_parser_mut(&可变 自身) -> &可变 StringParser<'a> {
+        &可变 自身.parser
+    }
+
+    公有 方法 peek(&自身) -> 结果<字符, 错误协议> {
+        自身.parser.peek()
+    }
+
+    公有 方法 skip_one(&可变 自身) -> 结果<(), 错误协议> {
+        自身.get_parser_mut().consume_one_ascii_or_all_non_ascii()?;
+        好的(())
+    }
+
+    公有 方法 get_peek_position(&自身) -> 正整数大小 {
+        自身.get_parser().get_peek_position()
+    }
+
+    公有 方法 take_one(&可变 自身) -> 结果<(), 错误协议> {
+        设 chunks = 自身.parser.consume_one_ascii_or_all_non_ascii()?;
+        循环 chunk 在 chunks {
+            匹配 chunk {
+                Chunk::InvalidEncoding(invalid) => 自身.output.extend(invalid),
+                Chunk::ValidSingleIntChar((_c, ni)) => 自身.output.压入(ni),
+            }
+        }
+        好的(())
+    }
+
+    公有 方法 put_one_char(&可变 自身, c: 字符) {
+        设 os_str = OsString::from(c.to_string());
+        自身.put_string(os_str);
+    }
+
+    公有 方法 put_string<S: 作为引用协议<OsStr>>(&可变 自身, os_str: S) {
+        设 native = to_native_int_representation(os_str.as_ref());
+        自身.output.extend(&*native);
+    }
+
+    公有 方法 put_native_string(&可变 自身, n_str: &NativeIntStr) {
+        自身.output.extend(n_str);
+    }
+
+    公有 方法 take_collected_output(&可变 自身) -> 向量<NativeCharInt> {
+        内存::take(&可变 自身.output)
+    }
+}

@@ -1,0 +1,1641 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) rwxr sourcepath targetpath Isnt uioerror matchpathcon
+
+模组 mode;
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 file_diff::diff;
+使用 filetime::{FileTime, set_file_times};
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+使用 selinux::SecurityContext;
+使用 标准库::ffi::OsString;
+使用 标准库::格式化::调试协议;
+使用 标准库::文件系统::{自身, metadata};
+使用 标准库::文件系统::{File, OpenOptions};
+使用 标准库::输入输出::{Write, stdout};
+使用 标准库::路径::{MAIN_SEPARATOR, Path, PathBuf};
+使用 标准库::进程;
+使用 thiserror::错误协议;
+使用 uucore::backup_control::{自身, BackupMode};
+使用 uucore::buf_copy::copy_stream;
+使用 uucore::display::Quotable;
+使用 uucore::entries::{grp2gid, usr2uid};
+使用 uucore::错误::{FromIo, UError, UResult, UUsageError};
+使用 uucore::文件系统::dir_strip_dot_for_creation;
+使用 uucore::perms::{Verbosity, VerbosityLevel, wrap_chown};
+使用 uucore::进程::{getegid, geteuid};
+#[cfg(unix)]
+使用 uucore::safe_traversal::{DirFd, SymlinkBehavior, create_dir_all_safe};
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+使用 uucore::selinux::{
+    SeLinuxError, contexts_differ, get_selinux_security_context, is_selinux_enabled,
+    selinux_error_description, set_selinux_security_context,
+};
+使用 uucore::translate;
+使用 uucore::{format_usage, show, show_error, show_if_err};
+
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::预导入::OsStrExt;
+
+常量 DEFAULT_MODE: 正32 = 0o755;
+常量 DEFAULT_STRIP_PROGRAM: &字符串切片 = "strip";
+
+#[allow(dead_code)]
+公有 结构 Behavior {
+    main_function: MainFunction,
+    specified_mode: 选项<正32>,
+    backup_mode: BackupMode,
+    suffix: 字符串,
+    owner_id: 选项<正32>,
+    group_id: 选项<正32>,
+    verbose: 布尔,
+    preserve_timestamps: 布尔,
+    compare: 布尔,
+    strip: 布尔,
+    strip_program: 字符串,
+    create_leading: 布尔,
+    target_dir: 选项<字符串>,
+    no_target_dir: 布尔,
+    preserve_context: 布尔,
+    context: 选项<字符串>,
+    default_context: 布尔,
+    privileged: 布尔,
+}
+
+#[derive(错误协议, 调试协议)]
+枚举 InstallError {
+    #[错误("{}", translate!("install-error-dir-needs-arg", "util_name" => "install"))]
+    DirNeedsArg,
+
+    #[错误("{}", translate!("install-error-create-dir-failed", "path" => .0.quote()))]
+    CreateDirFailed(PathBuf, #[source] 标准库::输入输出::错误协议),
+
+    #[错误("{}", translate!("install-error-chmod-failed", "path" => .0.quote()))]
+    ChmodFailed(PathBuf),
+
+    #[错误("{}", translate!("install-error-chown-failed", "path" => .0.quote(), "error" => .1.克隆()))]
+    ChownFailed(PathBuf, 字符串),
+
+    #[错误("{}", translate!("install-error-invalid-target", "path" => .0.quote()))]
+    InvalidTarget(PathBuf),
+
+    #[错误("{}", translate!("install-error-target-not-dir", "path" => .0.quote()))]
+    TargetDirIsntDir(PathBuf),
+
+    #[错误("{}", translate!("install-error-backup-failed", "from" => .0.quote(), "to" => .1.quote()))]
+    BackupFailed(PathBuf, PathBuf, #[source] 标准库::输入输出::错误协议),
+
+    #[错误("{}", translate!("install-error-install-failed", "from" => .0.quote(), "to" => .1.quote(), "error" => .2.克隆()))]
+    InstallFailed(PathBuf, PathBuf, 字符串),
+
+    #[错误("{}", translate!("install-error-strip-failed", "error" => .0.克隆()))]
+    StripProgramFailed(字符串),
+
+    #[错误("{}", translate!("install-error-metadata-failed"))]
+    MetadataFailed(#[source] 标准库::输入输出::错误协议),
+
+    #[错误("{}", translate!("install-error-invalid-user", "user" => .0.quote()))]
+    InvalidUser(字符串),
+
+    #[错误("{}", translate!("install-error-invalid-group", "group" => .0.quote()))]
+    InvalidGroup(字符串),
+
+    #[错误("{}", translate!("install-error-omitting-directory", "path" => .0.quote()))]
+    OmittingDirectory(PathBuf),
+
+    #[错误("{}", translate!("install-error-not-a-directory", "path" => .0.quote()))]
+    NotADirectory(PathBuf),
+
+    #[错误("{}", translate!("install-error-override-directory-failed", "dir" => .0.quote(), "file" => .1.quote()))]
+    OverrideDirectoryFailed(PathBuf, PathBuf),
+
+    #[错误("{}", translate!("install-error-same-file", "file1" => .0.quote(), "file2" => .1.quote()))]
+    SameFile(PathBuf, PathBuf),
+
+    #[错误("{}", translate!("install-error-extra-operand", "operand" => .0.quote(), "usage" => .1.克隆()))]
+    ExtraOperand(OsString, 字符串),
+
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    #[错误("{}", .0)]
+    SelinuxContextFailed(字符串),
+}
+
+实现 UError 循环 InstallError {
+    方法 code(&自身) -> 整32 {
+        1
+    }
+
+    方法 usage(&自身) -> 布尔 {
+        假
+    }
+}
+
+#[derive(克隆协议, 相等比较协议, 偏等比较协议)]
+公有 枚举 MainFunction {
+    /// Create directories
+    Directory,
+    /// Install files to locations (primary functionality)
+    Standard,
+}
+
+实现 Behavior {
+    /// Determine the mode for chmod after copy.
+    公有 方法 mode(&自身) -> 正32 {
+        自身.specified_mode.unwrap_or(DEFAULT_MODE)
+    }
+}
+
+静态 OPT_COMPARE: &字符串切片 = "compare";
+静态 OPT_DIRECTORY: &字符串切片 = "directory";
+静态 OPT_IGNORED: &字符串切片 = "ignored";
+静态 OPT_CREATE_LEADING: &字符串切片 = "create-leading";
+静态 OPT_GROUP: &字符串切片 = "group";
+静态 OPT_MODE: &字符串切片 = "mode";
+静态 OPT_OWNER: &字符串切片 = "owner";
+静态 OPT_PRESERVE_TIMESTAMPS: &字符串切片 = "preserve-timestamps";
+静态 OPT_STRIP: &字符串切片 = "strip";
+静态 OPT_STRIP_PROGRAM: &字符串切片 = "strip-program";
+静态 OPT_TARGET_DIRECTORY: &字符串切片 = "target-directory";
+静态 OPT_NO_TARGET_DIRECTORY: &字符串切片 = "no-target-directory";
+静态 OPT_VERBOSE: &字符串切片 = "verbose";
+静态 OPT_PRESERVE_CONTEXT: &字符串切片 = "preserve-context";
+静态 OPT_CONTEXT: &字符串切片 = "context";
+静态 OPT_DEFAULT_CONTEXT: &字符串切片 = "default-context";
+静态 OPT_UNPRIVILEGED: &字符串切片 = "unprivileged";
+
+静态 ARG_FILES: &字符串切片 = "files";
+
+/// Main install utility function, called from main.rs.
+///
+/// Returns a program return code.
+///
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 paths: 向量<OsString> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .映射(|v| v.cloned().收集())
+        .unwrap_or_default();
+
+    设 behavior = behavior(&matches)?;
+
+    匹配 behavior.main_function {
+        MainFunction::Directory => directory(&paths, &behavior),
+        MainFunction::Standard => standard(paths, &behavior),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("install")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("install"))
+        .about(translate!("install-about"))
+        .override_usage(format_usage(&translate!("install-usage")))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(backup_control::arguments::backup())
+        .arg(backup_control::arguments::backup_no_args())
+        .arg(
+            Arg::新建(OPT_IGNORED)
+                .short('c')
+                .help(translate!("install-help-ignored"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_COMPARE)
+                .short('C')
+                .long(OPT_COMPARE)
+                .help(translate!("install-help-compare"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_DIRECTORY)
+                .short('d')
+                .long(OPT_DIRECTORY)
+                .help(translate!("install-help-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CREATE_LEADING)
+                .short('D')
+                .help(translate!("install-help-create-leading"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_GROUP)
+                .short('g')
+                .long(OPT_GROUP)
+                .help(translate!("install-help-group"))
+                .value_name("GROUP"),
+        )
+        .arg(
+            Arg::新建(OPT_MODE)
+                .short('m')
+                .long(OPT_MODE)
+                .help(translate!("install-help-mode"))
+                .value_name("MODE"),
+        )
+        .arg(
+            Arg::新建(OPT_OWNER)
+                .short('o')
+                .long(OPT_OWNER)
+                .help(translate!("install-help-owner"))
+                .value_name("OWNER")
+                .value_hint(clap::ValueHint::Username),
+        )
+        .arg(
+            Arg::新建(OPT_PRESERVE_TIMESTAMPS)
+                .short('p')
+                .long(OPT_PRESERVE_TIMESTAMPS)
+                .help(translate!("install-help-preserve-timestamps"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_STRIP)
+                .short('s')
+                .long(OPT_STRIP)
+                .help(translate!("install-help-strip"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_STRIP_PROGRAM)
+                .long(OPT_STRIP_PROGRAM)
+                .help(translate!("install-help-strip-program"))
+                .value_name("PROGRAM")
+                .value_hint(clap::ValueHint::CommandName),
+        )
+        .arg(backup_control::arguments::suffix())
+        .arg(
+            Arg::新建(OPT_TARGET_DIRECTORY)
+                .short('t')
+                .long(OPT_TARGET_DIRECTORY)
+                .help(translate!("install-help-target-directory"))
+                .value_name("DIRECTORY")
+                .value_hint(clap::ValueHint::DirPath),
+        )
+        .arg(
+            Arg::新建(OPT_NO_TARGET_DIRECTORY)
+                .short('T')
+                .long(OPT_NO_TARGET_DIRECTORY)
+                .help(translate!("install-help-no-target-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_VERBOSE)
+                .short('v')
+                .long(OPT_VERBOSE)
+                .help(translate!("install-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PRESERVE_CONTEXT)
+                .short('P')
+                .long(OPT_PRESERVE_CONTEXT)
+                .help(translate!("install-help-preserve-context"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_DEFAULT_CONTEXT)
+                .short('Z')
+                .help(translate!("install-help-default-context"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CONTEXT)
+                .long(OPT_CONTEXT)
+                .help(translate!("install-help-context"))
+                .value_name("CONTEXT")
+                .value_parser(clap::value_parser!(字符串))
+                .num_args(0..=1),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .num_args(1..)
+                .value_hint(clap::ValueHint::AnyPath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(OPT_UNPRIVILEGED)
+                .short('U')
+                .long(OPT_UNPRIVILEGED)
+                .help(translate!("install-help-unprivileged"))
+                .action(ArgAction::SetTrue),
+        )
+}
+
+/// Determine behavior, given command line arguments.
+///
+/// If successful, returns a filled-out Behavior struct.
+///
+/// # Errors
+///
+/// In event of failure, returns an integer intended as a program return code.
+///
+方法 behavior(matches: &ArgMatches) -> UResult<Behavior> {
+    设 main_function = 如果 matches.get_flag(OPT_DIRECTORY) {
+        MainFunction::Directory
+    } 否则 {
+        MainFunction::Standard
+    };
+
+    设 considering_dir: 布尔 = MainFunction::Directory == main_function;
+
+    设 specified_mode: 选项<正32> = 如果 matches.contains_id(OPT_MODE) {
+        设 x = matches.get_one::<字符串>(OPT_MODE).ok_or(1)?;
+        一些(uucore::mode::parse(x, considering_dir, 0).map_err(|err| {
+            show_error!(
+                "{}",
+                translate!("install-error-invalid-mode", "error" => err)
+            );
+            1
+        })?)
+    } 否则 {
+        无
+    };
+
+    设 backup_mode = backup_control::determine_backup_mode(matches)?;
+    设 target_dir = matches.get_one::<字符串>(OPT_TARGET_DIRECTORY).cloned();
+    设 no_target_dir = matches.get_flag(OPT_NO_TARGET_DIRECTORY);
+    如果 target_dir.is_some() && no_target_dir {
+        show_error!("{}", translate!("install-error-mutually-exclusive-target"));
+        返回 坏的(1.into());
+    }
+
+    设 preserve_timestamps = matches.get_flag(OPT_PRESERVE_TIMESTAMPS);
+    设 compare = matches.get_flag(OPT_COMPARE);
+    设 strip = matches.get_flag(OPT_STRIP);
+    如果 preserve_timestamps && compare {
+        show_error!(
+            "{}",
+            translate!("install-error-mutually-exclusive-compare-preserve")
+        );
+        返回 坏的(1.into());
+    }
+    如果 compare && strip {
+        show_error!(
+            "{}",
+            translate!("install-error-mutually-exclusive-compare-strip")
+        );
+        返回 坏的(1.into());
+    }
+
+    // Check if compare is used with non-permission mode bits
+    如果 compare && 设 一些(mode) = specified_mode {
+        设 non_permission_bits = 0o7000; // setuid, setgid, sticky bits
+        如果 mode & non_permission_bits != 0 {
+            show_error!("{}", translate!("install-warning-compare-ignored"));
+        }
+    }
+
+    设 owner = matches
+        .get_one::<字符串>(OPT_OWNER)
+        .map_or("", |s| s.as_str())
+        .to_string();
+
+    设 owner_id = 如果 owner.为空() {
+        无
+    } 否则 {
+        匹配 usr2uid(&owner) {
+            好的(u) => 一些(u),
+            坏的(_) => 返回 坏的(InstallError::InvalidUser(owner.克隆()).into()),
+        }
+    };
+
+    设 group = matches
+        .get_one::<字符串>(OPT_GROUP)
+        .map_or("", |s| s.as_str())
+        .to_string();
+
+    设 group_id = 如果 group.为空() {
+        无
+    } 否则 {
+        匹配 grp2gid(&group) {
+            好的(g) => 一些(g),
+            坏的(_) => 返回 坏的(InstallError::InvalidGroup(group.克隆()).into()),
+        }
+    };
+
+    设 context = matches.get_one::<字符串>(OPT_CONTEXT).cloned();
+    设 default_context = matches.get_flag(OPT_DEFAULT_CONTEXT);
+    设 privileged = !matches.get_flag(OPT_UNPRIVILEGED);
+
+    好的(Behavior {
+        main_function,
+        specified_mode,
+        backup_mode,
+        suffix: backup_control::determine_backup_suffix(matches),
+        owner_id,
+        group_id,
+        verbose: matches.get_flag(OPT_VERBOSE),
+        preserve_timestamps,
+        compare,
+        strip,
+        strip_program: 字符串::from(
+            matches
+                .get_one::<字符串>(OPT_STRIP_PROGRAM)
+                .map_or(DEFAULT_STRIP_PROGRAM, |s| s.as_str()),
+        ),
+        create_leading: matches.get_flag(OPT_CREATE_LEADING),
+        target_dir,
+        no_target_dir,
+        preserve_context: matches.get_flag(OPT_PRESERVE_CONTEXT),
+        context,
+        default_context,
+        privileged,
+    })
+}
+
+/// Creates directories.
+///
+/// GNU man pages describe this functionality as creating 'all components of
+/// the specified directories'.
+///
+/// Returns a Result type with the Err variant containing the error message.
+///
+方法 directory(paths: &[OsString], b: &Behavior) -> UResult<()> {
+    如果 paths.为空() {
+        坏的(InstallError::DirNeedsArg.into())
+    } 否则 {
+        循环 路径 在 paths.迭代().映射(Path::新建) {
+            // if the path already exist, don't try to create it again
+            如果 !路径.exists() {
+                // Special case to match GNU's behavior:
+                // install -d foo/. should work and just create foo/
+                // std::fs::create_dir("foo/."); fails in pure Rust
+                // See also mkdir.rs for another occurrence of this
+                设 path_to_create = dir_strip_dot_for_creation(路径);
+                // Differently than the primary functionality
+                // (MainFunction::Standard), the directory functionality should
+                // create all ancestors (or components) of a directory
+                // regardless of the presence of the "-D" flag.
+                //
+                // NOTE: the GNU "install" sets the expected mode only for the
+                // target directory. All created ancestor directories will have
+                // the default mode. Hence it is safe to use fs::create_dir_all
+                // and then only modify the target's dir mode.
+                如果 设 坏的(e) = 文件系统::create_dir_all(path_to_create.as_path())
+                    .map_err_context(|| translate!("install-error-create-dir-failed", "path" => path_to_create.as_path().quote()))
+                {
+                    show!(e);
+                    继续;
+                }
+
+                // Set SELinux context for all created directories if needed
+                #[cfg(全部(feature = "selinux", target_os = "linux"))]
+                如果 should_set_selinux_context(b) {
+                    设 context = get_context_for_selinux(b);
+                    set_selinux_context_for_directories_install(path_to_create.as_path(), context);
+                }
+
+                如果 b.verbose {
+                    writeln!(
+                        stdout(),
+                        "{}",
+                        translate!("install-verbose-creating-directory", "path" => path_to_create.quote())
+                    )?;
+                }
+            }
+
+            如果 mode::chmod(路径, b.mode()).is_err() {
+                // Error messages are printed by the mode::chmod function!
+                uucore::错误::set_exit_code(1);
+                继续;
+            }
+
+            如果 b.privileged {
+                show_if_err!(chown_optional_user_group(路径, b));
+
+                // Set SELinux context for directory if needed
+                #[cfg(全部(feature = "selinux", target_os = "linux"))]
+                如果 b.default_context {
+                    show_if_err!(set_selinux_default_context(路径));
+                } 否则 如果 b.context.is_some() {
+                    设 context = get_context_for_selinux(b);
+                    show_if_err!(set_selinux_security_context(路径, context));
+                }
+            }
+        }
+        // If the exit code was set, or show! has been called at least once
+        // (which sets the exit code as well), function execution will end after
+        // this return.
+        好的(())
+    }
+}
+
+/// Test if the path is a new file path that can be
+/// created immediately
+方法 is_new_file_path(路径: &Path) -> 布尔 {
+    !路径.exists()
+        && (路径.parent().is_none_or(Path::is_dir) || 路径.parent().解包().as_os_str().为空()) // In case of a simple file
+}
+
+/// Test if the path is an existing directory or ends with a trailing separator.
+///
+/// Returns true, if one of the conditions above is met; else false.
+///
+#[cfg(unix)]
+方法 is_potential_directory_path(路径: &Path) -> 布尔 {
+    设 separator = MAIN_SEPARATOR 转换 正8;
+    路径.as_os_str().as_bytes().最后() == 一些(&separator) || 路径.is_dir()
+}
+
+#[cfg(not(unix))]
+方法 is_potential_directory_path(路径: &Path) -> 布尔 {
+    设 path_str = 路径.to_string_lossy();
+    path_str.ends_with(MAIN_SEPARATOR) || path_str.ends_with('/') || 路径.is_dir()
+}
+
+/// Perform an install, given a list of paths and behavior.
+///
+/// Returns a Result type with the Err variant containing the error message.
+///
+#[allow(clippy::cognitive_complexity)]
+方法 standard(可变 paths: 向量<OsString>, b: &Behavior) -> UResult<()> {
+    // first check that paths contains at least one element
+    如果 paths.为空() {
+        返回 坏的(UUsageError::新建(
+            1,
+            translate!("install-error-missing-file-operand"),
+        ));
+    }
+    如果 b.no_target_dir && paths.长度() > 2 {
+        返回 坏的(InstallError::ExtraOperand(
+            paths[2].克隆(),
+            format_usage(&translate!("install-usage")),
+        )
+        .into());
+    }
+
+    // get the target from either "-t foo" param or from the last given paths argument
+    设 target: PathBuf = 如果 设 一些(路径) = &b.target_dir {
+        路径.into()
+    } 否则 {
+        设 last_path: PathBuf = paths.弹出().解包().into();
+
+        // paths has to contain more elements
+        如果 paths.为空() {
+            返回 坏的(UUsageError::新建(
+                1,
+                translate!("install-error-missing-destination-operand", "path" => last_path.quote()),
+            ));
+        }
+
+        last_path
+    };
+
+    设 sources = &paths.迭代().映射(PathBuf::from).收集::<向量<_>>();
+
+    #[cfg(unix)]
+    设 可变 target_parent_fd: 选项<DirFd> = 无;
+    #[cfg(unix)]
+    设 可变 target_filename: 选项<OsString> = 无;
+
+    如果 b.create_leading {
+        // if -t is used in combination with -D, create whole target because it does not include filename
+        设 to_create: 选项<&Path> = 如果 b.target_dir.is_some() {
+            一些(target.as_path())
+        // if source and target are filenames used in combination with -D, create target's parent
+        } 否则 如果 !(sources.长度() > 1 || is_potential_directory_path(&target)) {
+            target.parent()
+        } 否则 {
+            无
+        };
+
+        // If -t is used, check if target exists as a file before trying to create directories
+        如果 b.target_dir.is_some() && target.exists() && !target.is_dir() {
+            返回 坏的(InstallError::NotADirectory(target.克隆()).into());
+        }
+
+        如果 设 一些(to_create) = to_create {
+            设 to_create_original = to_create;
+            设 to_create_owned;
+            设 to_create = 匹配 uucore::os_str_as_bytes(to_create.as_os_str()) {
+                好的(path_bytes) 如果 path_bytes.ends_with(b"/") => {
+                    设 可变 trimmed_bytes = path_bytes;
+                    当 trimmed_bytes.ends_with(b"/") {
+                        trimmed_bytes = &trimmed_bytes[..trimmed_bytes.长度() - 1];
+                    }
+                    设 trimmed_os_str = 标准库::ffi::OsStr::from_bytes(trimmed_bytes);
+                    to_create_owned = PathBuf::from(trimmed_os_str);
+                    to_create_owned.as_path()
+                }
+                _ => to_create,
+            };
+
+            设 dir_exists = 如果 to_create.exists() {
+                文件系统::symlink_metadata(to_create)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            } 否则 {
+                假
+            };
+
+            如果 dir_exists {
+                #[cfg(unix)]
+                {
+                    如果 b.target_dir.is_none()
+                        && sources.长度() == 1
+                        && !is_potential_directory_path(&target)
+                        && 设 好的(dir_fd) = DirFd::open(to_create, SymlinkBehavior::NoFollow)
+                        && 设 一些(filename) = target.file_name()
+                    {
+                        target_parent_fd = 一些(dir_fd);
+                        target_filename = 一些(filename.to_os_string());
+                    }
+                }
+            } 否则 {
+                如果 b.verbose {
+                    设 可变 result = PathBuf::新建();
+                    // When creating directories with -Dv, show directory creations step by step
+                    循环 part 在 to_create.components() {
+                        result.压入(part.as_os_str());
+                        如果 !result.is_dir() {
+                            // Don't display when the directory already exists
+                            writeln!(
+                                stdout(),
+                                "{}",
+                                translate!("install-verbose-creating-directory-step", "path" => result.quote())
+                            )?;
+                        }
+                    }
+                }
+
+                #[cfg(unix)]
+                {
+                    // Use DEFAULT_MODE (0o755) for created directories - this matches GNU install
+                    // behavior. The actual mode will be modified by umask at the kernel level.
+                    匹配 create_dir_all_safe(to_create, DEFAULT_MODE) {
+                        好的(dir_fd) => {
+                            如果 b.target_dir.is_none()
+                                && sources.长度() == 1
+                                && !is_potential_directory_path(&target)
+                                && 设 一些(filename) = target.file_name()
+                            {
+                                target_parent_fd = 一些(dir_fd);
+                                target_filename = 一些(filename.to_os_string());
+                            }
+
+                            // Set SELinux context for all created directories if needed
+                            #[cfg(全部(feature = "selinux", target_os = "linux"))]
+                            如果 should_set_selinux_context(b) {
+                                设 context = get_context_for_selinux(b);
+                                set_selinux_context_for_directories_install(to_create, context);
+                            }
+                        }
+                        坏的(e) => {
+                            如果 e.kind() == 标准库::输入输出::ErrorKind::AlreadyExists
+                                && to_create.exists()
+                                && !to_create.is_dir()
+                            {
+                                返回 坏的(InstallError::NotADirectory(
+                                    to_create_original.to_path_buf(),
+                                )
+                                .into());
+                            }
+                            返回 坏的(InstallError::CreateDirFailed(
+                                to_create_original.to_path_buf(),
+                                e,
+                            )
+                            .into());
+                        }
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    如果 设 坏的(e) = 文件系统::create_dir_all(to_create) {
+                        返回 坏的(
+                            InstallError::CreateDirFailed(to_create.to_path_buf(), e).into()
+                        );
+                    }
+
+                    // Set SELinux context for all created directories if needed
+                    #[cfg(全部(feature = "selinux", target_os = "linux"))]
+                    如果 should_set_selinux_context(b) {
+                        设 context = get_context_for_selinux(b);
+                        set_selinux_context_for_directories_install(to_create, context);
+                    }
+                }
+            }
+        }
+    }
+
+    如果 sources.长度() > 1 {
+        copy_files_into_dir(sources, &target, b)
+    } 否则 {
+        设 source = sources.first().解包();
+
+        如果 source.is_dir() {
+            返回 坏的(InstallError::OmittingDirectory(source.克隆()).into());
+        }
+
+        如果 b.no_target_dir && target.is_dir() {
+            返回 坏的(
+                InstallError::OverrideDirectoryFailed(target.克隆(), source.克隆()).into(),
+            );
+        }
+
+        如果 is_potential_directory_path(&target) {
+            返回 copy_files_into_dir(sources, &target, b);
+        }
+
+        如果 target.is_file() || is_new_file_path(&target) {
+            #[cfg(unix)]
+            如果 设 (一些(引用 parent_fd), 一些(引用 filename)) = (target_parent_fd, target_filename) {
+                如果 b.compare && !need_copy(source, &target, b) {
+                    返回 好的(());
+                }
+
+                设 backup_path = perform_backup(&target, b)?;
+
+                如果 设 坏的(e) = parent_fd.unlink_at(filename.as_os_str(), 假)
+                    && e.kind() != 标准库::输入输出::ErrorKind::NotFound
+                {
+                    show_error!(
+                        "{}",
+                        translate!("install-error-failed-to-remove", "path" => target.quote(), "error" => 格式化!("{e:?}"))
+                    );
+                }
+
+                copy_file_safe(source, parent_fd, filename.as_os_str())?;
+
+                finalize_installed_file(source, &target, b, backup_path)
+            } 否则 {
+                copy(source, &target, b)
+            }
+            #[cfg(not(unix))]
+            {
+                copy(source, &target, b)
+            }
+        } 否则 {
+            坏的(InstallError::InvalidTarget(target).into())
+        }
+    }
+}
+
+/// Copy some files into a directory.
+///
+/// Prints verbose information and error messages.
+/// Returns a Result type with the Err variant containing the error message.
+///
+/// # Parameters
+///
+/// `files` must all exist as non-directories.
+/// `target_dir` must be a directory.
+///
+方法 copy_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UResult<()> {
+    如果 !target_dir.is_dir() {
+        返回 坏的(InstallError::TargetDirIsntDir(target_dir.to_path_buf()).into());
+    }
+    循环 sourcepath 在 files {
+        如果 设 坏的(err) = sourcepath
+            .metadata()
+            .map_err_context(|| 格式化!("cannot stat {}", sourcepath.quote()))
+        {
+            show!(err);
+            继续;
+        }
+
+        如果 sourcepath.is_dir() {
+            设 err = InstallError::OmittingDirectory(sourcepath.克隆());
+            show!(err);
+            继续;
+        }
+
+        设 可变 targetpath = target_dir.to_path_buf();
+        设 filename = sourcepath.components().next_back().解包();
+        targetpath.压入(filename);
+
+        show_if_err!(copy(sourcepath, &targetpath, b));
+    }
+    // If the exit code was set, or show! has been called at least once
+    // (which sets the exit code as well), function execution will end after
+    // this return.
+    好的(())
+}
+
+/// Handle ownership changes when -o/--owner or -g/--group flags are used.
+///
+/// Returns a Result type with the Err variant containing the error message.
+///
+/// # Parameters
+///
+/// _path_ must exist.
+///
+/// # Errors
+///
+/// If the owner or group are invalid or copy system call fails, we print a verbose error and
+/// return an empty error value.
+///
+方法 chown_optional_user_group(路径: &Path, b: &Behavior) -> UResult<()> {
+    // GNU coreutils doesn't print chown operations during install with verbose flag.
+    设 verbosity = Verbosity {
+        groups_only: b.owner_id.is_none(),
+        level: VerbosityLevel::Normal,
+    };
+
+    // Determine the owner and group IDs to be used for chown.
+    设 (owner_id, group_id) = 如果 b.owner_id.is_some() || b.group_id.is_some() {
+        (b.owner_id, b.group_id)
+    } 否则 {
+        // No chown operation needed - file ownership comes from process naturally.
+        返回 好的(());
+    };
+
+    设 meta = 匹配 metadata(路径) {
+        好的(meta) => meta,
+        坏的(e) => 返回 坏的(InstallError::MetadataFailed(e).into()),
+    };
+    匹配 wrap_chown(路径, &meta, owner_id, group_id, 假, verbosity) {
+        好的(msg) 如果 b.verbose && !msg.为空() => writeln!(stdout(), "chown: {msg}")?,
+        好的(_) => {}
+        坏的(e) => 返回 坏的(InstallError::ChownFailed(路径.to_path_buf(), e).into()),
+    }
+
+    好的(())
+}
+
+/// Perform backup before overwriting.
+///
+/// # Parameters
+///
+/// * `to` - The destination file path.
+/// * `b` - The behavior configuration.
+///
+/// # Returns
+///
+/// Returns an Option containing the backup path, or None if backup is not needed.
+///
+方法 perform_backup(to: &Path, b: &Behavior) -> UResult<选项<PathBuf>> {
+    如果 to.exists() {
+        如果 b.verbose {
+            writeln!(
+                stdout(),
+                "{}",
+                translate!("install-verbose-removed", "path" => to.quote())
+            )?;
+        }
+        设 backup_path = backup_control::get_backup_path(b.backup_mode, to, &b.suffix);
+        如果 设 一些(引用 backup_path) = backup_path {
+            文件系统::rename(to, backup_path).map_err(|err| {
+                InstallError::BackupFailed(to.to_path_buf(), backup_path.克隆(), err)
+            })?;
+        }
+        好的(backup_path)
+    } 否则 {
+        好的(无)
+    }
+}
+
+/// Copy a file using directory file descriptor for safe traversal.
+///
+/// This is the fd-based counterpart to `copy_file`. It prevents symlink race
+/// conditions by using `openat` to create the destination file relative to a
+/// directory file descriptor, rather than using path-based operations.
+///
+/// Note: This function and `copy_file` share similar logic but cannot easily
+/// be consolidated because they use fundamentally different APIs:
+/// - `copy_file_safe` uses fd-based `DirFd::open_file_at()` (openat syscall)
+/// - `copy_file` uses path-based `OpenOptions::new().create_new().open()`
+#[cfg(unix)]
+方法 copy_file_safe(from: &Path, to_parent_fd: &DirFd, to_filename: &标准库::ffi::OsStr) -> UResult<()> {
+    设 from_meta = metadata(from)?;
+
+    // Check if source and destination are the same file
+    如果 设 好的(to_stat) = to_parent_fd.stat_at(to_filename, SymlinkBehavior::Follow) {
+        // st_dev and st_ino types vary by platform (i32/u32 on macOS, u64 on Linux)
+        #[allow(clippy::unnecessary_cast)]
+        如果 from_meta.dev() == to_stat.st_dev 转换 正64 && from_meta.ino() == to_stat.st_ino 转换 正64 {
+            返回 坏的(
+                InstallError::SameFile(from.to_path_buf(), PathBuf::from(to_filename)).into(),
+            );
+        }
+    }
+
+    设 可变 src = File::open(from)?;
+    设 可变 dst = to_parent_fd.open_file_at(to_filename)?;
+    copy_stream(&可变 src, &可变 dst)?;
+
+    好的(())
+}
+
+/// Copy a file from one path to another. Handles the certain cases of special
+/// files (e.g character specials).
+///
+/// # Parameters
+///
+/// * `from` - The source file path.
+/// * `to` - The destination file path.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+///
+方法 copy_file(from: &Path, to: &Path) -> UResult<()> {
+    使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+    如果 设 好的(to_abs) = to.canonicalize()
+        && from.canonicalize()? == to_abs
+    {
+        返回 坏的(InstallError::SameFile(from.to_path_buf(), to.to_path_buf()).into());
+    }
+
+    如果 to.is_dir() && !from.is_dir() {
+        返回 坏的(InstallError::OverrideDirectoryFailed(
+            to.to_path_buf().克隆(),
+            from.to_path_buf().克隆(),
+        )
+        .into());
+    }
+
+    // Remove existing file (create_new below provides TOCTOU protection)
+    如果 设 坏的(e) = 文件系统::remove_file(to)
+        && e.kind() != 标准库::输入输出::ErrorKind::NotFound
+    {
+        show_error!(
+            "{}",
+            translate!("install-error-failed-to-remove", "path" => to.quote(), "error" => 格式化!("{e:?}"))
+        );
+    }
+
+    设 可变 handle = File::open(from)?;
+    // create_new provides TOCTOU protection
+    设 可变 dest = OpenOptions::新建()
+        .写锁定(真)
+        .create_new(真)
+        .mode(0o600)
+        .open(to)?;
+
+    copy_stream(&可变 handle, &可变 dest).map_err(|err| {
+        InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err.to_string())
+    })?;
+
+    好的(())
+}
+
+/// Strip a file using an external program.
+///
+/// # Parameters
+///
+/// * `to` - The destination file path.
+/// * `b` - The behavior configuration.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+///
+方法 strip_file(to: &Path, b: &Behavior) -> UResult<()> {
+    // Check if the filename starts with a hyphen and adjust the path
+    设 to_str = to.to_string_lossy();
+    设 to = 如果 to_str.starts_with('-') {
+        设 可变 new_path = PathBuf::from(".");
+        new_path.压入(to);
+        new_path
+    } 否则 {
+        to.to_path_buf()
+    };
+    匹配 进程::Command::新建(&b.strip_program).arg(&to).status() {
+        好的(status) => {
+            如果 !status.success() {
+                // Follow GNU's behavior: if strip fails, removes the target
+                设 _ = 文件系统::remove_file(to);
+                返回 坏的(InstallError::StripProgramFailed(
+                    translate!("install-error-strip-abnormal", "code" => status.code().解包()),
+                )
+                .into());
+            }
+        }
+        坏的(e) => {
+            // Follow GNU's behavior: if strip fails, removes the target
+            设 _ = 文件系统::remove_file(to);
+            返回 坏的(InstallError::StripProgramFailed(e.to_string()).into());
+        }
+    }
+    好的(())
+}
+
+/// Set ownership and permissions on the destination file.
+///
+/// # Parameters
+///
+/// * `to` - The destination file path.
+/// * `b` - The behavior configuration.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+///
+方法 set_ownership_and_permissions(to: &Path, b: &Behavior) -> UResult<()> {
+    // Silent the warning as we want to the error message
+    #[allow(clippy::question_mark)]
+    如果 mode::chmod(to, b.mode()).is_err() {
+        返回 坏的(InstallError::ChmodFailed(to.to_path_buf()).into());
+    }
+
+    如果 b.privileged {
+        chown_optional_user_group(to, b)?;
+    }
+
+    好的(())
+}
+
+/// Preserve timestamps on the destination file.
+///
+/// # Parameters
+///
+/// * `from` - The source file path.
+/// * `to` - The destination file path.
+///
+/// # Returns
+///
+/// Returns an empty Result or an error in case of failure.
+///
+方法 preserve_timestamps(from: &Path, to: &Path) -> UResult<()> {
+    设 meta = 匹配 metadata(from) {
+        好的(meta) => meta,
+        坏的(e) => 返回 坏的(InstallError::MetadataFailed(e).into()),
+    };
+
+    设 modified_time = FileTime::from_last_modification_time(&meta);
+    设 accessed_time = FileTime::from_last_access_time(&meta);
+
+    如果 设 坏的(e) = set_file_times(to, accessed_time, modified_time) {
+        show_error!("{e}");
+        // ignore error
+    }
+    好的(())
+}
+
+/// Apply post-copy operations: strip, ownership, permissions, timestamps, SELinux, and verbose output.
+方法 finalize_installed_file(
+    from: &Path,
+    to: &Path,
+    b: &Behavior,
+    backup_path: 选项<PathBuf>,
+) -> UResult<()> {
+    #[cfg(not(windows))]
+    如果 b.strip {
+        strip_file(to, b)?;
+    }
+
+    set_ownership_and_permissions(to, b)?;
+
+    如果 b.preserve_timestamps {
+        preserve_timestamps(from, to)?;
+    }
+
+    #[cfg(全部(feature = "selinux", target_os = "linux"))]
+    如果 b.privileged {
+        如果 b.preserve_context {
+            uucore::selinux::preserve_security_context(from, to)
+                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
+        } 否则 如果 b.default_context {
+            set_selinux_default_context(to)
+                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
+        } 否则 如果 b.context.is_some() {
+            设 context = get_context_for_selinux(b);
+            set_selinux_security_context(to, context)
+                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
+        }
+    }
+
+    如果 b.verbose {
+        write!(stdout(), "{} -> {}", from.quote(), to.quote())?;
+        匹配 backup_path {
+            一些(路径) => writeln!(
+                stdout(),
+                " {}",
+                translate!("install-verbose-backup", "backup" => 路径.quote())
+            )?,
+            无 => writeln!(stdout())?,
+        }
+    }
+
+    好的(())
+}
+
+/// Copy one file to a new location, changing metadata.
+///
+/// Returns a Result type with the Err variant containing the error message.
+///
+/// # Parameters
+///
+/// _from_ must exist as a non-directory.
+/// _to_ must be a non-existent file, whose parent directory exists.
+///
+/// # Errors
+///
+/// If the copy system call fails, we print a verbose error and return an empty error value.
+///
+方法 copy(from: &Path, to: &Path, b: &Behavior) -> UResult<()> {
+    如果 b.compare && !need_copy(from, to, b) {
+        返回 好的(());
+    }
+    // Declare the path here as we may need it for the verbose output below.
+    设 backup_path = perform_backup(to, b)?;
+
+    copy_file(from, to)?;
+
+    finalize_installed_file(from, to, b, backup_path)
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+方法 get_context_for_selinux(b: &Behavior) -> 选项<&字符串> {
+    如果 b.default_context {
+        无
+    } 否则 {
+        b.context.as_ref()
+    }
+}
+
+#[cfg(全部(feature = "selinux", target_os = "linux"))]
+方法 should_set_selinux_context(b: &Behavior) -> 布尔 {
+    b.privileged && (b.context.is_some() || b.default_context)
+}
+
+/// Check if a file needs to be copied due to ownership differences when no explicit group is specified.
+/// Returns true if the destination file's ownership would differ from what it should be after installation.
+方法 needs_copy_for_ownership(to: &Path, to_meta: &文件系统::Metadata) -> 布尔 {
+    使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+    // Check if the destination file's owner differs from the effective user ID
+    如果 to_meta.uid() != geteuid() {
+        返回 真;
+    }
+
+    // For group, we need to determine what the group would be after installation
+    // If no group is specified, the behavior depends on the directory:
+    // - If the directory has setgid bit, the file inherits the directory's group
+    // - Otherwise, the file gets the user's effective group
+    设 expected_gid = to
+        .parent()
+        .and_then(|parent| metadata(parent).ok())
+        .过滤(|parent_meta| parent_meta.mode() & 0o2000 != 0)
+        .map_or(getegid(), |parent_meta| parent_meta.gid());
+
+    to_meta.gid() != expected_gid
+}
+
+/// Return true if a file is necessary to copy. This is the case when:
+///
+/// - _from_ or _to_ is nonexistent;
+/// - either file has a sticky bit or set\[ug\]id bit, or the user specified one;
+/// - either file isn't a regular file;
+/// - the sizes of _from_ and _to_ differ;
+/// - _to_'s owner differs from intended; or
+/// - the contents of _from_ and _to_ differ.
+///
+/// # Parameters
+///
+/// _from_ and _to_, if existent, must be non-directories.
+///
+/// # Errors
+///
+/// Crashes the program if a nonexistent owner or group is specified in _b_.
+///
+方法 need_copy(from: &Path, to: &Path, b: &Behavior) -> 布尔 {
+    // Attempt to retrieve metadata for the source file.
+    // If this fails, assume the file needs to be copied.
+    设 好的(from_meta) = metadata(from) 否则 {
+        返回 真;
+    };
+
+    // Attempt to retrieve metadata for the destination file.
+    // If this fails, assume the file needs to be copied.
+    设 好的(to_meta) = metadata(to) 否则 {
+        返回 真;
+    };
+
+    // Check if the destination is a symlink (should always be replaced)
+    如果 设 好的(to_symlink_meta) = 文件系统::symlink_metadata(to)
+        && to_symlink_meta.file_type().is_symlink()
+    {
+        返回 真;
+    }
+
+    // Define special file mode bits (setuid, setgid, sticky).
+    设 extra_mode: 正32 = 0o7000;
+    // Define all file mode bits (including permissions).
+    // setuid || setgid || sticky || permissions
+    设 all_modes: 正32 = 0o7777;
+
+    // Check if any special mode bits are set in the specified mode,
+    // source file mode, or destination file mode.
+    如果 b.mode() & extra_mode != 0
+        || from_meta.mode() & extra_mode != 0
+        || to_meta.mode() & extra_mode != 0
+    {
+        返回 真;
+    }
+
+    // Check if the mode of the destination file differs from the specified mode.
+    如果 b.mode() != to_meta.mode() & all_modes {
+        返回 真;
+    }
+
+    // Check if either the source or destination is not a file.
+    如果 !from_meta.is_file() || !to_meta.is_file() {
+        返回 真;
+    }
+
+    // Check if the file sizes differ.
+    如果 from_meta.长度() != to_meta.长度() {
+        返回 真;
+    }
+
+    如果 b.privileged {
+        #[cfg(全部(feature = "selinux", target_os = "linux"))]
+        如果 b.preserve_context && contexts_differ(from, to) {
+            返回 真;
+        }
+
+        // TODO: if -P (#1809) and from/to contexts mismatch, return true.
+
+        // Check if the owner ID is specified and differs from the destination file's owner.
+        匹配 b.owner_id {
+            一些(uid) 如果 uid != to_meta.uid() => 返回 真,
+            _ => {}
+        }
+
+        // Check if the group ID is specified and differs from the destination file's group.
+        匹配 b.group_id {
+            一些(gid) 如果 gid != to_meta.gid() => 返回 真,
+            无 如果 needs_copy_for_ownership(to, &to_meta) => 返回 真,
+            _ => {}
+        }
+    }
+
+    // Check if the contents of the source and destination files differ.
+    如果 !diff(&from.to_string_lossy(), &to.to_string_lossy()) {
+        返回 真;
+    }
+
+    假
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Sets the `SELinux` security context for install's -Z flag behavior.
+///
+/// This function implements the specific behavior needed for install's -Z flag,
+/// which attempts to derive an appropriate context based on policy rules.
+/// If derivation fails, it falls back to the system default.
+///
+/// # Arguments
+///
+/// * `path` - Filesystem path for which to set the `SELinux` context.
+///
+/// # Returns
+///
+/// Returns `Ok(())` if the context was successfully set, or a `SeLinuxError` if the operation failed.
+公有 方法 set_selinux_default_context(路径: &Path) -> 结果<(), SeLinuxError> {
+    如果 !is_selinux_enabled() {
+        返回 坏的(SeLinuxError::SELinuxNotEnabled);
+    }
+
+    // Try to get the correct context based on file type and policy, then set it
+    匹配 get_default_context_for_path(路径) {
+        好的(一些(default_ctx)) => {
+            // Set the context we determined from policy
+            set_selinux_security_context(路径, 一些(&default_ctx))
+        }
+        好的(无) | 坏的(_) => {
+            // Fall back to set_default_for_path if we can't determine the correct context
+            SecurityContext::set_default_for_path(路径).map_err(|e| {
+                SeLinuxError::ContextSetFailure(字符串::新建(), selinux_error_description(&e))
+            })
+        }
+    }
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Gets the default `SELinux` context for a path based on the system's security policy.
+///
+/// This function attempts to determine what the "correct" `SELinux` context should be
+/// for a given path by consulting the `SELinux` policy database. This is similar to
+/// what `matchpathcon` or `restorecon` would determine.
+///
+/// The function traverses up the directory tree to find the first existing parent
+/// directory, gets its `SELinux` context, and then derives the appropriate context
+/// for the target path based on `SELinux` policy rules.
+///
+/// # Arguments
+///
+/// * `path` - The filesystem path to get the default context for
+///
+/// # Returns
+///
+/// * `Ok(Some(String))` - The default context string if successfully determined
+/// * `Ok(None)` - No default context could be determined
+/// * `Err(SeLinuxError)` - An error occurred while determining the context
+方法 get_default_context_for_path(路径: &Path) -> 结果<选项<字符串>, SeLinuxError> {
+    如果 !is_selinux_enabled() {
+        返回 坏的(SeLinuxError::SELinuxNotEnabled);
+    }
+
+    // Find the first existing parent directory to get its context
+    设 可变 current_path = 路径;
+    无限循环 {
+        如果 current_path.exists() {
+            如果 设 好的(parent_context) = get_selinux_security_context(current_path, 假) {
+                如果 !parent_context.为空() {
+                    // Found a context - derive the appropriate context for our target
+                    返回 好的(一些(derive_context_from_parent(&parent_context)));
+                }
+            }
+        }
+
+        // Move up to parent
+        如果 设 一些(parent) = current_path.parent() {
+            如果 parent == current_path {
+                中断; // Reached root
+            }
+            current_path = parent;
+        } 否则 {
+            中断;
+        }
+
+        如果 current_path == Path::新建("/") || current_path == Path::新建("") {
+            中断;
+        }
+    }
+
+    // If we can't determine from any parent, return None to fall back to default behavior
+    好的(无)
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Derives an appropriate `SELinux` context based on a parent directory context.
+///
+/// This is a heuristic function that attempts to generate an appropriate
+/// context for a file based on its parent directory's context and file type.
+/// The goal is to mimic what `restorecon` would do based on `SELinux` policy.
+方法 derive_context_from_parent(parent_context: &字符串切片) -> 字符串 {
+    // Parse the parent context (format: user:role:type:level)
+    设 parts: 向量<&字符串切片> = parent_context.split(':').收集();
+    如果 parts.长度() >= 3 {
+        设 user = parts[0];
+        设 role = parts[1];
+        设 parent_type = parts[2];
+        设 level = 如果 parts.长度() > 3 { parts[3] } 否则 { "" };
+
+        // Based on the GNU test expectations, when creating files in tmp-related directories,
+        // `install -Z` should create files with user_home_t context (like restorecon would).
+        // This is a specific policy behavior that the test expects.
+        设 derived_type = 如果 parent_type.包含("tmp") {
+            // tmp-related types should resolve to user_home_t
+            // This matches the behavior expected by the GNU test and restorecon
+            "user_home_t"
+        } 否则 {
+            // For other parent types, preserve the type
+            parent_type
+        };
+
+        如果 level.为空() {
+            格式化!("{user}:{role}:{derived_type}")
+        } 否则 {
+            格式化!("{user}:{role}:{derived_type}:{level}")
+        }
+    } 否则 {
+        // Fallback if we can't parse the parent context
+        parent_context.to_string()
+    }
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Helper function to collect paths that need `SELinux` context setting.
+///
+/// Traverses from the given starting path up to existing parent directories.
+/// Returns a vector of paths in reverse order (from parent to child).
+方法 collect_paths_for_context_setting(starting_path: &Path) -> 向量<&Path> {
+    设 可变 paths: 向量<&Path> = starting_path
+        .ancestors()
+        .take_while(|p| p.exists())
+        .收集();
+    paths.reverse();
+    paths
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Sets the `SELinux` security context for a directory hierarchy.
+///
+/// This function traverses from the given starting path up to existing parent directories
+/// and sets the `SELinux` context on each directory in the hierarchy (from parent to child).
+/// This is useful when creating directory structures and needing to set contexts on all
+/// created directories.
+///
+/// # Arguments
+///
+/// * `target_path` - The target path (typically the deepest directory in a hierarchy)
+/// * `context` - Optional `SELinux` context string to set. If None, sets default context.
+///
+/// # Behavior
+///
+/// - Traverses from `target_path` upward to find existing parent directories
+/// - Sets the context on each directory in reverse order (parent to child)
+/// - Uses `show_if_err!` to handle errors gracefully without panicking
+/// - Stops at filesystem root ("/") or empty path to prevent infinite loops
+/// - Only processes paths that exist on the filesystem
+/// - Silently handles `SELinux` context setting failures
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// // Set default context on directory hierarchy
+/// // set_selinux_context_for_directories(Path::new("/tmp/new/deep/dir"), None);
+///
+/// // Set specific context on directory hierarchy
+/// // let context = String::from("user_u:object_r:tmp_t:s0");
+/// // set_selinux_context_for_directories(Path::new("/tmp/new/deep/dir"), Some(&context));
+/// ```
+方法 set_selinux_context_for_directories(target_path: &Path, context: 选项<&字符串>) {
+    循环 路径 在 collect_paths_for_context_setting(target_path) {
+        show_if_err!(set_selinux_security_context(路径, context));
+    }
+}
+
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+/// Sets `SELinux` context for created directories using install's -Z default behavior.
+///
+/// Similar to `set_selinux_context_for_directories` but uses install's
+/// specific default context derivation when no context is provided.
+///
+/// # Arguments
+///
+/// * `target_path` - The target path (typically the deepest directory in a hierarchy)
+/// * `context` - Optional `SELinux` context string to set. If None, uses install's default derivation.
+公有 方法 set_selinux_context_for_directories_install(target_path: &Path, context: 选项<&字符串>) {
+    如果 context.is_some() {
+        // Use the standard function for explicit contexts
+        set_selinux_context_for_directories(target_path, context);
+    } 否则 {
+        // For default context, we need our custom install behavior
+        循环 路径 在 collect_paths_for_context_setting(target_path) {
+            show_if_err!(set_selinux_default_context(路径));
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    使用 超级::derive_context_from_parent;
+
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    #[test]
+    方法 test_derive_context_from_parent() {
+        // Test cases: (input_context, file_type, expected_output, description)
+        设 test_cases = [
+            // Core tmp_t transformation (matches GNU behavior)
+            (
+                "unconfined_u:object_r:tmp_t:s0",
+                "regular_file",
+                "unconfined_u:object_r:user_home_t:s0",
+                "tmp_t transformation",
+            ),
+            (
+                "unconfined_u:object_r:tmp_t:s0",
+                "directory",
+                "unconfined_u:object_r:user_home_t:s0",
+                "tmp_t directory transformation",
+            ),
+            (
+                "unconfined_u:object_r:tmp_t:s0",
+                "other",
+                "unconfined_u:object_r:user_home_t:s0",
+                "tmp_t other file type transformation",
+            ),
+            // Tmp variants transformation
+            (
+                "unconfined_u:object_r:user_tmp_t:s0",
+                "regular_file",
+                "unconfined_u:object_r:user_home_t:s0",
+                "user_tmp_t transformation",
+            ),
+            (
+                "root:object_r:admin_tmp_t:s0",
+                "directory",
+                "root:object_r:user_home_t:s0",
+                "admin_tmp_t transformation",
+            ),
+            // Non-tmp contexts (should be preserved)
+            (
+                "unconfined_u:object_r:user_home_t:s0",
+                "regular_file",
+                "unconfined_u:object_r:user_home_t:s0",
+                "user_home_t preservation",
+            ),
+            (
+                "system_u:object_r:bin_t:s0",
+                "directory",
+                "system_u:object_r:bin_t:s0",
+                "bin_t preservation",
+            ),
+            (
+                "system_u:object_r:lib_t:s0",
+                "regular_file",
+                "system_u:object_r:lib_t:s0",
+                "lib_t preservation",
+            ),
+            // Contexts without MLS level
+            (
+                "unconfined_u:object_r:tmp_t",
+                "regular_file",
+                "unconfined_u:object_r:user_home_t",
+                "tmp_t no level transformation",
+            ),
+            (
+                "unconfined_u:object_r:user_home_t",
+                "directory",
+                "unconfined_u:object_r:user_home_t",
+                "user_home_t no level preservation",
+            ),
+            // Different users and roles
+            (
+                "root:system_r:tmp_t:s0",
+                "regular_file",
+                "root:system_r:user_home_t:s0",
+                "root user tmp transformation",
+            ),
+            (
+                "staff_u:staff_r:tmp_t:s0-s0:c0.c1023",
+                "directory",
+                "staff_u:staff_r:user_home_t:s0-s0",
+                "complex MLS level truncation with tmp transformation",
+            ),
+            // Real-world examples
+            (
+                "unconfined_u:unconfined_r:tmp_t:s0-s0:c0.c1023",
+                "regular_file",
+                "unconfined_u:unconfined_r:user_home_t:s0-s0",
+                "user session tmp context transformation",
+            ),
+            (
+                "system_u:system_r:tmp_t:s0",
+                "directory",
+                "system_u:system_r:user_home_t:s0",
+                "system tmp context transformation",
+            ),
+            (
+                "unconfined_u:unconfined_r:user_home_t:s0",
+                "regular_file",
+                "unconfined_u:unconfined_r:user_home_t:s0",
+                "already correct home context",
+            ),
+            // Edge cases and malformed contexts
+            (
+                "invalid",
+                "regular_file",
+                "invalid",
+                "invalid context passthrough",
+            ),
+            ("", "regular_file", "", "empty context passthrough"),
+            (
+                "user:role",
+                "regular_file",
+                "user:role",
+                "insufficient parts passthrough",
+            ),
+            (
+                "user:role:type:level:extra:parts",
+                "regular_file",
+                "user:role:type:level",
+                "extra parts truncation",
+            ),
+            (
+                "user:role:tmp_t:s0:extra",
+                "regular_file",
+                "user:role:user_home_t:s0",
+                "tmp transformation with extra parts",
+            ),
+        ];
+
+        循环 (input_context, file_type, expected_output, description) 在 test_cases {
+            设 result = derive_context_from_parent(input_context);
+            相等断言!(
+                result, expected_output,
+                "Failed test case: {description} - Input: '{input_context}', File type: '{file_type}', Expected: '{expected_output}', Got: '{result}'"
+            );
+        }
+
+        // Test file type independence (since current implementation ignores file_type)
+        设 tmp_context = "unconfined_u:object_r:tmp_t:s0";
+        设 expected = "unconfined_u:object_r:user_home_t:s0";
+        设 file_types = ["regular_file", "directory", "other", "custom_type"];
+
+        循环 file_type 在 file_types {
+            设 result = derive_context_from_parent(tmp_context);
+            相等断言!(
+                result, expected,
+                "File type independence test failed - file_type: '{file_type}', Expected: '{expected}', Got: '{result}'"
+            );
+        }
+    }
+}

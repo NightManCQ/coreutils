@@ -1,0 +1,401 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) RFILE refsize rfilename fsize tsize
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::{OpenOptions, metadata};
+使用 标准库::输入输出::ErrorKind;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::FileTypeExt;
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+使用 uucore::parser::parse_size::{ParseSizeError, Parser, allow_list_with_all_suffixes};
+
+#[derive(调试协议, 相等比较协议, 偏等比较协议)]
+枚举 TruncateMode {
+    Absolute(正64),
+    Extend(正64),
+    Reduce(正64),
+    AtMost(正64),
+    AtLeast(正64),
+    RoundDown(正64),
+    RoundUp(正64),
+}
+
+实现 TruncateMode {
+    /// Compute a target size in bytes for this truncate mode.
+    ///
+    /// `fsize` is the size of the reference file, in bytes.
+    ///
+    /// If the mode is [`TruncateMode::Reduce`] and the value to
+    /// reduce by is greater than `fsize`, then this function returns
+    /// 0 (since it cannot return a negative number).
+    ///
+    /// # Returns
+    ///
+    /// `None` if rounding by 0, else the target size.
+    ///
+    /// # Examples
+    ///
+    /// Extending a file of 10 bytes by 5 bytes:
+    ///
+    /// ```rust,ignore
+    /// let mode = TruncateMode::Extend(5);
+    /// let fsize = 10;
+    /// assert_eq!(mode.to_size(fsize), Some(15));
+    /// ```
+    ///
+    /// Reducing a file by more than its size results in 0:
+    ///
+    /// ```rust,ignore
+    /// let mode = TruncateMode::Reduce(5);
+    /// let fsize = 3;
+    /// assert_eq!(mode.to_size(fsize), Some(0));
+    /// ```
+    ///
+    /// Rounding a file by 0:
+    ///
+    /// ```rust,ignore
+    /// let mode = TruncateMode::RoundDown(0);
+    /// let fsize = 17;
+    /// assert_eq!(mode.to_size(fsize), None);
+    /// ```
+    方法 to_size(&自身, fsize: 正64) -> 选项<正64> {
+        匹配 自身 {
+            自身类型::Absolute(size) => 一些(*size),
+            自身类型::Extend(size) => 一些(fsize + size),
+            自身类型::Reduce(size) => 一些(fsize.saturating_sub(*size)),
+            自身类型::AtMost(size) => 一些(fsize.min(*size)),
+            自身类型::AtLeast(size) => 一些(fsize.max(*size)),
+            自身类型::RoundDown(size) => fsize.checked_rem(*size).映射(|remainder| fsize - remainder),
+            自身类型::RoundUp(size) => fsize.checked_next_multiple_of(*size),
+        }
+    }
+
+    /// Determine if mode is absolute
+    ///
+    /// # Returns
+    ///
+    /// `true` is self matches Self::Absolute(_), `false` otherwise.
+    方法 is_absolute(&自身) -> 布尔 {
+        matches!(自身, 自身类型::Absolute(_))
+    }
+}
+
+公有 模组 options {
+    公有 静态 IO_BLOCKS: &字符串切片 = "io-blocks";
+    公有 静态 NO_CREATE: &字符串切片 = "no-create";
+    公有 静态 REFERENCE: &字符串切片 = "reference";
+    公有 静态 SIZE: &字符串切片 = "size";
+    公有 静态 ARG_FILES: &字符串切片 = "files";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 app = uu_app();
+    设 matches = uucore::clap_localization::handle_clap_result(app, args)?;
+
+    设 files: 向量<OsString> = matches
+        .get_many::<OsString>(options::ARG_FILES)
+        .映射(|v| v.cloned().收集())
+        .unwrap_or_default();
+
+    如果 files.为空() {
+        坏的(UUsageError::新建(
+            1,
+            translate!("truncate-error-missing-file-operand"),
+        ))
+    } 否则 {
+        设 io_blocks = matches.get_flag(options::IO_BLOCKS);
+        设 no_create = matches.get_flag(options::NO_CREATE);
+        设 reference = matches
+            .get_one::<字符串>(options::REFERENCE)
+            .映射(字符串::from);
+        设 size = matches.get_one::<字符串>(options::SIZE).映射(字符串::from);
+        truncate(no_create, io_blocks, reference, size, &files)
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("truncate")
+        .version(uucore::crate_version!())
+        .about(translate!("truncate-about"))
+        .override_usage(format_usage(&translate!("truncate-usage")))
+        .after_help(translate!("truncate-after-help"))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .arg(
+            Arg::新建(options::IO_BLOCKS)
+                .short('o')
+                .long(options::IO_BLOCKS)
+                .help(translate!("truncate-help-io-blocks"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::NO_CREATE)
+                .short('c')
+                .long(options::NO_CREATE)
+                .help(translate!("truncate-help-no-create"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::REFERENCE)
+                .short('r')
+                .long(options::REFERENCE)
+                .required_unless_present(options::SIZE)
+                .help(translate!("truncate-help-reference"))
+                .value_name("RFILE")
+                .value_hint(clap::ValueHint::FilePath),
+        )
+        .arg(
+            Arg::新建(options::SIZE)
+                .short('s')
+                .long(options::SIZE)
+                .required_unless_present(options::REFERENCE)
+                .help(translate!("truncate-help-size"))
+                .allow_hyphen_values(真)
+                .value_name("SIZE"),
+        )
+        .arg(
+            Arg::新建(options::ARG_FILES)
+                .value_name("FILE")
+                .action(ArgAction::Append)
+                .required(真)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}
+
+/// Truncate the named file to the specified size.
+///
+/// If `create` is true, then the file will be created if it does not
+/// already exist. If `size` is larger than the number of bytes in the
+/// file, then the file will be padded with zeros. If `size` is smaller
+/// than the number of bytes in the file, then the file will be
+/// truncated and any bytes beyond `size` will be lost.
+///
+/// # Errors
+///
+/// If the file could not be opened, or there was a problem setting the
+/// size of the file.
+方法 do_file_truncate(filename: &Path, create: 布尔, size: 正64) -> UResult<()> {
+    设 路径 = Path::新建(filename);
+
+    匹配 OpenOptions::新建().写锁定(真).create(create).open(路径) {
+        好的(file) => file.set_len(size),
+        坏的(e) 如果 e.kind() == ErrorKind::NotFound && !create => 好的(()),
+        坏的(e) => 坏的(e),
+    }
+    .map_err_context(
+        || translate!("truncate-error-cannot-open-for-writing", "filename" => filename.quote()),
+    )
+}
+
+方法 file_truncate(
+    no_create: 布尔,
+    reference_size: 选项<正64>,
+    mode: &TruncateMode,
+    filename: &OsString,
+) -> UResult<()> {
+    设 路径 = Path::新建(filename);
+
+    // Get the length of the file.
+    设 file_size = 匹配 metadata(路径) {
+        好的(metadata) => {
+            // A pipe has no length. Do this check here to avoid duplicate `stat()` syscall.
+            #[cfg(unix)]
+            如果 metadata.file_type().is_fifo() {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("truncate-error-cannot-open-no-device", "filename" => filename.to_string_lossy().quote()),
+                ));
+            }
+            metadata.长度()
+        }
+        坏的(_) => 0,
+    };
+
+    // The reference size can be either:
+    //
+    // 1. The size of a given file
+    // 2. The size of the file to be truncated if no reference has been provided.
+    设 actual_reference_size = reference_size.unwrap_or(file_size);
+
+    设 一些(truncate_size) = mode.to_size(actual_reference_size) 否则 {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("truncate-error-division-by-zero"),
+        ));
+    };
+
+    do_file_truncate(路径, !no_create, truncate_size)
+}
+
+方法 truncate(
+    no_create: 布尔,
+    _: 布尔,
+    reference: 选项<字符串>,
+    size: 选项<字符串>,
+    filenames: &[OsString],
+) -> UResult<()> {
+    设 reference_size = 匹配 reference {
+        一些(reference_path) => {
+            设 reference_metadata = metadata(&reference_path).map_err(|错误| 匹配 错误.kind() {
+                ErrorKind::NotFound => USimpleError::新建(
+                    1,
+                    translate!("truncate-error-cannot-stat-no-such-file", "filename" => reference_path.quote()),
+                ),
+                _ => 错误.map_err_context(字符串::新建),
+            })?;
+
+            一些(reference_metadata.长度())
+        }
+        无 => 无,
+    };
+
+    设 size_string = size.as_deref();
+
+    // Omitting the mode is equivalent to extending a file by 0 bytes.
+    设 mode = 匹配 size_string {
+        一些(string) => 匹配 parse_mode_and_size(string) {
+            坏的(错误) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("truncate-error-invalid-number", "error" => 错误),
+                ));
+            }
+            好的(mode) => mode,
+        },
+        无 => TruncateMode::Extend(0),
+    };
+
+    // If a reference file has been given, the truncate mode cannot be absolute.
+    如果 reference_size.is_some() && mode.is_absolute() {
+        返回 坏的(USimpleError::新建(
+            1,
+            translate!("truncate-error-must-specify-relative-size"),
+        ));
+    }
+
+    循环 filename 在 filenames {
+        file_truncate(no_create, reference_size, &mode, filename)?;
+    }
+
+    好的(())
+}
+
+/// Decide whether a character is one of the size modifiers, like '+' or '<'.
+方法 is_modifier(c: 字符) -> 布尔 {
+    c == '+' || c == '-' || c == '<' || c == '>' || c == '/' || c == '%'
+}
+
+/// Parse a size string with optional modifier symbol as its first character.
+///
+/// A size string is as described in [`Parser::parse_u64`]. The first character
+/// of `size_string` might be a modifier symbol, like `'+'` or
+/// `'<'`. The first element of the pair returned by this function
+/// indicates which modifier symbol was present, or
+/// [`TruncateMode::Absolute`] if none.
+///
+/// # Panics
+///
+/// If `size_string` is empty.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// assert_eq!(parse_mode_and_size("+123"), Ok(TruncateMode::Extend(123)));
+/// ```
+方法 parse_mode_and_size(size_string: &字符串切片) -> 结果<TruncateMode, ParseSizeError> {
+    // Trim any whitespace.
+    设 可变 size_string = size_string.trim();
+
+    // Get the modifier character from the size string, if any. For
+    // example, if the argument is "+123", then the modifier is '+'.
+    如果 设 一些(c) = size_string.chars().next() {
+        如果 is_modifier(c) {
+            size_string = &size_string[1..];
+        }
+        设 allow_list = allow_list_with_all_suffixes("EgGkKmMPQRtTYZ");
+        设 allow_list_ref = allow_list.迭代().映射(作为引用协议::as_ref).收集::<向量<&字符串切片>>();
+        Parser::默认()
+            .with_allow_list(&allow_list_ref)
+            .parse_u64(size_string)
+            .映射(匹配 c {
+                '+' => TruncateMode::Extend,
+                '-' => TruncateMode::Reduce,
+                '<' => TruncateMode::AtMost,
+                '>' => TruncateMode::AtLeast,
+                '/' => TruncateMode::RoundDown,
+                '%' => TruncateMode::RoundUp,
+                _ => TruncateMode::Absolute,
+            })
+    } 否则 {
+        坏的(ParseSizeError::ParseFailure(size_string.to_string()))
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::TruncateMode;
+    使用 箱::parse_mode_and_size;
+
+    #[test]
+    方法 test_parse_mode_and_size() {
+        相等断言!(parse_mode_and_size("10"), 好的(TruncateMode::Absolute(10)));
+        相等断言!(parse_mode_and_size("+10"), 好的(TruncateMode::Extend(10)));
+        相等断言!(parse_mode_and_size("-10"), 好的(TruncateMode::Reduce(10)));
+        相等断言!(parse_mode_and_size("<10"), 好的(TruncateMode::AtMost(10)));
+        相等断言!(parse_mode_and_size(">10"), 好的(TruncateMode::AtLeast(10)));
+        相等断言!(parse_mode_and_size("/10"), 好的(TruncateMode::RoundDown(10)));
+        相等断言!(parse_mode_and_size("%10"), 好的(TruncateMode::RoundUp(10)));
+        相等断言!(parse_mode_and_size("1kB"), 好的(TruncateMode::Absolute(1000)));
+        相等断言!(parse_mode_and_size("1kD"), 好的(TruncateMode::Absolute(1000)));
+        断言!(parse_mode_and_size("1b").is_err());
+    }
+
+    #[test]
+    方法 test_to_size() {
+        相等断言!(TruncateMode::Extend(5).to_size(10), 一些(15));
+        相等断言!(TruncateMode::Reduce(5).to_size(10), 一些(5));
+        相等断言!(TruncateMode::Reduce(5).to_size(3), 一些(0));
+        相等断言!(TruncateMode::RoundDown(4).to_size(13), 一些(12));
+        相等断言!(TruncateMode::RoundDown(4).to_size(16), 一些(16));
+        相等断言!(TruncateMode::RoundUp(8).to_size(10), 一些(16));
+        相等断言!(TruncateMode::RoundUp(8).to_size(16), 一些(16));
+        相等断言!(TruncateMode::RoundDown(0).to_size(123), 无);
+        相等断言!(TruncateMode::RoundUp(0).to_size(123), 无);
+    }
+
+    #[test]
+    方法 test_round_up_when_file_smaller_than_size() {
+        // fsize < size: must round up to size itself
+        相等断言!(
+            TruncateMode::RoundUp(131_072).to_size(24_696),
+            一些(131_072)
+        );
+        相等断言!(TruncateMode::RoundUp(4096).to_size(1), 一些(4096));
+        相等断言!(TruncateMode::RoundUp(100).to_size(50), 一些(100));
+    }
+
+    #[test]
+    方法 test_round_up_already_aligned() {
+        相等断言!(TruncateMode::RoundUp(4096).to_size(0), 一些(0));
+        相等断言!(TruncateMode::RoundUp(4096).to_size(4096), 一些(4096));
+        相等断言!(TruncateMode::RoundUp(4096).to_size(8192), 一些(8192));
+    }
+
+    #[test]
+    方法 test_round_up_not_aligned() {
+        // fsize > size but not a multiple: must round up to next multiple
+        相等断言!(TruncateMode::RoundUp(4096).to_size(5000), 一些(8192));
+        相等断言!(TruncateMode::RoundUp(8).to_size(13), 一些(16));
+    }
+}

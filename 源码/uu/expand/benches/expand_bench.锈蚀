@@ -1,0 +1,48 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::格式化::Write;
+使用 uu_expand::uumain;
+使用 uucore::benchmark::{create_test_file, run_util_function};
+
+/// Helper function to run expand benchmark with generated data
+方法 bench_expand(bencher: Bencher, data: 实现 作为引用协议<[正8]>, args: &[&字符串切片]) {
+    设 temp_dir = tempfile::tempdir().解包();
+    设 file_path = create_test_file(data.as_ref(), temp_dir.路径());
+    设 file_path_str = file_path.to_str().解包();
+
+    设 可变 all_args = 向量![];
+    all_args.extend_from_slice(args);
+    all_args.压入(file_path_str);
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &all_args));
+    });
+}
+
+/// Benchmark expanding tabs on files with many short lines
+#[divan::bench(args = [100_000])]
+方法 expand_many_lines(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = (0..num_lines).折叠(字符串::新建(), |可变 acc, i| {
+        writeln!(&可变 acc, "line{i}\tvalue{}\tdata{}", i * 2, i * 3).解包();
+        acc
+    });
+    bench_expand(bencher, data, &[]);
+}
+
+/// Benchmark expanding tabs with custom tab stops
+#[divan::bench(args = [50_000])]
+方法 expand_custom_tabstops(bencher: Bencher, num_lines: 正整数大小) {
+    设 data = (0..num_lines).折叠(字符串::新建(), |可变 acc, i| {
+        writeln!(&可变 acc, "a\tb\tc\td\te{i}").解包();
+        acc
+    });
+    bench_expand(bencher, data, &["--tabs=4,8,12"]);
+}
+
+方法 主函数() {
+    divan::主函数();
+}

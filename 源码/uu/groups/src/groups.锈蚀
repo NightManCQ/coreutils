@@ -1,0 +1,95 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) passwd
+
+使用 标准库::输入输出::{Write, stdout};
+使用 thiserror::错误协议;
+使用 uucore::{
+    display::Quotable,
+    entries::{Locate, Passwd, get_groups_gnu, gid2grp},
+    错误::{UError, UResult},
+    format_usage, show,
+};
+
+使用 clap::{Arg, ArgAction, Command};
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 USERS: &字符串切片 = "USERNAME";
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 GroupsError {
+    #[错误("{message}", message = translate!("groups-error-fetch"))]
+    GetGroupsFailed,
+
+    #[错误("{message} {gid}", message = translate!("groups-error-notfound"), gid = .0)]
+    GroupNotFound(正32),
+
+    #[错误("{user}: {message}", user = .0.quote(), message = translate!("groups-error-user"))]
+    UserNotFound(字符串),
+}
+
+实现 UError 循环 GroupsError {}
+
+方法 infallible_gid2grp(gid: 正32) -> 字符串 {
+    如果 设 好的(grp) = gid2grp(gid) {
+        grp
+    } 否则 {
+        // The `show!()` macro sets the global exit code for the program.
+        show!(GroupsError::GroupNotFound(gid));
+        gid.to_string()
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 users: 向量<字符串> = matches
+        .get_many::<字符串>(options::USERS)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    如果 users.为空() {
+        设 好的(gids) = get_groups_gnu(无) 否则 {
+            返回 坏的(GroupsError::GetGroupsFailed.into());
+        };
+        设 groups: 向量<字符串> = gids.into_iter().映射(infallible_gid2grp).收集();
+        writeln!(stdout(), "{}", groups.加入(" "))?;
+        返回 好的(());
+    }
+
+    循环 user 在 users {
+        匹配 Passwd::locate(user.as_str()) {
+            好的(p) => {
+                设 groups: 向量<字符串> =
+                    p.belongs_to().into_iter().映射(infallible_gid2grp).收集();
+                writeln!(stdout(), "{user} : {}", groups.加入(" "))?;
+            }
+            坏的(_) => {
+                // The `show!()` macro sets the global exit code for the program.
+                show!(GroupsError::UserNotFound(user));
+            }
+        }
+    }
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("groups")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("groups"))
+        .about(translate!("groups-about"))
+        .override_usage(format_usage(&translate!("groups-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::USERS)
+                .action(ArgAction::Append)
+                .value_name(options::USERS)
+                .value_hint(clap::ValueHint::Username),
+        )
+}

@@ -1,0 +1,201 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::字符::from_digit;
+
+使用 超级::Quotes;
+
+// PR#6559 : Remove `]{}` from special shell chars.
+常量 SPECIAL_SHELL_CHARS: &字符串切片 = "`$&*()|[;\\'\"<>?! ";
+
+// This implementation is heavily inspired by the std::char::EscapeDefault implementation
+// in the Rust standard library. This custom implementation is needed because the
+// characters \a, \b, \e, \f & \v are not recognized by Rust.
+公有 结构 EscapedChar {
+    公有 state: EscapeState,
+}
+
+公有 枚举 EscapeState {
+    Done,
+    Char(字符),
+    Backslash(字符),
+    ForceQuote(字符),
+    Octal(EscapeOctal),
+}
+
+/// Bytes we need to present as escaped octal, in the form of `\nnn` per byte.
+/// Only supports characters up to 2 bytes long in UTF-8.
+公有 结构 EscapeOctal {
+    c: [正8; 2],
+    state: EscapeOctalState,
+    idx: 正8,
+}
+
+枚举 EscapeOctalState {
+    Done,
+    FirstBackslash,
+    FirstValue,
+    LastBackslash,
+    LastValue,
+}
+
+方法 byte_to_octal_digit(byte: 正8, idx: 正8) -> 正8 {
+    (byte >> (idx * 3)) & 0o7
+}
+
+实现 迭代器协议 循环 EscapeOctal {
+    类型 Item = 字符;
+
+    方法 next(&可变 自身) -> 选项<字符> {
+        匹配 自身.state {
+            EscapeOctalState::Done => 无,
+            EscapeOctalState::FirstBackslash => {
+                自身.state = EscapeOctalState::FirstValue;
+                一些('\\')
+            }
+            EscapeOctalState::LastBackslash => {
+                自身.state = EscapeOctalState::LastValue;
+                一些('\\')
+            }
+            EscapeOctalState::FirstValue => {
+                设 octal_digit = byte_to_octal_digit(自身.c[0], 自身.idx);
+                如果 自身.idx == 0 {
+                    自身.state = EscapeOctalState::LastBackslash;
+                    自身.idx = 2;
+                } 否则 {
+                    自身.idx -= 1;
+                }
+                一些(from_digit(octal_digit.into(), 8).解包())
+            }
+            EscapeOctalState::LastValue => {
+                设 octal_digit = byte_to_octal_digit(自身.c[1], 自身.idx);
+                如果 自身.idx == 0 {
+                    自身.state = EscapeOctalState::Done;
+                } 否则 {
+                    自身.idx -= 1;
+                }
+                一些(from_digit(octal_digit.into(), 8).解包())
+            }
+        }
+    }
+}
+
+实现 EscapeOctal {
+    方法 from_char(c: 字符) -> 自身类型 {
+        如果 c.len_utf8() == 1 {
+            返回 自身类型::from_byte(c 转换 正8);
+        }
+
+        设 可变 buf = [0; 2];
+        设 _s = c.encode_utf8(&可变 buf);
+        自身类型 {
+            c: buf,
+            idx: 2,
+            state: EscapeOctalState::FirstBackslash,
+        }
+    }
+
+    方法 from_byte(b: 正8) -> 自身类型 {
+        自身类型 {
+            c: [0, b],
+            idx: 2,
+            state: EscapeOctalState::LastBackslash,
+        }
+    }
+}
+
+实现 EscapedChar {
+    公有 方法 new_literal(c: 字符) -> 自身类型 {
+        自身类型 {
+            state: EscapeState::Char(c),
+        }
+    }
+
+    公有 方法 new_octal(b: 正8) -> 自身类型 {
+        自身类型 {
+            state: EscapeState::Octal(EscapeOctal::from_byte(b)),
+        }
+    }
+
+    公有 方法 new_c(c: 字符, quotes: Quotes, dirname: 布尔) -> 自身类型 {
+        使用 EscapeState::*;
+        设 init_state = 匹配 c {
+            '\x07' => Backslash('a'),
+            '\x08' => Backslash('b'),
+            '\t' => Backslash('t'),
+            '\n' => Backslash('n'),
+            '\x0B' => Backslash('v'),
+            '\x0C' => Backslash('f'),
+            '\r' => Backslash('r'),
+            '\\' => Backslash('\\'),
+            '\'' => 匹配 quotes {
+                Quotes::Single => Backslash('\''),
+                _ => Char('\''),
+            },
+            '"' => 匹配 quotes {
+                Quotes::Double => Backslash('"'),
+                _ => Char('"'),
+            },
+            ' ' 如果 !dirname => 匹配 quotes {
+                Quotes::无 => Backslash(' '),
+                _ => Char(' '),
+            },
+            ':' 如果 dirname => Backslash(':'),
+            _ 如果 c.is_control() => Octal(EscapeOctal::from_char(c)),
+            _ => Char(c),
+        };
+        自身类型 { state: init_state }
+    }
+
+    公有 方法 new_shell(c: 字符, escape: 布尔, quotes: Quotes) -> 自身类型 {
+        使用 EscapeState::*;
+        设 init_state = 匹配 c {
+            _ 如果 !escape && c.is_control() => Char(c),
+            '\x07' => Backslash('a'),
+            '\x08' => Backslash('b'),
+            '\t' => Backslash('t'),
+            '\n' => Backslash('n'),
+            '\x0B' => Backslash('v'),
+            '\x0C' => Backslash('f'),
+            '\r' => Backslash('r'),
+            '\'' => 匹配 quotes {
+                Quotes::Single => Backslash('\''),
+                _ => Char('\''),
+            },
+            _ 如果 c.is_control() => Octal(EscapeOctal::from_char(c)),
+            _ 如果 SPECIAL_SHELL_CHARS.包含(c) => ForceQuote(c),
+            _ => Char(c),
+        };
+        自身类型 { state: init_state }
+    }
+
+    公有 方法 hide_control(自身) -> 自身类型 {
+        匹配 自身.state {
+            EscapeState::Char(c) 如果 c.is_control() => 自身类型 {
+                state: EscapeState::Char('?'),
+            },
+            _ => 自身,
+        }
+    }
+}
+
+实现 迭代器协议 循环 EscapedChar {
+    类型 Item = 字符;
+
+    方法 next(&可变 自身) -> 选项<字符> {
+        匹配 自身.state {
+            EscapeState::Backslash(c) => {
+                自身.state = EscapeState::Char(c);
+                一些('\\')
+            }
+            EscapeState::Char(c) | EscapeState::ForceQuote(c) => {
+                自身.state = EscapeState::Done;
+                一些(c)
+            }
+            EscapeState::Done => 无,
+            EscapeState::Octal(引用 可变 迭代) => 迭代.next(),
+        }
+    }
+}

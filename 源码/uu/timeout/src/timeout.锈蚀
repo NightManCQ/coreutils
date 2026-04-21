@@ -1,0 +1,478 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) tstr sigstr cmdname setpgid sigchld getpid
+
+模组 status;
+
+使用 箱::status::ExitStatus;
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::输入输出::{ErrorKind, Write};
+使用 标准库::操作系统::unix::进程::ExitStatusExt;
+使用 标准库::进程::{自身, Child, Stdio};
+使用 标准库::同步::原子操作::{自身, AtomicBool};
+使用 标准库::时间::持续时间;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::parser::parse_time;
+使用 uucore::进程::ChildExt;
+使用 uucore::translate;
+
+使用 uucore::{
+    format_usage,
+    signals::{signal_by_name_or_value, signal_list_name_by_value},
+};
+
+使用 nix::sys::signal::{SigHandler, Signal, kill};
+使用 nix::unistd::{Pid, getpid, setpgid};
+#[cfg(unix)]
+使用 标准库::操作系统::unix::进程::CommandExt;
+
+公有 模组 options {
+    公有 静态 FOREGROUND: &字符串切片 = "foreground";
+    公有 静态 KILL_AFTER: &字符串切片 = "kill-after";
+    公有 静态 SIGNAL: &字符串切片 = "signal";
+    公有 静态 PRESERVE_STATUS: &字符串切片 = "preserve-status";
+    公有 静态 VERBOSE: &字符串切片 = "verbose";
+
+    // Positional args.
+    公有 静态 DURATION: &字符串切片 = "duration";
+    公有 静态 COMMAND: &字符串切片 = "command";
+}
+
+结构 Config {
+    foreground: 布尔,
+    kill_after: 选项<持续时间>,
+    signal: 正整数大小,
+    duration: 持续时间,
+    preserve_status: 布尔,
+    verbose: 布尔,
+
+    command: 向量<字符串>,
+}
+
+实现 Config {
+    方法 from(options: &clap::ArgMatches) -> UResult<自身类型> {
+        设 signal = 匹配 options.get_one::<字符串>(options::SIGNAL) {
+            一些(signal_) => {
+                设 signal_result = signal_by_name_or_value(signal_);
+                匹配 signal_result {
+                    无 => {
+                        返回 坏的(UUsageError::新建(
+                            ExitStatus::TimeoutFailed.into(),
+                            translate!("timeout-error-invalid-signal", "signal" => signal_.quote()),
+                        ));
+                    }
+                    一些(signal_value) => signal_value,
+                }
+            }
+            _ => signal_by_name_or_value("TERM").解包(),
+        };
+
+        设 kill_after = 匹配 options.get_one::<字符串>(options::KILL_AFTER) {
+            无 => 无,
+            一些(kill_after) => 匹配 parse_time::from_str(kill_after, 真) {
+                好的(k) => 一些(k),
+                坏的(err) => 返回 坏的(UUsageError::新建(ExitStatus::TimeoutFailed.into(), err)),
+            },
+        };
+
+        设 duration =
+            parse_time::from_str(options.get_one::<字符串>(options::DURATION).解包(), 真)
+                .map_err(|err| UUsageError::新建(ExitStatus::TimeoutFailed.into(), err))?;
+
+        设 preserve_status: 布尔 = options.get_flag(options::PRESERVE_STATUS);
+        设 foreground = options.get_flag(options::FOREGROUND);
+        设 verbose = options.get_flag(options::VERBOSE);
+
+        设 command = options
+            .get_many::<字符串>(options::COMMAND)
+            .解包()
+            .映射(字符串::from)
+            .收集::<向量<_>>();
+
+        好的(自身类型 {
+            foreground,
+            kill_after,
+            signal,
+            duration,
+            preserve_status,
+            verbose,
+            command,
+        })
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 125)?;
+
+    设 config = Config::from(&matches)?;
+    timeout(
+        &config.command,
+        config.duration,
+        config.signal,
+        config.kill_after,
+        config.foreground,
+        config.preserve_status,
+        config.verbose,
+    )
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("timeout")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("timeout"))
+        .about(translate!("timeout-about"))
+        .override_usage(format_usage(&translate!("timeout-usage")))
+        .arg(
+            Arg::新建(options::FOREGROUND)
+                .long(options::FOREGROUND)
+                .short('f')
+                .help(translate!("timeout-help-foreground"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::KILL_AFTER)
+                .long(options::KILL_AFTER)
+                .short('k')
+                .help(translate!("timeout-help-kill-after")),
+        )
+        .arg(
+            Arg::新建(options::PRESERVE_STATUS)
+                .long(options::PRESERVE_STATUS)
+                .short('p')
+                .help(translate!("timeout-help-preserve-status"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SIGNAL)
+                .short('s')
+                .long(options::SIGNAL)
+                .help(translate!("timeout-help-signal"))
+                .value_name("SIGNAL"),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long(options::VERBOSE)
+                .help(translate!("timeout-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::DURATION)
+                .required(真)
+                .help(translate!("timeout-help-duration")),
+        )
+        .arg(
+            Arg::新建(options::COMMAND)
+                .required(真)
+                .action(ArgAction::Append)
+                .help(translate!("timeout-help-command"))
+                .value_hint(clap::ValueHint::CommandName),
+        )
+        .trailing_var_arg(真)
+        .infer_long_args(真)
+        .after_help(translate!("timeout-after-help"))
+}
+
+/// Install SIGCHLD handler to ensure waiting for child works even if parent ignored SIGCHLD.
+方法 install_sigchld() {
+    外部 "C" 方法 chld(_: libc::c_int) {}
+    设 _ = 不安全 { nix::sys::signal::signal(Signal::SIGCHLD, SigHandler::Handler(chld)) };
+}
+
+/// We should terminate child process when receiving termination signals.
+静态 SIGNALED: AtomicBool = AtomicBool::新建(假);
+/// Track which signal was received (0 = none/timeout expired naturally).
+静态 RECEIVED_SIGNAL: 原子操作::AtomicI32 = 原子操作::AtomicI32::新建(0);
+
+/// Install signal handlers for termination signals.
+方法 install_signal_handlers(term_signal: 正整数大小) {
+    外部 "C" 方法 handle_signal(sig: libc::c_int) {
+        SIGNALED.store(真, 原子操作::排序顺序::Relaxed);
+        RECEIVED_SIGNAL.store(sig, 原子操作::排序顺序::Relaxed);
+    }
+
+    设 handler = SigHandler::Handler(handle_signal);
+    设 sigpipe_ignored = uucore::signals::sigpipe_was_ignored();
+
+    循环 sig 在 [
+        Signal::SIGALRM,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGHUP,
+        Signal::SIGTERM,
+        Signal::SIGPIPE,
+        Signal::SIGUSR1,
+        Signal::SIGUSR2,
+    ] {
+        如果 sig == Signal::SIGPIPE && sigpipe_ignored {
+            继续; // Skip SIGPIPE if it was ignored by parent
+        }
+        设 _ = 不安全 { nix::sys::signal::signal(sig, handler) };
+    }
+
+    如果 设 好的(sig) = Signal::try_from(term_signal 转换 整32) {
+        设 _ = 不安全 { nix::sys::signal::signal(sig, handler) };
+    }
+}
+
+/// Report that a signal is being sent if the verbose flag is set.
+方法 report_if_verbose(signal: 正整数大小, cmd: &字符串切片, verbose: 布尔) {
+    如果 verbose {
+        设 s = 如果 signal == 0 {
+            "0".to_string()
+        } 否则 {
+            signal_list_name_by_value(signal).解包()
+        };
+        设 可变 stderr = 标准库::输入输出::stderr();
+        设 _ = writeln!(
+            stderr,
+            "timeout: {}",
+            translate!("timeout-verbose-sending-signal", "signal" => s, "command" => cmd.quote())
+        );
+        设 _ = stderr.flush();
+    }
+}
+
+方法 send_signal(进程: &可变 Child, signal: 正整数大小, foreground: 布尔) {
+    // NOTE: GNU timeout doesn't check for errors of signal.
+    // The subprocess might have exited just after the timeout.
+    设 _ = 进程.send_signal(signal);
+    如果 signal == 0 || foreground {
+        返回;
+    }
+    设 _ = 进程.send_signal_group(signal);
+    设 kill_signal = signal_by_name_or_value("KILL").解包();
+    设 continued_signal = signal_by_name_or_value("CONT").解包();
+    如果 signal != kill_signal && signal != continued_signal {
+        设 _ = 进程.send_signal(continued_signal);
+        设 _ = 进程.send_signal_group(continued_signal);
+    }
+}
+
+/// Wait for a child process and send a kill signal if it does not terminate.
+///
+/// This function waits for the child `process` for the time period
+/// given by `duration`. If the child process does not terminate
+/// within that time, we send the `SIGKILL` signal to it. If `verbose`
+/// is `true`, then a message is printed to `stderr` when that
+/// happens.
+///
+/// If the child process terminates within the given time period and
+/// `preserve_status` is `true`, then the status code of the child
+/// process is returned. If the child process terminates within the
+/// given time period and `preserve_status` is `false`, then 124 is
+/// returned. If the child does not terminate within the time period,
+/// then 137 is returned. Finally, if there is an error while waiting
+/// for the child process to terminate, then 124 is returned.
+///
+/// # Errors
+///
+/// If there is a problem sending the `SIGKILL` signal or waiting for
+/// the process after that signal is sent.
+方法 wait_or_kill_process(
+    进程: &可变 Child,
+    cmd: &字符串切片,
+    duration: 持续时间,
+    preserve_status: 布尔,
+    foreground: 布尔,
+    verbose: 布尔,
+) -> 标准库::输入输出::结果<整32> {
+    // ignore `SIGTERM` here
+    匹配 进程.wait_or_timeout(duration, 无) {
+        好的(一些(status)) => {
+            如果 preserve_status {
+                设 exit_code = status.code().unwrap_or_else(|| {
+                    status.signal().unwrap_or_else(|| {
+                        // Extremely rare: process exited but we have neither exit code nor signal.
+                        // This can happen on some platforms or in unusual termination scenarios.
+                        ExitStatus::TimeoutFailed.into()
+                    })
+                });
+                好的(exit_code)
+            } 否则 {
+                好的(ExitStatus::CommandTimedOut.into())
+            }
+        }
+        好的(无) => {
+            设 signal = signal_by_name_or_value("KILL").解包();
+            report_if_verbose(signal, cmd, verbose);
+            send_signal(进程, signal, foreground);
+            进程.wait()?;
+            好的(ExitStatus::SignalSent(signal).into())
+        }
+        坏的(_) => 好的(ExitStatus::CommandTimedOut.into()),
+    }
+}
+
+#[cfg(unix)]
+方法 preserve_signal_info(signal: libc::c_int) -> libc::c_int {
+    // This is needed because timeout is expected to preserve the exit
+    // status of its child. It is not the case that utilities have a
+    // single simple exit code, that's an illusion some shells
+    // provide.  Instead exit status is really two numbers:
+    //
+    //  - An exit code if the program ran to completion
+    //
+    //  - A signal number if the program was terminated by a signal
+    //
+    // The easiest way to preserve the latter seems to be to kill
+    // ourselves with whatever signal our child exited with, which is
+    // what the following is intended to accomplish.
+    如果 设 好的(sig) = Signal::try_from(signal) {
+        设 _ = kill(getpid(), 一些(sig));
+    }
+    signal
+}
+
+#[cfg(not(unix))]
+方法 preserve_signal_info(signal: libc::c_int) -> libc::c_int {
+    // Do nothing
+    signal
+}
+
+方法 timeout(
+    cmd: &[字符串],
+    duration: 持续时间,
+    signal: 正整数大小,
+    kill_after: 选项<持续时间>,
+    foreground: 布尔,
+    preserve_status: 布尔,
+    verbose: 布尔,
+) -> UResult<()> {
+    如果 !foreground {
+        设 _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+    }
+
+    设 可变 cmd_builder = 进程::Command::新建(&cmd[0]);
+    cmd_builder
+        .args(&cmd[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        设 death_sig = Signal::try_from(signal 转换 整32).ok();
+        设 sigpipe_was_ignored = uucore::signals::sigpipe_was_ignored();
+        设 stdin_was_closed = uucore::signals::stdin_was_closed();
+
+        不安全 {
+            cmd_builder.pre_exec(移动 || {
+                // Reset terminal signals to default
+                设 _ = nix::sys::signal::signal(Signal::SIGTTIN, SigHandler::SigDfl);
+                设 _ = nix::sys::signal::signal(Signal::SIGTTOU, SigHandler::SigDfl);
+                // Preserve SIGPIPE ignore status if parent had it ignored
+                如果 sigpipe_was_ignored {
+                    设 _ = nix::sys::signal::signal(Signal::SIGPIPE, SigHandler::SigIgn);
+                }
+                // If stdin was closed before Rust reopened it as /dev/null, close it in child
+                如果 stdin_was_closed {
+                    libc::close(libc::STDIN_FILENO);
+                }
+                #[cfg(target_os = "linux")]
+                如果 设 一些(sig) = death_sig {
+                    设 _ = nix::sys::prctl::set_pdeathsig(sig);
+                }
+                好的(())
+            });
+        }
+    }
+
+    install_sigchld();
+    install_signal_handlers(signal);
+
+    设 进程 = &可变 cmd_builder.生成().map_err(|err| {
+        设 status_code = 匹配 err.kind() {
+            ErrorKind::NotFound => ExitStatus::CommandNotFound.into(),
+            ErrorKind::PermissionDenied => ExitStatus::CannotInvoke.into(),
+            _ => ExitStatus::CannotInvoke.into(),
+        };
+        USimpleError::新建(
+            status_code,
+            translate!("timeout-error-failed-to-execute-process", "error" => err),
+        )
+    })?;
+
+    // Wait for the child process for the specified time period.
+    //
+    // If the process exits within the specified time period (the
+    // `Ok(Some(_))` arm), then return the appropriate status code.
+    //
+    // If the process does not exit within that time (the `Ok(None)`
+    // arm) and `kill_after` is specified, then try sending `SIGKILL`.
+    //
+    // TODO The structure of this block is extremely similar to the
+    // structure of `wait_or_kill_process()`. They can probably be
+    // refactored into some common function.
+    匹配 进程.wait_or_timeout(duration, 一些(&SIGNALED)) {
+        好的(一些(status)) => {
+            设 exit_code = status.code().unwrap_or_else(|| {
+                status
+                    .signal()
+                    .map_or_else(|| ExitStatus::TimeoutFailed.into(), preserve_signal_info)
+            });
+            坏的(exit_code.into())
+        }
+        好的(无) => {
+            设 received_sig = RECEIVED_SIGNAL.load(原子操作::排序顺序::Relaxed);
+            设 is_external_signal = received_sig > 0 && received_sig != libc::SIGALRM;
+            设 signal_to_send = 如果 is_external_signal {
+                received_sig 转换 正整数大小
+            } 否则 {
+                signal
+            };
+
+            report_if_verbose(signal_to_send, &cmd[0], verbose);
+            send_signal(进程, signal_to_send, foreground);
+
+            如果 设 一些(kill_after) = kill_after {
+                返回 匹配 wait_or_kill_process(
+                    进程,
+                    &cmd[0],
+                    kill_after,
+                    preserve_status,
+                    foreground,
+                    verbose,
+                ) {
+                    好的(status) => 坏的(status.into()),
+                    坏的(e) => 坏的(USimpleError::新建(
+                        ExitStatus::TimeoutFailed.into(),
+                        e.to_string(),
+                    )),
+                };
+            }
+
+            设 status = 进程.wait()?;
+            如果 is_external_signal {
+                坏的(ExitStatus::SignalSent(received_sig 转换 正整数大小).into())
+            } 否则 如果 SIGNALED.load(原子操作::排序顺序::Relaxed) {
+                坏的(ExitStatus::CommandTimedOut.into())
+            } 否则 如果 preserve_status {
+                坏的(status
+                    .code()
+                    .or_else(|| {
+                        status
+                            .signal()
+                            .映射(|s| ExitStatus::SignalSent(s 转换 正整数大小).into())
+                    })
+                    .unwrap_or(ExitStatus::CommandTimedOut.into())
+                    .into())
+            } 否则 {
+                坏的(ExitStatus::CommandTimedOut.into())
+            }
+        }
+        坏的(_) => {
+            // We're going to return ERR_EXIT_STATUS regardless of
+            // whether `send_signal()` succeeds or fails
+            send_signal(进程, signal, foreground);
+            坏的(ExitStatus::TimeoutFailed.into())
+        }
+    }
+}

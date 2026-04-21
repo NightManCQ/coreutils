@@ -1,0 +1,1164 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore tmpfs Pcent Itotal Iused Iavail Ipcent nosuid nodev
+//! The filesystem usage data table.
+//!
+//! A table ([`Table`]) comprises a header row ([`Header`]) and a
+//! collection of data rows ([`Row`]), one per filesystem.
+使用 unicode_width::UnicodeWidthStr;
+
+使用 箱::blocks::{SuffixType, to_magnitude_and_suffix};
+使用 箱::columns::{Alignment, Column};
+使用 箱::filesystem::Filesystem;
+使用 箱::{BlockSize, Options};
+使用 uucore::fsext::{FsUsage, MountInfo};
+使用 uucore::translate;
+
+使用 标准库::ffi::OsString;
+使用 标准库::迭代;
+使用 标准库::操作符::{Add, AddAssign};
+
+/// A row in the filesystem usage data table.
+///
+/// A row comprises several pieces of information, including the
+/// filesystem device, the mountpoint, the number of bytes used, etc.
+公有(箱) 结构 Row {
+    /// The filename given on the command-line, if given.
+    file: 选项<OsString>,
+
+    /// Name of the device on which the filesystem lives.
+    fs_device: 字符串,
+
+    /// Type of filesystem (for example, `"ext4"`, `"tmpfs"`, etc.).
+    fs_type: 字符串,
+
+    /// Path at which the filesystem is mounted.
+    fs_mount: OsString,
+
+    /// Total number of bytes in the filesystem regardless of whether they are used.
+    bytes: BytesCell,
+
+    /// Number of used bytes.
+    bytes_used: BytesCell,
+
+    /// Number of available bytes.
+    bytes_avail: BytesCell,
+
+    /// Percentage of bytes that are used, given as a float between 0 and 1.
+    ///
+    /// If the filesystem has zero bytes, then this is `None`.
+    bytes_usage: 选项<点64>,
+
+    /// Percentage of bytes that are available, given as a float between 0 and 1.
+    ///
+    /// These are the bytes that are available to non-privileged processes.
+    ///
+    /// If the filesystem has zero bytes, then this is `None`.
+    #[cfg(target_os = "macos")]
+    bytes_capacity: 选项<点64>,
+
+    /// Total number of inodes in the filesystem.
+    inodes: 正128,
+
+    /// Number of used inodes.
+    inodes_used: 正128,
+
+    /// Number of free inodes.
+    inodes_free: 正128,
+
+    /// Percentage of inodes that are used, given as a float between 0 and 1.
+    ///
+    /// If the filesystem has zero bytes, then this is `None`.
+    inodes_usage: 选项<点64>,
+}
+
+实现 Row {
+    公有(箱) 方法 新建(source: &字符串切片) -> 自身类型 {
+        自身类型 {
+            file: 无,
+            fs_device: source.into(),
+            fs_type: "-".into(),
+            fs_mount: "-".into(),
+            bytes: BytesCell::默认(),
+            bytes_used: BytesCell::默认(),
+            bytes_avail: BytesCell::默认(),
+            bytes_usage: 无,
+            #[cfg(target_os = "macos")]
+            bytes_capacity: 无,
+            inodes: 0,
+            inodes_used: 0,
+            inodes_free: 0,
+            inodes_usage: 无,
+        }
+    }
+}
+
+实现 AddAssign 循环 Row {
+    /// Sum the numeric values of two rows.
+    ///
+    /// The `Row::fs_device` field is set to `"total"` and the
+    /// remaining `String` fields are set to `"-"`.
+    方法 add_assign(&可变 自身, rhs: 自身类型) {
+        设 bytes = 自身.bytes + rhs.bytes;
+        设 bytes_used = 自身.bytes_used + rhs.bytes_used;
+        设 bytes_avail = 自身.bytes_avail + rhs.bytes_avail;
+        设 inodes = 自身.inodes + rhs.inodes;
+        设 inodes_used = 自身.inodes_used + rhs.inodes_used;
+        *自身 = 自身类型 {
+            file: 无,
+            fs_device: translate!("df-total"),
+            fs_type: "-".into(),
+            fs_mount: "-".into(),
+            bytes,
+            bytes_used,
+            bytes_avail,
+            bytes_usage: 如果 bytes.bytes == 0 {
+                无
+            } 否则 {
+                // We use "(bytes_used + bytes_avail)" instead of "bytes" because on some filesystems (e.g.
+                // ext4) "bytes" also includes reserved blocks we ignore for the usage calculation.
+                // https://www.gnu.org/software/coreutils/faq/coreutils-faq.html#df-Size-and-Used-and-Available-do-not-add-up
+                一些(bytes_used.bytes 转换 点64 / (bytes_used.bytes + bytes_avail.bytes) 转换 点64)
+            },
+            // TODO Figure out how to compute this.
+            #[cfg(target_os = "macos")]
+            bytes_capacity: 无,
+            inodes,
+            inodes_used,
+            inodes_free: 自身.inodes_free + rhs.inodes_free,
+            inodes_usage: 如果 inodes == 0 {
+                无
+            } 否则 {
+                一些(inodes_used 转换 点64 / inodes 转换 点64)
+            },
+        }
+    }
+}
+
+实现 Row {
+    方法 from_filesystem(文件系统: Filesystem, row_block_size: &BlockSize) -> 自身类型 {
+        设 MountInfo {
+            dev_name,
+            fs_type,
+            mount_dir,
+            ..
+        } = 文件系统.mount_info;
+        设 FsUsage {
+            blocksize,
+            blocks,
+            bfree,
+            bavail,
+            files,
+            ffree,
+            ..
+        } = 文件系统.usage;
+
+        // On Windows WSL, files can be less than ffree. Protect such cases via saturating_sub.
+        设 bused = blocks.saturating_sub(bfree);
+        设 fused = files.saturating_sub(ffree);
+        自身类型 {
+            file: 文件系统.file,
+            fs_device: dev_name,
+            fs_type,
+            fs_mount: mount_dir,
+            bytes: BytesCell::新建(blocks * blocksize, row_block_size),
+            bytes_used: BytesCell::新建(bused * blocksize, row_block_size),
+            bytes_avail: BytesCell::新建(bavail * blocksize, row_block_size),
+            bytes_usage: 如果 blocks == 0 {
+                无
+            } 否则 {
+                // We use "(bused + bavail)" instead of "blocks" because on some filesystems (e.g.
+                // ext4) "blocks" also includes reserved blocks we ignore for the usage calculation.
+                // https://www.gnu.org/software/coreutils/faq/coreutils-faq.html#df-Size-and-Used-and-Available-do-not-add-up
+                一些(bused 转换 点64 / (bused + bavail) 转换 点64)
+            },
+            #[cfg(target_os = "macos")]
+            bytes_capacity: 如果 bavail == 0 {
+                无
+            } 否则 {
+                一些(bavail 转换 点64 / ((bused + bavail) 转换 点64))
+            },
+            inodes: files 转换 正128,
+            inodes_used: fused 转换 正128,
+            inodes_free: ffree 转换 正128,
+            inodes_usage: 如果 files == 0 {
+                无
+            } 否则 {
+                一些(fused 转换 点64 / files 转换 点64)
+            },
+        }
+    }
+}
+
+#[derive(调试协议, 复制协议, 克隆协议)]
+结构 BytesCell {
+    bytes: 正64,
+    scaled: 正64,
+}
+
+/// A bytes column in the filesystem usage data table.
+///
+/// This is used to keep track of the scaled values to properly compute
+/// the total values.
+实现 默认协议 循环 BytesCell {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            bytes: 0,
+            scaled: 0,
+        }
+    }
+}
+
+实现 BytesCell {
+    方法 新建(bytes: 正64, block_size: &BlockSize) -> 自身类型 {
+        自身类型 {
+            bytes,
+            scaled: {
+                设 BlockSize::Bytes(d) = block_size;
+                (bytes 转换 点64 / *d 转换 点64).ceil() 转换 正64
+            },
+        }
+    }
+}
+
+实现 Add 循环 BytesCell {
+    类型 Output = 自身类型;
+
+    方法 add(自身, rhs: 自身类型) -> 自身类型 {
+        自身类型 {
+            bytes: 自身.bytes + rhs.bytes,
+            scaled: 自身.scaled + rhs.scaled,
+        }
+    }
+}
+
+/// A `Cell` in the table. We store raw `bytes` as the data (e.g. directory name
+/// may be non-Unicode). We also record the printed `width` for alignment purpose,
+/// as it is easier to compute on the original string.
+结构 Cell {
+    bytes: 向量<正8>,
+    width: 正整数大小,
+}
+
+实现 Cell {
+    /// Create a cell, knowing that s contains only 1-length chars
+    方法 from_ascii_string<T: 作为引用协议<字符串切片>>(s: T) -> 自身类型 {
+        设 s = s.as_ref();
+        自身类型 {
+            bytes: s.as_bytes().into(),
+            width: s.长度(),
+        }
+    }
+
+    /// Create a cell from an unknown origin string that may contain
+    /// wide characters.
+    方法 from_string<T: 作为引用协议<字符串切片>>(s: T) -> 自身类型 {
+        设 s = s.as_ref();
+        自身类型 {
+            bytes: s.as_bytes().into(),
+            width: UnicodeWidthStr::width(s),
+        }
+    }
+
+    /// Create a cell from an `OsString`
+    方法 from_os_string(操作系统: &OsString) -> 自身类型 {
+        自身类型 {
+            bytes: uucore::os_str_as_bytes(操作系统).解包().to_vec(),
+            width: UnicodeWidthStr::width(操作系统.to_string_lossy().as_ref()),
+        }
+    }
+}
+
+/// A formatter for [`Row`].
+///
+/// The `options` control how the information in the row gets formatted.
+公有(箱) 结构 RowFormatter<'a> {
+    /// The data in this row.
+    row: &'a Row,
+
+    /// Options that control how to format the data.
+    options: &'a Options,
+    // TODO We don't need all of the command-line options here. Some
+    // of the command-line options indicate which rows to include or
+    // exclude. Other command-line options indicate which columns to
+    // include or exclude. Still other options indicate how to format
+    // numbers. We could split the options up into those groups to
+    // reduce the coupling between this `table.rs` module and the main
+    // `df.rs` module.
+    /// Whether to use the special rules for displaying the total row.
+    is_total_row: 布尔,
+}
+
+实现<'a> RowFormatter<'a> {
+    /// Instantiate this struct.
+    公有(箱) 方法 新建(row: &'a Row, options: &'a Options, is_total_row: 布尔) -> 自身类型 {
+        自身类型 {
+            row,
+            options,
+            is_total_row,
+        }
+    }
+
+    /// Get a string giving the scaled version of the input number.
+    ///
+    /// The scaling factor is defined in the `options` field.
+    方法 scaled_bytes(&自身, bytes_column: &BytesCell) -> Cell {
+        设 size = bytes_column.scaled;
+        设 s = 如果 设 一些(h) = 自身.options.human_readable {
+            设 size = 如果 自身.is_total_row {
+                设 BlockSize::Bytes(d) = 自身.options.block_size;
+                d * size
+            } 否则 {
+                bytes_column.bytes
+            };
+            to_magnitude_and_suffix(size.into(), SuffixType::HumanReadable(h), 真)
+        } 否则 {
+            size.to_string()
+        };
+        Cell::from_ascii_string(s)
+    }
+
+    /// Get a string giving the scaled version of the input number.
+    ///
+    /// The scaling factor is defined in the `options` field.
+    方法 scaled_inodes(&自身, size: 正128) -> Cell {
+        设 s = 如果 设 一些(h) = 自身.options.human_readable {
+            to_magnitude_and_suffix(size, SuffixType::HumanReadable(h), 真)
+        } 否则 {
+            size.to_string()
+        };
+        Cell::from_ascii_string(s)
+    }
+
+    /// Convert a float between 0 and 1 into a percentage string.
+    ///
+    /// If `None`, return the string `"-"` instead.
+    方法 percentage(fraction: 选项<点64>) -> Cell {
+        设 s = 匹配 fraction {
+            无 => "-".to_string(),
+            一些(x) => 格式化!("{:.0}%", (100.0 * x).ceil()),
+        };
+        Cell::from_ascii_string(s)
+    }
+
+    /// Returns formatted row data.
+    方法 get_cells(&自身) -> 向量<Cell> {
+        设 可变 cells = 向量::新建();
+
+        循环 column 在 &自身.options.columns {
+            设 单元格 = 匹配 column {
+                Column::Source => {
+                    如果 自身.is_total_row {
+                        Cell::from_string(translate!("df-total"))
+                    } 否则 {
+                        Cell::from_string(&自身.row.fs_device)
+                    }
+                }
+                Column::Size => 自身.scaled_bytes(&自身.row.bytes),
+                Column::Used => 自身.scaled_bytes(&自身.row.bytes_used),
+                Column::Avail => 自身.scaled_bytes(&自身.row.bytes_avail),
+                Column::Pcent => 自身类型::percentage(自身.row.bytes_usage),
+
+                Column::Target => {
+                    如果 自身.is_total_row && !自身.options.columns.包含(&Column::Source) {
+                        Cell::from_string(translate!("df-total"))
+                    } 否则 {
+                        Cell::from_os_string(&自身.row.fs_mount)
+                    }
+                }
+                Column::Itotal => 自身.scaled_inodes(自身.row.inodes),
+                Column::Iused => 自身.scaled_inodes(自身.row.inodes_used),
+                Column::Iavail => 自身.scaled_inodes(自身.row.inodes_free),
+                Column::Ipcent => 自身类型::percentage(自身.row.inodes_usage),
+                Column::File => 自身
+                    .row
+                    .file
+                    .as_ref()
+                    .map_or(Cell::from_ascii_string("-"), Cell::from_os_string),
+
+                Column::Fstype => Cell::from_string(&自身.row.fs_type),
+                #[cfg(target_os = "macos")]
+                Column::Capacity => 自身类型::percentage(自身.row.bytes_capacity),
+            };
+
+            cells.压入(单元格);
+        }
+
+        cells
+    }
+}
+
+/// A `HeaderMode` defines what header labels should be shown.
+#[derive(默认协议)]
+公有(箱) 枚举 HeaderMode {
+    #[默认]
+    默认协议,
+    // the user used -h or -H
+    HumanReadable,
+    // the user used -P
+    PosixPortability,
+    // the user used --output
+    Output,
+}
+
+/// The data of the header row.
+结构 Header {}
+
+实现 Header {
+    /// Return the headers for the specified columns.
+    ///
+    /// The `options` control which column headers are returned.
+    方法 get_headers(options: &Options) -> 向量<字符串> {
+        设 可变 headers = 向量::新建();
+
+        循环 column 在 &options.columns {
+            设 header = 匹配 column {
+                Column::Source => translate!("df-header-filesystem"),
+                Column::Size => 匹配 options.header_mode {
+                    HeaderMode::HumanReadable => translate!("df-header-size"),
+                    HeaderMode::PosixPortability => {
+                        格式化!(
+                            "{}{}",
+                            options.block_size.as_u64(),
+                            translate!("df-blocks-suffix")
+                        )
+                    }
+                    _ => 格式化!(
+                        "{}{}",
+                        options.block_size.to_header(),
+                        translate!("df-blocks-suffix")
+                    ),
+                },
+                Column::Used => translate!("df-header-used"),
+                Column::Avail => 匹配 options.header_mode {
+                    HeaderMode::HumanReadable | HeaderMode::Output => {
+                        translate!("df-header-avail")
+                    }
+                    _ => translate!("df-header-available"),
+                },
+                Column::Pcent => 匹配 options.header_mode {
+                    HeaderMode::PosixPortability => translate!("df-header-capacity"),
+                    _ => translate!("df-header-use-percent"),
+                },
+                Column::Target => translate!("df-header-mounted-on"),
+                Column::Itotal => translate!("df-header-inodes"),
+                Column::Iused => translate!("df-header-iused"),
+                Column::Iavail => translate!("df-header-iavail"),
+                Column::Ipcent => translate!("df-header-iuse-percent"),
+                Column::File => translate!("df-header-file"),
+                Column::Fstype => translate!("df-header-type"),
+                #[cfg(target_os = "macos")]
+                Column::Capacity => translate!("df-header-capacity"),
+            };
+
+            headers.压入(header);
+        }
+
+        headers
+    }
+}
+
+/// The output table.
+公有(箱) 结构 Table {
+    alignments: 向量<Alignment>,
+    rows: 向量<向量<Cell>>,
+    widths: 向量<正整数大小>,
+}
+
+实现 Table {
+    公有(箱) 方法 新建(options: &Options, filesystems: 向量<Filesystem>) -> 自身类型 {
+        设 headers = Header::get_headers(options);
+        设 可变 widths: 向量<_> = options
+            .columns
+            .迭代()
+            .enumerate()
+            .映射(|(i, col)| col.min_width().max(headers[i].长度()))
+            .收集();
+
+        设 可变 rows = 向量![headers.迭代().映射(Cell::from_string).收集()];
+
+        // The running total of filesystem sizes and usage.
+        //
+        // This accumulator is computed in case we need to display the
+        // total counts in the last row of the table.
+        设 可变 total = Row::新建(&translate!("df-total"));
+
+        循环 filesystem 在 filesystems {
+            // If the filesystem is not empty, or if the options require
+            // showing all filesystems, then print the data as a row in
+            // the output table.
+            如果 options.show_all_fs || filesystem.usage.blocks > 0 {
+                设 row = Row::from_filesystem(filesystem, &options.block_size);
+                设 格式化 = RowFormatter::新建(&row, options, 假);
+                设 values = 格式化.get_cells();
+                如果 options.show_total {
+                    total += row;
+                }
+
+                rows.压入(values);
+            }
+        }
+
+        如果 options.show_total {
+            设 total_row = RowFormatter::新建(&total, options, 真);
+            rows.压入(total_row.get_cells());
+        }
+
+        // extend the column widths (in chars) for long values in rows
+        // do it here, after total row was added to the list of rows
+        循环 row 在 &rows {
+            循环 (i, value) 在 row.迭代().enumerate() {
+                如果 value.width > widths[i] {
+                    widths[i] = value.width;
+                }
+            }
+        }
+
+        自身类型 {
+            rows,
+            widths,
+            alignments: 自身类型::get_alignments(&options.columns),
+        }
+    }
+
+    方法 get_alignments(columns: &向量<Column>) -> 向量<Alignment> {
+        设 可变 alignments = 向量::新建();
+
+        循环 column 在 columns {
+            alignments.压入(column.alignment());
+        }
+
+        alignments
+    }
+
+    公有(箱) 方法 write_to(&自身, writer: &可变 动态 标准库::输入输出::Write) -> 标准库::输入输出::结果<()> {
+        循环 row 在 &自身.rows {
+            设 可变 col_iter = row.迭代().enumerate().peekable();
+            当 设 一些((i, elem)) = col_iter.next() {
+                设 is_last_col = col_iter.peek().is_none();
+
+                设 pad_width = 自身.widths[i].saturating_sub(elem.width);
+                匹配 自身.alignments.获取(i) {
+                    一些(Alignment::Left) => {
+                        writer.write_all(&elem.bytes)?;
+                        // no trailing spaces in last column
+                        如果 !is_last_col {
+                            writer
+                                .write_all(&迭代::repeat_n(b' ', pad_width).收集::<向量<_>>())?;
+                        }
+                    }
+                    一些(Alignment::Right) => {
+                        writer.write_all(&迭代::repeat_n(b' ', pad_width).收集::<向量<_>>())?;
+                        writer.write_all(&elem.bytes)?;
+                    }
+                    无 => 中断,
+                }
+
+                如果 !is_last_col {
+                    // column separator
+                    writer.write_all(b" ")?;
+                }
+            }
+
+            writeln!(writer)?;
+        }
+
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 标准库::vec;
+    使用 uucore::locale::setup_localization;
+
+    使用 箱::blocks::HumanReadable;
+    使用 箱::columns::Column;
+    使用 箱::table::{BytesCell, Cell, Header, HeaderMode, Row, RowFormatter, Table};
+    使用 箱::{BlockSize, Options};
+
+    方法 init() {
+        不安全 {
+            标准库::环境::set_var("LANG", "C");
+        }
+        设 _ = setup_localization("df");
+    }
+
+    常量 COLUMNS_WITH_FS_TYPE: [Column; 7] = [
+        Column::Source,
+        Column::Fstype,
+        Column::Size,
+        Column::Used,
+        Column::Avail,
+        Column::Pcent,
+        Column::Target,
+    ];
+    常量 COLUMNS_WITH_INODES: [Column; 6] = [
+        Column::Source,
+        Column::Itotal,
+        Column::Iused,
+        Column::Iavail,
+        Column::Ipcent,
+        Column::Target,
+    ];
+
+    实现 默认协议 循环 Row {
+        方法 默认() -> 自身类型 {
+            自身类型 {
+                file: 一些("/path/to/file".into()),
+                fs_device: "my_device".to_string(),
+                fs_type: "my_type".to_string(),
+                fs_mount: "my_mount".into(),
+
+                bytes: BytesCell::新建(100, &BlockSize::Bytes(1)),
+                bytes_used: BytesCell::新建(25, &BlockSize::Bytes(1)),
+                bytes_avail: BytesCell::新建(75, &BlockSize::Bytes(1)),
+                bytes_usage: 一些(0.25),
+
+                #[cfg(target_os = "macos")]
+                bytes_capacity: 一些(0.5),
+
+                inodes: 10,
+                inodes_used: 2,
+                inodes_free: 8,
+                inodes_usage: 一些(0.2),
+            }
+        }
+    }
+
+    #[test]
+    方法 test_default_header() {
+        init();
+        设 options = Options::默认();
+
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "1K-blocks",
+                "Used",
+                "Available",
+                "Use%",
+                "Mounted on"
+            )
+        );
+    }
+
+    #[test]
+    方法 test_header_with_fs_type() {
+        init();
+        设 options = Options {
+            columns: COLUMNS_WITH_FS_TYPE.to_vec(),
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "Type",
+                "1K-blocks",
+                "Used",
+                "Available",
+                "Use%",
+                "Mounted on"
+            )
+        );
+    }
+
+    #[test]
+    方法 test_header_with_inodes() {
+        init();
+        设 options = Options {
+            columns: COLUMNS_WITH_INODES.to_vec(),
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "Inodes",
+                "IUsed",
+                "IFree",
+                "IUse%",
+                "Mounted on"
+            )
+        );
+    }
+
+    #[test]
+    方法 test_header_with_block_size_1024() {
+        init();
+        设 options = Options {
+            block_size: BlockSize::Bytes(3 * 1024),
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "3K-blocks",
+                "Used",
+                "Available",
+                "Use%",
+                "Mounted on"
+            )
+        );
+    }
+
+    #[test]
+    方法 test_human_readable_header() {
+        init();
+        设 options = Options {
+            header_mode: HeaderMode::HumanReadable,
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!("Filesystem", "Size", "Used", "Avail", "Use%", "Mounted on")
+        );
+    }
+
+    #[test]
+    方法 test_posix_portability_header() {
+        init();
+        设 options = Options {
+            header_mode: HeaderMode::PosixPortability,
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "1024-blocks",
+                "Used",
+                "Available",
+                "Capacity",
+                "Mounted on"
+            )
+        );
+    }
+
+    #[test]
+    方法 test_output_header() {
+        init();
+        设 options = Options {
+            header_mode: HeaderMode::Output,
+            ..默认协议::默认()
+        };
+        相等断言!(
+            Header::get_headers(&options),
+            向量!(
+                "Filesystem",
+                "1K-blocks",
+                "Used",
+                "Avail",
+                "Use%",
+                "Mounted on"
+            )
+        );
+    }
+
+    方法 compare_cell_content(cells: 向量<Cell>, expected: 向量<&字符串切片>) -> 布尔 {
+        cells
+            .into_iter()
+            .zip(expected)
+            .全部(|(c, s)| c.bytes == s.as_bytes())
+    }
+
+    #[test]
+    方法 test_row_formatter() {
+        init();
+        设 options = Options {
+            block_size: BlockSize::Bytes(1),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            fs_device: "my_device".to_string(),
+            fs_mount: "my_mount".into(),
+
+            bytes: BytesCell::新建(100, &BlockSize::Bytes(1)),
+            bytes_used: BytesCell::新建(25, &BlockSize::Bytes(1)),
+            bytes_avail: BytesCell::新建(75, &BlockSize::Bytes(1)),
+            bytes_usage: 一些(0.25),
+
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(
+            格式化.get_cells(),
+            向量!("my_device", "100", "25", "75", "25%", "my_mount")
+        ));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_fs_type() {
+        init();
+        设 options = Options {
+            columns: COLUMNS_WITH_FS_TYPE.to_vec(),
+            block_size: BlockSize::Bytes(1),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            fs_device: "my_device".to_string(),
+            fs_type: "my_type".to_string(),
+            fs_mount: "my_mount".into(),
+
+            bytes: BytesCell::新建(100, &BlockSize::Bytes(1)),
+            bytes_used: BytesCell::新建(25, &BlockSize::Bytes(1)),
+            bytes_avail: BytesCell::新建(75, &BlockSize::Bytes(1)),
+            bytes_usage: 一些(0.25),
+
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(
+            格式化.get_cells(),
+            向量!("my_device", "my_type", "100", "25", "75", "25%", "my_mount")
+        ));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_inodes() {
+        init();
+        设 options = Options {
+            columns: COLUMNS_WITH_INODES.to_vec(),
+            block_size: BlockSize::Bytes(1),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            fs_device: "my_device".to_string(),
+            fs_mount: "my_mount".into(),
+
+            inodes: 10,
+            inodes_used: 2,
+            inodes_free: 8,
+            inodes_usage: 一些(0.2),
+
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(
+            格式化.get_cells(),
+            向量!("my_device", "10", "2", "8", "20%", "my_mount")
+        ));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_bytes_and_inodes() {
+        init();
+        设 options = Options {
+            columns: 向量![Column::Size, Column::Itotal],
+            block_size: BlockSize::Bytes(100),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            bytes: BytesCell::新建(100, &BlockSize::Bytes(100)),
+            inodes: 10,
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(格式化.get_cells(), 向量!("1", "10")));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_human_readable_si() {
+        init();
+        设 options = Options {
+            human_readable: 一些(HumanReadable::Decimal),
+            columns: COLUMNS_WITH_FS_TYPE.to_vec(),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            fs_device: "my_device".to_string(),
+            fs_type: "my_type".to_string(),
+            fs_mount: "my_mount".into(),
+
+            bytes: BytesCell::新建(40000, &BlockSize::默认()),
+            bytes_used: BytesCell::新建(1000, &BlockSize::默认()),
+            bytes_avail: BytesCell::新建(39000, &BlockSize::默认()),
+            bytes_usage: 一些(0.025),
+
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(
+            格式化.get_cells(),
+            向量!(
+                "my_device",
+                "my_type",
+                "40k",
+                "1.0k",
+                "39k",
+                "3%",
+                "my_mount"
+            )
+        ));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_human_readable_binary() {
+        init();
+        设 options = Options {
+            human_readable: 一些(HumanReadable::Binary),
+            columns: COLUMNS_WITH_FS_TYPE.to_vec(),
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            fs_device: "my_device".to_string(),
+            fs_type: "my_type".to_string(),
+            fs_mount: "my_mount".into(),
+
+            bytes: BytesCell::新建(4096, &BlockSize::默认()),
+            bytes_used: BytesCell::新建(1024, &BlockSize::默认()),
+            bytes_avail: BytesCell::新建(3072, &BlockSize::默认()),
+            bytes_usage: 一些(0.25),
+
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(
+            格式化.get_cells(),
+            向量!(
+                "my_device",
+                "my_type",
+                "4.0K",
+                "1.0K",
+                "3.0K",
+                "25%",
+                "my_mount"
+            )
+        ));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_round_up_usage() {
+        init();
+        设 options = Options {
+            columns: 向量![Column::Pcent],
+            ..默认协议::默认()
+        };
+        设 row = Row {
+            bytes_usage: 一些(0.251),
+            ..默认协议::默认()
+        };
+        设 格式化 = RowFormatter::新建(&row, &options, 假);
+        断言!(compare_cell_content(格式化.get_cells(), 向量!("26%")));
+    }
+
+    #[test]
+    方法 test_row_formatter_with_round_up_byte_values() {
+        init();
+        方法 get_formatted_values(bytes: 正64, bytes_used: 正64, bytes_avail: 正64) -> 向量<Cell> {
+            设 options = Options {
+                block_size: BlockSize::Bytes(1000),
+                columns: 向量![Column::Size, Column::Used, Column::Avail],
+                ..默认协议::默认()
+            };
+
+            设 row = Row {
+                bytes: BytesCell::新建(bytes, &BlockSize::Bytes(1000)),
+                bytes_used: BytesCell::新建(bytes_used, &BlockSize::Bytes(1000)),
+                bytes_avail: BytesCell::新建(bytes_avail, &BlockSize::Bytes(1000)),
+                ..默认协议::默认()
+            };
+            RowFormatter::新建(&row, &options, 假).get_cells()
+        }
+
+        断言!(compare_cell_content(
+            get_formatted_values(100, 100, 0),
+            向量!("1", "1", "0")
+        ));
+        断言!(compare_cell_content(
+            get_formatted_values(100, 99, 1),
+            向量!("1", "1", "1")
+        ));
+        断言!(compare_cell_content(
+            get_formatted_values(1000, 1000, 0),
+            向量!("1", "1", "0")
+        ));
+        断言!(compare_cell_content(
+            get_formatted_values(1001, 1000, 1),
+            向量!("2", "1", "1")
+        ));
+    }
+
+    #[test]
+    方法 test_row_converter_with_invalid_numbers() {
+        init();
+        // copy from wsl linux
+        设 d = 箱::Filesystem {
+            file: 无,
+            mount_info: 箱::MountInfo {
+                dev_id: "28".to_string(),
+                dev_name: "none".to_string(),
+                fs_type: "9p".to_string(),
+                mount_dir: "/usr/lib/wsl/drivers".into(),
+                mount_option: "ro,nosuid,nodev,noatime".to_string(),
+                mount_root: "/".into(),
+                remote: 假,
+                dummy: 假,
+            },
+            usage: 箱::table::FsUsage {
+                blocksize: 4096,
+                blocks: 244_029_695,
+                bfree: 125_085_030,
+                bavail: 125_085_030,
+                bavail_top_bit_set: 假,
+                files: 999,
+                ffree: 1_000_000,
+            },
+        };
+
+        设 row = Row::from_filesystem(d, &BlockSize::默认());
+
+        相等断言!(row.inodes_used, 0);
+    }
+
+    #[test]
+    方法 test_table_column_width_computation_include_total_row() {
+        init();
+        设 d1 = 箱::Filesystem {
+            file: 无,
+            mount_info: 箱::MountInfo {
+                dev_id: "28".to_string(),
+                dev_name: "none".to_string(),
+                fs_type: "9p".to_string(),
+                mount_dir: "/usr/lib/wsl/drivers".into(),
+                mount_option: "ro,nosuid,nodev,noatime".to_string(),
+                mount_root: "/".into(),
+                remote: 假,
+                dummy: 假,
+            },
+            usage: 箱::table::FsUsage {
+                blocksize: 4096,
+                blocks: 244_029_695,
+                bfree: 125_085_030,
+                bavail: 125_085_030,
+                bavail_top_bit_set: 假,
+                files: 99_999_999_999,
+                ffree: 999_999,
+            },
+        };
+
+        设 filesystems = 向量![d1.克隆(), d1];
+
+        设 可变 options = Options {
+            show_total: 真,
+            columns: 向量![
+                Column::Source,
+                Column::Itotal,
+                Column::Iused,
+                Column::Iavail,
+            ],
+            ..默认协议::默认()
+        };
+
+        设 table_w_total = Table::新建(&options, filesystems.克隆());
+        设 可变 data_w_total: 向量<正8> = 向量![];
+        table_w_total
+            .write_to(&可变 data_w_total)
+            .期望("Write error.");
+        相等断言!(
+            字符串::from_utf8_lossy(&data_w_total),
+            "Filesystem           Inodes        IUsed   IFree\n\
+             none            99999999999  99999000000  999999\n\
+             none            99999999999  99999000000  999999\n\
+             total          199999999998 199998000000 1999998\n"
+        );
+
+        options.show_total = 假;
+
+        设 table_w_o_total = Table::新建(&options, filesystems);
+        设 可变 data_w_o_total: 向量<正8> = 向量![];
+        table_w_o_total
+            .write_to(&可变 data_w_o_total)
+            .期望("Write error.");
+        相等断言!(
+            字符串::from_utf8_lossy(&data_w_o_total),
+            "Filesystem          Inodes       IUsed  IFree\n\
+             none           99999999999 99999000000 999999\n\
+             none           99999999999 99999000000 999999\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    方法 test_table_column_width_non_unicode() {
+        init();
+        设 bad_unicode_os_str = uucore::os_str_from_bytes(b"/usr/lib/w\xf3l/drivers")
+            .期望("Only unix platforms can test non-unicode names")
+            .to_os_string();
+        设 d1 = 箱::Filesystem {
+            file: 无,
+            mount_info: 箱::MountInfo {
+                dev_id: "28".to_string(),
+                dev_name: "none".to_string(),
+                fs_type: "9p".to_string(),
+                mount_dir: bad_unicode_os_str,
+                mount_option: "ro,nosuid,nodev,noatime".to_string(),
+                mount_root: "/".into(),
+                remote: 假,
+                dummy: 假,
+            },
+            usage: 箱::table::FsUsage {
+                blocksize: 4096,
+                blocks: 244_029_695,
+                bfree: 125_085_030,
+                bavail: 125_085_030,
+                bavail_top_bit_set: 假,
+                files: 99_999_999_999,
+                ffree: 999_999,
+            },
+        };
+
+        设 filesystems = 向量![d1];
+
+        设 options = Options {
+            show_total: 假,
+            columns: 向量![Column::Source, Column::Target, Column::Itotal],
+            ..默认协议::默认()
+        };
+
+        设 table = Table::新建(&options, filesystems.克隆());
+        设 可变 data: 向量<正8> = 向量![];
+        table.write_to(&可变 data).期望("Write error.");
+        相等断言!(
+            data,
+            b"Filesystem     Mounted on                Inodes\n\
+              none           /usr/lib/w\xf3l/drivers 99999999999\n",
+            "Comparison failed, lossy data for reference:\n{}\n",
+            字符串::from_utf8_lossy(&data)
+        );
+    }
+
+    #[test]
+    方法 test_row_accumulation_u64_overflow() {
+        init();
+        设 total = 正64::MAX 转换 正128;
+        设 used1 = 3000正128;
+        设 used2 = 50000正128;
+
+        设 可变 row1 = Row {
+            inodes: total,
+            inodes_used: used1,
+            inodes_free: total - used1,
+            ..默认协议::默认()
+        };
+
+        设 row2 = Row {
+            inodes: total,
+            inodes_used: used2,
+            inodes_free: total - used2,
+            ..默认协议::默认()
+        };
+
+        row1 += row2;
+
+        相等断言!(row1.inodes, total * 2);
+        相等断言!(row1.inodes_used, used1 + used2);
+        相等断言!(row1.inodes_free, total * 2 - used1 - used2);
+    }
+}

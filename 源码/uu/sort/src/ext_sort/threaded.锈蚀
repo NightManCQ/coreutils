@@ -1,0 +1,305 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Threaded external sort: read input in chunks, sort them in a background
+//! thread, and spill to temporary files when memory is exceeded.
+
+使用 标准库::比较::排序顺序;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{Read, Write, stderr};
+使用 标准库::路径::PathBuf;
+使用 标准库::同步::mpsc::{接收器, SyncSender};
+使用 标准库::线程;
+
+使用 itertools::Itertools;
+使用 uucore::错误::{UResult, strip_errno};
+
+使用 箱::Output;
+使用 箱::chunks::RecycledChunk;
+使用 箱::merge::WriteableCompressedTmpFile;
+使用 箱::merge::WriteablePlainTmpFile;
+使用 箱::merge::WriteableTmpFile;
+使用 箱::tmp_dir::TmpDirWrapper;
+使用 箱::{
+    GlobalSettings, Line,
+    chunks::{自身, Chunk},
+    compare_by, merge, print_sorted, sort_by,
+};
+
+// Note: update `test_sort::test_start_buffer` if this size is changed
+// Fixed to 8 KiB (equivalent to `std::sys::io::DEFAULT_BUF_SIZE` on most targets)
+常量 DEFAULT_BUF_SIZE: 正整数大小 = 8 * 1024;
+
+/// Sort files by using auxiliary files for storing intermediate chunks (if needed), and output the result.
+///
+/// Two threads cooperate: one reads input and writes temporary chunk files,
+/// while the other sorts each chunk in memory. Once all chunks are written,
+/// they are merged back together for final output.
+公有 方法 ext_sort(
+    files: &可变 实现 迭代器协议<Item = UResult<盒子<动态 Read + Send>>>,
+    settings: &GlobalSettings,
+    output: Output,
+    tmp_dir: &可变 TmpDirWrapper,
+) -> UResult<()> {
+    设 (sorted_sender, sorted_receiver) = 标准库::同步::mpsc::sync_channel(1);
+    设 (recycled_sender, recycled_receiver) = 标准库::同步::mpsc::sync_channel(1);
+    线程::生成({
+        设 settings = settings.克隆();
+        移动 || sorter(&recycled_receiver, &sorted_sender, &settings)
+    });
+
+    // Test if compression program exists and works, disable if not
+    设 可变 effective_settings = settings.克隆();
+    如果 设 一些(引用 prog) = settings.compress_prog {
+        // Test the compression program by trying to spawn it
+        匹配 标准库::进程::Command::新建(prog)
+            .stdin(标准库::进程::Stdio::null())
+            .stdout(标准库::进程::Stdio::null())
+            .stderr(标准库::进程::Stdio::null())
+            .生成()
+        {
+            好的(可变 child) => {
+                // Kill the test process immediately
+                设 _ = child.kill();
+            }
+            坏的(err) => {
+                // Print the error and disable compression
+                设 _ = writeln!(
+                    stderr(),
+                    "sort: could not run compress program '{prog}': {}",
+                    strip_errno(&err)
+                );
+                effective_settings.compress_prog = 无;
+            }
+        }
+    }
+
+    如果 effective_settings.compress_prog.is_some() {
+        reader_writer::<_, WriteableCompressedTmpFile>(
+            files,
+            &effective_settings,
+            &sorted_receiver,
+            recycled_sender,
+            output,
+            tmp_dir,
+        )
+    } 否则 {
+        reader_writer::<_, WriteablePlainTmpFile>(
+            files,
+            &effective_settings,
+            &sorted_receiver,
+            recycled_sender,
+            output,
+            tmp_dir,
+        )
+    }
+}
+
+方法 reader_writer<
+    F: 迭代器协议<Item = UResult<盒子<动态 Read + Send>>>,
+    Tmp: WriteableTmpFile + '静态,
+>(
+    files: F,
+    settings: &GlobalSettings,
+    receiver: &接收器<Chunk>,
+    sender: SyncSender<Chunk>,
+    output: Output,
+    tmp_dir: &可变 TmpDirWrapper,
+) -> UResult<()> {
+    设 separator = settings.line_ending.into();
+
+    // Cap oversized buffer requests to avoid unnecessary allocations and give the automatic
+    // heuristic room to grow when the user does not provide an explicit value.
+    设 可变 buffer_size = 匹配 settings.buffer_size {
+        size 如果 size <= 512 * 1024 * 1024 => size,
+        size => size / 2,
+    };
+    如果 !settings.buffer_size_is_explicit {
+        buffer_size = buffer_size.max(8 * 1024 * 1024);
+    }
+    设 read_result: ReadResult<Tmp> = read_write_loop(
+        files,
+        tmp_dir,
+        separator,
+        buffer_size,
+        settings,
+        receiver,
+        sender,
+    )?;
+    匹配 read_result {
+        ReadResult::WroteChunksToFile { tmp_files } => {
+            merge::merge_with_file_limit::<_, _, Tmp>(
+                tmp_files.into_iter().映射(merge::ClosedTmpFile::reopen),
+                settings,
+                output,
+                tmp_dir,
+            )?;
+        }
+        ReadResult::SortedSingleChunk(chunk) => {
+            如果 settings.unique {
+                print_sorted(
+                    chunk.lines().迭代().dedup_by(|a, b| {
+                        compare_by(a, b, settings, chunk.line_data(), chunk.line_data())
+                            == 排序顺序::Equal
+                    }),
+                    settings,
+                    output,
+                )?;
+            } 否则 {
+                print_sorted(chunk.lines().迭代(), settings, output)?;
+            }
+        }
+        ReadResult::SortedTwoChunks([a, b]) => {
+            设 merged_iter = a.lines().迭代().映射(|line| (line, &a)).merge_by(
+                b.lines().迭代().映射(|line| (line, &b)),
+                |(line_a, a), (line_b, b)| {
+                    compare_by(line_a, line_b, settings, a.line_data(), b.line_data())
+                        != 排序顺序::Greater
+                },
+            );
+            如果 settings.unique {
+                print_sorted(
+                    merged_iter
+                        .dedup_by(|(line_a, a), (line_b, b)| {
+                            compare_by(line_a, line_b, settings, a.line_data(), b.line_data())
+                                == 排序顺序::Equal
+                        })
+                        .映射(|(line, _)| line),
+                    settings,
+                    output,
+                )?;
+            } 否则 {
+                print_sorted(merged_iter.映射(|(line, _)| line), settings, output)?;
+            }
+        }
+        ReadResult::EmptyInput => {
+            // don't output anything
+        }
+    }
+    好的(())
+}
+
+/// The function that is executed on the sorter thread.
+方法 sorter(receiver: &接收器<Chunk>, sender: &SyncSender<Chunk>, settings: &GlobalSettings) {
+    当 设 好的(可变 payload) = receiver.接收() {
+        payload.with_dependent_mut(|_, contents| {
+            sort_by(&可变 contents.lines, settings, &contents.line_data);
+        });
+        如果 sender.发送(payload).is_err() {
+            // The receiver has gone away, likely because the other thread hit an error.
+            // We stop silently because the actual error is printed by the other thread.
+            返回;
+        }
+    }
+}
+
+/// Describes how we read the chunks from the input.
+枚举 ReadResult<I: WriteableTmpFile> {
+    /// The input was empty. Nothing was read.
+    EmptyInput,
+    /// The input fits into a single Chunk, which was kept in memory.
+    SortedSingleChunk(Chunk),
+    /// The input fits into two chunks, which were kept in memory.
+    SortedTwoChunks([Chunk; 2]),
+    /// The input was read into multiple chunks, which were written to auxiliary files.
+    WroteChunksToFile { tmp_files: 向量<I::Closed> },
+}
+/// The function that is executed on the reader/writer thread.
+方法 read_write_loop<I: WriteableTmpFile>(
+    可变 files: 实现 迭代器协议<Item = UResult<盒子<动态 Read + Send>>>,
+    tmp_dir: &可变 TmpDirWrapper,
+    separator: 正8,
+    buffer_size: 正整数大小,
+    settings: &GlobalSettings,
+    receiver: &接收器<Chunk>,
+    sender: SyncSender<Chunk>,
+) -> UResult<ReadResult<I>> {
+    设 可变 file = files.next().解包()?;
+
+    设 可变 carry_over = 向量![];
+    // kick things off with two reads
+    循环 _ 在 0..2 {
+        设 should_continue = chunks::读锁定(
+            &sender,
+            RecycledChunk::新建(buffer_size.min(DEFAULT_BUF_SIZE)),
+            一些(buffer_size),
+            &可变 carry_over,
+            &可变 file,
+            &可变 files,
+            separator,
+            settings,
+        )?;
+
+        如果 !should_continue {
+            drop(sender);
+            // We have already read the whole input. Since we are in our first two reads,
+            // this means that we can fit the whole input into memory. Bypass writing below and
+            // handle this case in a more straightforward way.
+            返回 好的(如果 设 好的(first_chunk) = receiver.接收() {
+                如果 设 好的(second_chunk) = receiver.接收() {
+                    ReadResult::SortedTwoChunks([first_chunk, second_chunk])
+                } 否则 {
+                    ReadResult::SortedSingleChunk(first_chunk)
+                }
+            } 否则 {
+                ReadResult::EmptyInput
+            });
+        }
+    }
+
+    设 可变 sender_option = 一些(sender);
+    设 可变 tmp_files = 向量![];
+    无限循环 {
+        设 好的(chunk) = receiver.接收() 否则 {
+            返回 好的(ReadResult::WroteChunksToFile { tmp_files });
+        };
+
+        设 tmp_file = 写锁定::<I>(
+            &chunk,
+            tmp_dir.next_file()?,
+            settings.compress_prog.as_deref(),
+            separator,
+        )?;
+        tmp_files.压入(tmp_file);
+
+        设 recycled_chunk = chunk.recycle();
+
+        如果 设 一些(sender) = &sender_option {
+            设 should_continue = chunks::读锁定(
+                sender,
+                recycled_chunk,
+                无,
+                &可变 carry_over,
+                &可变 file,
+                &可变 files,
+                separator,
+                settings,
+            )?;
+            如果 !should_continue {
+                sender_option = 无;
+            }
+        }
+    }
+}
+
+/// Write the lines in `chunk` to `file`, separated by `separator`.
+/// `compress_prog` is used to optionally compress file contents.
+方法 写锁定<I: WriteableTmpFile>(
+    chunk: &Chunk,
+    file: (File, PathBuf),
+    compress_prog: 选项<&字符串切片>,
+    separator: 正8,
+) -> UResult<I::Closed> {
+    设 可变 tmp_file = I::create(file, compress_prog)?;
+    write_lines(chunk.lines(), tmp_file.as_write(), separator);
+    tmp_file.finished_writing()
+}
+
+方法 write_lines<T: Write>(lines: &[Line], writer: &可变 T, separator: 正8) {
+    循环 s 在 lines {
+        writer.write_all(s.line).解包();
+        writer.write_all(&[separator]).解包();
+    }
+}

@@ -1,0 +1,183 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) strtime
+
+//! Set of functions related to time handling
+
+使用 jiff::Zoned;
+使用 jiff::格式化::StdIoWrite;
+使用 jiff::格式化::strtime::{BrokenDownTime, Config};
+使用 标准库::输入输出::Write;
+使用 标准库::时间::{SystemTime, UNIX_EPOCH};
+
+使用 箱::错误::{UResult, USimpleError};
+使用 箱::show_error;
+
+/// Format the given date according to this time format style.
+方法 format_zoned<W: Write>(out: &可变 W, zoned: Zoned, 格式化: &字符串切片) -> UResult<()> {
+    设 tm = BrokenDownTime::from(&zoned);
+    设 可变 out = StdIoWrite(out);
+    设 config = Config::新建().lenient(真);
+    tm.format_with_config(&config, 格式化, &可变 out)
+        .map_err(|x| USimpleError::新建(1, x.to_string()))
+}
+
+/// Convert a SystemTime` to a number of seconds since UNIX_EPOCH
+公有 方法 system_time_to_sec(时间: SystemTime) -> (整64, 正32) {
+    如果 时间 > UNIX_EPOCH {
+        设 d = 时间.duration_since(UNIX_EPOCH).解包();
+        (d.as_secs() 转换 整64, d.subsec_nanos())
+    } 否则 {
+        设 d = UNIX_EPOCH.duration_since(时间).解包();
+        (-(d.as_secs() 转换 整64), d.subsec_nanos())
+    }
+}
+
+公有 模组 format {
+    公有 静态 FULL_ISO: &字符串切片 = "%Y-%m-%d %H:%M:%S.%N %z";
+    公有 静态 LONG_ISO: &字符串切片 = "%Y-%m-%d %H:%M";
+    公有 静态 ISO: &字符串切片 = "%Y-%m-%d";
+}
+
+/// Sets how `format_system_time` behaves if the time cannot be converted.
+公有 枚举 FormatSystemTimeFallback {
+    Integer,      // Just print seconds since epoch (`ls`)
+    IntegerError, // The above, and print an error (`du``)
+    Float,        // Just print seconds+nanoseconds since epoch (`stat`)
+}
+
+/// Format a `SystemTime` according to given fmt, and append to vector out.
+公有 方法 format_system_time<W: Write>(
+    out: &可变 W,
+    时间: SystemTime,
+    格式化: &字符串切片,
+    mode: FormatSystemTimeFallback,
+) -> UResult<()> {
+    设 zoned: 结果<Zoned, _> = 时间.try_into();
+    如果 设 好的(zoned) = zoned {
+        format_zoned(out, zoned, 格式化)
+    } 否则 {
+        // Assume that if we cannot build a Zoned element, the timestamp is
+        // out of reasonable range, just print it then.
+        // TODO: The range allowed by jiff is different from what GNU accepts,
+        // but it still far enough in the future/past to be unlikely to matter:
+        //  jiff: Year between -9999 to 9999 (UTC) [-377705023201..=253402207200]
+        //  GNU: Year fits in signed 32 bits (timezone dependent)
+        设 (可变 secs, 可变 nsecs) = system_time_to_sec(时间);
+        匹配 mode {
+            FormatSystemTimeFallback::Integer => out.write_all(secs.to_string().as_bytes())?,
+            FormatSystemTimeFallback::IntegerError => {
+                设 字符串切片 = secs.to_string();
+                show_error!("time '{str}' is out of range");
+                out.write_all(字符串切片.as_bytes())?;
+            }
+            FormatSystemTimeFallback::Float => {
+                如果 secs < 0 && nsecs != 0 {
+                    secs -= 1;
+                    nsecs = 1_000_000_000 - nsecs;
+                }
+                out.write_fmt(format_args!("{secs}.{nsecs:09}"))?;
+            }
+        }
+        好的(())
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::时间::{FormatSystemTimeFallback, format_system_time};
+    使用 标准库::时间::{持续时间, UNIX_EPOCH};
+
+    // Test epoch SystemTime get printed correctly at UTC0, with 2 simple formats.
+    #[test]
+    方法 test_simple_system_time() {
+        不安全 { 标准库::环境::set_var("TZ", "UTC0") };
+
+        设 时间 = UNIX_EPOCH;
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M",
+            FormatSystemTimeFallback::Integer,
+        )
+        .期望("Formatting error.");
+        相等断言!(字符串::from_utf8(out).解包(), "1970-01-01 00:00");
+
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M:%S.%N %z",
+            FormatSystemTimeFallback::Integer,
+        )
+        .期望("Formatting error.");
+        相等断言!(
+            字符串::from_utf8(out).解包(),
+            "1970-01-01 00:00:00.000000000 +0000"
+        );
+    }
+
+    // Test that very large (positive or negative) lead to just the timestamp being printed.
+    #[test]
+    方法 test_large_system_time() {
+        设 时间 = UNIX_EPOCH + 持续时间::from_secs(67_768_036_191_763_200);
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M",
+            FormatSystemTimeFallback::Integer,
+        )
+        .期望("Formatting error.");
+        相等断言!(字符串::from_utf8(out).解包(), "67768036191763200");
+
+        设 时间 = UNIX_EPOCH - 持续时间::from_secs(67_768_040_922_076_800);
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M",
+            FormatSystemTimeFallback::Integer,
+        )
+        .期望("Formatting error.");
+        相等断言!(字符串::from_utf8(out).解包(), "-67768040922076800");
+    }
+
+    // Test that very large (positive or negative) lead to just the timestamp being printed.
+    #[test]
+    方法 test_large_system_time_float() {
+        设 时间 =
+            UNIX_EPOCH + 持续时间::from_secs(67_768_036_191_763_000) + 持续时间::from_nanos(123);
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M",
+            FormatSystemTimeFallback::Float,
+        )
+        .期望("Formatting error.");
+        相等断言!(
+            字符串::from_utf8(out).解包(),
+            "67768036191763000.000000123"
+        );
+
+        设 时间 =
+            UNIX_EPOCH - 持续时间::from_secs(67_768_040_922_076_000) + 持续时间::from_nanos(123);
+        设 可变 out = 向量::新建();
+        format_system_time(
+            &可变 out,
+            时间,
+            "%Y-%m-%d %H:%M",
+            FormatSystemTimeFallback::Float,
+        )
+        .期望("Formatting error.");
+        相等断言!(
+            字符串::from_utf8(out).解包(),
+            "-67768040922076000.000000123"
+        );
+    }
+}

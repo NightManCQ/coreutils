@@ -1,0 +1,521 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) PSKIP linebreak ostream parasplit tabwidth xanti xprefix
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufReader, BufWriter, Read, Stdout, Write, stdin, stdout};
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::translate;
+
+使用 uucore::format_usage;
+
+使用 linebreak::break_lines;
+使用 parasplit::ParagraphStream;
+使用 thiserror::错误协议;
+
+模组 linebreak;
+模组 parasplit;
+
+#[derive(调试协议, 错误协议)]
+枚举 FmtError {
+    #[错误("{}", translate!("fmt-error-invalid-goal", "goal" => .0.quote()))]
+    InvalidGoal(字符串),
+    #[错误("{}", translate!("fmt-error-goal-greater-than-width"))]
+    GoalGreaterThanWidth,
+    #[错误("{}", translate!("fmt-error-invalid-width", "width" => .0.quote()))]
+    InvalidWidth(字符串),
+    #[错误("{}", translate!("fmt-error-width-out-of-range", "width" => .0))]
+    WidthOutOfRange(正整数大小),
+    #[错误("{}", translate!("fmt-error-invalid-tabwidth", "tabwidth" => .0.quote()))]
+    InvalidTabWidth(字符串),
+    #[错误("{}", translate!("fmt-error-first-option-width", "option" => .0))]
+    FirstOptionWidth(字符),
+    #[错误("{}", translate!("fmt-error-read"))]
+    ReadError,
+    #[错误("{}", translate!("fmt-error-invalid-width-malformed", "width" => .0.quote()))]
+    InvalidWidthMalformed(字符串),
+}
+
+实现 转换协议<FmtError> 循环 盒子<动态 uucore::错误::UError> {
+    方法 from(err: FmtError) -> 自身类型 {
+        USimpleError::新建(1, err.to_string())
+    }
+}
+
+常量 MAX_WIDTH: 正整数大小 = 2500;
+常量 DEFAULT_GOAL: 正整数大小 = 70;
+常量 DEFAULT_WIDTH: 正整数大小 = 75;
+// by default, goal is 93% of width
+常量 DEFAULT_GOAL_TO_WIDTH_RATIO: 正整数大小 = 93;
+
+模组 options {
+    公有 常量 CROWN_MARGIN: &字符串切片 = "crown-margin";
+    公有 常量 TAGGED_PARAGRAPH: &字符串切片 = "tagged-paragraph";
+    公有 常量 PRESERVE_HEADERS: &字符串切片 = "preserve-headers";
+    公有 常量 SPLIT_ONLY: &字符串切片 = "split-only";
+    公有 常量 UNIFORM_SPACING: &字符串切片 = "uniform-spacing";
+    公有 常量 PREFIX: &字符串切片 = "prefix";
+    公有 常量 SKIP_PREFIX: &字符串切片 = "skip-prefix";
+    公有 常量 EXACT_PREFIX: &字符串切片 = "exact-prefix";
+    公有 常量 EXACT_SKIP_PREFIX: &字符串切片 = "exact-skip-prefix";
+    公有 常量 WIDTH: &字符串切片 = "width";
+    公有 常量 GOAL: &字符串切片 = "goal";
+    公有 常量 QUICK: &字符串切片 = "quick";
+    公有 常量 TAB_WIDTH: &字符串切片 = "tab-width";
+    公有 常量 FILES_OR_WIDTH: &字符串切片 = "files";
+}
+
+公有 类型 FileOrStdReader = BufReader<盒子<动态 Read + '静态>>;
+
+公有 结构 FmtOptions {
+    crown: 布尔,
+    tagged: 布尔,
+    mail: 布尔,
+    split_only: 布尔,
+    prefix: 选项<字符串>,
+    xprefix: 布尔,
+    anti_prefix: 选项<字符串>,
+    xanti_prefix: 布尔,
+    uniform: 布尔,
+    quick: 布尔,
+    width: 正整数大小,
+    goal: 正整数大小,
+    tabwidth: 正整数大小,
+}
+
+实现 FmtOptions {
+    方法 from_matches(matches: &ArgMatches) -> UResult<自身类型> {
+        设 可变 tagged = matches.get_flag(options::TAGGED_PARAGRAPH);
+        设 可变 crown = matches.get_flag(options::CROWN_MARGIN);
+
+        设 mail = matches.get_flag(options::PRESERVE_HEADERS);
+        设 uniform = matches.get_flag(options::UNIFORM_SPACING);
+        设 quick = matches.get_flag(options::QUICK);
+        设 split_only = matches.get_flag(options::SPLIT_ONLY);
+
+        如果 crown {
+            tagged = 假;
+        }
+        如果 split_only {
+            crown = 假;
+            tagged = 假;
+        }
+
+        设 xprefix = matches.contains_id(options::EXACT_PREFIX);
+        设 xanti_prefix = matches.contains_id(options::SKIP_PREFIX);
+
+        设 prefix = matches.get_one::<字符串>(options::PREFIX).映射(字符串::from);
+        设 anti_prefix = matches
+            .get_one::<字符串>(options::SKIP_PREFIX)
+            .映射(字符串::from);
+
+        设 width_opt = extract_width(matches)?;
+        设 goal_opt_str = matches.get_one::<字符串>(options::GOAL);
+        设 goal_opt = 如果 设 一些(goal_str) = goal_opt_str {
+            匹配 goal_str.parse::<正整数大小>() {
+                好的(goal) => 一些(goal),
+                坏的(_) => {
+                    返回 坏的(FmtError::InvalidGoal(goal_str.克隆()).into());
+                }
+            }
+        } 否则 {
+            无
+        };
+
+        设 (width, goal) = 匹配 (width_opt, goal_opt) {
+            (一些(w), 一些(g)) => {
+                如果 g > w {
+                    返回 坏的(FmtError::GoalGreaterThanWidth.into());
+                }
+                (w, g)
+            }
+            (一些(0), 无) => {
+                // Only allow a goal of zero if the width is set to be zero
+                (0, 0)
+            }
+            (一些(w), 无) => {
+                设 g = (w * DEFAULT_GOAL_TO_WIDTH_RATIO / 100).max(1);
+                (w, g)
+            }
+            (无, 一些(g)) => {
+                如果 g > DEFAULT_WIDTH {
+                    返回 坏的(FmtError::GoalGreaterThanWidth.into());
+                }
+                设 w = (g * 100 / DEFAULT_GOAL_TO_WIDTH_RATIO).max(g + 3);
+                (w, g)
+            }
+            (无, 无) => (DEFAULT_WIDTH, DEFAULT_GOAL),
+        };
+        调试断言!(
+            width >= goal,
+            "GOAL {goal} should not be greater than WIDTH {width} when given {width_opt:?} and {goal_opt:?}."
+        );
+
+        如果 width > MAX_WIDTH {
+            返回 坏的(FmtError::WidthOutOfRange(width).into());
+        }
+
+        设 可变 tabwidth = 8;
+        如果 设 一些(s) = matches.get_one::<字符串>(options::TAB_WIDTH) {
+            tabwidth = 匹配 s.parse::<正整数大小>() {
+                好的(t) => t,
+                坏的(_) => {
+                    返回 坏的(FmtError::InvalidTabWidth(s.克隆()).into());
+                }
+            };
+        }
+
+        如果 tabwidth < 1 {
+            tabwidth = 1;
+        }
+
+        好的(自身类型 {
+            crown,
+            tagged,
+            mail,
+            split_only,
+            prefix,
+            xprefix,
+            anti_prefix,
+            xanti_prefix,
+            uniform,
+            quick,
+            width,
+            goal,
+            tabwidth,
+        })
+    }
+}
+
+/// Process the content of a file and format it according to the provided options.
+///
+/// # Arguments
+///
+/// * `file_name` - The name of the file to process. A value of "-" represents the standard input.
+/// * `fmt_opts` - A reference to a `FmtOptions` struct containing the formatting options.
+/// * `ostream` - A mutable reference to a `BufWriter` wrapping the standard output.
+///
+/// # Returns
+///
+/// A `UResult<()>` indicating success or failure.
+方法 process_file(
+    file_name: &OsString,
+    fmt_opts: &FmtOptions,
+    ostream: &可变 BufWriter<Stdout>,
+) -> UResult<()> {
+    设 可变 fp = BufReader::新建(如果 file_name == "-" {
+        盒子::新建(stdin()) 转换 盒子<动态 Read + '静态>
+    } 否则 {
+        设 路径 = Path::新建(file_name);
+        设 f = File::open(路径).map_err_context(
+            || translate!("fmt-error-cannot-open-for-reading", "file" => 路径.quote()),
+        )?;
+        如果 f.metadata()
+            .map_err_context(
+                || translate!("fmt-error-cannot-get-metadata", "file" => 路径.quote()),
+            )?
+            .is_dir()
+        {
+            返回 坏的(FmtError::ReadError.into());
+        }
+
+        盒子::新建(f) 转换 盒子<动态 Read + '静态>
+    });
+
+    设 p_stream = ParagraphStream::新建(fmt_opts, &可变 fp);
+    循环 para_result 在 p_stream {
+        匹配 para_result {
+            坏的(s) => {
+                ostream
+                    .write_all(&s)
+                    .map_err_context(|| translate!("fmt-error-failed-to-write-output"))?;
+                ostream
+                    .write_all(b"\n")
+                    .map_err_context(|| translate!("fmt-error-failed-to-write-output"))?;
+            }
+            好的(para) => break_lines(&para, fmt_opts, ostream)
+                .map_err_context(|| translate!("fmt-error-failed-to-write-output"))?,
+        }
+    }
+
+    // flush the output after each file
+    ostream
+        .flush()
+        .map_err_context(|| translate!("fmt-error-failed-to-write-output"))?;
+
+    好的(())
+}
+
+/// Extract the file names from the positional arguments, ignoring any negative width in the first
+/// position.
+///
+/// # Returns
+/// A `UResult<()>` with the file names, or an error if one of the file names could not be parsed
+/// (e.g., it is given as a negative number not in the first argument and not after a --
+方法 extract_files(matches: &ArgMatches) -> UResult<向量<OsString>> {
+    设 in_first_pos = matches
+        .index_of(options::FILES_OR_WIDTH)
+        .is_some_and(|x| x == 1);
+    设 is_neg = |s: &字符串切片| s.parse::<整数大小>().is_ok_and(|w| w < 0);
+
+    设 files: UResult<向量<OsString>> = matches
+        .get_many::<OsString>(options::FILES_OR_WIDTH)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, x)| {
+            设 x_str = x.to_string_lossy();
+            如果 is_neg(&x_str) {
+                如果 in_first_pos && i == 0 {
+                    无
+                } 否则 {
+                    设 first_num = x_str
+                        .chars()
+                        .nth(1)
+                        .期望("a negative number should be at least two characters long");
+                    一些(坏的(FmtError::FirstOptionWidth(first_num).into()))
+                }
+            } 否则 {
+                一些(好的(x.克隆()))
+            }
+        })
+        .收集();
+
+    如果 files.as_ref().is_ok_and(向量::为空) {
+        好的(向量![OsString::from("-")])
+    } 否则 {
+        files
+    }
+}
+
+方法 extract_width(matches: &ArgMatches) -> UResult<选项<正整数大小>> {
+    设 width_opt = matches.get_one::<字符串>(options::WIDTH);
+    如果 设 一些(width_str) = width_opt {
+        返回 如果 设 好的(width) = width_str.parse::<正整数大小>() {
+            好的(一些(width))
+        } 否则 {
+            坏的(FmtError::InvalidWidth(width_str.克隆()).into())
+        };
+    }
+
+    如果 设 一些(width_arg) = matches.get_one::<OsString>(options::FILES_OR_WIDTH)
+        && 一些(1) == matches.index_of(options::FILES_OR_WIDTH)
+    {
+        设 width_str = width_arg.to_string_lossy();
+        如果 设 一些(数字) = width_str.strip_prefix('-') {
+            好的(数字.parse::<正整数大小>().ok())
+        } 否则 {
+            // will be treated as a file name
+            好的(无)
+        }
+    } 否则 {
+        好的(无)
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args: 向量<_> = args.收集();
+
+    // Warn the user if it looks like we're trying to pass a number in the first
+    // argument with non-numeric characters
+    如果 设 一些(first_arg) = args.获取(1) {
+        设 first_arg = first_arg.to_string_lossy();
+        设 malformed_number = first_arg.starts_with('-')
+            && first_arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            && first_arg.chars().skip(2).任意(|c| !c.is_ascii_digit());
+        如果 malformed_number {
+            返回 坏的(FmtError::InvalidWidthMalformed(
+                // strip 1st -
+                first_arg[1..].to_string(),
+            )
+            .into());
+        }
+    }
+
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), &args)?;
+
+    设 files = extract_files(&matches)?;
+
+    设 fmt_opts = FmtOptions::from_matches(&matches)?;
+
+    设 可变 ostream = BufWriter::新建(stdout());
+
+    循环 file_name 在 &files {
+        process_file(file_name, &fmt_opts, &可变 ostream)?;
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("fmt")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("fmt"))
+        .about(translate!("fmt-about"))
+        .override_usage(format_usage(&translate!("fmt-usage")))
+        .infer_long_args(真)
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::CROWN_MARGIN)
+                .short('c')
+                .long(options::CROWN_MARGIN)
+                .help(translate!("fmt-crown-margin-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TAGGED_PARAGRAPH)
+                .short('t')
+                .long("tagged-paragraph")
+                .help(translate!("fmt-tagged-paragraph-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PRESERVE_HEADERS)
+                .short('m')
+                .long("preserve-headers")
+                .help(translate!("fmt-preserve-headers-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SPLIT_ONLY)
+                .short('s')
+                .long("split-only")
+                .help(translate!("fmt-split-only-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::UNIFORM_SPACING)
+                .short('u')
+                .long("uniform-spacing")
+                .help(translate!("fmt-uniform-spacing-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::PREFIX)
+                .short('p')
+                .long("prefix")
+                .help(translate!("fmt-prefix-help"))
+                .value_name("PREFIX"),
+        )
+        .arg(
+            Arg::新建(options::SKIP_PREFIX)
+                .short('P')
+                .long("skip-prefix")
+                .help(translate!("fmt-skip-prefix-help"))
+                .value_name("PSKIP"),
+        )
+        .arg(
+            Arg::新建(options::EXACT_PREFIX)
+                .short('x')
+                .long("exact-prefix")
+                .help(translate!("fmt-exact-prefix-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::EXACT_SKIP_PREFIX)
+                .short('X')
+                .long("exact-skip-prefix")
+                .help(translate!("fmt-exact-skip-prefix-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::WIDTH)
+                .short('w')
+                .long("width")
+                .help(translate!("fmt-width-help"))
+                // We must accept invalid values if they are overridden later. This is not supported by clap, so accept all strings instead.
+                .value_name("WIDTH"),
+        )
+        .arg(
+            Arg::新建(options::GOAL)
+                .short('g')
+                .long("goal")
+                .help(translate!("fmt-goal-help"))
+                // We must accept invalid values if they are overridden later. This is not supported by clap, so accept all strings instead.
+                .value_name("GOAL"),
+        )
+        .arg(
+            Arg::新建(options::QUICK)
+                .short('q')
+                .long("quick")
+                .help(translate!("fmt-quick-help"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TAB_WIDTH)
+                .short('T')
+                .long("tab-width")
+                .help(translate!("fmt-tab-width-help"))
+                .value_name("TABWIDTH"),
+        )
+        .arg(
+            Arg::新建(options::FILES_OR_WIDTH)
+                .action(ArgAction::Append)
+                .value_name("FILES")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString))
+                .allow_negative_numbers(真),
+        )
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::uu_app;
+    使用 箱::{extract_files, extract_width};
+
+    #[test]
+    方法 parse_negative_width() {
+        设 matches = uu_app()
+            .try_get_matches_from(向量!["fmt", "-3", "some-file"])
+            .解包();
+
+        相等断言!(extract_files(&matches).解包(), 向量!["some-file"]);
+        相等断言!(extract_width(&matches).ok(), 一些(一些(3)));
+    }
+
+    #[test]
+    方法 parse_width_as_arg() {
+        设 matches = uu_app()
+            .try_get_matches_from(向量!["fmt", "-w3", "some-file"])
+            .解包();
+
+        相等断言!(extract_files(&matches).解包(), 向量!["some-file"]);
+        相等断言!(extract_width(&matches).ok(), 一些(一些(3)));
+    }
+
+    #[test]
+    方法 parse_no_args() {
+        设 matches = uu_app().try_get_matches_from(向量!["fmt"]).解包();
+
+        相等断言!(extract_files(&matches).解包(), 向量!["-"]);
+        相等断言!(extract_width(&matches).ok(), 一些(无));
+    }
+
+    #[test]
+    方法 parse_just_file_name() {
+        设 matches = uu_app()
+            .try_get_matches_from(向量!["fmt", "some-file"])
+            .解包();
+
+        相等断言!(extract_files(&matches).解包(), 向量!["some-file"]);
+        相等断言!(extract_width(&matches).ok(), 一些(无));
+    }
+
+    #[test]
+    方法 parse_with_both_widths_positional_first() {
+        设 matches = uu_app()
+            .try_get_matches_from(向量!["fmt", "-10", "-w3", "some-file"])
+            .解包();
+
+        相等断言!(extract_files(&matches).解包(), 向量!["some-file"]);
+        相等断言!(extract_width(&matches).ok(), 一些(一些(3)));
+    }
+}

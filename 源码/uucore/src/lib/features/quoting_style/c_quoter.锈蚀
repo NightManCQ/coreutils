@@ -1,0 +1,57 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 超级::{EscapedChar, Quoter, Quotes};
+
+公有(超级) 结构 CQuoter {
+    /// The type of quotes to use.
+    quotes: Quotes,
+
+    dirname: 布尔,
+
+    buffer: 向量<正8>,
+}
+
+实现 CQuoter {
+    公有 方法 新建(quotes: Quotes, dirname: 布尔, size_hint: 正整数大小) -> 自身类型 {
+        设 可变 buffer = 向量::with_capacity(size_hint);
+        匹配 quotes {
+            Quotes::无 => (),
+            Quotes::Single => buffer.压入(b'\''),
+            Quotes::Double => buffer.压入(b'"'),
+        }
+
+        自身类型 {
+            quotes,
+            dirname,
+            buffer,
+        }
+    }
+}
+
+实现 Quoter 循环 CQuoter {
+    方法 push_char(&可变 自身, input: 字符) {
+        设 escaped: 字符串 = EscapedChar::new_c(input, 自身.quotes, 自身.dirname)
+            .hide_control()
+            .收集();
+        自身.buffer.extend_from_slice(escaped.as_bytes());
+    }
+
+    方法 push_invalid(&可变 自身, input: &[正8]) {
+        循环 b 在 input {
+            设 escaped: 字符串 = EscapedChar::new_octal(*b).hide_control().收集();
+            自身.buffer.extend_from_slice(escaped.as_bytes());
+        }
+    }
+
+    方法 finalize(可变 自身: 盒子<自身类型>) -> 向量<正8> {
+        匹配 自身.quotes {
+            Quotes::无 => (),
+            Quotes::Single => 自身.buffer.压入(b'\''),
+            Quotes::Double => 自身.buffer.压入(b'"'),
+        }
+        自身.buffer
+    }
+}

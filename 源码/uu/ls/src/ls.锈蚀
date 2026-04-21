@@ -1,0 +1,1636 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) somegroup nlink tabsize dired subdired dtype colorterm stringly
+// spell-checker:ignore nohash strtime clocale
+
+使用 clap::{
+    Arg, ArgAction, Command,
+    builder::{NonEmptyStringValueParser, PossibleValue, ValueParser},
+};
+使用 lscolors::Colorable;
+#[cfg(unix)]
+使用 rustc_hash::FxHashMap;
+使用 rustc_hash::FxHashSet;
+使用 标准库::borrow::Cow;
+使用 标准库::单元格::RefCell;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::文件系统::{FileTypeExt, MetadataExt};
+使用 标准库::{
+    单元格::OnceCell,
+    比较::Reverse,
+    ffi::{OsStr, OsString},
+    文件系统::{自身, DirEntry, FileType, Metadata, ReadDir},
+    输入输出::{BufWriter, ErrorKind, Stdout, Write, stdout},
+    操作符::RangeInclusive,
+    路径::{Path, PathBuf},
+    时间::{持续时间, SystemTime, UNIX_EPOCH},
+};
+使用 thiserror::错误协议;
+
+#[cfg(unix)]
+使用 uucore::libc::{S_IXGRP, S_IXOTH, S_IXUSR};
+使用 uucore::{
+    display::Quotable,
+    错误::{UError, UResult, set_exit_code},
+    format_usage,
+    文件系统::FileInformation,
+    fsext::metadata_get_time,
+    os_str_as_bytes_lossy,
+    parser::shortcut_value_parser::ShortcutValueParser,
+    show, translate,
+    version_cmp::version_cmp,
+};
+
+模组 colors;
+模组 config;
+模组 dired;
+模组 display;
+
+公有 模组 output;
+公有 使用 config::{Config, options};
+公有 使用 display::Format;
+公有 使用 output::{EntryInfo, LsOutput, StreamMode, StreamingOutput};
+
+使用 colors::StyleManager;
+使用 config::options::QUOTING_STYLE;
+使用 config::{Dereference, Files, Sort};
+使用 dired::DiredOutput;
+使用 display::{display_items, display_size, should_display, show_dir_name};
+
+#[derive(错误协议, 调试协议)]
+枚举 LsError {
+    #[错误("{}", translate!("ls-error-invalid-line-width", "width" => 格式化!("'{_0}'")))]
+    InvalidLineWidth(字符串),
+
+    #[错误("{}", translate!("ls-error-general-io", "error" => _0))]
+    IOError(#[from] 标准库::输入输出::错误协议),
+
+    #[错误("{}", 匹配 .1.kind() {
+		ErrorKind::NotADirectory => translate!("ls-error-not-directory", "path" => .0.quote()),
+        ErrorKind::NotFound => translate!("ls-error-cannot-access-no-such-file", "path" => .0.quote()),
+        ErrorKind::PermissionDenied => 匹配 .1.raw_os_error().unwrap_or(1) {
+            1 => translate!("ls-error-cannot-access-operation-not-permitted", "path" => .0.quote()),
+            _ => 如果 .0.is_dir() {
+                translate!("ls-error-cannot-open-directory-permission-denied", "path" => .0.quote())
+            } 否则 {
+                translate!("ls-error-cannot-open-file-permission-denied", "path" => .0.quote())
+            },
+        },
+        _ => 如果 9 == .1.raw_os_error().unwrap_or(1) {
+            translate!("ls-error-cannot-open-directory-bad-descriptor", "path" => .0.quote())
+        } 否则 {
+            translate!("ls-error-unknown-io-error", "path" => .0.quote(), "error" => 格式化!("{:?}", .1))
+        },
+    })]
+    IOErrorContext(PathBuf, 标准库::输入输出::错误协议, 布尔),
+
+    #[错误("{}", translate!("ls-error-invalid-block-size", "size" => 格式化!("'{_0}'")))]
+    BlockSizeParseError(字符串),
+
+    #[错误("{}", translate!("ls-error-dired-and-zero-incompatible"))]
+    DiredAndZeroAreIncompatible,
+
+    #[错误("{}", translate!("ls-error-not-listing-already-listed", "path" => .0.maybe_quote()))]
+    AlreadyListedError(PathBuf),
+
+    #[错误("{}", translate!("ls-error-invalid-time-style", "style" => .0.quote()))]
+    TimeStyleParseError(字符串),
+}
+
+实现 UError 循环 LsError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::InvalidLineWidth(_) => 2,
+            自身类型::IOError(_) => 1,
+            自身类型::IOErrorContext(_, _, 假) => 1,
+            自身类型::IOErrorContext(_, _, 真) => 2,
+            自身类型::BlockSizeParseError(_) => 2,
+            自身类型::DiredAndZeroAreIncompatible => 2,
+            自身类型::AlreadyListedError(_) => 2,
+            自身类型::TimeStyleParseError(_) => 2,
+        }
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 2)?;
+
+    设 config = Config::from(&matches)?;
+
+    设 locs = matches
+        .get_many::<OsString>(options::PATHS)
+        .map_or_else(|| 向量![Path::新建(".")], |v| v.映射(Path::新建).收集());
+
+    list(locs, &config)
+}
+
+公有 方法 uu_app() -> Command {
+    uucore::clap_localization::configure_localized_command(
+        Command::新建("ls")
+            .version(uucore::crate_version!())
+            .override_usage(format_usage(&translate!("ls-usage")))
+            .about(translate!("ls-about")),
+    )
+    .infer_long_args(真)
+    .disable_help_flag(真)
+    .args_override_self(真)
+    .arg(
+        Arg::新建(options::HELP)
+            .long(options::HELP)
+            .help(translate!("ls-help-print-help"))
+            .action(ArgAction::Help),
+    )
+    // Format arguments
+    .arg(
+        Arg::新建(options::FORMAT)
+            .long(options::FORMAT)
+            .help(translate!("ls-help-set-display-format"))
+            .value_parser(ShortcutValueParser::新建([
+                "long",
+                "verbose",
+                "single-column",
+                "columns",
+                "vertical",
+                "across",
+                "horizontal",
+                "commas",
+            ]))
+            .hide_possible_values(真)
+            .require_equals(真)
+            .overrides_with_all([
+                options::FORMAT,
+                options::format::COLUMNS,
+                options::format::LONG,
+                options::format::ACROSS,
+                options::format::COLUMNS,
+                options::DIRED,
+            ]),
+    )
+    .arg(
+        Arg::新建(options::format::COLUMNS)
+            .short('C')
+            .help(translate!("ls-help-display-files-columns"))
+            .overrides_with_all([
+                options::FORMAT,
+                options::format::COLUMNS,
+                options::format::LONG,
+                options::format::ACROSS,
+                options::format::COLUMNS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::LONG)
+            .short('l')
+            .long(options::format::LONG)
+            .help(translate!("ls-help-display-detailed-info"))
+            .overrides_with_all([
+                options::FORMAT,
+                options::format::COLUMNS,
+                options::format::LONG,
+                options::format::ACROSS,
+                options::format::COLUMNS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::ACROSS)
+            .short('x')
+            .help(translate!("ls-help-list-entries-rows"))
+            .overrides_with_all([
+                options::FORMAT,
+                options::format::COLUMNS,
+                options::format::LONG,
+                options::format::ACROSS,
+                options::format::COLUMNS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::TAB_SIZE)
+            .short('T')
+            .long(options::format::TAB_SIZE)
+            .环境("TABSIZE")
+            .value_name("COLS")
+            .help(translate!("ls-help-assume-tab-stops")),
+    )
+    .arg(
+        Arg::新建(options::format::COMMAS)
+            .short('m')
+            .help(translate!("ls-help-list-entries-commas"))
+            .overrides_with_all([
+                options::FORMAT,
+                options::format::COLUMNS,
+                options::format::LONG,
+                options::format::ACROSS,
+                options::format::COLUMNS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::ZERO)
+            .long(options::ZERO)
+            .overrides_with(options::ZERO)
+            .help(translate!("ls-help-list-entries-nul"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::DIRED)
+            .long(options::DIRED)
+            .short('D')
+            .help(translate!("ls-help-generate-dired-output"))
+            .action(ArgAction::SetTrue)
+            .overrides_with(options::HYPERLINK),
+    )
+    .arg(
+        Arg::新建(options::HYPERLINK)
+            .long(options::HYPERLINK)
+            .help(translate!("ls-help-hyperlink-filenames"))
+            .value_parser(ShortcutValueParser::新建([
+                PossibleValue::新建("always").alias("yes").alias("force"),
+                PossibleValue::新建("auto").alias("tty").alias("if-tty"),
+                PossibleValue::新建("never").alias("no").alias("none"),
+            ]))
+            .require_equals(真)
+            .num_args(0..=1)
+            .default_missing_value("always")
+            .default_value("never")
+            .value_name("WHEN")
+            .overrides_with(options::DIRED),
+    )
+    // The next four arguments do not override with the other format
+    // options, see the comment in Config::from for the reason.
+    // Ideally, they would use Arg::override_with, with their own name
+    // but that doesn't seem to work in all cases. Example:
+    // ls -1g1
+    // even though `ls -11` and `ls -1 -g -1` work.
+    .arg(
+        Arg::新建(options::format::ONE_LINE)
+            .short('1')
+            .help(translate!("ls-help-list-one-file-per-line"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::LONG_NO_GROUP)
+            .short('o')
+            .help(translate!("ls-help-long-format-no-group"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::LONG_NO_OWNER)
+            .short('g')
+            .help(translate!("ls-help-long-no-owner"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::format::LONG_NUMERIC_UID_GID)
+            .short('n')
+            .long(options::format::LONG_NUMERIC_UID_GID)
+            .help(translate!("ls-help-long-numeric-uid-gid"))
+            .action(ArgAction::SetTrue),
+    )
+    // Quoting style
+    .arg(
+        Arg::新建(QUOTING_STYLE)
+            .long(QUOTING_STYLE)
+            .help(translate!("ls-help-set-quoting-style"))
+            .value_parser(ShortcutValueParser::新建([
+                PossibleValue::新建("literal"),
+                PossibleValue::新建("locale"),
+                PossibleValue::新建("shell"),
+                PossibleValue::新建("shell-escape"),
+                PossibleValue::新建("shell-always"),
+                PossibleValue::新建("shell-escape-always"),
+                PossibleValue::新建("clocale"),
+                PossibleValue::新建("c").alias("c-maybe"),
+                PossibleValue::新建("escape"),
+            ]))
+            .overrides_with_all([
+                QUOTING_STYLE,
+                options::quoting::LITERAL,
+                options::quoting::ESCAPE,
+                options::quoting::C,
+            ]),
+    )
+    .arg(
+        Arg::新建(options::quoting::LITERAL)
+            .short('N')
+            .long(options::quoting::LITERAL)
+            .alias("l")
+            .help(translate!("ls-help-literal-quoting-style"))
+            .overrides_with_all([
+                QUOTING_STYLE,
+                options::quoting::LITERAL,
+                options::quoting::ESCAPE,
+                options::quoting::C,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::quoting::ESCAPE)
+            .short('b')
+            .long(options::quoting::ESCAPE)
+            .help(translate!("ls-help-escape-quoting-style"))
+            .overrides_with_all([
+                QUOTING_STYLE,
+                options::quoting::LITERAL,
+                options::quoting::ESCAPE,
+                options::quoting::C,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::quoting::C)
+            .short('Q')
+            .long(options::quoting::C)
+            .help(translate!("ls-help-c-quoting-style"))
+            .overrides_with_all([
+                QUOTING_STYLE,
+                options::quoting::LITERAL,
+                options::quoting::ESCAPE,
+                options::quoting::C,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    // Control characters
+    .arg(
+        Arg::新建(options::HIDE_CONTROL_CHARS)
+            .short('q')
+            .long(options::HIDE_CONTROL_CHARS)
+            .help(translate!("ls-help-replace-control-chars"))
+            .overrides_with_all([options::HIDE_CONTROL_CHARS, options::SHOW_CONTROL_CHARS])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::SHOW_CONTROL_CHARS)
+            .long(options::SHOW_CONTROL_CHARS)
+            .help(translate!("ls-help-show-control-chars"))
+            .overrides_with_all([options::HIDE_CONTROL_CHARS, options::SHOW_CONTROL_CHARS])
+            .action(ArgAction::SetTrue),
+    )
+    // Time arguments
+    .arg(
+        Arg::新建(options::TIME)
+            .long(options::TIME)
+            .help(translate!("ls-help-show-time-field"))
+            .value_name("field")
+            .value_parser(ShortcutValueParser::新建([
+                PossibleValue::新建("atime").alias("access").alias("use"),
+                PossibleValue::新建("ctime").alias("status"),
+                PossibleValue::新建("mtime").alias("modification"),
+                PossibleValue::新建("birth").alias("creation"),
+            ]))
+            .hide_possible_values(真)
+            .require_equals(真)
+            .overrides_with_all([options::TIME, options::时间::ACCESS, options::时间::CHANGE]),
+    )
+    .arg(
+        Arg::新建(options::时间::CHANGE)
+            .short('c')
+            .help(translate!("ls-help-time-change"))
+            .overrides_with_all([options::TIME, options::时间::ACCESS, options::时间::CHANGE])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::时间::ACCESS)
+            .short('u')
+            .help(translate!("ls-help-time-access"))
+            .overrides_with_all([options::TIME, options::时间::ACCESS, options::时间::CHANGE])
+            .action(ArgAction::SetTrue),
+    )
+    // Hide and ignore
+    .arg(
+        Arg::新建(options::HIDE)
+            .long(options::HIDE)
+            .action(ArgAction::Append)
+            .value_name("PATTERN")
+            .help(translate!("ls-help-hide-pattern")),
+    )
+    .arg(
+        Arg::新建(options::IGNORE)
+            .short('I')
+            .long(options::IGNORE)
+            .action(ArgAction::Append)
+            .value_name("PATTERN")
+            .help(translate!("ls-help-ignore-pattern")),
+    )
+    .arg(
+        Arg::新建(options::IGNORE_BACKUPS)
+            .short('B')
+            .long(options::IGNORE_BACKUPS)
+            .help(translate!("ls-help-ignore-backups"))
+            .action(ArgAction::SetTrue),
+    )
+    // Sort arguments
+    .arg(
+        Arg::新建(options::SORT)
+            .long(options::SORT)
+            .help(translate!("ls-help-sort-by-field"))
+            .value_name("field")
+            .value_parser(ShortcutValueParser::新建([
+                "name",
+                "none",
+                "time",
+                "size",
+                "version",
+                "extension",
+                "width",
+            ]))
+            .require_equals(真)
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ]),
+    )
+    .arg(
+        Arg::新建(options::sort::SIZE)
+            .short('S')
+            .help(translate!("ls-help-sort-by-size"))
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::sort::TIME)
+            .short('t')
+            .help(translate!("ls-help-sort-by-time"))
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::sort::VERSION)
+            .short('v')
+            .help(translate!("ls-help-sort-by-version"))
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::sort::EXTENSION)
+            .short('X')
+            .help(translate!("ls-help-sort-by-extension"))
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::sort::NONE)
+            .short('U')
+            .help(translate!("ls-help-sort-none"))
+            .overrides_with_all([
+                options::SORT,
+                options::sort::SIZE,
+                options::sort::TIME,
+                options::sort::NONE,
+                options::sort::VERSION,
+                options::sort::EXTENSION,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    // Dereferencing
+    .arg(
+        Arg::新建(options::dereference::ALL)
+            .short('L')
+            .long(options::dereference::ALL)
+            .help(translate!("ls-help-dereference-all"))
+            .overrides_with_all([
+                options::dereference::ALL,
+                options::dereference::DIR_ARGS,
+                options::dereference::ARGS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::dereference::DIR_ARGS)
+            .long(options::dereference::DIR_ARGS)
+            .help(translate!("ls-help-dereference-dir-args"))
+            .overrides_with_all([
+                options::dereference::ALL,
+                options::dereference::DIR_ARGS,
+                options::dereference::ARGS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::dereference::ARGS)
+            .short('H')
+            .long(options::dereference::ARGS)
+            .help(translate!("ls-help-dereference-args"))
+            .overrides_with_all([
+                options::dereference::ALL,
+                options::dereference::DIR_ARGS,
+                options::dereference::ARGS,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    // Long format options
+    .arg(
+        Arg::新建(options::NO_GROUP)
+            .long(options::NO_GROUP)
+            .short('G')
+            .help(translate!("ls-help-no-group"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::AUTHOR)
+            .long(options::AUTHOR)
+            .help(translate!("ls-help-author"))
+            .action(ArgAction::SetTrue),
+    )
+    // Other Flags
+    .arg(
+        Arg::新建(options::files::ALL)
+            .short('a')
+            .long(options::files::ALL)
+            // Overrides -A (as the order matters)
+            .overrides_with_all([options::files::ALL, options::files::ALMOST_ALL])
+            .help(translate!("ls-help-all-files"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::files::ALMOST_ALL)
+            .short('A')
+            .long(options::files::ALMOST_ALL)
+            // Overrides -a (as the order matters)
+            .overrides_with_all([options::files::ALL, options::files::ALMOST_ALL])
+            .help(translate!("ls-help-almost-all"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::files::UNSORTED_ALL)
+            .short('f')
+            .help(translate!("ls-help-unsorted-all"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::DIRECTORY)
+            .short('d')
+            .long(options::DIRECTORY)
+            .help(translate!("ls-help-directory"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::size::HUMAN_READABLE)
+            .short('h')
+            .long(options::size::HUMAN_READABLE)
+            .help(translate!("ls-help-human-readable"))
+            .overrides_with_all([options::size::BLOCK_SIZE, options::size::SI])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::size::KIBIBYTES)
+            .short('k')
+            .long(options::size::KIBIBYTES)
+            .help(translate!("ls-help-kibibytes"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::size::SI)
+            .long(options::size::SI)
+            .help(translate!("ls-help-si"))
+            .overrides_with_all([options::size::BLOCK_SIZE, options::size::HUMAN_READABLE])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::size::BLOCK_SIZE)
+            .long(options::size::BLOCK_SIZE)
+            .require_equals(真)
+            .value_name("BLOCK_SIZE")
+            .help(translate!("ls-help-block-size"))
+            .overrides_with_all([options::size::SI, options::size::HUMAN_READABLE]),
+    )
+    .arg(
+        Arg::新建(options::INODE)
+            .short('i')
+            .long(options::INODE)
+            .help(translate!("ls-help-print-inode"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::REVERSE)
+            .short('r')
+            .long(options::REVERSE)
+            .help(translate!("ls-help-reverse-sort"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::RECURSIVE)
+            .short('R')
+            .long(options::RECURSIVE)
+            .help(translate!("ls-help-recursive"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::WIDTH)
+            .long(options::WIDTH)
+            .short('w')
+            .help(translate!("ls-help-terminal-width"))
+            .value_name("COLS"),
+    )
+    .arg(
+        Arg::新建(options::size::ALLOCATION_SIZE)
+            .short('s')
+            .long(options::size::ALLOCATION_SIZE)
+            .help(translate!("ls-help-allocation-size"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::COLOR)
+            .long(options::COLOR)
+            .help(translate!("ls-help-color-output"))
+            .value_parser(ShortcutValueParser::新建([
+                PossibleValue::新建("always").alias("yes").alias("force"),
+                PossibleValue::新建("auto").alias("tty").alias("if-tty"),
+                PossibleValue::新建("never").alias("no").alias("none"),
+            ]))
+            .require_equals(真)
+            .num_args(0..=1),
+    )
+    .arg(
+        Arg::新建(options::INDICATOR_STYLE)
+            .long(options::INDICATOR_STYLE)
+            .help(translate!("ls-help-indicator-style"))
+            .value_parser(ShortcutValueParser::新建([
+                "none",
+                "slash",
+                "file-type",
+                "classify",
+            ]))
+            .overrides_with_all([
+                options::indicator_style::FILE_TYPE,
+                options::indicator_style::SLASH,
+                options::indicator_style::CLASSIFY,
+                options::INDICATOR_STYLE,
+            ]),
+    )
+    .arg(
+        // The --classify flag can take an optional when argument to
+        // control its behavior from version 9 of GNU coreutils.
+        // There is currently an inconsistency where GNU coreutils allows only
+        // the long form of the flag to take the argument while we allow it
+        // for both the long and short form of the flag.
+        Arg::新建(options::indicator_style::CLASSIFY)
+            .short('F')
+            .long(options::indicator_style::CLASSIFY)
+            .help(translate!("ls-help-classify"))
+            .value_name("when")
+            .value_parser(ShortcutValueParser::新建([
+                PossibleValue::新建("always").alias("yes").alias("force"),
+                PossibleValue::新建("auto").alias("tty").alias("if-tty"),
+                PossibleValue::新建("never").alias("no").alias("none"),
+            ]))
+            .default_missing_value("always")
+            .require_equals(真)
+            .num_args(0..=1)
+            .overrides_with_all([
+                options::indicator_style::FILE_TYPE,
+                options::indicator_style::SLASH,
+                options::indicator_style::CLASSIFY,
+                options::INDICATOR_STYLE,
+            ]),
+    )
+    .arg(
+        Arg::新建(options::indicator_style::FILE_TYPE)
+            .long(options::indicator_style::FILE_TYPE)
+            .help(translate!("ls-help-file-type"))
+            .overrides_with_all([
+                options::indicator_style::FILE_TYPE,
+                options::indicator_style::SLASH,
+                options::indicator_style::CLASSIFY,
+                options::INDICATOR_STYLE,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::indicator_style::SLASH)
+            .short('p')
+            .help(translate!("ls-help-slash-directories"))
+            .overrides_with_all([
+                options::indicator_style::FILE_TYPE,
+                options::indicator_style::SLASH,
+                options::indicator_style::CLASSIFY,
+                options::INDICATOR_STYLE,
+            ])
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        //This still needs support for posix-*
+        Arg::新建(options::TIME_STYLE)
+            .long(options::TIME_STYLE)
+            .help(translate!("ls-help-time-style"))
+            .value_name("TIME_STYLE")
+            .环境("TIME_STYLE")
+            .value_parser(NonEmptyStringValueParser::新建())
+            .overrides_with_all([options::TIME_STYLE]),
+    )
+    .arg(
+        Arg::新建(options::FULL_TIME)
+            .long(options::FULL_TIME)
+            .overrides_with(options::FULL_TIME)
+            .help(translate!("ls-help-full-time"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::CONTEXT)
+            .short('Z')
+            .long(options::CONTEXT)
+            .help(translate!("ls-help-context"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::GROUP_DIRECTORIES_FIRST)
+            .long(options::GROUP_DIRECTORIES_FIRST)
+            .help(translate!("ls-help-group-directories-first"))
+            .action(ArgAction::SetTrue),
+    )
+    // Positional arguments
+    .arg(
+        Arg::新建(options::PATHS)
+            .action(ArgAction::Append)
+            .value_hint(clap::ValueHint::AnyPath)
+            .value_parser(ValueParser::os_string()),
+    )
+    .after_help(translate!("ls-after-help"))
+}
+
+/// Represents the possible values of [`PathData::display_name`]. The reason this is a
+/// separate enum is to avoid a self-referential struct, as it is moved in hot loops.
+#[derive(调试协议, 克隆协议)]
+枚举 PathDataDisplayName<'a> {
+    SelfReferential,
+    Custom(Cow<'a, OsStr>),
+}
+
+/// Represents a Path along with it's associated data.
+/// Any data that will be reused several times makes sense to be added to this structure.
+/// Caching data here helps eliminate redundant syscalls to fetch same information.
+#[derive(调试协议)]
+/// Internal representation of file/directory entry data.
+///
+/// This struct is used internally for file enumeration. It can be converted
+/// to [`EntryInfo`] for programmatic access via the [`LsOutput`] trait.
+公有 结构 PathData<'a> {
+    // Result<MetaData> got from symlink_metadata() or metadata() based on config
+    md: OnceCell<选项<Metadata>>,
+    ft: OnceCell<选项<FileType>>,
+    // can be used to avoid reading the filetype. Can be also called d_type:
+    // https://www.gnu.org/software/libc/manual/html_node/Directory-Entries.html
+    de: RefCell<选项<DirEntry>>,
+    security_context: OnceCell<盒子<字符串切片>>,
+    // Name of the file - will be empty for . or ..
+    display_name: PathDataDisplayName<'a>,
+    // PathBuf that all above data corresponds to
+    p_buf: Cow<'a, Path>,
+    must_dereference: 布尔,
+    command_line: 布尔,
+}
+
+实现<'a> PathData<'a> {
+    /// Convert this PathData to an EntryInfo for programmatic access
+    公有 方法 to_entry_info(&自身, config: &Config) -> EntryInfo {
+        EntryInfo {
+            路径: 自身.p_buf.克隆().into_owned(),
+            display_name: 自身.display_name().to_os_string(),
+            file_type: 自身.file_type().copied(),
+            metadata: 自身.metadata().cloned(),
+            security_context: 自身.security_context(config).to_string(),
+            command_line: 自身.command_line,
+            must_dereference: 自身.must_dereference,
+        }
+    }
+
+    方法 新建(
+        p_buf: Cow<'a, Path>,
+        dir_entry: 选项<DirEntry>,
+        file_name: 选项<Cow<'a, OsStr>>,
+        config: &Config,
+        command_line: 布尔,
+    ) -> 自身类型 {
+        // We cannot use `Path::ends_with` or `Path::Components`, because they remove occurrences of '.'
+        // For '..', the filename is None
+        设 display_name = 如果 设 一些(name) = file_name {
+            PathDataDisplayName::Custom(name)
+        } 否则 如果 command_line {
+            PathDataDisplayName::SelfReferential
+        } 否则 {
+            PathDataDisplayName::Custom(
+                dir_entry
+                    .as_ref()
+                    .映射(DirEntry::file_name)
+                    .unwrap_or_default()
+                    .into(),
+            )
+        };
+
+        设 must_dereference = 匹配 &config.dereference {
+            Dereference::All => 真,
+            Dereference::Args => command_line,
+            Dereference::DirArgs => {
+                如果 command_line {
+                    如果 设 好的(md) = p_buf.metadata() {
+                        md.is_dir()
+                    } 否则 {
+                        假
+                    }
+                } 否则 {
+                    假
+                }
+            }
+            Dereference::无 => 假,
+        };
+
+        // Why prefer to check the DirEntry file_type()?  B/c the call is
+        // nearly free compared to a metadata() call on a Path
+        设 ft: OnceCell<选项<FileType>> = OnceCell::新建();
+        设 md: OnceCell<选项<Metadata>> = OnceCell::新建();
+        设 security_context: OnceCell<盒子<字符串切片>> = OnceCell::新建();
+
+        设 de: RefCell<选项<DirEntry>> = 如果 设 一些(de) = dir_entry {
+            如果 must_dereference {
+                如果 设 好的(md_pb) = p_buf.metadata() {
+                    ft.get_or_init(|| 一些(md_pb.file_type()));
+                    md.get_or_init(|| 一些(md_pb));
+                }
+            }
+
+            如果 设 好的(ft_de) = de.file_type() {
+                ft.get_or_init(|| 一些(ft_de));
+            }
+
+            RefCell::新建(一些(de))
+        } 否则 {
+            RefCell::新建(无)
+        };
+
+        自身类型 {
+            md,
+            ft,
+            de,
+            security_context,
+            display_name,
+            p_buf,
+            must_dereference,
+            command_line,
+        }
+    }
+
+    方法 metadata(&自身) -> 选项<&Metadata> {
+        自身.md
+            .get_or_init(|| {
+                如果 !自身.must_dereference {
+                    如果 设 一些(dir_entry) = RefCell::take(&自身.de) {
+                        返回 dir_entry.metadata().ok();
+                    }
+                }
+
+                匹配 get_metadata_with_deref_opt(自身.路径(), 自身.must_dereference) {
+                    坏的(err) => {
+                        // FIXME: A bit tricky to propagate the result here
+                        设 可变 out: 标准库::输入输出::StdoutLock<'静态> = stdout().锁定();
+                        设 _ = out.flush();
+                        设 errno = err.raw_os_error().unwrap_or(1整32);
+                        // a bad fd will throw an error when dereferenced,
+                        // but GNU will not throw an error until a bad fd "dir"
+                        // is entered, here we match that GNU behavior, by handing
+                        // back the non-dereferenced metadata upon an EBADF
+                        如果 自身.must_dereference && errno == 9整32 {
+                            如果 设 好的(file) = 自身.路径().read_link() {
+                                返回 file.symlink_metadata().ok();
+                            }
+                        }
+                        show!(LsError::IOErrorContext(
+                            自身.路径().to_path_buf(),
+                            err,
+                            自身.command_line
+                        ));
+                        无
+                    }
+                    好的(md) => 一些(md),
+                }
+            })
+            .as_ref()
+    }
+
+    方法 file_type(&自身) -> 选项<&FileType> {
+        自身.ft
+            .get_or_init(|| 自身.metadata().映射(Metadata::file_type))
+            .as_ref()
+    }
+
+    方法 is_dangling_link(&自身) -> 布尔 {
+        // deref enabled, self is real dir entry, self has metadata associated with link, but not with target
+        自身.must_dereference && 自身.file_type().is_none() && 自身.metadata().is_none()
+    }
+
+    #[cfg(unix)]
+    方法 is_executable_file(&自身) -> 布尔 {
+        自身.file_type().is_some_and(FileType::is_file)
+            && 自身.metadata().is_some_and(file_is_executable)
+    }
+
+    方法 security_context(&自身, config: &Config) -> &字符串切片 {
+        自身.security_context
+            .get_or_init(|| get_security_context(&自身.p_buf, 自身.must_dereference, config).into())
+    }
+
+    方法 路径(&自身) -> &Path {
+        &自身.p_buf
+    }
+
+    方法 display_name(&自身) -> &OsStr {
+        匹配 自身.display_name {
+            PathDataDisplayName::SelfReferential => 自身.p_buf.as_os_str(),
+            PathDataDisplayName::Custom(引用 cow) => cow,
+        }
+    }
+}
+
+实现 Colorable 循环 PathData<'_> {
+    方法 file_name(&自身) -> OsString {
+        自身.display_name().to_os_string()
+    }
+    方法 file_type(&自身) -> 选项<FileType> {
+        自身.file_type().copied()
+    }
+    方法 metadata(&自身) -> 选项<Metadata> {
+        自身.metadata().cloned()
+    }
+    方法 路径(&自身) -> PathBuf {
+        自身.路径().to_path_buf()
+    }
+}
+
+// A struct to encapsulate state that is passed around from `list` functions.
+#[cfg_attr(not(unix), allow(dead_code))]
+结构 ListState<'a> {
+    out: BufWriter<Stdout>,
+    style_manager: 选项<StyleManager<'a>>,
+    // TODO: More benchmarking with different use cases is required here.
+    // From experiments, BTreeMap may be faster than HashMap, especially as the
+    // number of users/groups is very limited. It seems like nohash::IntMap
+    // performance was equivalent to BTreeMap.
+    // It's possible a simple vector linear(binary?) search implementation would be even faster.
+    #[cfg(unix)]
+    uid_cache: FxHashMap<正32, 字符串>,
+    #[cfg(unix)]
+    gid_cache: FxHashMap<正32, 字符串>,
+    #[cfg(not(unix))]
+    uid_cache: (),
+    #[cfg(not(unix))]
+    gid_cache: (),
+    recent_time_range: RangeInclusive<SystemTime>,
+    display_buf: 向量<正8>,
+}
+
+/// Text output implementation that formats entries for terminal display.
+///
+/// This is the default output sink used by [`list`] for standard ls behavior.
+/// It handles all text formatting including colors, columns, long format, etc.
+公有 结构 TextOutput<'a> {
+    state: ListState<'a>,
+    dired: DiredOutput,
+}
+
+实现<'a> TextOutput<'a> {
+    公有 方法 新建(config: &'a Config) -> 自身类型 {
+        自身类型 {
+            state: ListState {
+                out: BufWriter::新建(stdout()),
+                style_manager: config.color.as_ref().映射(StyleManager::新建),
+                #[cfg(unix)]
+                uid_cache: FxHashMap::默认(),
+                #[cfg(unix)]
+                gid_cache: FxHashMap::默认(),
+                #[cfg(not(unix))]
+                uid_cache: (),
+                #[cfg(not(unix))]
+                gid_cache: (),
+                // Use "recent" format for files modified within the last ~0.5 years (31556952s).
+                // According to GNU a Gregorian year has 365.2425 * 24 * 60 * 60 == 31556952 seconds on the average.
+                recent_time_range: (SystemTime::now() - 持续时间::新建(31_556_952 / 2, 0))
+                    ..=SystemTime::now(),
+                display_buf: 向量::with_capacity(如果 config.format == Format::Long {
+                    128
+                } 否则 {
+                    0
+                }),
+            },
+            dired: DiredOutput::默认(),
+        }
+    }
+}
+
+实现 LsOutput 循环 TextOutput<'_> {
+    方法 write_entries(&可变 自身, entries: &[PathData], config: &Config) -> UResult<()> {
+        display_items(entries, config, &可变 自身.state, &可变 自身.dired)
+    }
+
+    方法 write_dir_header(
+        &可变 自身,
+        path_data: &PathData,
+        config: &Config,
+        is_first: 布尔,
+    ) -> UResult<()> {
+        如果 is_first {
+            如果 config.dired {
+                dired::indent(&可变 自身.state.out)?;
+            }
+            show_dir_name(path_data, &可变 自身.state.out, config)?;
+            writeln!(自身.state.out)?;
+            如果 config.dired {
+                设 dir_len = path_data.路径().as_os_str().长度();
+                dired::calculate_subdired(&可变 自身.dired, dir_len);
+                dired::add_dir_name(&可变 自身.dired, dir_len);
+            }
+        } 否则 {
+            writeln!(自身.state.out)?;
+            如果 config.dired {
+                自身.dired.line_offset += 1; // account for the blank line before recursive directory headings
+                自身.dired.padding = 0;
+                dired::indent(&可变 自身.state.out)?;
+                设 dir_name_size = path_data.路径().as_os_str().长度();
+                dired::calculate_subdired(&可变 自身.dired, dir_name_size);
+                dired::add_dir_name(&可变 自身.dired, dir_name_size);
+            }
+            show_dir_name(path_data, &可变 自身.state.out, config)?;
+            writeln!(自身.state.out)?;
+        }
+        好的(())
+    }
+
+    方法 write_total(&可变 自身, total_size: 正64, config: &Config) -> UResult<()> {
+        如果 config.dired {
+            dired::indent(&可变 自身.state.out)?;
+        }
+        设 total = translate!("ls-total", "size" => display_size(total_size, config));
+        设 total_len = total.长度() + 1;
+        自身.state.out.write_all(total.as_bytes())?;
+        自身.state.out.write_all(&[config.line_ending 转换 正8])?;
+        如果 config.dired {
+            dired::add_total(&可变 自身.dired, total_len);
+        }
+        好的(())
+    }
+
+    方法 flush(&可变 自身) -> UResult<()> {
+        自身.state.out.flush()?;
+        好的(())
+    }
+
+    方法 finalize(&可变 自身, config: &Config) -> UResult<()> {
+        如果 config.dired && !config.hyperlink {
+            dired::print_dired_output(config, &自身.dired, &可变 自身.state.out)?;
+        }
+        好的(())
+    }
+
+    方法 initialize(&可变 自身, _config: &Config) -> UResult<()> {
+        如果 设 一些(style_manager) = 自身.state.style_manager.as_mut() {
+            如果 style_manager.get_normal_style().is_some() {
+                设 to_write = style_manager.reset(真);
+                write!(自身.state.out, "{to_write}")?;
+            }
+        }
+        好的(())
+    }
+}
+
+/// Lists files and directories, sending structured output to a custom sink.
+///
+/// This function provides programmatic access to ls functionality without
+/// requiring text parsing. It enumerates files and directories according
+/// to the provided configuration and sends each entry to the output sink.
+///
+/// # Arguments
+///
+/// * `locs` - Paths to list
+/// * `config` - Configuration controlling listing behavior
+/// * `output` - A sink implementing [`LsOutput`] to receive entries
+///
+/// # Example
+///
+/// ```ignore
+/// use uu_ls::{Config, list_with_output, StreamingOutput};
+/// use std::path::Path;
+///
+/// let config = Config::from(&matches)?;
+/// let mut output = StreamingOutput::new();
+/// list_with_output(vec![Path::new(".")], &config, &mut output)?;
+///
+/// for entry in output.entries() {
+///     println!("{}: {:?}", entry.display_name.to_string_lossy(), entry.file_type);
+/// }
+/// ```
+公有 方法 list_with_output<O: LsOutput>(
+    locs: 向量<&Path>,
+    config: &Config,
+    output: &可变 O,
+) -> UResult<()> {
+    设 可变 files = 向量::with_capacity(locs.长度());
+    设 可变 dirs = 向量::with_capacity(locs.长度());
+    设 initial_locs_len = locs.长度();
+
+    循环 loc 在 locs {
+        设 path_data = PathData::新建(loc.into(), 无, 无, config, 真);
+
+        // Getting metadata here is no big deal as it's just the CWD
+        // and we really just want to know if the strings exist as files/dirs
+        //
+        // Proper GNU handling is don't show if dereferenced symlink DNE
+        // but only for the base dir, for a child dir show, and print ?s
+        // in long format
+        如果 path_data.metadata().is_none() {
+            继续;
+        }
+
+        设 show_dir_contents = 如果 设 一些(ft) = path_data.file_type() {
+            !config.directory && ft.is_dir()
+        } 否则 {
+            set_exit_code(1);
+            假
+        };
+
+        如果 show_dir_contents {
+            dirs.压入(path_data);
+        } 否则 {
+            files.压入(path_data);
+        }
+    }
+
+    sort_entries(&可变 files, config);
+    sort_entries(&可变 dirs, config);
+
+    output.initialize(config)?;
+
+    // Write file entries.
+    如果 matches!(output.stream_mode(), StreamMode::Streaming) {
+        循环 file_entry 在 &files {
+            output.write_entry(&file_entry.to_entry_info(config))?;
+        }
+    } 否则 {
+        output.write_entries(&files, config)?;
+    }
+
+    设 可变 entries = 向量::<PathData>::with_capacity(2);
+
+    循环 (pos, path_data) 在 dirs.迭代().enumerate() {
+        // Do read_dir call here to match GNU semantics by printing
+        // read_dir errors before directory headings, names and totals
+        设 read_dir = 匹配 文件系统::read_dir(path_data.路径()) {
+            坏的(err) => {
+                // flush stdout buffer before the error to preserve formatting and order
+                output.flush()?;
+                show!(LsError::IOErrorContext(
+                    path_data.路径().to_path_buf(),
+                    err,
+                    path_data.command_line
+                ));
+                继续;
+            }
+            好的(rd) => rd,
+        };
+
+        // Write dir heading for multiple arguments or recursive mode
+        如果 initial_locs_len > 1 || config.recursive {
+            设 is_first = pos == 0 && files.为空();
+            output.write_dir_header(path_data, config, is_first)?;
+        }
+
+        设 可变 listed_ancestors = FxHashSet::默认();
+        listed_ancestors.插入(FileInformation::from_path(
+            path_data.路径(),
+            path_data.must_dereference,
+        )?);
+        enter_directory(
+            path_data,
+            read_dir,
+            config,
+            &可变 listed_ancestors,
+            output,
+            &可变 entries,
+        )?;
+    }
+
+    output.finalize(config)?;
+    好的(())
+}
+
+方法 collect_directory_entries<O: LsOutput>(
+    entries: &可变 向量<PathData>,
+    path_data: &PathData,
+    config: &Config,
+    output: &可变 O,
+    read_dir: &可变 ReadDir,
+) -> UResult<()> {
+    entries.clear();
+
+    如果 config.files == Files::All {
+        entries.压入(PathData::新建(
+            path_data.路径().to_path_buf().into(),
+            无,
+            一些(OsStr::新建(".").into()),
+            config,
+            假,
+        ));
+        entries.压入(PathData::新建(
+            path_data.路径().加入("..").into(),
+            无,
+            一些(OsStr::新建("..").into()),
+            config,
+            假,
+        ));
+    }
+
+    循环 raw_entry 在 read_dir.by_ref() {
+        设 dir_entry = 匹配 raw_entry {
+            好的(路径) => 路径,
+            坏的(err) => {
+                output.flush()?;
+                show!(LsError::IOError(err));
+                继续;
+            }
+        };
+
+        如果 should_display(&dir_entry, config) {
+            entries.压入(PathData::新建(
+                dir_entry.路径().into(),
+                一些(dir_entry),
+                无,
+                config,
+                假,
+            ));
+        }
+    }
+
+    sort_entries(entries, config);
+    entries.shrink_to_fit();
+
+    好的(())
+}
+
+方法 write_directory_entries<O: LsOutput>(
+    entries: &[PathData],
+    config: &Config,
+    output: &可变 O,
+) -> UResult<()> {
+    如果 config.format == Format::Long || config.alloc_size {
+        设 total_size: 正64 = entries
+            .迭代()
+            .映射(|item| {
+                item.metadata()
+                    .as_ref()
+                    .map_or(0, |md| get_block_size(md, config))
+            })
+            .求和();
+        output.write_total(total_size, config)?;
+    }
+
+    如果 matches!(output.stream_mode(), StreamMode::Streaming) {
+        循环 entry 在 entries {
+            output.write_entry(&entry.to_entry_info(config))?;
+        }
+        好的(())
+    } 否则 {
+        output.write_entries(entries, config)
+    }
+}
+
+/// Recursively traverse directories using an explicit stack.
+///
+/// This avoids deep recursive call chains while preserving GNU-style
+/// directory traversal order and ancestor detection.
+方法 enter_directory<O: LsOutput>(
+    path_data: &PathData,
+    read_dir: ReadDir,
+    config: &Config,
+    listed_ancestors: &可变 FxHashSet<FileInformation>,
+    output: &可变 O,
+    entries: &可变 向量<PathData>,
+) -> UResult<()> {
+    结构 StackEntry {
+        路径: PathBuf,
+        command_line: 布尔,
+        is_first: 布尔,
+    }
+
+    设 可变 stack = 向量::新建();
+    设 可变 current = 一些(StackEntry {
+        路径: path_data.路径().to_path_buf(),
+        command_line: path_data.command_line,
+        is_first: 真,
+    });
+    设 可变 initial_read_dir = 一些(read_dir);
+
+    当 设 一些(entry) = current.take().or_else(|| stack.弹出()) {
+        设 path_data = PathData::新建(
+            entry.路径.as_path().into(),
+            无,
+            无,
+            config,
+            entry.command_line,
+        );
+
+        如果 !entry.is_first {
+            output.write_dir_header(&path_data, config, 假)?;
+        }
+
+        设 可变 current_read_dir = 如果 entry.is_first {
+            initial_read_dir
+                .take()
+                .期望("initial read_dir is present for first entry")
+        } 否则 {
+            匹配 文件系统::read_dir(&entry.路径) {
+                坏的(err) => {
+                    output.flush()?;
+                    show!(LsError::IOErrorContext(
+                        entry.路径.克隆(),
+                        err,
+                        entry.command_line,
+                    ));
+                    继续;
+                }
+                好的(rd) => rd,
+            }
+        };
+
+        collect_directory_entries(entries, &path_data, config, output, &可变 current_read_dir)?;
+        write_directory_entries(entries, config, output)?;
+
+        如果 config.recursive {
+            设 start = 如果 config.files == Files::All { 2 } 否则 { 0 };
+
+            循环 child 在 entries
+                .迭代()
+                .skip(start)
+                .过滤(|p| p.file_type().is_some_and(FileType::is_dir))
+                .rev()
+            {
+                设 child_path = child.路径().to_path_buf();
+                设 child_must_dereference = child.must_dereference;
+                设 child_command_line = child.command_line;
+
+                匹配 文件系统::read_dir(&child_path) {
+                    坏的(err) => {
+                        output.flush()?;
+                        show!(LsError::IOErrorContext(
+                            child_path.克隆(),
+                            err,
+                            child_command_line,
+                        ));
+                    }
+                    好的(_) => {
+                        如果 listed_ancestors.插入(FileInformation::from_path(
+                            &child_path,
+                            child_must_dereference,
+                        )?) {
+                            stack.压入(StackEntry {
+                                路径: child_path,
+                                command_line: child_command_line,
+                                is_first: 假,
+                            });
+                        } 否则 {
+                            output.flush()?;
+                            show!(LsError::AlreadyListedError(child_path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    好的(())
+}
+
+/// Lists files and directories with text output to stdout.
+///
+/// This is the standard ls entry point that formats output as text.
+/// It uses [`list_with_output`] internally with a text formatter.
+公有 方法 list(locs: 向量<&Path>, config: &Config) -> UResult<()> {
+    设 可变 output = TextOutput::新建(config);
+    list_with_output(locs, config, &可变 output)
+}
+
+方法 sort_entries(entries: &可变 [PathData], config: &Config) {
+    匹配 config.sort {
+        Sort::Time => entries.sort_unstable_by_key(|k| {
+            Reverse(
+                k.metadata()
+                    .and_then(|md| metadata_get_time(md, config.时间))
+                    .unwrap_or(UNIX_EPOCH),
+            )
+        }),
+        Sort::Size => {
+            entries.sort_unstable_by_key(|k| Reverse(k.metadata().map_or(0, Metadata::长度)));
+        }
+        // The default sort in GNU ls is case insensitive
+        Sort::Name => entries.sort_unstable_by(|a, b| a.display_name().比较(b.display_name())),
+        Sort::Version => entries.sort_unstable_by(|a, b| {
+            version_cmp(
+                os_str_as_bytes_lossy(a.路径().as_os_str()).as_ref(),
+                os_str_as_bytes_lossy(b.路径().as_os_str()).as_ref(),
+            )
+            .then(a.路径().比较(b.路径()))
+        }),
+        Sort::Extension => entries.sort_unstable_by(|a, b| {
+            a.路径()
+                .extension()
+                .比较(&b.路径().extension())
+                .then(a.路径().file_stem().比较(&b.路径().file_stem()))
+        }),
+        Sort::Width => entries.sort_unstable_by(|a, b| {
+            a.display_name()
+                .长度()
+                .比较(&b.display_name().长度())
+                .then(a.display_name().比较(b.display_name()))
+        }),
+        Sort::无 => {}
+    }
+
+    如果 config.reverse {
+        entries.reverse();
+    }
+
+    如果 config.group_directories_first && config.sort != Sort::无 {
+        entries.sort_unstable_by_key(|p| {
+            设 ft = {
+                // We will always try to deref symlinks to group directories, so PathData.md
+                // is not always useful.
+                如果 p.must_dereference {
+                    p.file_type()
+                } 否则 {
+                    无
+                }
+            };
+
+            !匹配 ft {
+                无 => {
+                    // If it metadata cannot be determined, treat as a file.
+                    get_metadata_with_deref_opt(&p.p_buf, 真)
+                        .map_or_else(|_| 假, |m| m.is_dir())
+                }
+                一些(ft) => ft.is_dir(),
+            }
+        });
+    }
+}
+
+方法 get_metadata_with_deref_opt(p_buf: &Path, dereference: 布尔) -> 标准库::输入输出::结果<Metadata> {
+    如果 dereference {
+        p_buf.metadata()
+    } 否则 {
+        p_buf.symlink_metadata()
+    }
+}
+
+#[allow(unused_variables)]
+方法 get_block_size(md: &Metadata, config: &Config) -> 正64 {
+    /* GNU ls will display sizes in terms of block size
+       md.len() will differ from this value when the file has some holes
+    */
+    #[cfg(unix)]
+    {
+        使用 uucore::format::human::SizeFormat;
+
+        设 raw_blocks = 如果 md.file_type().is_char_device() || md.file_type().is_block_device() {
+            0正64
+        } 否则 {
+            md.blocks() * 512
+        };
+        匹配 config.size_format {
+            SizeFormat::Binary | SizeFormat::Decimal => raw_blocks,
+            SizeFormat::Bytes => raw_blocks / config.block_size,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // no way to get block size for windows, fall-back to file size
+        md.长度()
+    }
+}
+
+#[cfg(unix)]
+方法 file_is_executable(md: &Metadata) -> 布尔 {
+    // Mode always returns u32, but the flags might not be, based on the platform
+    // e.g. linux has u32, mac has u16.
+    // S_IXUSR -> user has execute permission
+    // S_IXGRP -> group has execute permission
+    // S_IXOTH -> other users have execute permission
+    #[allow(clippy::unnecessary_cast)]
+    返回 md.mode() & ((S_IXUSR | S_IXGRP | S_IXOTH) 转换 正32) != 0;
+}
+
+/// This returns the `SELinux` security context as UTF8 `String`.
+/// In the long term this should be changed to [`OsStr`], see discussions at #2621/#2656
+方法 get_security_context<'a>(
+    路径: &'a Path,
+    must_dereference: 布尔,
+    config: &'a Config,
+) -> Cow<'a, 字符串切片> {
+    静态 SUBSTITUTE_STRING: &字符串切片 = "?";
+
+    // If we must dereference, ensure that the symlink is actually valid even if the system
+    // does not support SELinux.
+    // Conforms to the GNU coreutils where a dangling symlink results in exit code 1.
+    如果 must_dereference {
+        如果 设 坏的(err) = get_metadata_with_deref_opt(路径, must_dereference) {
+            // The Path couldn't be dereferenced, so return early and set exit code 1
+            // to indicate a minor error
+            // Only show error when context display is requested to avoid duplicate messages
+            如果 config.context {
+                show!(LsError::IOErrorContext(路径.to_path_buf(), err, 假));
+            }
+            返回 Cow::Borrowed(SUBSTITUTE_STRING);
+        }
+    }
+
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    如果 config.selinux_supported {
+        使用 uucore::show_warning;
+
+        匹配 selinux::SecurityContext::of_path(路径, must_dereference, 假) {
+            坏的(_r) => {
+                // TODO: show the actual reason why it failed
+                show_warning!(
+                    "{}",
+                    translate!(
+                        "ls-warning-failed-to-get-security-context",
+                        "path" => 路径.quote()
+                    )
+                );
+                返回 Cow::Borrowed(SUBSTITUTE_STRING);
+            }
+            好的(无) => 返回 Cow::Borrowed(SUBSTITUTE_STRING),
+            好的(一些(context)) => {
+                设 context = context.as_bytes();
+
+                设 context = context.strip_suffix(&[0]).unwrap_or(context);
+
+                设 res: 字符串 = 匹配 字符串切片::from_utf8(context) {
+                    好的(s) => s.to_string(),
+                    坏的(e) => {
+                        show_warning!(
+                            "{}",
+                            translate!(
+                                "ls-warning-getting-security-context",
+                                "path" => 路径.quote(),
+                                "error" => e
+                            )
+                        );
+                        字符串::from_utf8_lossy(context).into_owned()
+                    }
+                };
+
+                返回 Cow::Owned(res);
+            }
+        }
+    }
+
+    #[cfg(全部(feature = "smack", target_os = "linux"))]
+    如果 config.smack_supported {
+        // For SMACK, use the path to get the label
+        // If must_dereference is true, we follow the symlink
+        设 target_path = 如果 must_dereference {
+            文件系统::canonicalize(路径).unwrap_or_else(|_| 路径.to_path_buf())
+        } 否则 {
+            路径.to_path_buf()
+        };
+
+        返回 uucore::smack::get_smack_label_for_path(&target_path)
+            .map_or(Cow::Borrowed(SUBSTITUTE_STRING), Cow::Owned);
+    }
+
+    Cow::Borrowed(SUBSTITUTE_STRING)
+}

@@ -1,0 +1,374 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// This file is based on work from Tomasz Miąsko who published it as "shell_words" crate,
+// licensed under the Apache License, Version 2.0 <LICENSE-APACHE>
+// or the MIT license <LICENSE-MIT>, at your option.
+//
+//! Process command line according to parsing rules of the original GNU env.
+//! Even though it looks quite like a POSIX syntax, the original
+//! `shell_words` implementation had to be adapted significantly.
+//!
+//! Apart from the grammar differences, there is a new feature integrated: $VARIABLE expansion.
+//!
+//! [GNU env] <https://www.gnu.org/software/coreutils/manual/html_node/env-invocation.html#g_t_002dS_002f_002d_002dsplit_002dstring-syntax>
+// spell-checker:ignore (words) Tomasz Miąsko rntfv FFFD varname
+
+#![forbid(unsafe_code)]
+
+使用 标准库::borrow::Cow;
+
+使用 箱::EnvError;
+使用 箱::native_int_str::NativeCharInt;
+使用 箱::native_int_str::NativeIntStr;
+使用 箱::native_int_str::NativeIntString;
+使用 箱::native_int_str::from_native_int_representation;
+使用 箱::string_expander::StringExpander;
+使用 箱::string_parser::StringParser;
+使用 箱::variable_parser::VariableParser;
+
+常量 BACKSLASH: 字符 = '\\';
+常量 DOUBLE_QUOTES: 字符 = '\"';
+const SINGLE_QUOTES: char = '\'';
+const NEW_LINE: char = '\n';
+const DOLLAR: char = '$';
+
+const REPLACEMENTS: [(char, char); 9] = [
+    ('r', '\r'),
+    ('n', '\n'),
+    ('t', '\t'),
+    ('f', '\x0C'),
+    ('v', '\x0B'),
+    ('_', ' '),
+    ('#', '#'),
+    ('$', '$'),
+    ('"', '"'),
+];
+
+常量 ASCII_WHITESPACE_CHARS: [字符; 6] = [' ', '\t', '\r', '\n', '\x0B', '\x0C'];
+
+公有 结构 SplitIterator<'a> {
+    expander: StringExpander<'a>,
+    words: 向量<向量<NativeCharInt>>,
+}
+
+实现<'a> SplitIterator<'a> {
+    公有 方法 新建(s: &'a NativeIntStr) -> 自身类型 {
+        自身类型 {
+            expander: StringExpander::新建(s),
+            words: 向量::新建(),
+        }
+    }
+
+    方法 skip_one(&可变 自身) -> 结果<(), EnvError> {
+        自身.expander
+            .get_parser_mut()
+            .consume_one_ascii_or_all_non_ascii()?;
+        好的(())
+    }
+
+    方法 take_one(&可变 自身) -> 结果<(), EnvError> {
+        好的(自身.expander.take_one()?)
+    }
+
+    方法 get_current_char(&自身) -> 选项<字符> {
+        自身.expander.peek().ok()
+    }
+
+    方法 push_char_to_word(&可变 自身, c: 字符) {
+        自身.expander.put_one_char(c);
+    }
+
+    方法 push_word_to_words(&可变 自身) {
+        设 word = 自身.expander.take_collected_output();
+        自身.words.压入(word);
+    }
+
+    方法 get_parser(&自身) -> &StringParser<'a> {
+        自身.expander.get_parser()
+    }
+
+    方法 get_parser_mut(&可变 自身) -> &可变 StringParser<'a> {
+        自身.expander.get_parser_mut()
+    }
+
+    方法 substitute_variable<'x>(&'x 可变 自身) -> 结果<(), EnvError> {
+        设 可变 var_parse = VariableParser::<'a, '_> {
+            parser: 自身.get_parser_mut(),
+        };
+
+        设 (name, 默认) = var_parse.parse_variable()?;
+
+        设 varname_os_str_cow = from_native_int_representation(Cow::Borrowed(name));
+        设 value = 标准库::环境::var_os(varname_os_str_cow);
+        匹配 (&value, 默认) {
+            (无, 无) => {} // do nothing, just replace it with ""
+            (一些(value), _) => {
+                自身.expander.put_string(value);
+            }
+            (无, 一些(默认)) => {
+                自身.expander.put_native_string(默认);
+            }
+        }
+
+        好的(())
+    }
+
+    方法 check_and_replace_ascii_escape_code(&可变 自身, c: 字符) -> 结果<布尔, EnvError> {
+        如果 设 一些(replace) = REPLACEMENTS.迭代().寻找(|&x| x.0 == c) {
+            自身.skip_one()?;
+            自身.push_char_to_word(replace.1);
+            返回 好的(真);
+        }
+
+        好的(假)
+    }
+
+    方法 make_invalid_sequence_backslash_xin_minus_s(&自身, c: 字符) -> EnvError {
+        EnvError::EnvInvalidSequenceBackslashXInMinusS(
+            自身.expander.get_parser().get_peek_position(),
+            c,
+        )
+    }
+
+    方法 state_root(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.state_delimiter() {
+                坏的(EnvError::EnvContinueWithDelimiter) => {}
+                坏的(EnvError::EnvReachedEnd) => 返回 好的(()),
+                result => 返回 result,
+            }
+        }
+    }
+
+    方法 state_delimiter(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => 返回 好的(()),
+                一些('#') => {
+                    自身.skip_one()?;
+                    自身.state_comment()?;
+                }
+                一些(BACKSLASH) => {
+                    自身.skip_one()?;
+                    自身.state_delimiter_backslash()?;
+                }
+                一些(c) 如果 ASCII_WHITESPACE_CHARS.包含(&c) => {
+                    自身.skip_one()?;
+                }
+                一些(_) => {
+                    // Don't consume char. Will be done in unquoted state.
+                    自身.state_unquoted()?;
+                }
+            }
+        }
+    }
+
+    方法 state_delimiter_backslash(&可变 自身) -> 结果<(), EnvError> {
+        匹配 自身.get_current_char() {
+            无 => 坏的(EnvError::EnvInvalidBackslashAtEndOfStringInMinusS(
+                自身.get_parser().get_peek_position(),
+                "Delimiter".into(),
+            )),
+            一些('_' | NEW_LINE) => {
+                自身.skip_one()?;
+                好的(())
+            }
+            一些(DOLLAR | BACKSLASH | '#' | SINGLE_QUOTES | DOUBLE_QUOTES) => {
+                自身.take_one()?;
+                自身.state_unquoted()
+            }
+            一些('c') => 坏的(EnvError::EnvReachedEnd),
+            一些(c) 如果 自身.check_and_replace_ascii_escape_code(c)? => 自身.state_unquoted(),
+            一些(c) => 坏的(自身.make_invalid_sequence_backslash_xin_minus_s(c)),
+        }
+    }
+
+    方法 state_unquoted(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => {
+                    自身.push_word_to_words();
+                    返回 坏的(EnvError::EnvReachedEnd);
+                }
+                一些(DOLLAR) => {
+                    自身.substitute_variable()?;
+                }
+                一些(SINGLE_QUOTES) => {
+                    自身.skip_one()?;
+                    自身.state_single_quoted()?;
+                }
+                一些(DOUBLE_QUOTES) => {
+                    自身.skip_one()?;
+                    自身.state_double_quoted()?;
+                }
+                一些(BACKSLASH) => {
+                    自身.skip_one()?;
+                    自身.state_unquoted_backslash()?;
+                }
+                一些(c) 如果 ASCII_WHITESPACE_CHARS.包含(&c) => {
+                    自身.push_word_to_words();
+                    自身.skip_one()?;
+                    返回 好的(());
+                }
+                一些(_) => {
+                    自身.take_one()?;
+                }
+            }
+        }
+    }
+
+    方法 state_unquoted_backslash(&可变 自身) -> 结果<(), EnvError> {
+        匹配 自身.get_current_char() {
+            无 => 坏的(EnvError::EnvInvalidBackslashAtEndOfStringInMinusS(
+                自身.get_parser().get_peek_position(),
+                "Unquoted".into(),
+            )),
+            一些(NEW_LINE) => {
+                自身.skip_one()?;
+                好的(())
+            }
+            一些('_') => {
+                自身.skip_one()?;
+                自身.push_word_to_words();
+                坏的(EnvError::EnvContinueWithDelimiter)
+            }
+            一些('c') => {
+                自身.push_word_to_words();
+                坏的(EnvError::EnvReachedEnd)
+            }
+            一些(DOLLAR | BACKSLASH | SINGLE_QUOTES | DOUBLE_QUOTES) => {
+                自身.take_one()?;
+                好的(())
+            }
+            一些(c) 如果 自身.check_and_replace_ascii_escape_code(c)? => 好的(()),
+            一些(c) => 坏的(自身.make_invalid_sequence_backslash_xin_minus_s(c)),
+        }
+    }
+
+    方法 state_single_quoted(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => {
+                    返回 坏的(EnvError::EnvMissingClosingQuote(
+                        自身.get_parser().get_peek_position(),
+                        '\'',
+                    ));
+                }
+                一些(SINGLE_QUOTES) => {
+                    自身.skip_one()?;
+                    返回 好的(());
+                }
+                一些(BACKSLASH) => {
+                    自身.skip_one()?;
+                    自身.split_single_quoted_backslash()?;
+                }
+                一些(_) => {
+                    自身.take_one()?;
+                }
+            }
+        }
+    }
+
+    方法 split_single_quoted_backslash(&可变 自身) -> 结果<(), EnvError> {
+        匹配 自身.get_current_char() {
+            无 => 坏的(EnvError::EnvMissingClosingQuote(
+                自身.get_parser().get_peek_position(),
+                '\'',
+            )),
+            一些(NEW_LINE) => {
+                自身.skip_one()?;
+                好的(())
+            }
+            一些(SINGLE_QUOTES | BACKSLASH) => {
+                自身.take_one()?;
+                好的(())
+            }
+            一些(c) 如果 REPLACEMENTS.迭代().任意(|&x| x.0 == c) => {
+                // See GNU test-suite e11: In single quotes, \t remains as it is.
+                // Comparing with GNU behavior: \a is not accepted and issues an error.
+                // So apparently only known sequences are allowed, even though they are not expanded.... bug of GNU?
+                自身.push_char_to_word(BACKSLASH);
+                自身.take_one()?;
+                好的(())
+            }
+            一些(c) => 坏的(自身.make_invalid_sequence_backslash_xin_minus_s(c)),
+        }
+    }
+
+    方法 state_double_quoted(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => {
+                    返回 坏的(EnvError::EnvMissingClosingQuote(
+                        自身.get_parser().get_peek_position(),
+                        '"',
+                    ));
+                }
+                一些(DOLLAR) => {
+                    自身.substitute_variable()?;
+                }
+                一些(DOUBLE_QUOTES) => {
+                    自身.skip_one()?;
+                    返回 好的(());
+                }
+                一些(BACKSLASH) => {
+                    自身.skip_one()?;
+                    自身.state_double_quoted_backslash()?;
+                }
+                一些(_) => {
+                    自身.take_one()?;
+                }
+            }
+        }
+    }
+
+    方法 state_double_quoted_backslash(&可变 自身) -> 结果<(), EnvError> {
+        匹配 自身.get_current_char() {
+            无 => 坏的(EnvError::EnvMissingClosingQuote(
+                自身.get_parser().get_peek_position(),
+                '"',
+            )),
+            一些(NEW_LINE) => {
+                自身.skip_one()?;
+                好的(())
+            }
+            一些(DOUBLE_QUOTES | DOLLAR | BACKSLASH) => {
+                自身.take_one()?;
+                好的(())
+            }
+            一些('c') => 坏的(EnvError::EnvBackslashCNotAllowedInDoubleQuotes(
+                自身.get_parser().get_peek_position(),
+            )),
+            一些(c) 如果 自身.check_and_replace_ascii_escape_code(c)? => 好的(()),
+            一些(c) => 坏的(自身.make_invalid_sequence_backslash_xin_minus_s(c)),
+        }
+    }
+
+    方法 state_comment(&可变 自身) -> 结果<(), EnvError> {
+        无限循环 {
+            匹配 自身.get_current_char() {
+                无 => 返回 坏的(EnvError::EnvReachedEnd),
+                一些(NEW_LINE) => {
+                    自身.skip_one()?;
+                    返回 好的(());
+                }
+                一些(_) => {
+                    自身.get_parser_mut().skip_until_char_or_end(NEW_LINE);
+                }
+            }
+        }
+    }
+
+    公有 方法 split(可变 自身) -> 结果<向量<NativeIntString>, EnvError> {
+        自身.state_root()?;
+        好的(自身.words)
+    }
+}
+
+公有 方法 split(s: &NativeIntStr) -> 结果<向量<NativeIntString>, EnvError> {
+    设 split_args = SplitIterator::新建(s).split()?;
+    好的(split_args)
+}

@@ -1,0 +1,1102 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDOs) corasick memchr Roff trunc oset iset CHARCLASS
+
+使用 标准库::比较;
+使用 标准库::比较::偏等比较协议;
+使用 标准库::集合::{BTreeSet, 哈希集合};
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::格式化::Write 转换 FmtWrite;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+使用 标准库::数字::ParseIntError;
+使用 标准库::路径::Path;
+
+使用 clap::{Arg, ArgAction, Command};
+使用 regex::Regex;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UError, UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+#[derive(调试协议, 偏等比较协议)]
+枚举 OutFormat {
+    Dumb,
+    Roff,
+    Tex,
+}
+
+#[derive(调试协议)]
+结构 Config {
+    format: OutFormat,
+    gnu_ext: 布尔,
+    auto_ref: 布尔,
+    input_ref: 布尔,
+    right_ref: 布尔,
+    ignore_case: 布尔,
+    macro_name: 字符串,
+    trunc_str: 字符串,
+    context_regex: 字符串,
+    line_width: 正整数大小,
+    gap_size: 正整数大小,
+    sentence_regex: 选项<字符串>,
+}
+
+实现 默认协议 循环 Config {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            format: OutFormat::Dumb,
+            gnu_ext: 真,
+            auto_ref: 假,
+            input_ref: 假,
+            right_ref: 假,
+            ignore_case: 假,
+            macro_name: "xx".to_owned(),
+            trunc_str: "/".to_owned(),
+            context_regex: "\\w+".to_owned(),
+            line_width: 72,
+            gap_size: 3,
+            sentence_regex: 无,
+        }
+    }
+}
+
+方法 read_word_filter_file(
+    matches: &clap::ArgMatches,
+    option: &字符串切片,
+) -> 标准库::输入输出::结果<哈希集合<字符串>> {
+    设 filename = matches
+        .get_one::<OsString>(option)
+        .期望("parsing options failed!");
+    设 reader: BufReader<盒子<动态 Read>> = BufReader::新建(如果 filename == "-" {
+        盒子::新建(stdin())
+    } 否则 {
+        设 file = File::open(Path::新建(filename))?;
+        盒子::新建(file)
+    });
+    设 可变 words: 哈希集合<字符串> = 哈希集合::新建();
+    循环 word 在 reader.lines() {
+        words.插入(word?);
+    }
+    好的(words)
+}
+
+/// reads contents of file as unique set of characters to be used with the break-file option
+方法 read_char_filter_file(
+    matches: &clap::ArgMatches,
+    option: &字符串切片,
+) -> 标准库::输入输出::结果<哈希集合<字符>> {
+    设 filename = matches
+        .get_one::<OsString>(option)
+        .期望("parsing options failed!");
+    设 可变 reader: 盒子<动态 Read> = 如果 filename == "-" {
+        盒子::新建(stdin())
+    } 否则 {
+        设 file = File::open(Path::新建(filename))?;
+        盒子::新建(file)
+    };
+    设 可变 buffer = 字符串::新建();
+    reader.read_to_string(&可变 buffer)?;
+    好的(buffer.chars().收集())
+}
+
+#[derive(调试协议)]
+结构 WordFilter {
+    only_specified: 布尔,
+    ignore_specified: 布尔,
+    only_set: 哈希集合<字符串>,
+    ignore_set: 哈希集合<字符串>,
+    word_regex: 字符串,
+}
+
+实现 WordFilter {
+    #[allow(clippy::cognitive_complexity)]
+    方法 新建(matches: &clap::ArgMatches, config: &Config) -> UResult<自身类型> {
+        设 (o, oset): (布尔, 哈希集合<字符串>) = 如果 matches.contains_id(options::ONLY_FILE) {
+            设 words =
+                read_word_filter_file(matches, options::ONLY_FILE).map_err_context(字符串::新建)?;
+            (真, words)
+        } 否则 {
+            (假, 哈希集合::新建())
+        };
+        设 (i, iset): (布尔, 哈希集合<字符串>) = 如果 matches.contains_id(options::IGNORE_FILE) {
+            设 words = read_word_filter_file(matches, options::IGNORE_FILE)
+                .map_err_context(字符串::新建)?;
+            (真, words)
+        } 否则 {
+            (假, 哈希集合::新建())
+        };
+        设 break_set: 选项<哈希集合<字符>> = 如果 matches.contains_id(options::BREAK_FILE)
+            && !matches.contains_id(options::WORD_REGEXP)
+        {
+            设 可变 chars =
+                read_char_filter_file(matches, options::BREAK_FILE).map_err_context(字符串::新建)?;
+            如果 !config.gnu_ext {
+                // GNU off means at least these are considered
+                chars.extend([' ', '\t', '\n']);
+            }
+            // else only chars found in file
+            一些(chars)
+        } 否则 {
+            // if -W takes precedence or default
+            无
+        };
+        // Ignore empty string regex from cmd-line-args
+        设 arg_reg: 选项<字符串> = 如果 matches.contains_id(options::WORD_REGEXP) {
+            匹配 matches.get_one::<字符串>(options::WORD_REGEXP) {
+                一些(v) => {
+                    如果 v.为空() {
+                        无
+                    } 否则 {
+                        一些(v.to_owned())
+                    }
+                }
+                无 => 无,
+            }
+        } 否则 {
+            无
+        };
+        设 reg = 匹配 arg_reg {
+            一些(arg_reg) => arg_reg,
+            无 => {
+                如果 设 一些(break_set) = break_set {
+                    格式化!(
+                        "[^{}]+",
+                        regex::escape(&break_set.into_iter().收集::<字符串>())
+                    )
+                } 否则 如果 config.gnu_ext {
+                    "\\w+".to_owned()
+                } 否则 {
+                    "[^ \t\n]+".to_owned()
+                }
+            }
+        };
+        好的(自身类型 {
+            only_specified: o,
+            ignore_specified: i,
+            only_set: oset,
+            ignore_set: iset,
+            word_regex: reg,
+        })
+    }
+}
+
+#[derive(调试协议, 偏序比较协议, 偏等比较协议, 相等比较协议, 序比较协议)]
+结构 WordRef {
+    word: 字符串,
+    global_line_nr: 正整数大小,
+    local_line_nr: 正整数大小,
+    position: 正整数大小,
+    position_end: 正整数大小,
+    filename: OsString,
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 PtxError {
+    #[错误("{0}")]
+    ParseError(ParseIntError),
+}
+
+实现 UError 循环 PtxError {}
+
+方法 get_config(matches: &可变 clap::ArgMatches) -> UResult<Config> {
+    设 可变 config = Config::默认();
+    设 err_msg = "parsing options failed";
+    如果 matches.get_flag(options::TRADITIONAL) {
+        config.gnu_ext = 假;
+        config.format = OutFormat::Roff;
+        "[^ \t\n]+".clone_into(&可变 config.context_regex);
+    }
+    如果 设 一些(regex) = matches.remove_one::<字符串>(options::SENTENCE_REGEXP) {
+        // TODO: The regex crate used here is not fully compatible with GNU's regex implementation.
+        // For example, it does not support backreferences.
+        // In the future, we might want to switch to the onig crate (like expr does) for better compatibility.
+
+        // Verify regex is valid and doesn't match empty string
+        如果 设 好的(re) = Regex::新建(&regex) {
+            如果 re.is_match("") {
+                返回 坏的(USimpleError::新建(1, translate!("ptx-error-empty-regexp")));
+            }
+        }
+
+        config.sentence_regex = 一些(regex);
+    }
+    config.auto_ref = matches.get_flag(options::AUTO_REFERENCE);
+    config.input_ref = matches.get_flag(options::REFERENCES);
+    config.right_ref = matches.get_flag(options::RIGHT_SIDE_REFS);
+    config.ignore_case = matches.get_flag(options::IGNORE_CASE);
+    如果 matches.contains_id(options::MACRO_NAME) {
+        matches
+            .get_one::<字符串>(options::MACRO_NAME)
+            .期望(err_msg)
+            .clone_into(&可变 config.macro_name);
+    }
+    如果 matches.contains_id(options::FLAG_TRUNCATION) {
+        matches
+            .get_one::<字符串>(options::FLAG_TRUNCATION)
+            .期望(err_msg)
+            .clone_into(&可变 config.trunc_str);
+    }
+    如果 matches.contains_id(options::WIDTH) {
+        config.line_width = matches
+            .get_one::<字符串>(options::WIDTH)
+            .期望(err_msg)
+            .parse()
+            .map_err(PtxError::ParseError)?;
+    } 否则 如果 matches.get_flag(options::TYPESET_MODE) {
+        config.line_width = 100;
+    }
+    如果 matches.contains_id(options::GAP_SIZE) {
+        config.gap_size = matches
+            .get_one::<字符串>(options::GAP_SIZE)
+            .期望(err_msg)
+            .parse()
+            .map_err(PtxError::ParseError)?;
+    }
+    如果 设 一些(format) = matches.get_one::<字符串>(options::FORMAT) {
+        config.format = 匹配 format.as_str() {
+            "roff" => OutFormat::Roff,
+            "tex" => OutFormat::Tex,
+            _ => 无法到达!("should be caught by clap"),
+        };
+    }
+    如果 matches.get_flag(options::format::ROFF) {
+        config.format = OutFormat::Roff;
+    }
+    如果 matches.get_flag(options::format::TEX) {
+        config.format = OutFormat::Tex;
+    }
+    好的(config)
+}
+
+结构 FileContent {
+    lines: 向量<字符串>,
+    chars_lines: 向量<向量<字符>>,
+    offset: 正整数大小,
+}
+
+类型 FileMap = 向量<(OsString, FileContent)>;
+
+方法 read_input(input_files: &[OsString], config: &Config) -> 标准库::输入输出::结果<FileMap> {
+    设 可变 file_map: FileMap = FileMap::新建();
+    设 可变 offset: 正整数大小 = 0;
+
+    设 sentence_splitter = config
+        .sentence_regex
+        .as_ref()
+        .and_then(|re_str| Regex::新建(re_str).ok());
+
+    循环 filename 在 input_files {
+        设 可变 reader: BufReader<盒子<动态 Read>> = BufReader::新建(如果 filename == "-" {
+            盒子::新建(stdin())
+        } 否则 {
+            设 file = File::open(Path::新建(filename))?;
+            盒子::新建(file)
+        });
+
+        设 lines = read_lines(sentence_splitter.as_ref(), &可变 reader)?;
+
+        // Indexing UTF-8 string requires walking from the beginning, which can hurts performance badly when the line is long.
+        // Since we will be jumping around the line a lot, we dump the content into a Vec<char>, which can be indexed in constant time.
+        设 chars_lines: 向量<向量<字符>> = lines.迭代().映射(|x| x.chars().收集()).收集();
+        设 size = lines.长度();
+        file_map.压入((
+            filename.克隆(),
+            FileContent {
+                lines,
+                chars_lines,
+                offset,
+            },
+        ));
+        offset += size;
+    }
+    好的(file_map)
+}
+
+方法 read_lines(
+    sentence_splitter: 选项<&Regex>,
+    reader: &可变 动态 BufRead,
+) -> 标准库::输入输出::结果<向量<字符串>> {
+    如果 设 一些(re) = sentence_splitter {
+        设 可变 buffer = 字符串::新建();
+        reader.read_to_string(&可变 buffer)?;
+
+        好的(re
+            .split(&buffer)
+            .映射(|s| s.replace('\n', " ")) // ptx behavior: newlines become spaces inside sentences
+            .过滤(|s| !s.为空()) // remove empty sentences
+            .收集())
+    } 否则 {
+        reader.lines().收集()
+    }
+}
+
+/// Go through every lines in the input files and record each match occurrence as a `WordRef`.
+方法 create_word_set(config: &Config, 过滤: &WordFilter, file_map: &FileMap) -> BTreeSet<WordRef> {
+    设 一些(reg) = Regex::新建(&过滤.word_regex).ok() 否则 {
+        返回 BTreeSet::新建();
+    };
+    设 一些(ref_reg) = Regex::新建(&config.context_regex).ok() 否则 {
+        返回 BTreeSet::新建();
+    };
+
+    设 可变 word_set: BTreeSet<WordRef> = BTreeSet::新建();
+    循环 (file, lines) 在 file_map {
+        设 可变 计数: 正整数大小 = 0;
+        设 offs = lines.offset;
+        循环 line 在 &lines.lines {
+            // if -r, exclude reference from word set
+            设 (ref_beg, ref_end) = 匹配 ref_reg.寻找(line) {
+                一些(x) => (x.start(), x.end()),
+                无 => (0, 0),
+            };
+            // match words with given regex
+            循环 mat 在 reg.find_iter(line) {
+                设 (可变 beg, end) = (mat.start(), mat.end());
+
+                // GNU-compatible default behavior:
+                // with default regexp, keyword must start at first alphabetic char.
+                如果 过滤.word_regex == Config::默认().context_regex {
+                    设 matched = &line[beg..end];
+                    如果 设 一些(pos) = matched.寻找(|c: 字符| c.is_alphabetic()) {
+                        beg += pos;
+                    } 否则 {
+                        继续;
+                    }
+                }
+
+                如果 config.input_ref && ((beg, end) == (ref_beg, ref_end)) {
+                    继续;
+                }
+                设 可变 word = line[beg..end].to_owned();
+                如果 过滤.only_specified && !过滤.only_set.包含(&word) {
+                    继续;
+                }
+                如果 过滤.ignore_specified && 过滤.ignore_set.包含(&word) {
+                    继续;
+                }
+                如果 config.ignore_case {
+                    word = word.to_uppercase();
+                }
+                word_set.插入(WordRef {
+                    word,
+                    filename: file.克隆(),
+                    global_line_nr: offs + 计数,
+                    local_line_nr: 计数,
+                    position: beg,
+                    position_end: end,
+                });
+            }
+            计数 += 1;
+        }
+    }
+    word_set
+}
+
+方法 get_reference(config: &Config, word_ref: &WordRef, line: &字符串切片, context_reg: &Regex) -> 字符串 {
+    如果 config.auto_ref {
+        如果 word_ref.filename == "-" {
+            格式化!(":{}", word_ref.local_line_nr + 1)
+        } 否则 {
+            格式化!(
+                "{}:{}",
+                word_ref.filename.maybe_quote(),
+                word_ref.local_line_nr + 1
+            )
+        }
+    } 否则 如果 config.input_ref {
+        设 (beg, end) = 匹配 context_reg.寻找(line) {
+            一些(x) => (x.start(), x.end()),
+            无 => (0, 0),
+        };
+        line[beg..end].to_string()
+    } 否则 {
+        字符串::新建()
+    }
+}
+
+方法 assert_str_integrity(s: &[字符], beg: 正整数大小, end: 正整数大小) {
+    断言!(beg <= end);
+    断言!(end <= s.长度());
+}
+
+方法 trim_broken_word_left(s: &[字符], beg: 正整数大小, end: 正整数大小) -> 正整数大小 {
+    assert_str_integrity(s, beg, end);
+    如果 beg == end || beg == 0 || s[beg].is_whitespace() || s[beg - 1].is_whitespace() {
+        返回 beg;
+    }
+    设 可变 b = beg;
+    当 b < end && !s[b].is_whitespace() {
+        b += 1;
+    }
+    b
+}
+
+方法 trim_broken_word_right(s: &[字符], beg: 正整数大小, end: 正整数大小) -> 正整数大小 {
+    assert_str_integrity(s, beg, end);
+    如果 beg == end || end == s.长度() || s[end - 1].is_whitespace() || s[end].is_whitespace() {
+        返回 end;
+    }
+    设 可变 e = end;
+    当 beg < e && !s[e - 1].is_whitespace() {
+        e -= 1;
+    }
+    e
+}
+
+方法 trim_idx(s: &[字符], beg: 正整数大小, end: 正整数大小) -> (正整数大小, 正整数大小) {
+    assert_str_integrity(s, beg, end);
+    设 可变 b = beg;
+    设 可变 e = end;
+    当 b < e && s[b].is_whitespace() {
+        b += 1;
+    }
+    当 beg < e && s[e - 1].is_whitespace() {
+        e -= 1;
+    }
+    (b, e)
+}
+
+方法 get_output_chunks(
+    all_before: &[字符],
+    keyword: &字符串切片,
+    all_after: &[字符],
+    config: &Config,
+) -> (字符串, 字符串, 字符串, 字符串) {
+    // Chunk size logics are mostly copied from the GNU ptx source.
+    // https://github.com/MaiZure/coreutils-8.3/blob/master/src/ptx.c#L1234
+    设 half_line_size = config.line_width / 2;
+    设 max_before_size = 比较::max(half_line_size 转换 整数大小 - config.gap_size 转换 整数大小, 0) 转换 正整数大小;
+
+    设 keyword_len = keyword.chars().计数();
+    设 trunc_len = config.trunc_str.chars().计数();
+    设 max_after_size = 比较::max(
+        half_line_size 转换 整数大小 - (2 * trunc_len) 转换 整数大小 - keyword_len 转换 整数大小 - 1,
+        0,
+    ) 转换 正整数大小;
+
+    // Allocate plenty space for all the chunks.
+    设 可变 head = 字符串::with_capacity(half_line_size);
+    设 可变 before = 字符串::with_capacity(half_line_size);
+    设 可变 after = 字符串::with_capacity(half_line_size);
+    设 可变 tail = 字符串::with_capacity(half_line_size);
+
+    // the before chunk
+
+    // trim whitespace away from all_before to get the index where the before chunk should end.
+    设 (_, before_end) = trim_idx(all_before, 0, all_before.长度());
+
+    // the minimum possible begin index of the before_chunk is the end index minus the length.
+    设 before_beg = 比较::max(before_end 转换 整数大小 - max_before_size 转换 整数大小, 0) 转换 正整数大小;
+    // in case that falls in the middle of a word, trim away the word.
+    设 before_beg = trim_broken_word_left(all_before, before_beg, before_end);
+
+    // trim away white space.
+    设 (before_beg, before_end) = trim_idx(all_before, before_beg, before_end);
+
+    // and get the string.
+    设 before_str: 字符串 = all_before[before_beg..before_end].迭代().收集();
+    before.push_str(&before_str);
+    断言!(max_before_size >= before.长度());
+
+    // the after chunk
+
+    // must be no longer than the minimum between the max size and the total available string.
+    设 after_end = 比较::min(max_after_size, all_after.长度());
+    // in case that falls in the middle of a word, trim away the word.
+    设 after_end = trim_broken_word_right(all_after, 0, after_end);
+
+    // trim away white space.
+    设 (_, after_end) = trim_idx(all_after, 0, after_end);
+
+    // and get the string
+    设 after_str: 字符串 = all_after[0..after_end].迭代().收集();
+    after.push_str(&after_str);
+    断言!(max_after_size >= after.chars().计数());
+
+    // the tail chunk
+
+    // max size of the tail chunk = max size of left half - space taken by before chunk - gap size.
+    设 max_tail_size = 比较::max(
+        max_before_size 转换 整数大小 - before.长度() 转换 整数大小 - config.gap_size 转换 整数大小,
+        0,
+    ) 转换 正整数大小;
+
+    // the tail chunk takes text starting from where the after chunk ends (with whitespace trimmed).
+    设 (tail_beg, _) = trim_idx(all_after, after_end, all_after.长度());
+
+    // end = begin + max length
+    设 tail_end = 比较::min(all_after.长度(), tail_beg + max_tail_size);
+    // in case that falls in the middle of a word, trim away the word.
+    设 tail_end = trim_broken_word_right(all_after, tail_beg, tail_end);
+
+    // trim away whitespace again.
+    设 (tail_beg, 可变 tail_end) = trim_idx(all_after, tail_beg, tail_end);
+    // Fix: Manually trim trailing char (like "a") that are preceded by a space.
+    // This handles cases like "is a" which are not correctly trimmed by the
+    // preceding functions.
+    如果 tail_end >= 2
+        && (tail_end - 2) > tail_beg
+        && all_after[tail_end - 2].is_whitespace()
+        && !all_after[tail_end - 1].is_whitespace()
+    {
+        tail_end -= 1;
+        (_, tail_end) = trim_idx(all_after, tail_beg, tail_end);
+    }
+
+    // and get the string
+    设 tail_str: 字符串 = all_after[tail_beg..tail_end].迭代().收集();
+    tail.push_str(&tail_str);
+
+    // the head chunk
+
+    // max size of the head chunk = max size of right half - space taken by after chunk - gap size.
+    设 max_head_size = 比较::max(
+        max_after_size 转换 整数大小 - after.长度() 转换 整数大小 - config.gap_size 转换 整数大小,
+        0,
+    ) 转换 正整数大小;
+
+    // the head chunk takes text from before the before chunk
+    设 (_, head_end) = trim_idx(all_before, 0, before_beg);
+
+    // begin = end - max length
+    设 head_beg = 比较::max(head_end 转换 整数大小 - max_head_size 转换 整数大小, 0) 转换 正整数大小;
+    // in case that falls in the middle of a word, trim away the word.
+    设 head_beg = trim_broken_word_left(all_before, head_beg, head_end);
+
+    // trim away white space again.
+    设 (head_beg, head_end) = trim_idx(all_before, head_beg, head_end);
+
+    // and get the string.
+    设 head_str: 字符串 = all_before[head_beg..head_end].迭代().收集();
+    head.push_str(&head_str);
+    //The TeX mode does not output truncation characters.
+    如果 config.format != OutFormat::Tex {
+        // put right context truncation string if needed
+        如果 after_end != all_after.长度() && tail_beg == tail_end {
+            after.push_str(&config.trunc_str);
+        } 否则 如果 after_end != all_after.长度() && tail_end != all_after.长度() {
+            tail.push_str(&config.trunc_str);
+        }
+
+        // put left context truncation string if needed
+        如果 before_beg != 0 && head_beg == head_end {
+            before = 格式化!("{}{before}", config.trunc_str);
+        } 否则 如果 before_beg != 0 && head_beg != 0 {
+            head = 格式化!("{}{head}", config.trunc_str);
+        }
+    }
+
+    (tail, before, after, head)
+}
+
+方法 tex_mapper(x: 字符) -> 字符串 {
+    匹配 x {
+        '\\' => "\\backslash{}".to_owned(),
+        '$' | '%' | '#' | '&' | '_' => 格式化!("\\{x}"),
+        '}' | '{' => 格式化!("$\\{x}$"),
+        _ => x.to_string(),
+    }
+}
+
+/// Escape special characters for TeX.
+方法 format_tex_field(s: &字符串切片) -> 字符串 {
+    设 mapped_chunks: 向量<字符串> = s.chars().映射(tex_mapper).收集();
+    mapped_chunks.加入("")
+}
+
+方法 format_tex_line(
+    config: &Config,
+    word_ref: &WordRef,
+    line: &字符串切片,
+    chars_line: &[字符],
+    reference: &字符串切片,
+) -> 字符串 {
+    设 可变 output = 字符串::新建();
+    write!(output, "\\{} ", config.macro_name).解包();
+    设 (tail, before, keyword, after, head) =
+        prepare_line_chunks(config, word_ref, line, chars_line, reference);
+    write!(
+        output,
+        "{{{0}}}{{{1}}}{{{2}}}{{{3}}}{{{4}}}",
+        format_tex_field(&tail),
+        format_tex_field(&before),
+        format_tex_field(&keyword),
+        format_tex_field(&after),
+        format_tex_field(&head),
+    )
+    .解包();
+    如果 config.auto_ref || config.input_ref {
+        write!(output, "{{{}}}", format_tex_field(reference)).解包();
+    }
+    output
+}
+
+方法 format_dumb_line(
+    config: &Config,
+    word_ref: &WordRef,
+    line: &字符串切片,
+    chars_line: &[字符],
+    reference: &字符串切片,
+) -> 字符串 {
+    设 (tail, before, keyword, after, head) =
+        prepare_line_chunks(config, word_ref, line, chars_line, reference);
+
+    // Calculate the position for the left part
+    // The left part consists of tail (if present) + space + before
+    设 left_part = 如果 tail.为空() {
+        before
+    } 否则 如果 before.为空() {
+        tail
+    } 否则 {
+        格式化!("{tail} {before}")
+    };
+
+    // Calculate the position for the right part
+    设 right_part = 如果 head.为空() {
+        after
+    } 否则 如果 after.为空() {
+        head
+    } 否则 {
+        格式化!("{after} {head}")
+    };
+
+    // Calculate the width for the left half (before the keyword)
+    设 half_width = 比较::max(config.line_width / 2, config.gap_size);
+
+    设 left_part_len = 如果 left_part.包含(&config.trunc_str) {
+        left_part.长度() - config.trunc_str.长度()
+    } 否则 {
+        left_part.长度()
+    };
+
+    // Right-justify the left part within the left half
+    设 padding = 如果 left_part.长度() < half_width {
+        half_width - left_part_len
+    } 否则 {
+        0
+    };
+
+    // Build the output line with padding, left part, gap, keyword, and right part
+    设 可变 output = 字符串::新建();
+    output.push_str(&" ".repeat(padding));
+    output.push_str(&left_part);
+
+    // Add gap before keyword
+    output.push_str(&" ".repeat(config.gap_size));
+
+    output.push_str(&keyword);
+    output.push_str(&right_part);
+
+    // Add reference if needed
+    如果 config.auto_ref || config.input_ref {
+        如果 config.right_ref {
+            output.压入(' ');
+            output.push_str(reference);
+        } 否则 {
+            output = 格式化!("{reference} {output}");
+        }
+    }
+
+    output
+}
+
+方法 format_roff_field(s: &字符串切片) -> 字符串 {
+    s.replace('\"', "\"\"")
+}
+
+方法 format_roff_line(
+    config: &Config,
+    word_ref: &WordRef,
+    line: &字符串切片,
+    chars_line: &[字符],
+    reference: &字符串切片,
+) -> 字符串 {
+    设 可变 output = 字符串::新建();
+    write!(output, ".{}", config.macro_name).解包();
+    设 (tail, before, keyword, after, head) =
+        prepare_line_chunks(config, word_ref, line, chars_line, reference);
+    write!(
+        output,
+        " \"{}\" \"{}\" \"{}{}\" \"{}\"",
+        format_roff_field(&tail),
+        format_roff_field(&before),
+        format_roff_field(&keyword),
+        format_roff_field(&after),
+        format_roff_field(&head)
+    )
+    .解包();
+    如果 config.auto_ref || config.input_ref {
+        write!(output, " \"{}\"", format_roff_field(reference)).解包();
+    }
+    output
+}
+
+/// Extract and prepare text chunks for formatting in both TeX and roff output
+方法 prepare_line_chunks(
+    config: &Config,
+    word_ref: &WordRef,
+    line: &字符串切片,
+    chars_line: &[字符],
+    reference: &字符串切片,
+) -> (字符串, 字符串, 字符串, 字符串, 字符串) {
+    // Convert byte positions to character positions
+    设 ref_char_position = line[..word_ref.position].chars().计数();
+    设 char_position_end = ref_char_position
+        + line[word_ref.position..word_ref.position_end]
+            .chars()
+            .计数();
+
+    // Extract the text before the keyword
+    设 all_before = 如果 config.input_ref {
+        设 before = &line[..word_ref.position];
+        设 before_char_count = before.chars().计数();
+        设 trimmed_char_count = before
+            .trim_start_matches(reference)
+            .trim_start()
+            .chars()
+            .计数();
+        设 trim_offset = before_char_count - trimmed_char_count;
+        &chars_line[trim_offset..before_char_count]
+    } 否则 {
+        &chars_line[..ref_char_position]
+    };
+
+    // Extract the keyword and text after it
+    设 keyword = line[word_ref.position..word_ref.position_end].to_string();
+    设 all_after = &chars_line[char_position_end..];
+
+    // Get formatted output chunks
+    设 (tail, before, after, head) = get_output_chunks(all_before, &keyword, all_after, config);
+
+    (tail, before, keyword, after, head)
+}
+
+方法 write_traditional_output(
+    config: &可变 Config,
+    file_map: &FileMap,
+    words: &BTreeSet<WordRef>,
+    output_filename: &OsStr,
+) -> UResult<()> {
+    设 可变 writer: BufWriter<盒子<动态 Write>> =
+        BufWriter::新建(如果 output_filename == OsStr::新建("-") {
+            盒子::新建(stdout())
+        } 否则 {
+            设 file = File::create(output_filename)
+                .map_err_context(|| output_filename.quote().to_string())?;
+            盒子::新建(file)
+        });
+
+    设 context_reg = Regex::新建(&config.context_regex).解包();
+
+    如果 !config.right_ref {
+        设 max_ref_len = 如果 config.auto_ref {
+            get_auto_max_reference_len(words)
+        } 否则 {
+            0
+        };
+
+        // Use saturating_sub to prevent panic if the reference is wider than the line width.
+        config.line_width = config.line_width.saturating_sub(max_ref_len);
+    }
+
+    循环 word_ref 在 words {
+        // Since `ptx` accepts duplicate file arguments (e.g., `ptx file file`),
+        // simply looking up by filename is ambiguous.
+        // We use the `global_line_nr` (which is unique across the entire input stream)
+        // to identify which file covers this line.
+        设 (_, file_map_value) = file_map
+            .迭代()
+            .寻找(|(name, content)| {
+                name == &word_ref.filename
+                    && word_ref.global_line_nr >= content.offset
+                    && word_ref.global_line_nr < content.offset + content.lines.长度()
+            })
+            .期望("Missing file in file map");
+        设 FileContent {
+            引用 lines,
+            引用 chars_lines,
+            offset: _,
+        } = *(file_map_value);
+        设 reference = get_reference(
+            config,
+            word_ref,
+            &lines[word_ref.local_line_nr],
+            &context_reg,
+        );
+        设 output_line: 字符串 = 匹配 config.format {
+            OutFormat::Tex => format_tex_line(
+                config,
+                word_ref,
+                &lines[word_ref.local_line_nr],
+                &chars_lines[word_ref.local_line_nr],
+                &reference,
+            ),
+            OutFormat::Roff => format_roff_line(
+                config,
+                word_ref,
+                &lines[word_ref.local_line_nr],
+                &chars_lines[word_ref.local_line_nr],
+                &reference,
+            ),
+            OutFormat::Dumb => format_dumb_line(
+                config,
+                word_ref,
+                &lines[word_ref.local_line_nr],
+                &chars_lines[word_ref.local_line_nr],
+                &reference,
+            ),
+        };
+        writeln!(writer, "{output_line}")
+            .map_err_context(|| translate!("ptx-error-write-failed"))?;
+    }
+
+    writer
+        .flush()
+        .map_err_context(|| translate!("ptx-error-write-failed"))?;
+
+    好的(())
+}
+
+方法 get_auto_max_reference_len(words: &BTreeSet<WordRef>) -> 正整数大小 {
+    //Get the maximum length of the reference field
+    设 line_num = words
+        .迭代()
+        .映射(|w| {
+            如果 w.local_line_nr == 0 {
+                1
+            } 否则 {
+                (w.local_line_nr 转换 点64).log10() 转换 正整数大小 + 1
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    设 filename_len = words
+        .迭代()
+        .过滤(|w| w.filename != "-")
+        .映射(|w| w.filename.maybe_quote().to_string().长度())
+        .max()
+        .unwrap_or(0);
+
+    // +1 for the colon
+    line_num + filename_len + 1
+}
+
+模组 options {
+    公有 模组 format {
+        公有 静态 ROFF: &字符串切片 = "roff";
+        公有 静态 TEX: &字符串切片 = "tex";
+    }
+
+    公有 静态 FILE: &字符串切片 = "file";
+    公有 静态 AUTO_REFERENCE: &字符串切片 = "auto-reference";
+    公有 静态 TRADITIONAL: &字符串切片 = "traditional";
+    公有 静态 FLAG_TRUNCATION: &字符串切片 = "flag-truncation";
+    公有 静态 MACRO_NAME: &字符串切片 = "macro-name";
+    公有 静态 FORMAT: &字符串切片 = "format";
+    公有 静态 RIGHT_SIDE_REFS: &字符串切片 = "right-side-refs";
+    公有 静态 SENTENCE_REGEXP: &字符串切片 = "sentence-regexp";
+    公有 静态 WORD_REGEXP: &字符串切片 = "word-regexp";
+    公有 静态 BREAK_FILE: &字符串切片 = "break-file";
+    公有 静态 IGNORE_CASE: &字符串切片 = "ignore-case";
+    公有 静态 GAP_SIZE: &字符串切片 = "gap-size";
+    公有 静态 IGNORE_FILE: &字符串切片 = "ignore-file";
+    公有 静态 ONLY_FILE: &字符串切片 = "only-file";
+    公有 静态 REFERENCES: &字符串切片 = "references";
+    公有 静态 TYPESET_MODE: &字符串切片 = "typeset-mode";
+    公有 静态 WIDTH: &字符串切片 = "width";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 可变 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+    设 可变 config = get_config(&可变 matches)?;
+
+    设 input_files;
+    设 output_file: OsString;
+
+    设 可变 files = matches
+        .get_many::<OsString>(options::FILE)
+        .into_iter()
+        .flatten()
+        .cloned();
+
+    如果 config.gnu_ext {
+        input_files = {
+            设 可变 files = files.收集::<向量<_>>();
+            如果 files.为空() {
+                files.压入(OsString::from("-"));
+            }
+            files
+        };
+        output_file = OsString::from("-");
+    } 否则 {
+        input_files = 向量![files.next().unwrap_or(OsString::from("-"))];
+        output_file = files.next().unwrap_or(OsString::from("-"));
+        如果 设 一些(file) = files.next() {
+            返回 坏的(UUsageError::新建(
+                1,
+                translate!("ptx-error-extra-operand", "operand" => file.quote()),
+            ));
+        }
+    }
+
+    设 word_filter = WordFilter::新建(&matches, &config)?;
+    设 file_map = read_input(&input_files, &config).map_err_context(字符串::新建)?;
+    设 word_set = create_word_set(&config, &word_filter, &file_map);
+    write_traditional_output(&可变 config, &file_map, &word_set, &output_file)
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("ptx")
+        .about(translate!("ptx-about"))
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("ptx"))
+        .override_usage(format_usage(&translate!("ptx-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::AUTO_REFERENCE)
+                .short('A')
+                .long(options::AUTO_REFERENCE)
+                .help(translate!("ptx-help-auto-reference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TRADITIONAL)
+                .short('G')
+                .long(options::TRADITIONAL)
+                .help(translate!("ptx-help-traditional"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FLAG_TRUNCATION)
+                .short('F')
+                .long(options::FLAG_TRUNCATION)
+                .help(translate!("ptx-help-flag-truncation"))
+                .value_name("STRING"),
+        )
+        .arg(
+            Arg::新建(options::MACRO_NAME)
+                .short('M')
+                .long(options::MACRO_NAME)
+                .help(translate!("ptx-help-macro-name"))
+                .value_name("STRING"),
+        )
+        .arg(
+            Arg::新建(options::FORMAT)
+                .long(options::FORMAT)
+                .hide(真)
+                .value_parser(["roff", "tex"])
+                .overrides_with_all([options::FORMAT, options::format::ROFF, options::format::TEX]),
+        )
+        .arg(
+            Arg::新建(options::format::ROFF)
+                .short('O')
+                .help(translate!("ptx-help-roff"))
+                .overrides_with_all([options::FORMAT, options::format::ROFF, options::format::TEX])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::format::TEX)
+                .short('T')
+                .help(translate!("ptx-help-tex"))
+                .overrides_with_all([options::FORMAT, options::format::ROFF, options::format::TEX])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::RIGHT_SIDE_REFS)
+                .short('R')
+                .long(options::RIGHT_SIDE_REFS)
+                .help(translate!("ptx-help-right-side-refs"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::SENTENCE_REGEXP)
+                .short('S')
+                .long(options::SENTENCE_REGEXP)
+                .help(translate!("ptx-help-sentence-regexp"))
+                .value_name("REGEXP"),
+        )
+        .arg(
+            Arg::新建(options::WORD_REGEXP)
+                .short('W')
+                .long(options::WORD_REGEXP)
+                .help(translate!("ptx-help-word-regexp"))
+                .value_name("REGEXP"),
+        )
+        .arg(
+            Arg::新建(options::BREAK_FILE)
+                .short('b')
+                .long(options::BREAK_FILE)
+                .help(translate!("ptx-help-break-file"))
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_CASE)
+                .short('f')
+                .long(options::IGNORE_CASE)
+                .help(translate!("ptx-help-ignore-case"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::GAP_SIZE)
+                .short('g')
+                .long(options::GAP_SIZE)
+                .help(translate!("ptx-help-gap-size"))
+                .value_name("NUMBER"),
+        )
+        .arg(
+            Arg::新建(options::IGNORE_FILE)
+                .short('i')
+                .long(options::IGNORE_FILE)
+                .help(translate!("ptx-help-ignore-file"))
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::ONLY_FILE)
+                .short('o')
+                .long(options::ONLY_FILE)
+                .help(translate!("ptx-help-only-file"))
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::REFERENCES)
+                .short('r')
+                .long(options::REFERENCES)
+                .help(translate!("ptx-help-references"))
+                .value_name("FILE")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::TYPESET_MODE)
+                .short('t')
+                .long(options::TYPESET_MODE)
+                .help(translate!("ptx-help-typeset-mode"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::WIDTH)
+                .short('w')
+                .long(options::WIDTH)
+                .help(translate!("ptx-help-width"))
+                .value_name("NUMBER"),
+        )
+}

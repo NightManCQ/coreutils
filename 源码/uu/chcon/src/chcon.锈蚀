@@ -1,0 +1,803 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) RFILE
+
+#![cfg(任意(target_os = "linux", target_os = "android"))]
+#![allow(clippy::upper_case_acronyms)]
+
+使用 clap::builder::ValueParser;
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::translate;
+使用 uucore::{display::Quotable, format_usage, show_error, show_warning};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 selinux::{OpaqueSecurityContext, SecurityContext};
+
+使用 标准库::borrow::Cow;
+使用 标准库::ffi::{CStr, CString, OsStr, OsString};
+使用 标准库::操作系统::raw::c_int;
+使用 标准库::路径::{Path, PathBuf};
+使用 标准库::{文件系统, 输入输出};
+
+模组 errors;
+模组 fts;
+
+使用 errors::{错误协议, 结果, report_full_error};
+
+公有 模组 options {
+    公有 静态 HELP: &字符串切片 = "help";
+    公有 静态 VERBOSE: &字符串切片 = "verbose";
+
+    公有 静态 REFERENCE: &字符串切片 = "reference";
+
+    公有 静态 USER: &字符串切片 = "user";
+    公有 静态 ROLE: &字符串切片 = "role";
+    公有 静态 TYPE: &字符串切片 = "type";
+    公有 静态 RANGE: &字符串切片 = "range";
+
+    公有 静态 RECURSIVE: &字符串切片 = "recursive";
+
+    公有 模组 sym_links {
+        公有 静态 FOLLOW_ARG_DIR_SYM_LINK: &字符串切片 = "follow-arg-dir-sym-link";
+        公有 静态 FOLLOW_DIR_SYM_LINKS: &字符串切片 = "follow-dir-sym-links";
+        公有 静态 NO_FOLLOW_SYM_LINKS: &字符串切片 = "no-follow-sym-links";
+    }
+
+    公有 模组 dereference {
+        公有 静态 DEREFERENCE: &字符串切片 = "dereference";
+        公有 静态 NO_DEREFERENCE: &字符串切片 = "no-dereference";
+    }
+
+    公有 模组 preserve_root {
+        公有 静态 PRESERVE_ROOT: &字符串切片 = "preserve-root";
+        公有 静态 NO_PRESERVE_ROOT: &字符串切片 = "no-preserve-root";
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 options = 匹配 parse_command_line(&matches) {
+        好的(r) => r,
+        坏的(r) => {
+            如果 设 错误协议::CommandLine(r) = r {
+                返回 坏的(r.into());
+            }
+
+            返回 坏的(UUsageError::新建(libc::EXIT_FAILURE, 格式化!("{r}.\n")));
+        }
+    };
+
+    设 context = 匹配 &options.mode {
+        CommandLineMode::ReferenceBased { reference } => {
+            设 result = 匹配 SecurityContext::of_path(reference, 真, 假) {
+                好的(一些(context)) => 好的(context),
+
+                好的(无) => {
+                    设 err = 输入输出::错误协议::from_raw_os_error(libc::ENODATA);
+                    坏的(错误协议::from_io1(
+                        translate!("chcon-op-getting-security-context"),
+                        reference,
+                        err,
+                    ))
+                }
+
+                坏的(r) => 坏的(错误协议::from_selinux(
+                    translate!("chcon-op-getting-security-context"),
+                    r,
+                )),
+            };
+
+            匹配 result {
+                坏的(r) => {
+                    返回 坏的(USimpleError::新建(
+                        libc::EXIT_FAILURE,
+                        格式化!("{}.", report_full_error(&r)),
+                    ));
+                }
+
+                好的(file_context) => SELinuxSecurityContext::File(file_context),
+            }
+        }
+
+        CommandLineMode::ContextBased { context } => {
+            设 c_context = 匹配 os_str_to_c_string(context) {
+                好的(context) => context,
+
+                坏的(_r) => {
+                    返回 坏的(USimpleError::新建(
+                        libc::EXIT_FAILURE,
+                        translate!("chcon-error-invalid-context", "context" => context.quote()),
+                    ));
+                }
+            };
+
+            如果 SecurityContext::from_c_str(&c_context, 假).check() == 一些(假) {
+                返回 坏的(USimpleError::新建(
+                    libc::EXIT_FAILURE,
+                    translate!("chcon-error-invalid-context", "context" => context.quote()),
+                ));
+            }
+
+            SELinuxSecurityContext::字符串(一些(c_context))
+        }
+
+        CommandLineMode::Custom { .. } => SELinuxSecurityContext::字符串(无),
+    };
+
+    设 root_dev_ino = 如果 options.preserve_root && options.recursive_mode.is_recursive() {
+        匹配 get_root_dev_ino() {
+            好的(r) => 一些(r),
+
+            坏的(r) => {
+                返回 坏的(USimpleError::新建(
+                    libc::EXIT_FAILURE,
+                    格式化!("{}.", report_full_error(&r)),
+                ));
+            }
+        }
+    } 否则 {
+        无
+    };
+
+    设 results = process_files(&options, &context, root_dev_ino);
+    如果 results.为空() {
+        返回 好的(());
+    }
+
+    循环 result 在 &results {
+        show_error!("{}.", report_full_error(result));
+    }
+    坏的(libc::EXIT_FAILURE.into())
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("chcon")
+        .version(uucore::crate_version!())
+        .about(translate!("chcon-about"))
+        .override_usage(format_usage(&translate!("chcon-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .args_override_self(真)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::dereference::DEREFERENCE)
+                .long(options::dereference::DEREFERENCE)
+                .overrides_with(options::dereference::NO_DEREFERENCE)
+                .help(translate!("chcon-help-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::dereference::NO_DEREFERENCE)
+                .short('h')
+                .long(options::dereference::NO_DEREFERENCE)
+                .help(translate!("chcon-help-no-dereference"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("help")
+                .long("help")
+                .help(translate!("help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(options::preserve_root::PRESERVE_ROOT)
+                .long(options::preserve_root::PRESERVE_ROOT)
+                .overrides_with(options::preserve_root::NO_PRESERVE_ROOT)
+                .help(translate!("chcon-help-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::preserve_root::NO_PRESERVE_ROOT)
+                .long(options::preserve_root::NO_PRESERVE_ROOT)
+                .help(translate!("chcon-help-no-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::REFERENCE)
+                .long(options::REFERENCE)
+                .value_name("RFILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .conflicts_with_all([options::USER, options::ROLE, options::TYPE, options::RANGE])
+                .help(translate!("chcon-help-reference"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::USER)
+                .short('u')
+                .long(options::USER)
+                .value_name("USER")
+                .value_hint(clap::ValueHint::Username)
+                .help(translate!("chcon-help-user"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::ROLE)
+                .short('r')
+                .long(options::ROLE)
+                .value_name("ROLE")
+                .help(translate!("chcon-help-role"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::TYPE)
+                .short('t')
+                .long(options::TYPE)
+                .value_name("TYPE")
+                .help(translate!("chcon-help-type"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::RANGE)
+                .short('l')
+                .long(options::RANGE)
+                .value_name("RANGE")
+                .help(translate!("chcon-help-range"))
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::新建(options::RECURSIVE)
+                .short('R')
+                .long(options::RECURSIVE)
+                .help(translate!("chcon-help-recursive"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::sym_links::FOLLOW_ARG_DIR_SYM_LINK)
+                .short('H')
+                .requires(options::RECURSIVE)
+                .overrides_with_all([
+                    options::sym_links::FOLLOW_DIR_SYM_LINKS,
+                    options::sym_links::NO_FOLLOW_SYM_LINKS,
+                ])
+                .help(translate!("chcon-help-follow-arg-dir-symlink"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::sym_links::FOLLOW_DIR_SYM_LINKS)
+                .short('L')
+                .requires(options::RECURSIVE)
+                .overrides_with_all([
+                    options::sym_links::FOLLOW_ARG_DIR_SYM_LINK,
+                    options::sym_links::NO_FOLLOW_SYM_LINKS,
+                ])
+                .help(translate!("chcon-help-follow-dir-symlinks"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::sym_links::NO_FOLLOW_SYM_LINKS)
+                .short('P')
+                .requires(options::RECURSIVE)
+                .overrides_with_all([
+                    options::sym_links::FOLLOW_ARG_DIR_SYM_LINK,
+                    options::sym_links::FOLLOW_DIR_SYM_LINKS,
+                ])
+                .help(translate!("chcon-help-no-follow-symlinks"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::VERBOSE)
+                .short('v')
+                .long(options::VERBOSE)
+                .help(translate!("chcon-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建("FILE")
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath)
+                .num_args(1..)
+                .value_parser(ValueParser::os_string()),
+        )
+}
+
+#[derive(调试协议)]
+结构 Options {
+    verbose: 布尔,
+    preserve_root: 布尔,
+    recursive_mode: RecursiveMode,
+    affect_symlink_referent: 布尔,
+    mode: CommandLineMode,
+    files: 向量<PathBuf>,
+}
+
+方法 parse_command_line(matches: &ArgMatches) -> 结果<Options> {
+    设 verbose = matches.get_flag(options::VERBOSE);
+
+    设 (recursive_mode, affect_symlink_referent) = 如果 matches.get_flag(options::RECURSIVE) {
+        如果 matches.get_flag(options::sym_links::FOLLOW_DIR_SYM_LINKS) {
+            如果 matches.get_flag(options::dereference::NO_DEREFERENCE) {
+                返回 坏的(错误协议::ArgumentsMismatch(translate!(
+                    "chcon-error-recursive-no-dereference-require-p"
+                )));
+            }
+
+            (RecursiveMode::RecursiveAndFollowAllDirSymLinks, 真)
+        } 否则 如果 matches.get_flag(options::sym_links::FOLLOW_ARG_DIR_SYM_LINK) {
+            如果 matches.get_flag(options::dereference::NO_DEREFERENCE) {
+                返回 坏的(错误协议::ArgumentsMismatch(translate!(
+                    "chcon-error-recursive-no-dereference-require-p"
+                )));
+            }
+
+            (RecursiveMode::RecursiveAndFollowArgDirSymLinks, 真)
+        } 否则 {
+            如果 matches.get_flag(options::dereference::DEREFERENCE) {
+                返回 坏的(错误协议::ArgumentsMismatch(translate!(
+                    "chcon-error-recursive-dereference-require-h-or-l"
+                )));
+            }
+
+            (RecursiveMode::RecursiveButDoNotFollowSymLinks, 假)
+        }
+    } 否则 {
+        设 no_dereference = matches.get_flag(options::dereference::NO_DEREFERENCE);
+        (RecursiveMode::NotRecursive, !no_dereference)
+    };
+
+    // By default, do not preserve root.
+    设 preserve_root = matches.get_flag(options::preserve_root::PRESERVE_ROOT);
+
+    设 可变 files = matches.get_many::<OsString>("FILE").unwrap_or_default();
+
+    设 mode = 如果 设 一些(路径) = matches.get_one::<OsString>(options::REFERENCE) {
+        CommandLineMode::ReferenceBased {
+            reference: PathBuf::from(路径),
+        }
+    } 否则 如果 matches.contains_id(options::USER)
+        || matches.contains_id(options::ROLE)
+        || matches.contains_id(options::TYPE)
+        || matches.contains_id(options::RANGE)
+    {
+        CommandLineMode::Custom {
+            user: matches.get_one::<OsString>(options::USER).映射(转换为目标协议::into),
+            role: matches.get_one::<OsString>(options::ROLE).映射(转换为目标协议::into),
+            the_type: matches.get_one::<OsString>(options::TYPE).映射(转换为目标协议::into),
+            range: matches.get_one::<OsString>(options::RANGE).映射(转换为目标协议::into),
+        }
+    } 否则 如果 设 一些(context) = files.next() {
+        CommandLineMode::ContextBased {
+            context: context.into(),
+        }
+    } 否则 {
+        返回 坏的(错误协议::MissingContext);
+    };
+
+    设 files: 向量<_> = files.映射(PathBuf::from).收集();
+    如果 files.为空() {
+        返回 坏的(错误协议::MissingFiles);
+    }
+
+    好的(Options {
+        verbose,
+        preserve_root,
+        recursive_mode,
+        affect_symlink_referent,
+        mode,
+        files,
+    })
+}
+
+#[derive(调试协议, 复制协议, 克隆协议)]
+枚举 RecursiveMode {
+    NotRecursive,
+    /// Do not traverse any symbolic links.
+    RecursiveButDoNotFollowSymLinks,
+    /// Traverse every symbolic link to a directory encountered.
+    RecursiveAndFollowAllDirSymLinks,
+    /// If a command line argument is a symbolic link to a directory, traverse it.
+    RecursiveAndFollowArgDirSymLinks,
+}
+
+实现 RecursiveMode {
+    方法 is_recursive(自身) -> 布尔 {
+        匹配 自身 {
+            自身类型::NotRecursive => 假,
+
+            自身类型::RecursiveButDoNotFollowSymLinks
+            | 自身类型::RecursiveAndFollowAllDirSymLinks
+            | 自身类型::RecursiveAndFollowArgDirSymLinks => 真,
+        }
+    }
+
+    方法 fts_open_options(自身) -> c_int {
+        匹配 自身 {
+            自身类型::NotRecursive | 自身类型::RecursiveButDoNotFollowSymLinks => fts_sys::FTS_PHYSICAL,
+
+            自身类型::RecursiveAndFollowAllDirSymLinks => fts_sys::FTS_LOGICAL,
+
+            自身类型::RecursiveAndFollowArgDirSymLinks => {
+                fts_sys::FTS_PHYSICAL | fts_sys::FTS_COMFOLLOW
+            }
+        }
+    }
+}
+
+#[derive(调试协议)]
+枚举 CommandLineMode {
+    ReferenceBased {
+        reference: PathBuf,
+    },
+    ContextBased {
+        context: OsString,
+    },
+    Custom {
+        user: 选项<OsString>,
+        role: 选项<OsString>,
+        the_type: 选项<OsString>,
+        range: 选项<OsString>,
+    },
+}
+
+#[derive(调试协议, 克隆协议, 复制协议, 偏等比较协议, 相等比较协议)]
+结构 DeviceAndINode {
+    device_id: 正64,
+    inode: 正64,
+}
+
+#[cfg(unix)]
+实现 转换协议<文件系统::Metadata> 循环 DeviceAndINode {
+    方法 from(md: 文件系统::Metadata) -> 自身类型 {
+        使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+        自身类型 {
+            device_id: md.dev(),
+            inode: md.ino(),
+        }
+    }
+}
+
+实现 TryFrom<&libc::stat> 循环 DeviceAndINode {
+    类型 错误协议 = 错误协议;
+
+    #[allow(clippy::useless_conversion)]
+    方法 try_from(st: &libc::stat) -> 结果<自身类型> {
+        设 device_id = 正64::try_from(st.st_dev).map_err(|_r| 错误协议::OutOfRange)?;
+        设 inode = 正64::try_from(st.st_ino).map_err(|_r| 错误协议::OutOfRange)?;
+        好的(自身类型 { device_id, inode })
+    }
+}
+
+方法 process_files(
+    options: &Options,
+    context: &SELinuxSecurityContext,
+    root_dev_ino: 选项<DeviceAndINode>,
+) -> 向量<错误协议> {
+    设 fts_options = options.recursive_mode.fts_open_options();
+    设 可变 fts = 匹配 fts::FTS::新建(options.files.迭代(), fts_options) {
+        好的(fts) => fts,
+        坏的(err) => 返回 向量![err],
+    };
+
+    设 可变 errors = 向量::默认();
+    无限循环 {
+        匹配 fts.read_next_entry() {
+            好的(真) => {
+                如果 设 坏的(err) = process_file(options, context, &可变 fts, root_dev_ino) {
+                    errors.压入(err);
+                }
+            }
+
+            好的(假) => 中断,
+
+            坏的(err) => {
+                errors.压入(err);
+                中断;
+            }
+        }
+    }
+    errors
+}
+
+方法 process_file(
+    options: &Options,
+    context: &SELinuxSecurityContext,
+    fts: &可变 fts::FTS,
+    root_dev_ino: 选项<DeviceAndINode>,
+) -> 结果<()> {
+    设 可变 entry = fts.last_entry_ref().解包();
+
+    设 file_full_name = entry.路径().映射(PathBuf::from).ok_or_else(|| {
+        错误协议::from_io(
+            translate!("chcon-op-file-name-validation"),
+            输入输出::ErrorKind::InvalidInput.into(),
+        )
+    })?;
+
+    设 fts_access_path = entry.access_path().ok_or_else(|| {
+        设 err = 输入输出::ErrorKind::InvalidInput.into();
+        错误协议::from_io1(
+            translate!("chcon-op-file-name-validation"),
+            &file_full_name,
+            err,
+        )
+    })?;
+
+    设 err = |s, k: 输入输出::ErrorKind| 错误协议::from_io1(s, &file_full_name, k.into());
+
+    设 fts_err = |s| {
+        设 r = 输入输出::错误协议::from_raw_os_error(entry.errno());
+        坏的(错误协议::from_io1(s, &file_full_name, r))
+    };
+
+    // SAFETY: If `entry.fts_statp` is not null, then is is assumed to be valid.
+    设 file_dev_ino: DeviceAndINode = 如果 设 一些(st) = entry.stat() {
+        st.try_into()?
+    } 否则 {
+        返回 坏的(err(
+            translate!("chcon-op-getting-meta-data"),
+            输入输出::ErrorKind::InvalidInput,
+        ));
+    };
+
+    设 可变 result = 好的(());
+
+    匹配 entry.flags() {
+        fts_sys::FTS_D 如果 options.recursive_mode.is_recursive() => {
+            如果 root_dev_ino_check(root_dev_ino, file_dev_ino) {
+                // This happens e.g., with "chcon -R --preserve-root ... /"
+                // and with "chcon -RH --preserve-root ... symlink-to-root".
+                root_dev_ino_warn(&file_full_name);
+
+                // Tell fts not to traverse into this hierarchy.
+                设 _ignored = fts.set(fts_sys::FTS_SKIP);
+
+                // Ensure that we do not process "/" on the second visit.
+                设 _ignored = fts.read_next_entry();
+
+                返回 坏的(err(
+                    translate!("chcon-op-modifying-root-path"),
+                    输入输出::ErrorKind::PermissionDenied,
+                ));
+            }
+
+            返回 好的(());
+        }
+
+        fts_sys::FTS_DP 如果 !options.recursive_mode.is_recursive() => {
+            返回 好的(());
+        }
+
+        fts_sys::FTS_NS => {
+            // For a top-level file or directory, this FTS_NS (stat failed) indicator is determined
+            // at the time of the initial fts_open call. With programs like chmod, chown, and chgrp,
+            // that modify permissions, it is possible that the file in question is accessible when
+            // control reaches this point. So, if this is the first time we've seen the FTS_NS for
+            // this file, tell fts_read to stat it "again".
+            如果 entry.level() == 0 && entry.number() == 0 {
+                entry.set_number(1);
+                设 _ignored = fts.set(fts_sys::FTS_AGAIN);
+                返回 好的(());
+            }
+
+            result = fts_err(translate!("chcon-op-accessing"));
+        }
+
+        fts_sys::FTS_ERR => result = fts_err(translate!("chcon-op-accessing")),
+
+        fts_sys::FTS_DNR => result = fts_err(translate!("chcon-op-reading-directory")),
+
+        fts_sys::FTS_DC
+            如果 cycle_warning_required(options.recursive_mode.fts_open_options(), &entry) =>
+        {
+            emit_cycle_warning(&file_full_name);
+            返回 坏的(err(
+                translate!("chcon-op-reading-cyclic-directory"),
+                输入输出::ErrorKind::InvalidData,
+            ));
+        }
+
+        _ => {}
+    }
+
+    如果 entry.flags() == fts_sys::FTS_DP
+        && result.is_ok()
+        && root_dev_ino_check(root_dev_ino, file_dev_ino)
+    {
+        root_dev_ino_warn(&file_full_name);
+        result = 坏的(err(
+            translate!("chcon-op-modifying-root-path"),
+            输入输出::ErrorKind::PermissionDenied,
+        ));
+    }
+
+    如果 result.is_ok() {
+        如果 options.verbose {
+            打印行!(
+                "{}",
+                translate!("chcon-verbose-changing-context", "util_name" => "chcon", "file" => file_full_name.quote())
+            );
+        }
+
+        result = change_file_context(options, context, fts_access_path);
+    }
+
+    如果 !options.recursive_mode.is_recursive() {
+        设 _ignored = fts.set(fts_sys::FTS_SKIP);
+    }
+    result
+}
+
+方法 change_file_context(
+    options: &Options,
+    context: &SELinuxSecurityContext,
+    路径: &Path,
+) -> 结果<()> {
+    匹配 &options.mode {
+        CommandLineMode::Custom {
+            user,
+            role,
+            the_type,
+            range,
+        } => {
+            设 err0 = || -> 结果<()> {
+                // If the file doesn't have a context, and we're not setting all of the context
+                // components, there isn't really an obvious default. Thus, we just give up.
+                设 op = translate!("chcon-op-applying-partial-context");
+                设 err = 输入输出::ErrorKind::InvalidInput.into();
+                坏的(错误协议::from_io1(op, 路径, err))
+            };
+
+            设 file_context =
+                匹配 SecurityContext::of_path(路径, options.affect_symlink_referent, 假) {
+                    好的(一些(context)) => context,
+
+                    好的(无) => 返回 err0(),
+                    坏的(r) => {
+                        返回 坏的(错误协议::from_selinux(
+                            translate!("chcon-op-getting-security-context"),
+                            r,
+                        ));
+                    }
+                };
+
+            设 c_file_context = 匹配 file_context.to_c_string() {
+                好的(一些(context)) => context,
+
+                好的(无) => 返回 err0(),
+                坏的(r) => {
+                    返回 坏的(错误协议::from_selinux(
+                        translate!("chcon-op-getting-security-context"),
+                        r,
+                    ));
+                }
+            };
+
+            设 se_context =
+                OpaqueSecurityContext::from_c_str(c_file_context.as_ref()).map_err(|_r| {
+                    设 err = 输入输出::ErrorKind::InvalidInput.into();
+                    错误协议::from_io1(translate!("chcon-op-creating-security-context"), 路径, err)
+                })?;
+
+            类型 SetValueProc = 方法(&OpaqueSecurityContext, &CStr) -> selinux::errors::结果<()>;
+
+            设 list: &[(&选项<OsString>, SetValueProc)] = &[
+                (user, OpaqueSecurityContext::set_user),
+                (role, OpaqueSecurityContext::set_role),
+                (the_type, OpaqueSecurityContext::set_type),
+                (range, OpaqueSecurityContext::set_range),
+            ];
+
+            循环 (new_value, set_value_proc) 在 list {
+                如果 设 一些(new_value) = new_value {
+                    设 c_new_value = os_str_to_c_string(new_value).map_err(|_r| {
+                        设 err = 输入输出::ErrorKind::InvalidInput.into();
+                        错误协议::from_io1(translate!("chcon-op-creating-security-context"), 路径, err)
+                    })?;
+
+                    set_value_proc(&se_context, &c_new_value).map_err(|r| {
+                        错误协议::from_selinux(translate!("chcon-op-setting-security-context-user"), r)
+                    })?;
+                }
+            }
+
+            设 context_string = se_context.to_c_string().map_err(|r| {
+                错误协议::from_selinux(translate!("chcon-op-getting-security-context"), r)
+            })?;
+
+            如果 c_file_context.as_ref().to_bytes() == context_string.as_ref().to_bytes() {
+                好的(()) // Nothing to change.
+            } 否则 {
+                SecurityContext::from_c_str(&context_string, 假)
+                    .set_for_path(路径, options.affect_symlink_referent, 假)
+                    .map_err(|r| {
+                        错误协议::from_selinux(translate!("chcon-op-setting-security-context"), r)
+                    })
+            }
+        }
+
+        CommandLineMode::ReferenceBased { .. } | CommandLineMode::ContextBased { .. } => {
+            如果 设 一些(c_context) = context.to_c_string()? {
+                SecurityContext::from_c_str(c_context.as_ref(), 假)
+                    .set_for_path(路径, options.affect_symlink_referent, 假)
+                    .map_err(|r| {
+                        错误协议::from_selinux(translate!("chcon-op-setting-security-context"), r)
+                    })
+            } 否则 {
+                设 err = 输入输出::ErrorKind::InvalidInput.into();
+                坏的(错误协议::from_io1(
+                    translate!("chcon-op-setting-security-context"),
+                    路径,
+                    err,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+公有(箱) 方法 os_str_to_c_string(s: &OsStr) -> 结果<CString> {
+    使用 标准库::操作系统::unix::ffi::OsStrExt;
+
+    CString::新建(s.as_bytes())
+        .map_err(|_r| 错误协议::from_io("CString::new()", 输入输出::ErrorKind::InvalidInput.into()))
+}
+
+/// Call `lstat()` to get the device and inode numbers for `/`.
+#[cfg(unix)]
+方法 get_root_dev_ino() -> 结果<DeviceAndINode> {
+    文件系统::symlink_metadata("/")
+        .映射(DeviceAndINode::from)
+        .map_err(|r| 错误协议::from_io1("std::fs::symlink_metadata", "/", r))
+}
+
+方法 root_dev_ino_check(root_dev_ino: 选项<DeviceAndINode>, dir_dev_ino: DeviceAndINode) -> 布尔 {
+    root_dev_ino == 一些(dir_dev_ino)
+}
+
+方法 root_dev_ino_warn(dir_name: &Path) {
+    如果 dir_name.as_os_str() == "/" {
+        show_warning!(
+            "{}",
+            translate!("chcon-warning-dangerous-recursive-root", "option" => options::preserve_root::NO_PRESERVE_ROOT)
+        );
+    } 否则 {
+        show_warning!(
+            "{}",
+            translate!("chcon-warning-dangerous-recursive-dir", "dir" => dir_name.quote(), "option" => options::preserve_root::NO_PRESERVE_ROOT)
+        );
+    }
+}
+
+/// When `fts_read` returns [`fts_sys::FTS_DC`] to indicate a directory cycle, it may or may not indicate
+/// a real problem.
+/// When a program like chgrp performs a recursive traversal that requires traversing symbolic links,
+/// it is *not* a problem.
+/// However, when invoked with "-P -R", it deserves a warning.
+/// The `fts_options` parameter records the options that control this aspect of fts behavior,
+/// so test that.
+方法 cycle_warning_required(fts_options: c_int, entry: &fts::EntryRef) -> 布尔 {
+    // When dereferencing no symlinks, or when dereferencing only those listed on the command line
+    // and we're not processing a command-line argument, then a cycle is a serious problem.
+    ((fts_options & fts_sys::FTS_PHYSICAL) != 0)
+        && (((fts_options & fts_sys::FTS_COMFOLLOW) == 0) || entry.level() != 0)
+}
+
+方法 emit_cycle_warning(file_name: &Path) {
+    show_warning!(
+        "{}",
+        translate!("chcon-warning-circular-directory", "file" => file_name.quote())
+    );
+}
+
+#[derive(调试协议)]
+枚举 SELinuxSecurityContext<'t> {
+    File(SecurityContext<'t>),
+    字符串(选项<CString>),
+}
+
+实现 SELinuxSecurityContext<'_> {
+    方法 to_c_string(&自身) -> 结果<选项<Cow<'_, CStr>>> {
+        匹配 自身 {
+            自身类型::File(context) => context
+                .to_c_string()
+                .map_err(|r| 错误协议::from_selinux("SELinuxSecurityContext::to_c_string()", r)),
+
+            自身类型::字符串(context) => 好的(context.as_deref().映射(Cow::Borrowed)),
+        }
+    }
+}

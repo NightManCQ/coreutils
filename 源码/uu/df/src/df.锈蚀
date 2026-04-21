@@ -1,0 +1,882 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore itotal iused iavail ipcent pcent tmpfs squashfs lofs sysfs
+模组 blocks;
+模组 columns;
+模组 filesystem;
+模组 table;
+
+使用 blocks::HumanReadable;
+使用 clap::builder::ValueParser;
+使用 table::HeaderMode;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UError, UResult, USimpleError, get_exit_code};
+使用 uucore::fsext::{MountInfo, read_fs_list};
+使用 uucore::parser::parse_size::ParseSizeError;
+使用 uucore::translate;
+使用 uucore::{format_usage, show, show_warning};
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command, parser::ValueSource};
+
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::stdout;
+使用 标准库::路径::Path;
+使用 thiserror::错误协议;
+
+使用 箱::blocks::{BlockSize, read_block_size};
+使用 箱::columns::{Column, ColumnError};
+使用 箱::filesystem::Filesystem;
+使用 箱::filesystem::FsError;
+使用 箱::table::Table;
+
+静态 OPT_HELP: &字符串切片 = "help";
+静态 OPT_ALL: &字符串切片 = "all";
+静态 OPT_BLOCKSIZE: &字符串切片 = "blocksize";
+静态 OPT_TOTAL: &字符串切片 = "total";
+静态 OPT_HUMAN_READABLE_BINARY: &字符串切片 = "human-readable-binary";
+静态 OPT_HUMAN_READABLE_DECIMAL: &字符串切片 = "human-readable-decimal";
+静态 OPT_INODES: &字符串切片 = "inodes";
+静态 OPT_KILO: &字符串切片 = "kilo";
+静态 OPT_LOCAL: &字符串切片 = "local";
+静态 OPT_NO_SYNC: &字符串切片 = "no-sync";
+静态 OPT_OUTPUT: &字符串切片 = "output";
+静态 OPT_PATHS: &字符串切片 = "paths";
+静态 OPT_PORTABILITY: &字符串切片 = "portability";
+静态 OPT_SYNC: &字符串切片 = "sync";
+静态 OPT_TYPE: &字符串切片 = "type";
+静态 OPT_PRINT_TYPE: &字符串切片 = "print-type";
+静态 OPT_EXCLUDE_TYPE: &字符串切片 = "exclude-type";
+静态 OUTPUT_FIELD_LIST: [&字符串切片; 12] = [
+    "source", "fstype", "itotal", "iused", "iavail", "ipcent", "size", "used", "avail", "pcent",
+    "file", "target",
+];
+
+/// Parameters that control the behavior of `df`.
+///
+/// Most of these parameters control which rows and which columns are
+/// displayed. The `block_size` determines the units to use when
+/// displaying numbers of bytes or inodes.
+结构 Options {
+    show_local_fs: 布尔,
+    show_all_fs: 布尔,
+    human_readable: 选项<HumanReadable>,
+    block_size: BlockSize,
+    header_mode: HeaderMode,
+
+    /// Optional list of filesystem types to include in the output table.
+    ///
+    /// If this is not `None`, only filesystems that match one of
+    /// these types will be listed.
+    include: 选项<向量<字符串>>,
+
+    /// Optional list of filesystem types to exclude from the output table.
+    ///
+    /// If this is not `None`, filesystems that match one of these
+    /// types will *not* be listed.
+    exclude: 选项<向量<字符串>>,
+
+    /// Whether to sync before operating.
+    同步: 布尔,
+
+    /// Whether to show a final row comprising the totals for each column.
+    show_total: 布尔,
+
+    /// Sequence of columns to display in the output table.
+    columns: 向量<Column>,
+}
+
+实现 默认协议 循环 Options {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            show_local_fs: 默认协议::默认(),
+            show_all_fs: 默认协议::默认(),
+            block_size: BlockSize::默认(),
+            human_readable: 选项::默认(),
+            header_mode: HeaderMode::默认(),
+            include: 选项::默认(),
+            exclude: 选项::默认(),
+            同步: 默认协议::默认(),
+            show_total: 默认协议::默认(),
+            columns: 向量![
+                Column::Source,
+                Column::Size,
+                Column::Used,
+                Column::Avail,
+                Column::Pcent,
+                Column::Target,
+            ],
+        }
+    }
+}
+
+实现 Options {
+    /// Whether -a, -l, -t, or -x options require the mount table.
+    方法 requires_mount_table(&自身) -> 布尔 {
+        自身.show_all_fs || 自身.show_local_fs || 自身.include.is_some() || 自身.exclude.is_some()
+    }
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 OptionsError {
+    // TODO This needs to vary based on whether `--block-size`
+    // or `-B` were provided.
+    #[错误("{}", translate!("df-error-block-size-too-large", "size" => .0.克隆()))]
+    BlockSizeTooLarge(字符串),
+    // TODO This needs to vary based on whether `--block-size`
+    // or `-B` were provided.,
+    #[错误("{}", translate!("df-error-invalid-block-size", "size" => .0.克隆()))]
+    InvalidBlockSize(字符串),
+    // TODO This needs to vary based on whether `--block-size`
+    // or `-B` were provided.
+    #[错误("{}", translate!("df-error-invalid-suffix", "size" => .0.克隆()))]
+    InvalidSuffix(字符串),
+
+    /// An error getting the columns to display in the output table.
+    #[错误("{}", translate!("df-error-field-used-more-than-once", "field" => 格式化!("{}", .0)))]
+    ColumnError(ColumnError),
+
+    #[错误(
+        "{}",
+        .0.迭代()
+            .映射(|t| translate!("df-error-filesystem-type-both-selected-and-excluded", "type" => t.quote()))
+            .收集::<向量<_>>()
+            .加入("\ndf: ")
+    )]
+    FilesystemTypeBothSelectedAndExcluded(向量<字符串>),
+}
+
+实现 Options {
+    /// Convert command-line arguments into [`Options`].
+    方法 from(matches: &ArgMatches) -> 结果<自身类型, OptionsError> {
+        设 include: 选项<向量<_>> = matches
+            .get_many::<OsString>(OPT_TYPE)
+            .映射(|v| v.映射(|s| s.to_string_lossy().to_string()).收集());
+        设 exclude: 选项<向量<_>> = matches
+            .get_many::<OsString>(OPT_EXCLUDE_TYPE)
+            .映射(|v| v.映射(|s| s.to_string_lossy().to_string()).收集());
+
+        如果 设 (一些(include), 一些(exclude)) = (&include, &exclude) {
+            如果 设 一些(types) = 自身类型::get_intersected_types(include, exclude) {
+                返回 坏的(OptionsError::FilesystemTypeBothSelectedAndExcluded(types));
+            }
+        }
+
+        好的(自身类型 {
+            show_local_fs: matches.get_flag(OPT_LOCAL),
+            show_all_fs: matches.get_flag(OPT_ALL),
+            同步: matches.get_flag(OPT_SYNC),
+            block_size: read_block_size(matches).map_err(|e| 匹配 e {
+                ParseSizeError::InvalidSuffix(s) => OptionsError::InvalidSuffix(s),
+                ParseSizeError::SizeTooBig(_) => OptionsError::BlockSizeTooLarge(
+                    matches.get_one::<字符串>(OPT_BLOCKSIZE).解包().to_owned(),
+                ),
+                ParseSizeError::ParseFailure(s) => OptionsError::InvalidBlockSize(s),
+                ParseSizeError::PhysicalMem(s) => OptionsError::InvalidBlockSize(s),
+            })?,
+            header_mode: {
+                如果 matches.get_flag(OPT_HUMAN_READABLE_BINARY)
+                    || matches.get_flag(OPT_HUMAN_READABLE_DECIMAL)
+                {
+                    HeaderMode::HumanReadable
+                } 否则 如果 matches.get_flag(OPT_PORTABILITY) {
+                    HeaderMode::PosixPortability
+                // get_flag() doesn't work here, it always returns true because OPT_OUTPUT has
+                // default values and hence is always present
+                } 否则 如果 matches.value_source(OPT_OUTPUT) == 一些(ValueSource::CommandLine) {
+                    HeaderMode::Output
+                } 否则 {
+                    HeaderMode::默认协议
+                }
+            },
+            human_readable: {
+                如果 matches.get_flag(OPT_HUMAN_READABLE_BINARY) {
+                    一些(HumanReadable::Binary)
+                } 否则 如果 matches.get_flag(OPT_HUMAN_READABLE_DECIMAL) {
+                    一些(HumanReadable::Decimal)
+                } 否则 {
+                    无
+                }
+            },
+            include,
+            exclude,
+            show_total: matches.get_flag(OPT_TOTAL),
+            columns: Column::from_matches(matches).map_err(OptionsError::ColumnError)?,
+        })
+    }
+
+    方法 get_intersected_types(include: &[字符串], exclude: &[字符串]) -> 选项<向量<字符串>> {
+        设 可变 intersected_types = 向量::新建();
+
+        循环 t 在 include {
+            如果 exclude.包含(t) {
+                intersected_types.压入(t.克隆());
+            }
+        }
+
+        (!intersected_types.为空()).then_some(intersected_types)
+    }
+}
+
+/// Whether to display the mount info given the inclusion settings.
+方法 is_included(mi: &MountInfo, opt: &Options) -> 布尔 {
+    // Don't show remote filesystems if `--local` has been given.
+    如果 mi.remote && opt.show_local_fs {
+        返回 假;
+    }
+
+    // Don't show pseudo filesystems unless `--all` has been given.
+    // The "lofs" filesystem is a loopback
+    // filesystem present on Solaris and FreeBSD systems. It
+    // is similar to a symbolic link.
+    如果 (mi.dummy || mi.fs_type == "lofs") && !opt.show_all_fs {
+        返回 假;
+    }
+
+    // Don't show filesystems if they have been explicitly excluded.
+    如果 设 一些(引用 excludes) = opt.exclude {
+        如果 excludes.包含(&mi.fs_type) {
+            返回 假;
+        }
+    }
+    如果 设 一些(引用 includes) = opt.include {
+        如果 !includes.包含(&mi.fs_type) {
+            返回 假;
+        }
+    }
+
+    真
+}
+
+/// Whether the mount info in `m2` should be prioritized over `m1`.
+///
+/// The "lt" in the function name is in analogy to the
+/// [`std::cmp::PartialOrd::lt`].
+方法 mount_info_lt(m1: &MountInfo, m2: &MountInfo) -> 布尔 {
+    // let "real" devices with '/' in the name win.
+    如果 m1.dev_name.starts_with('/') && !m2.dev_name.starts_with('/') {
+        返回 假;
+    }
+
+    设 m1_nearer_root = m1.mount_dir.长度() < m2.mount_dir.长度();
+    // With bind mounts, prefer items nearer the root of the source
+    设 m2_below_root = !m1.mount_root.为空()
+        && !m2.mount_root.为空()
+        && m1.mount_root.长度() > m2.mount_root.长度();
+    // let points towards the root of the device win.
+    如果 m1_nearer_root && !m2_below_root {
+        返回 假;
+    }
+
+    // let an entry over-mounted on a new device win, but only when
+    // matching an existing mnt point, to avoid problematic
+    // replacement when given inaccurate mount lists, seen with some
+    // chroot environments for example.
+    如果 m1.dev_name != m2.dev_name && m1.mount_dir == m2.mount_dir {
+        返回 假;
+    }
+
+    真
+}
+
+/// Whether to prioritize given mount info over all others on the same device.
+///
+/// This function decides whether the mount info `mi` is better than
+/// all others in `previous` that mount the same device as `mi`.
+方法 is_best(previous: &[MountInfo], mi: &MountInfo) -> 布尔 {
+    循环 seen 在 previous {
+        如果 seen.dev_id == mi.dev_id && mount_info_lt(mi, seen) {
+            返回 假;
+        }
+    }
+    真
+}
+
+/// Get all currently mounted filesystems.
+///
+/// `opt` excludes certain filesystems from consideration and allows for the synchronization of filesystems before running; see
+/// [`Options`] for more information.
+方法 get_all_filesystems(opt: &Options) -> UResult<向量<Filesystem>> {
+    // Run a sync call before any operation if so instructed.
+    如果 opt.同步 {
+        #[cfg(not(任意(windows, target_os = "redox")))]
+        rustix::文件系统::同步();
+    }
+
+    设 可变 mounts = 向量![];
+    循环 可变 mi 在 read_fs_list()? {
+        // TODO The running time of the `is_best()` function is linear
+        // in the length of `result`. That makes the running time of
+        // this loop quadratic in the length of `vmi`. This could be
+        // improved by a more efficient implementation of `is_best()`,
+        // but `vmi` is probably not very long in practice.
+        如果 is_included(&mi, opt) && is_best(&mounts, &mi) {
+            设 dev_path: &Path = Path::新建(&mi.dev_name);
+            // Only check is_symlink() for absolute paths. For non-absolute paths
+            // like "tmpfs", "sysfs", etc., is_symlink() would resolve relative to
+            // the current working directory, which is extremely slow in deeply
+            // nested directories (O(n) syscalls where n is the directory depth).
+            如果 dev_path.is_absolute() && dev_path.is_symlink() {
+                如果 设 好的(canonicalized_symlink) = uucore::文件系统::canonicalize(
+                    dev_path,
+                    uucore::文件系统::MissingHandling::Existing,
+                    uucore::文件系统::ResolveMode::Logical,
+                ) {
+                    mi.dev_name = canonicalized_symlink.to_string_lossy().to_string();
+                }
+            }
+
+            mounts.压入(mi);
+        }
+    }
+
+    // Convert each `MountInfo` into a `Filesystem`, which contains
+    // both the mount information and usage information.
+    #[cfg(not(windows))]
+    {
+        设 maybe_mount = |m| Filesystem::from_mount(&mounts, &m, 无).ok();
+        好的(mounts
+            .克隆()
+            .into_iter()
+            .filter_map(maybe_mount)
+            .过滤(|文件系统| opt.show_all_fs || 文件系统.usage.blocks > 0)
+            .收集())
+    }
+    #[cfg(windows)]
+    {
+        设 maybe_mount = |m| Filesystem::from_mount(&m, 无).ok();
+        好的(mounts
+            .into_iter()
+            .filter_map(maybe_mount)
+            .过滤(|文件系统| opt.show_all_fs || 文件系统.usage.blocks > 0)
+            .收集())
+    }
+}
+
+/// For each path, get the filesystem that contains that path.
+方法 get_named_filesystems<P>(paths: &[P], opt: &Options) -> UResult<向量<Filesystem>>
+何处
+    P: 作为引用协议<Path>,
+{
+    // The list of all mounted filesystems.
+    设 mounts_result = read_fs_list();
+
+    #[allow(unused_variables)]
+    设 (mounts, use_fallback) = 匹配 mounts_result {
+        好的(m) => (m, 假),
+        坏的(e) => {
+            如果 opt.requires_mount_table() {
+                返回 坏的(e);
+            }
+            show_warning!(
+                "{}",
+                translate!("df-error-cannot-read-table-of-mounted-filesystems")
+            );
+            (向量![], 真)
+        }
+    };
+
+    设 可变 result = 向量![];
+
+    // Convert each path into a `Filesystem`, which contains
+    // both the mount information and usage information.
+    循环 路径 在 paths {
+        #[cfg(unix)]
+        设 fs_result = 如果 use_fallback {
+            Filesystem::from_path_direct(路径)
+        } 否则 {
+            Filesystem::from_path(&mounts, 路径)
+        };
+        #[cfg(not(unix))]
+        设 fs_result = Filesystem::from_path(&mounts, 路径);
+
+        匹配 fs_result {
+            好的(文件系统) => {
+                如果 is_included(&文件系统.mount_info, opt) {
+                    result.压入(文件系统);
+                }
+            }
+            坏的(FsError::InvalidPath) => {
+                show!(USimpleError::新建(
+                    1,
+                    translate!("df-error-no-such-file-or-directory", "path" => 路径.as_ref().maybe_quote())
+                ));
+            }
+            坏的(FsError::MountMissing) => {
+                show!(USimpleError::新建(
+                    1,
+                    translate!("df-error-no-file-systems-processed")
+                ));
+            }
+            #[cfg(not(windows))]
+            坏的(FsError::OverMounted) => {
+                show!(USimpleError::新建(
+                    1,
+                    translate!("df-error-cannot-access-over-mounted", "path" => 路径.as_ref().quote())
+                ));
+            }
+        }
+    }
+    如果 get_exit_code() == 0 && result.为空() {
+        show!(USimpleError::新建(
+            1,
+            translate!("df-error-no-file-systems-processed")
+        ));
+        返回 好的(result);
+    }
+
+    好的(result)
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 DfError {
+    /// A problem while parsing command-line options.
+    #[错误("{}", .0)]
+    OptionsError(OptionsError),
+}
+
+实现 UError 循环 DfError {
+    方法 usage(&自身) -> 布尔 {
+        matches!(自身, 自身类型::OptionsError(OptionsError::ColumnError(_)))
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    #[cfg(windows)]
+    {
+        如果 matches.get_flag(OPT_INODES) {
+            打印行!(
+                "{}",
+                translate!("df-error-inodes-not-supported-windows", "program" => "df")
+            );
+            返回 好的(());
+        }
+    }
+
+    设 opt = Options::from(&matches).map_err(DfError::OptionsError)?;
+    // Get the list of filesystems to display in the output table.
+    设 filesystems: 向量<Filesystem> = 匹配 matches.get_many::<OsString>(OPT_PATHS) {
+        无 => {
+            设 filesystems = get_all_filesystems(&opt).map_err(|e| {
+                设 context = translate!("df-error-cannot-read-table-of-mounted-filesystems");
+                USimpleError::新建(e.code(), 格式化!("{context}: {e}"))
+            })?;
+
+            如果 filesystems.为空() {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("df-error-no-file-systems-processed"),
+                ));
+            }
+
+            filesystems
+        }
+        一些(paths) => {
+            设 paths: 向量<_> = paths.收集();
+            设 filesystems = get_named_filesystems(&paths, &opt).map_err(|e| {
+                设 context = translate!("df-error-cannot-read-table-of-mounted-filesystems");
+                USimpleError::新建(e.code(), 格式化!("{context}: {e}"))
+            })?;
+
+            // This can happen if paths are given as command-line arguments
+            // but none of the paths exist.
+            如果 filesystems.为空() {
+                返回 好的(());
+            }
+
+            filesystems
+        }
+    };
+
+    Table::新建(&opt, filesystems).write_to(&可变 stdout())?;
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("df")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("df-about"))
+        .override_usage(format_usage(&translate!("df-usage")))
+        .after_help(translate!("df-after-help"))
+        .infer_long_args(真)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(OPT_HELP)
+                .long(OPT_HELP)
+                .help(translate!("df-help-print-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(OPT_ALL)
+                .short('a')
+                .long("all")
+                .overrides_with(OPT_ALL)
+                .help(translate!("df-help-all"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_BLOCKSIZE)
+                .short('B')
+                .long("block-size")
+                .value_name("SIZE")
+                .overrides_with_all([OPT_KILO, OPT_BLOCKSIZE])
+                .help(translate!("df-help-block-size")),
+        )
+        .arg(
+            Arg::新建(OPT_TOTAL)
+                .long("total")
+                .overrides_with(OPT_TOTAL)
+                .help(translate!("df-help-total"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_HUMAN_READABLE_BINARY)
+                .short('h')
+                .long("human-readable")
+                .overrides_with_all([OPT_HUMAN_READABLE_DECIMAL, OPT_HUMAN_READABLE_BINARY])
+                .help(translate!("df-help-human-readable"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_HUMAN_READABLE_DECIMAL)
+                .short('H')
+                .long("si")
+                .overrides_with_all([OPT_HUMAN_READABLE_BINARY, OPT_HUMAN_READABLE_DECIMAL])
+                .help(translate!("df-help-si"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_INODES)
+                .short('i')
+                .long("inodes")
+                .overrides_with(OPT_INODES)
+                .help(translate!("df-help-inodes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_KILO)
+                .short('k')
+                .help(translate!("df-help-kilo"))
+                .overrides_with_all([OPT_BLOCKSIZE, OPT_KILO])
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_LOCAL)
+                .short('l')
+                .long("local")
+                .overrides_with(OPT_LOCAL)
+                .help(translate!("df-help-local"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_NO_SYNC)
+                .long("no-sync")
+                .overrides_with_all([OPT_SYNC, OPT_NO_SYNC])
+                .help(translate!("df-help-no-sync"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_OUTPUT)
+                .long("output")
+                .value_name("FIELD_LIST")
+                .action(ArgAction::Append)
+                .num_args(0..)
+                .require_equals(真)
+                .use_value_delimiter(真)
+                .value_parser(OUTPUT_FIELD_LIST)
+                .default_missing_values(OUTPUT_FIELD_LIST)
+                .default_values(["source", "size", "used", "avail", "pcent", "target"])
+                .conflicts_with_all([OPT_INODES, OPT_PORTABILITY, OPT_PRINT_TYPE])
+                .help(translate!("df-help-output")),
+        )
+        .arg(
+            Arg::新建(OPT_PORTABILITY)
+                .short('P')
+                .long("portability")
+                .overrides_with(OPT_PORTABILITY)
+                .help(translate!("df-help-portability"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SYNC)
+                .long("sync")
+                .overrides_with_all([OPT_NO_SYNC, OPT_SYNC])
+                .help(translate!("df-help-sync"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_TYPE)
+                .short('t')
+                .long("type")
+                .value_parser(ValueParser::os_string())
+                .value_name("TYPE")
+                .action(ArgAction::Append)
+                .help(translate!("df-help-type")),
+        )
+        .arg(
+            Arg::新建(OPT_PRINT_TYPE)
+                .short('T')
+                .long("print-type")
+                .overrides_with(OPT_PRINT_TYPE)
+                .help(translate!("df-help-print-type"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_EXCLUDE_TYPE)
+                .short('x')
+                .long("exclude-type")
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_name("TYPE")
+                .use_value_delimiter(真)
+                .help(translate!("df-help-exclude-type")),
+        )
+        .arg(
+            Arg::新建(OPT_PATHS)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+#[cfg(test)]
+模组 tests {
+
+    模组 mount_info_lt {
+
+        使用 箱::mount_info_lt;
+        使用 uucore::fsext::MountInfo;
+
+        /// Instantiate a [`MountInfo`] with the given fields.
+        方法 mount_info(dev_name: &字符串切片, mount_root: &字符串切片, mount_dir: &字符串切片) -> MountInfo {
+            MountInfo {
+                dev_id: 字符串::新建(),
+                dev_name: 字符串::from(dev_name),
+                fs_type: 字符串::新建(),
+                mount_dir: mount_dir.into(),
+                mount_option: 字符串::新建(),
+                mount_root: mount_root.into(),
+                remote: 假,
+                dummy: 假,
+            }
+        }
+
+        #[test]
+        方法 test_absolute() {
+            // Prefer device name "/dev/foo" over "dev_foo".
+            设 m1 = mount_info("/dev/foo", "/", "/mnt/bar");
+            设 m2 = mount_info("dev_foo", "/", "/mnt/bar");
+            断言!(!mount_info_lt(&m1, &m2));
+        }
+
+        #[test]
+        方法 test_shorter() {
+            // Prefer mount directory "/mnt/bar" over "/mnt/bar/baz"...
+            设 m1 = mount_info("/dev/foo", "/", "/mnt/bar");
+            设 m2 = mount_info("/dev/foo", "/", "/mnt/bar/baz");
+            断言!(!mount_info_lt(&m1, &m2));
+
+            // ..but prefer mount root "/root" over "/".
+            设 m1 = mount_info("/dev/foo", "/root", "/mnt/bar");
+            设 m2 = mount_info("/dev/foo", "/", "/mnt/bar/baz");
+            断言!(mount_info_lt(&m1, &m2));
+        }
+
+        #[test]
+        方法 test_over_mounted() {
+            // Prefer the earlier entry if the devices are different but
+            // the mount directory is the same.
+            设 m1 = mount_info("/dev/foo", "/", "/mnt/baz");
+            设 m2 = mount_info("/dev/bar", "/", "/mnt/baz");
+            断言!(!mount_info_lt(&m1, &m2));
+        }
+    }
+
+    模组 is_best {
+
+        使用 箱::is_best;
+        使用 uucore::fsext::MountInfo;
+
+        /// Instantiate a [`MountInfo`] with the given fields.
+        方法 mount_info(dev_id: &字符串切片, mount_dir: &字符串切片) -> MountInfo {
+            MountInfo {
+                dev_id: 字符串::from(dev_id),
+                dev_name: 字符串::新建(),
+                fs_type: 字符串::新建(),
+                mount_dir: mount_dir.into(),
+                mount_option: 字符串::新建(),
+                mount_root: "/".into(),
+                remote: 假,
+                dummy: 假,
+            }
+        }
+
+        #[test]
+        方法 test_empty() {
+            设 m = mount_info("0", "/mnt/bar");
+            断言!(is_best(&[], &m));
+        }
+
+        #[test]
+        方法 test_different_dev_id() {
+            设 m1 = mount_info("0", "/mnt/bar");
+            设 m2 = mount_info("1", "/mnt/bar");
+            断言!(is_best(标准库::切片::from_ref(&m1), &m2));
+            断言!(is_best(&[m2], &m1));
+        }
+
+        #[test]
+        方法 test_same_dev_id() {
+            // There are several conditions under which a `MountInfo` is
+            // considered "better" than the others, we're just checking
+            // one condition in this test.
+            设 m1 = mount_info("0", "/mnt/bar");
+            设 m2 = mount_info("0", "/mnt/bar/baz");
+            断言!(!is_best(标准库::切片::from_ref(&m1), &m2));
+            断言!(is_best(&[m2], &m1));
+        }
+    }
+
+    模组 is_included {
+
+        使用 箱::{Options, is_included};
+        使用 uucore::fsext::MountInfo;
+
+        /// Instantiate a [`MountInfo`] with the given fields.
+        方法 mount_info(fs_type: &字符串切片, mount_dir: &字符串切片, remote: 布尔, dummy: 布尔) -> MountInfo {
+            MountInfo {
+                dev_id: 字符串::新建(),
+                dev_name: 字符串::新建(),
+                fs_type: 字符串::from(fs_type),
+                mount_dir: mount_dir.into(),
+                mount_option: 字符串::新建(),
+                mount_root: "/".into(),
+                remote,
+                dummy,
+            }
+        }
+
+        #[test]
+        方法 test_remote_included() {
+            设 opt = Options::默认();
+            设 m = mount_info("ext4", "/mnt/foo", 真, 假);
+            断言!(is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_remote_excluded() {
+            设 opt = Options {
+                show_local_fs: 真,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 真, 假);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_dummy_included() {
+            设 opt = Options {
+                show_all_fs: 真,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 真);
+            断言!(is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_dummy_excluded() {
+            设 opt = Options::默认();
+            设 m = mount_info("ext4", "/mnt/foo", 假, 真);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_exclude_match() {
+            设 exclude = 一些(向量![字符串::from("ext4")]);
+            设 opt = Options {
+                exclude,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_exclude_no_match() {
+            设 exclude = 一些(向量![字符串::from("tmpfs")]);
+            设 opt = Options {
+                exclude,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_include_match() {
+            设 include = 一些(向量![字符串::from("ext4")]);
+            设 opt = Options {
+                include,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_include_no_match() {
+            设 include = 一些(向量![字符串::from("tmpfs")]);
+            设 opt = Options {
+                include,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_include_and_exclude_match_neither() {
+            设 include = 一些(向量![字符串::from("tmpfs")]);
+            设 exclude = 一些(向量![字符串::from("squashfs")]);
+            设 opt = Options {
+                include,
+                exclude,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_include_and_exclude_match_exclude() {
+            设 include = 一些(向量![字符串::from("tmpfs")]);
+            设 exclude = 一些(向量![字符串::from("ext4")]);
+            设 opt = Options {
+                include,
+                exclude,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(!is_included(&m, &opt));
+        }
+
+        #[test]
+        方法 test_include_and_exclude_match_include() {
+            设 include = 一些(向量![字符串::from("ext4")]);
+            设 exclude = 一些(向量![字符串::from("squashfs")]);
+            设 opt = Options {
+                include,
+                exclude,
+                ..默认协议::默认()
+            };
+            设 m = mount_info("ext4", "/mnt/foo", 假, 假);
+            断言!(is_included(&m, &opt));
+        }
+    }
+}

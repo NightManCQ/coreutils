@@ -1,0 +1,342 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore espidf nopipe
+
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::OpenOptions;
+使用 标准库::输入输出::{错误协议, ErrorKind, Read, 结果, Write, stderr, stdin, stdout};
+使用 标准库::路径::PathBuf;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{UResult, strip_errno};
+使用 uucore::translate;
+
+模组 cli;
+公有 使用 箱::cli::uu_app;
+使用 箱::cli::{Options, OutputErrorMode, options};
+
+#[cfg(target_os = "linux")]
+使用 uucore::signals::ensure_stdout_not_broken;
+#[cfg(unix)]
+使用 uucore::signals::{disable_pipe_errors, ignore_interrupts};
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 append = matches.get_flag(options::APPEND);
+    设 ignore_interrupts = matches.get_flag(options::IGNORE_INTERRUPTS);
+    设 ignore_pipe_errors = matches.get_flag(options::IGNORE_PIPE_ERRORS);
+    设 output_error = matches
+        .get_one::<字符串>(options::OUTPUT_ERROR)
+        .映射(|s| 匹配 s.as_str() {
+            "warn" => OutputErrorMode::Warn,
+            "warn-nopipe" => OutputErrorMode::WarnNoPipe,
+            "exit" => OutputErrorMode::Exit,
+            "exit-nopipe" => OutputErrorMode::ExitNoPipe,
+            _ => 无法到达!("clap excluded it"),
+        })
+        .or_else(|| ignore_pipe_errors.then_some(OutputErrorMode::WarnNoPipe));
+
+    设 files = matches
+        .get_many::<OsString>(options::FILE)
+        .映射(|v| v.cloned().收集())
+        .unwrap_or_default();
+
+    设 options = Options {
+        append,
+        ignore_interrupts,
+        ignore_pipe_errors,
+        files,
+        output_error,
+    };
+
+    tee(&options).map_err(|_| 1.into())
+}
+
+方法 tee(options: &Options) -> 结果<()> {
+    #[cfg(unix)]
+    {
+        // ErrorKind::Other is raised by MultiWriter when all writers have exited.
+        // This is therefore just a clever way to stop all writers
+
+        如果 options.ignore_interrupts {
+            ignore_interrupts().map_err(|_| 错误协议::from(ErrorKind::Other))?;
+        }
+        如果 options.output_error.is_some() {
+            disable_pipe_errors().map_err(|_| 错误协议::from(ErrorKind::Other))?;
+        }
+    }
+    设 可变 writers: 向量<NamedWriter> = options
+        .files
+        .迭代()
+        .filter_map(|file| open(file, options.append, options.output_error.as_ref()))
+        .收集::<结果<向量<NamedWriter>>>()?;
+    设 had_open_errors = writers.长度() != options.files.长度();
+
+    writers.插入(
+        0,
+        NamedWriter {
+            name: translate!("tee-standard-output").into(),
+            inner: Writer::Stdout(stdout()),
+        },
+    );
+
+    设 可变 output = MultiWriter::新建(writers, options.output_error.克隆());
+    设 input = NamedReader { inner: stdin() };
+
+    #[cfg(target_os = "linux")]
+    如果 options.ignore_pipe_errors && !ensure_stdout_not_broken()? && output.writers.长度() == 1 {
+        返回 好的(());
+    }
+
+    // We cannot use std::io::copy here as it doesn't flush the output buffer
+    设 res = 匹配 copy(input, &可变 output) {
+        // ErrorKind::Other is raised by MultiWriter when all writers
+        // have exited, so that copy will abort. It's equivalent to
+        // success of this part (if there was an error that should
+        // cause a failure from any writer, that error would have been
+        // returned instead).
+        坏的(e) 如果 e.kind() != ErrorKind::Other => 坏的(e),
+        _ => 好的(()),
+    };
+
+    如果 had_open_errors || res.is_err() || output.flush().is_err() || output.error_occurred() {
+        坏的(错误协议::from(ErrorKind::Other))
+    } 否则 {
+        好的(())
+    }
+}
+
+/// Copies all bytes from the input buffer to the output buffer.
+方法 copy(可变 input: 实现 Read, 可变 output: 实现 Write) -> 结果<()> {
+    // The implementation for this function is adopted from the generic buffer copy implementation from
+    // the standard library:
+    // https://github.com/rust-lang/rust/blob/2feb91181882e525e698c4543063f4d0296fcf91/library/std/src/io/copy.rs#L271-L297
+
+    // Use buffer size from std implementation
+    // https://github.com/rust-lang/rust/blob/2feb91181882e525e698c4543063f4d0296fcf91/library/std/src/sys/io/mod.rs#L44
+    常量 BUF_SIZE: 正整数大小 = 8 * 1024;
+    设 可变 buffer = [0正8; BUF_SIZE];
+
+    循环 _ 在 0..2 {
+        匹配 input.读锁定(&可变 buffer) {
+            好的(0) => 返回 好的(()), // end of file
+            好的(received) => {
+                output.write_all(&buffer[..received])?;
+                // flush the buffer to comply with POSIX requirement that
+                // `tee` does not buffer the input.
+                output.flush()?;
+            }
+            坏的(e) 如果 e.kind() != ErrorKind::Interrupted => 返回 坏的(e),
+            _ => {}
+        }
+    }
+    // buffer is too small optimize for large input
+    //stack array makes code path for smaller file slower
+    设 可变 buffer = 向量![0正8; 4 * BUF_SIZE];
+    无限循环 {
+        匹配 input.读锁定(&可变 buffer) {
+            好的(0) => 返回 好的(()), // end of file
+            好的(received) => {
+                output.write_all(&buffer[..received])?;
+                // flush the buffer to comply with POSIX requirement that
+                // `tee` does not buffer the input.
+                output.flush()?;
+            }
+            坏的(e) 如果 e.kind() != ErrorKind::Interrupted => 返回 坏的(e),
+            _ => {}
+        }
+    }
+}
+
+/// Tries to open the indicated file and return it. Reports an error if that's not possible.
+/// If that error should lead to program termination, this function returns Some(Err()),
+/// otherwise it returns None.
+方法 open(
+    name: &OsString,
+    append: 布尔,
+    output_error: 选项<&OutputErrorMode>,
+) -> 选项<结果<NamedWriter>> {
+    设 路径 = PathBuf::from(name);
+    设 可变 options = OpenOptions::新建();
+    设 mode = 如果 append {
+        options.append(真)
+    } 否则 {
+        options.truncate(真)
+    };
+    匹配 mode.写锁定(真).create(真).open(路径.as_path()) {
+        好的(file) => 一些(好的(NamedWriter {
+            inner: Writer::File(file),
+            name: name.克隆(),
+        })),
+        坏的(f) => {
+            设 _ = writeln!(stderr(), "{}: {f}", name.maybe_quote());
+            匹配 output_error {
+                一些(OutputErrorMode::Exit | OutputErrorMode::ExitNoPipe) => 一些(坏的(f)),
+                _ => 无,
+            }
+        }
+    }
+}
+
+结构 MultiWriter {
+    writers: 向量<NamedWriter>,
+    output_error_mode: 选项<OutputErrorMode>,
+    ignored_errors: 正整数大小,
+}
+
+实现 MultiWriter {
+    方法 新建(writers: 向量<NamedWriter>, output_error_mode: 选项<OutputErrorMode>) -> 自身类型 {
+        自身类型 {
+            writers,
+            output_error_mode,
+            ignored_errors: 0,
+        }
+    }
+
+    方法 error_occurred(&自身) -> 布尔 {
+        自身.ignored_errors != 0
+    }
+}
+
+方法 process_error(
+    mode: 选项<&OutputErrorMode>,
+    f: 错误协议,
+    writer: &NamedWriter,
+    ignored_errors: &可变 正整数大小,
+) -> 结果<()> {
+    匹配 mode {
+        一些(OutputErrorMode::Warn) => {
+            设 _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+            *ignored_errors += 1;
+            好的(())
+        }
+        一些(OutputErrorMode::WarnNoPipe) | 无 => {
+            如果 f.kind() != ErrorKind::BrokenPipe {
+                设 _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+                *ignored_errors += 1;
+            }
+            好的(())
+        }
+        一些(OutputErrorMode::Exit) => {
+            设 _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+            坏的(f)
+        }
+        一些(OutputErrorMode::ExitNoPipe) => {
+            如果 f.kind() == ErrorKind::BrokenPipe {
+                好的(())
+            } 否则 {
+                设 _ = writeln!(stderr(), "{}: {f}", writer.name.maybe_quote());
+                坏的(f)
+            }
+        }
+    }
+}
+
+实现 Write 循环 MultiWriter {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 结果<正整数大小> {
+        设 可变 aborted = 无;
+        设 mode = 自身.output_error_mode.克隆();
+        设 可变 errors = 0;
+        自身.writers.retain_mut(|writer| {
+            writer
+                .write_all(buf)
+                .map_err(|f| {
+                    设 _ = process_error(mode.as_ref(), f, writer, &可变 errors)
+                        .map_err(|e| aborted.get_or_insert(e));
+                })
+                .is_ok()
+        });
+        自身.ignored_errors += errors;
+        如果 设 一些(e) = aborted {
+            坏的(e)
+        } 否则 如果 自身.writers.为空() {
+            // This error kind will never be raised by the standard
+            // library, so we can use it for early termination of
+            // `copy`
+            坏的(错误协议::from(ErrorKind::Other))
+        } 否则 {
+            好的(buf.长度())
+        }
+    }
+
+    方法 flush(&可变 自身) -> 结果<()> {
+        设 可变 aborted = 无;
+        设 mode = 自身.output_error_mode.克隆();
+        设 可变 errors = 0;
+        自身.writers.retain_mut(|writer| {
+            writer
+                .flush()
+                .map_err(|f| {
+                    设 _ = process_error(mode.as_ref(), f, writer, &可变 errors)
+                        .map_err(|e| aborted.get_or_insert(e));
+                })
+                .is_ok()
+        });
+        自身.ignored_errors += errors;
+        如果 设 一些(e) = aborted {
+            坏的(e)
+        } 否则 {
+            好的(())
+        }
+    }
+}
+
+枚举 Writer {
+    File(标准库::文件系统::File),
+    Stdout(标准库::输入输出::Stdout),
+}
+
+实现 Write 循环 Writer {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 结果<正整数大小> {
+        匹配 自身 {
+            自身类型::File(f) => f.写锁定(buf),
+            自身类型::Stdout(s) => s.写锁定(buf),
+        }
+    }
+
+    方法 flush(&可变 自身) -> 结果<()> {
+        匹配 自身 {
+            自身类型::File(f) => f.flush(),
+            自身类型::Stdout(s) => s.flush(),
+        }
+    }
+}
+
+结构 NamedWriter {
+    inner: Writer,
+    公有 name: OsString,
+}
+
+实现 Write 循环 NamedWriter {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 结果<正整数大小> {
+        自身.inner.写锁定(buf)
+    }
+
+    方法 flush(&可变 自身) -> 结果<()> {
+        自身.inner.flush()
+    }
+}
+
+结构 NamedReader {
+    inner: 标准库::输入输出::Stdin,
+}
+
+实现 Read 循环 NamedReader {
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> 结果<正整数大小> {
+        匹配 自身.inner.读锁定(buf) {
+            坏的(f) => {
+                设 _ = writeln!(
+                    stderr(),
+                    "tee: {}",
+                    translate!("tee-error-stdin", "error" => strip_errno(&f))
+                );
+                坏的(f)
+            }
+            okay => okay,
+        }
+    }
+}

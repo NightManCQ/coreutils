@@ -1,0 +1,74 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::环境;
+使用 标准库::输入输出::Write;
+
+使用 clap::{Arg, ArgAction, Command};
+
+使用 uucore::display::{OsWrite, print_all_env_vars};
+使用 uucore::错误::UResult;
+使用 uucore::line_ending::LineEnding;
+使用 uucore::{format_usage, translate};
+
+静态 OPT_NULL: &字符串切片 = "null";
+
+静态 ARG_VARIABLES: &字符串切片 = "variables";
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 2)?;
+
+    设 variables: 向量<字符串> = matches
+        .get_many::<字符串>(ARG_VARIABLES)
+        .映射(|v| v.映射(ToString::to_string).收集())
+        .unwrap_or_default();
+
+    设 separator = LineEnding::from_zero_flag(matches.get_flag(OPT_NULL));
+
+    如果 variables.为空() {
+        print_all_env_vars(separator)?;
+        返回 好的(());
+    }
+
+    设 可变 error_found = 假;
+    循环 env_var 在 variables {
+        // we silently ignore a=b as variable but we trigger an error
+        如果 env_var.包含('=') {
+            error_found = 真;
+            继续;
+        }
+        如果 设 一些(var) = 环境::var_os(env_var) {
+            设 可变 stdout = 标准库::输入输出::stdout().锁定();
+            stdout.write_all_os(&var)?;
+            write!(stdout, "{separator}")?;
+        } 否则 {
+            error_found = 真;
+        }
+    }
+
+    如果 error_found { 坏的(1.into()) } 否则 { 好的(()) }
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("printenv")
+        .version(uucore::crate_version!())
+        .about(translate!("printenv-about"))
+        .override_usage(format_usage(&translate!("printenv-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .arg(
+            Arg::新建(OPT_NULL)
+                .short('0')
+                .long(OPT_NULL)
+                .help(translate!("printenv-help-null"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_VARIABLES)
+                .action(ArgAction::Append)
+                .num_args(1..),
+        )
+}

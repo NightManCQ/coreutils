@@ -1,0 +1,19 @@
+使用 divan::{Bencher, black_box};
+使用 uu_cat::uumain;
+使用 uucore::benchmark::{run_util_function, setup_test_file};
+
+#[divan::bench(args = [10_000, 10_000_000])]
+方法 cat_default(bencher: Bencher, size_bytes: 正整数大小) {
+    设 data = 向量![b'a'; size_bytes];
+
+    设 file_path = setup_test_file(&data);
+    设 path_str = file_path.to_str().解包();
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &[path_str]));
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

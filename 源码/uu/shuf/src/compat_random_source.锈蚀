@@ -1,0 +1,123 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 标准库::{输入输出::BufRead, 操作符::RangeInclusive};
+
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::translate;
+
+/// A uniform integer generator that tries to exactly match GNU shuf's --random-source.
+///
+/// It's not particularly efficient and possibly not quite uniform. It should *only* be
+/// used for compatibility with GNU: other modes shouldn't touch this code.
+///
+/// All the logic here was black box reverse engineered. It might not match up in all edge
+/// cases but it gives identical results on many different large and small inputs.
+///
+/// It seems that GNU uses fairly textbook rejection sampling to generate integers, reading
+/// one byte at a time until it has enough entropy, and recycling leftover entropy after
+/// accepting or rejecting a value.
+///
+/// To do your own experiments, start with commands like these:
+///
+///   printf '\x01\x02\x03\x04' | shuf -i0-255 -r --random-source=/dev/stdin
+///
+/// Then vary the integer range and the input and the input length. It can be useful to
+/// see when exactly shuf crashes with an "end of file" error.
+///
+/// To spot small inconsistencies it's useful to run:
+///
+///   diff -y <(my_shuf ...) <(shuf -i0-{MAX} -r --random-source={INPUT}) | head -n 50
+公有 结构 RandomSourceAdapter<R> {
+    reader: R,
+    state: 正64,
+    entropy: 正64,
+}
+
+实现<R> RandomSourceAdapter<R> {
+    公有 方法 新建(reader: R) -> 自身类型 {
+        自身类型 {
+            reader,
+            state: 0,
+            entropy: 0,
+        }
+    }
+}
+
+实现<R: BufRead> RandomSourceAdapter<R> {
+    方法 generate_at_most(&可变 自身, at_most: 正64) -> UResult<正64> {
+        当 自身.entropy < at_most {
+            设 buf = 自身
+                .reader
+                .fill_buf()
+                .map_err_context(|| translate!("shuf-error-read-random-bytes"))?;
+            设 一些(&byte) = buf.first() 否则 {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("shuf-error-end-of-random-bytes"),
+                ));
+            };
+            自身.reader.consume(1);
+            // Is overflow OK here? Won't it cause bias? (Seems to work out...)
+            自身.state = 自身.state.wrapping_mul(256).wrapping_add(byte 转换 正64);
+            自身.entropy = 自身.entropy.wrapping_mul(256).wrapping_add(255);
+        }
+
+        如果 at_most == 正64::MAX {
+            // at_most + 1 would overflow but this case is easy.
+            设 val = 自身.state;
+            自身.entropy = 0;
+            自身.state = 0;
+            返回 好的(val);
+        }
+
+        设 num_possibilities = at_most + 1;
+
+        // If the generated number falls within this margin at the upper end of the
+        // range then we retry to avoid modulo bias.
+        设 margin = ((自身.entropy 转换 正128 + 1) % num_possibilities 转换 正128) 转换 正64;
+        设 safe_zone = 自身.entropy - margin;
+
+        如果 自身.state <= safe_zone {
+            设 val = 自身.state % num_possibilities;
+            // Reuse the rest of the state.
+            自身.state /= num_possibilities;
+            // We need this subtraction, otherwise we consume new input slightly more
+            // slowly than GNU. Not sure if it checks out mathematically.
+            自身.entropy -= at_most;
+            自身.entropy /= num_possibilities;
+            好的(val)
+        } 否则 {
+            自身.state %= num_possibilities;
+            自身.entropy %= num_possibilities;
+            // I sure hope the compiler optimizes this tail call.
+            自身.generate_at_most(at_most)
+        }
+    }
+
+    公有 方法 choose_from_range(&可变 自身, range: RangeInclusive<正64>) -> UResult<正64> {
+        设 offset = 自身.generate_at_most(*range.end() - *range.start())?;
+        好的(*range.start() + offset)
+    }
+
+    公有 方法 choose_from_slice<T: 复制协议>(&可变 自身, vals: &[T]) -> UResult<T> {
+        断言!(!vals.为空());
+        设 idx = 自身.generate_at_most(vals.长度() 转换 正64 - 1)? 转换 正整数大小;
+        好的(vals[idx])
+    }
+
+    公有 方法 shuffle<'a, T>(&可变 自身, vals: &'a 可变 [T], amount: 正整数大小) -> UResult<&'a 可变 [T]> {
+        // Fisher-Yates shuffle.
+        // TODO: GNU does something different if amount <= vals.len() and the input is stdin.
+        // The order changes completely and depends on --head-count.
+        // No clue what they might do differently and why.
+        设 amount = amount.min(vals.长度());
+        循环 idx 在 0..amount {
+            设 other_idx = 自身.generate_at_most((vals.长度() - idx - 1) 转换 正64)? 转换 正整数大小 + idx;
+            vals.swap(idx, other_idx);
+        }
+        好的(&可变 vals[..amount])
+    }
+}

@@ -1,0 +1,103 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// features ~ feature-gated modules (core/bundler file)
+//
+// spell-checker:ignore (features) extendedbigdecimal logind
+
+#[cfg(feature = "backup-control")]
+公有 模组 backup_control;
+#[cfg(feature = "benchmark")]
+公有 模组 benchmark;
+#[cfg(feature = "buf-copy")]
+公有 模组 buf_copy;
+#[cfg(feature = "checksum")]
+公有 模组 checksum;
+#[cfg(feature = "colors")]
+公有 模组 colors;
+#[cfg(feature = "encoding")]
+公有 模组 encoding;
+#[cfg(feature = "extendedbigdecimal")]
+公有 模组 extendedbigdecimal;
+#[cfg(feature = "fast-inc")]
+公有 模组 fast_inc;
+#[cfg(feature = "format")]
+公有 模组 format;
+#[cfg(feature = "fs")]
+公有 模组 文件系统;
+#[cfg(feature = "fsext")]
+公有 模组 fsext;
+#[cfg(feature = "i18n-common")]
+公有 模组 i18n;
+#[cfg(feature = "lines")]
+公有 模组 lines;
+#[cfg(任意(
+    feature = "parser",
+    feature = "parser-num",
+    feature = "parser-size",
+    feature = "parser-glob"
+))]
+公有 模组 parser;
+#[cfg(feature = "quoting-style")]
+公有 模组 quoting_style;
+#[cfg(feature = "ranges")]
+公有 模组 ranges;
+#[cfg(feature = "ringbuffer")]
+公有 模组 ringbuffer;
+#[cfg(feature = "sum")]
+公有 模组 求和;
+#[cfg(feature = "time")]
+公有 模组 时间;
+#[cfg(feature = "update-control")]
+公有 模组 update_control;
+#[cfg(feature = "uptime")]
+公有 模组 uptime;
+#[cfg(feature = "version-cmp")]
+公有 模组 version_cmp;
+
+// * (platform-specific) feature-gated modules
+// ** non-windows (i.e. Unix + Fuchsia)
+#[cfg(全部(not(windows), feature = "mode"))]
+公有 模组 mode;
+
+// ** unix-only
+#[cfg(全部(unix, feature = "entries"))]
+公有 模组 entries;
+#[cfg(全部(unix, feature = "perms"))]
+公有 模组 perms;
+#[cfg(全部(unix, 任意(feature = "pipes", feature = "buf-copy")))]
+公有 模组 pipes;
+#[cfg(全部(target_os = "linux", feature = "proc-info"))]
+公有 模组 proc_info;
+#[cfg(全部(unix, feature = "process"))]
+公有 模组 进程;
+#[cfg(全部(unix, not(target_os = "redox")))]
+公有 模组 safe_traversal;
+#[cfg(全部(target_os = "linux", feature = "tty"))]
+公有 模组 tty;
+
+#[cfg(全部(unix, feature = "fsxattr"))]
+公有 模组 fsxattr;
+#[cfg(feature = "hardware")]
+公有 模组 hardware;
+#[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+公有 模组 selinux;
+#[cfg(全部(unix, not(target_os = "fuchsia"), feature = "signals"))]
+公有 模组 signals;
+#[cfg(全部(target_os = "linux", feature = "smack"))]
+公有 模组 smack;
+#[cfg(feature = "feat_systemd_logind")]
+公有 模组 systemd_logind;
+#[cfg(全部(
+    unix,
+    not(target_os = "android"),
+    not(target_os = "fuchsia"),
+    not(target_os = "openbsd"),
+    not(target_os = "redox"),
+    feature = "utmpx"
+))]
+公有 模组 utmpx;
+// ** windows-only
+#[cfg(全部(windows, feature = "wide"))]
+公有 模组 wide;

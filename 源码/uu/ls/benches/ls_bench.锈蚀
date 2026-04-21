@@ -1,0 +1,110 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::文件系统;
+使用 tempfile::TempDir;
+使用 uu_ls::uumain;
+使用 uucore::benchmark::{fs_tree, run_util_function};
+
+/// Helper to run ls with given arguments on a directory
+方法 bench_ls_with_args(bencher: Bencher, temp_dir: &TempDir, args: &[&字符串切片]) {
+    设 temp_path_str = temp_dir.路径().to_str().解包();
+    设 可变 full_args = 向量!["-R"];
+    full_args.extend_from_slice(args);
+    full_args.压入(temp_path_str);
+
+    bencher.bench(|| {
+        black_box(run_util_function(uumain, &full_args));
+    });
+}
+
+/// Benchmark ls -R on balanced directory tree
+#[divan::bench(args = [(6, 4, 15)])]
+方法 ls_recursive_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_balanced_tree(temp_dir.路径(), depth, dirs_per_level, files_per_dir);
+    bench_ls_with_args(bencher, &temp_dir, &[]);
+}
+
+/// Benchmark ls -R -a -l on balanced directory tree (tests PR #8728 optimization)
+#[divan::bench(args = [(6, 4, 15)])]
+方法 ls_recursive_long_all_balanced_tree(
+    bencher: Bencher,
+    (depth, dirs_per_level, files_per_dir): (正整数大小, 正整数大小, 正整数大小),
+) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_balanced_tree(temp_dir.路径(), depth, dirs_per_level, files_per_dir);
+    bench_ls_with_args(bencher, &temp_dir, &["-a", "-l"]);
+}
+
+/// Benchmark ls -R on wide directory structures
+#[divan::bench(args = [(10000, 1000)])]
+方法 ls_recursive_wide_tree(bencher: Bencher, (total_files, total_dirs): (正整数大小, 正整数大小)) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_wide_tree(temp_dir.路径(), total_files, total_dirs);
+    bench_ls_with_args(bencher, &temp_dir, &[]);
+}
+
+/// Benchmark ls -R -a -l on wide directory structures
+#[divan::bench(args = [(15000, 1500)])]
+方法 ls_recursive_long_all_wide_tree(bencher: Bencher, (total_files, total_dirs): (正整数大小, 正整数大小)) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_wide_tree(temp_dir.路径(), total_files, total_dirs);
+    bench_ls_with_args(bencher, &temp_dir, &["-a", "-l"]);
+}
+
+/// Benchmark ls -R on deep directory structures
+#[divan::bench(args = [(200, 2)])]
+方法 ls_recursive_deep_tree(bencher: Bencher, (depth, files_per_level): (正整数大小, 正整数大小)) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_deep_tree(temp_dir.路径(), depth, files_per_level);
+    bench_ls_with_args(bencher, &temp_dir, &[]);
+}
+
+/// Benchmark ls -R -a -l on deep directory structures
+#[divan::bench(args = [(100, 4)])]
+方法 ls_recursive_long_all_deep_tree(bencher: Bencher, (depth, files_per_level): (正整数大小, 正整数大小)) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_deep_tree(temp_dir.路径(), depth, files_per_level);
+    bench_ls_with_args(bencher, &temp_dir, &["-a", "-l"]);
+}
+
+/// Benchmark ls -R on mixed file types (comprehensive real-world test)
+#[divan::bench]
+方法 ls_recursive_mixed_tree(bencher: Bencher) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_mixed_tree(temp_dir.路径());
+
+    循环 i 在 0..10 {
+        设 subdir = temp_dir.路径().加入(格式化!("mixed_branch_{i}"));
+        文件系统::create_dir(&subdir).解包();
+        fs_tree::create_mixed_tree(&subdir);
+    }
+
+    bench_ls_with_args(bencher, &temp_dir, &[]);
+}
+
+/// Benchmark ls -R -a -l on mixed file types (most comprehensive test)
+#[divan::bench]
+方法 ls_recursive_long_all_mixed_tree(bencher: Bencher) {
+    设 temp_dir = TempDir::新建().解包();
+    fs_tree::create_mixed_tree(temp_dir.路径());
+
+    循环 i 在 0..10 {
+        设 subdir = temp_dir.路径().加入(格式化!("mixed_branch_{i}"));
+        文件系统::create_dir(&subdir).解包();
+        fs_tree::create_mixed_tree(&subdir);
+    }
+
+    bench_ls_with_args(bencher, &temp_dir, &["-a", "-l"]);
+}
+
+方法 主函数() {
+    divan::主函数();
+}

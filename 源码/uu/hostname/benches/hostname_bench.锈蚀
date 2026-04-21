@@ -1,0 +1,135 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Benchmarks for hostname utility
+//!
+//! This benchmark tests the performance of hostname with large /etc/hosts files,
+//! specifically targeting the DNS resolution functionality (`-i` flag).
+//!
+//! # Important Note on Large Hosts File Testing
+//!
+//! To properly test with large /etc/hosts files, NSS_WRAPPER library must be used:
+//!
+//! ```bash
+//! LD_PRELOAD=/usr/lib/libnss_wrapper.so NSS_WRAPPER_HOSTS=/tmp/large_hosts \
+//!   cargo bench --package uu_hostname hostname_ip_lookup
+//! ```
+//!
+//! Without NSS_WRAPPER, the benchmark tests with the system's real /etc/hosts.
+
+使用 divan::{Bencher, black_box};
+使用 标准库::输入输出::Write;
+使用 uu_hostname::uumain;
+使用 uucore::benchmark::run_util_function;
+
+/// Generate a large hosts file with the specified number of entries
+方法 generate_hosts_file(entries: 正整数大小) -> 向量<正8> {
+    设 avg_line_size = 80;
+    设 可变 data = 向量::with_capacity(entries * avg_line_size);
+    设 可变 writer = 标准库::输入输出::BufWriter::新建(&可变 data);
+
+    // Localhost entries
+    writeln!(writer, "127.0.0.1   localhost localhost.localdomain").解包();
+    writeln!(writer, "::1         localhost localhost.localdomain").解包();
+
+    // Generate host entries
+    设 environments = ["prod", "staging", "dev", "test"];
+    设 regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"];
+    设 roles = [
+        "web", "db", "cache", "api", "worker", "lb", "monitor", "backup",
+    ];
+
+    循环 i 在 2..=entries {
+        设 ip = 匹配 i % 5 {
+            0 => 格式化!("127.0.0.{}", i % 256),
+            1 => 格式化!("10.{}.{}.{}", (i / 256) % 256, (i / 16) % 16, i % 256),
+            2 => 格式化!("192.168.{}.{}", (i / 256) % 256, i % 256),
+            3 => 格式化!("172.16.{}.{}", (i / 256) % 256, i % 256),
+            _ => 格式化!("10.0.{}.{}", (i / 256) % 256, i % 256),
+        };
+
+        设 role = roles[i % roles.长度()];
+        设 环境 = environments[i % environments.长度()];
+        设 region = regions[i % regions.长度()];
+        设 fqdn = 格式化!("{role}-{i:03}.{region}.{env}.example.com");
+        设 short = 格式化!("{role}-{i:03}");
+
+        writeln!(writer, "{ip:<15} {fqdn} {short}").解包();
+    }
+
+    writer.flush().解包();
+    drop(writer);
+    data
+}
+
+/// Benchmark hostname -i with large hosts file
+///
+/// # Important
+/// Use NSS_WRAPPER to test with generated hosts file:
+/// `LD_PRELOAD=/usr/lib/libnss_wrapper.so NSS_WRAPPER_HOSTS=/path/to/hosts cargo bench`
+#[divan::bench(
+    args = [100_000],
+    name = "hostname_ip_lookup"
+)]
+方法 bench_hostname_ip(bencher: Bencher, entries: 正整数大小) {
+    设 temp_dir = tempfile::tempdir().解包();
+    设 hosts_file = temp_dir.路径().加入("hosts");
+    设 hosts_data = generate_hosts_file(entries);
+    标准库::文件系统::写锁定(&hosts_file, &hosts_data).解包();
+
+    设 nss_wrapper_env = 标准库::环境::var("LD_PRELOAD").unwrap_or_default();
+    设 has_nss_wrapper = nss_wrapper_env.包含("nss_wrapper");
+
+    如果 has_nss_wrapper {
+        不安全 {
+            标准库::环境::set_var("NSS_WRAPPER_HOSTS", &hosts_file);
+        }
+    }
+
+    bencher.bench(|| {
+        设 result = black_box(run_util_function(uumain, &["-i"]));
+        相等断言!(result, 0);
+    });
+
+    如果 has_nss_wrapper {
+        不安全 {
+            标准库::环境::remove_var("NSS_WRAPPER_HOSTS");
+        }
+    }
+}
+
+/// Benchmark basic hostname display (baseline)
+#[divan::bench(name = "hostname_basic")]
+方法 bench_hostname_basic(bencher: Bencher) {
+    bencher.bench(|| {
+        设 result = black_box(run_util_function(uumain, &[]));
+        相等断言!(result, 0);
+    });
+}
+
+/// Benchmark direct DNS lookup (Linux/macOS path)
+#[cfg(not(任意(target_os = "freebsd", target_os = "openbsd")))]
+#[divan::bench(
+    args = [100_000],
+    name = "socket_addrs_direct"
+)]
+方法 bench_socket_addrs_direct(bencher: Bencher, _entries: 正整数大小) {
+    使用 标准库::网络::ToSocketAddrs;
+
+    设 hostname = hostname::获取()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    设 hostname_with_port = 格式化!("{hostname}:1");
+
+    bencher.bench(|| {
+        设 result: 结果<向量<_>, _> = hostname_with_port.to_socket_addrs().映射(迭代器协议::收集);
+        设 _ = black_box(result);
+    });
+}
+
+方法 主函数() {
+    divan::主函数();
+}

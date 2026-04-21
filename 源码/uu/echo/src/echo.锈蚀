@@ -1,0 +1,256 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, Command};
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::输入输出::{StdoutLock, Write, stdout};
+使用 uucore::错误::UResult;
+使用 uucore::format::{FormatChar, OctalParsing, parse_escape_only};
+使用 uucore::{crate_version, format_usage, os_str_as_bytes};
+
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 STRING: &字符串切片 = "STRING";
+    公有 常量 NO_NEWLINE: &字符串切片 = "no_newline";
+    公有 常量 ENABLE_BACKSLASH_ESCAPE: &字符串切片 = "enable_backslash_escape";
+    公有 常量 DISABLE_BACKSLASH_ESCAPE: &字符串切片 = "disable_backslash_escape";
+}
+
+/// Options for the echo command.
+#[derive(调试协议, 克隆协议, 复制协议)]
+结构 Options {
+    /// Whether the output should have a trailing newline.
+    ///
+    /// True by default. `-n` disables it.
+    公有 trailing_newline: 布尔,
+
+    /// Whether given string literals should be parsed for
+    /// escape characters.
+    ///
+    /// False by default, can be enabled with `-e`. Always true if
+    /// `POSIXLY_CORRECT` (cannot be disabled with `-E`).
+    公有 escape: 布尔,
+}
+
+实现 默认协议 循环 Options {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            trailing_newline: 真,
+            escape: 假,
+        }
+    }
+}
+
+实现 Options {
+    方法 posixly_correct_default() -> 自身类型 {
+        自身类型 {
+            trailing_newline: 真,
+            escape: 真,
+        }
+    }
+}
+
+/// Checks if an argument is a valid echo flag, and if
+/// it is records the changes in [`Options`].
+方法 is_flag(arg: &OsStr, options: &可变 Options) -> 布尔 {
+    设 arg = arg.as_encoded_bytes();
+
+    如果 arg.first() != 一些(&b'-') || arg == b"-" {
+        // Argument doesn't start with '-' or is '-' => not a flag.
+        返回 假;
+    }
+
+    // We don't modify the given options until after
+    // the loop because there is a chance the flag isn't
+    // valid after all & shouldn't affect the options.
+    设 可变 options_: Options = *options;
+
+    // Skip the '-' when processing characters.
+    循环 c 在 &arg[1..] {
+        匹配 c {
+            b'e' => options_.escape = 真,
+            b'E' => options_.escape = 假,
+            b'n' => options_.trailing_newline = 假,
+
+            // If there is any character in an supposed flag
+            // that is not a valid flag character, it is not
+            // a flag.
+            //
+            // "-eeEnEe" => is a flag.
+            // "-eeBne" => not a flag, short circuit at the B.
+            _ => 返回 假,
+        }
+    }
+
+    // We are now sure that the argument is a
+    // flag, and can apply the modified options.
+    *options = options_;
+    真
+}
+
+/// Processes command line arguments, separating flags from normal arguments.
+///
+/// # Returns
+///
+/// - Vector of non-flag arguments.
+/// - [`Options`], describing how the arguments should be interpreted.
+方法 filter_flags(args: 实现 迭代器协议<Item = OsString>) -> (实现 迭代器协议<Item = OsString>, Options) {
+    设 可变 options = Options::默认();
+    设 可变 args = args.peekable();
+
+    // Process arguments until first non-flag is found.
+    当 设 一些(arg) = args.peek() {
+        // We parse flags and aggregate the options in `options`.
+        // First call to `is_flag` to return false will break the loop.
+        如果 is_flag(arg, &可变 options) {
+            args.next();
+        } 否则 {
+            // Not a flag. Can break out of flag-processing loop.
+            中断;
+        }
+    }
+
+    // Return remaining non-flag arguments.
+    (args, options)
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    // args[0] is the name of the binary.
+    设 可变 args = args.skip(1).peekable();
+
+    // Check POSIX compatibility mode
+    //
+    // From the GNU manual, on what it should do:
+    //
+    // > If the POSIXLY_CORRECT environment variable is set, then when
+    // > echo’s first argument is not -n it outputs option-like arguments
+    // > instead of treating them as options. For example, echo -ne hello
+    // > outputs ‘-ne hello’ instead of plain ‘hello’. Also backslash
+    // > escapes are always enabled. To echo the string ‘-n’, one of the
+    // > characters can be escaped in either octal or hexadecimal
+    // > representation. For example, echo -e '\x2dn'.
+    设 is_posixly_correct = 环境::var_os("POSIXLY_CORRECT").is_some();
+
+    设 (args, options): (盒子<动态 迭代器协议<Item = OsString>>, Options) = 如果 is_posixly_correct {
+        如果 args.peek().is_some_and(|arg| arg == "-n") {
+            // if POSIXLY_CORRECT is set and the first argument is the "-n" flag
+            // we filter flags normally but 'escaped' is activated nonetheless.
+            设 (args, _) = filter_flags(args);
+            (
+                盒子::新建(args),
+                Options {
+                    trailing_newline: 假,
+                    ..Options::posixly_correct_default()
+                },
+            )
+        } 否则 {
+            // if POSIXLY_CORRECT is set and the first argument is not the "-n" flag
+            // we just collect all arguments as no arguments are interpreted as flags.
+            (盒子::新建(args), Options::posixly_correct_default())
+        }
+    } 否则 如果 设 一些(first_arg) = args.next() {
+        如果 first_arg == "--help" && args.peek().is_none() {
+            // If POSIXLY_CORRECT is not set and the first argument
+            // is `--help`, GNU coreutils prints the help message.
+            //
+            // Verify this using:
+            //
+            //   POSIXLY_CORRECT=1 echo --help
+            //                     echo --help
+            uu_app().print_help()?;
+            返回 好的(());
+        } 否则 如果 first_arg == "--version" && args.peek().is_none() {
+            writeln!(stdout(), "echo {}", crate_version!())?;
+            返回 好的(());
+        }
+
+        // if POSIXLY_CORRECT is not set we filter the flags normally
+        设 (args, options) = filter_flags(标准库::迭代::once(first_arg).chain(args));
+        (盒子::新建(args), options)
+    } 否则 {
+        (盒子::新建(args), Options::默认())
+    };
+
+    execute(&可变 stdout().锁定(), args, options)?;
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    // Note: echo is different from the other utils in that it should **not**
+    // have `infer_long_args(true)`, because, for example, `--ver` should be
+    // printed as `--ver` and not show the version text.
+    Command::新建("echo")
+        // TrailingVarArg specifies the final positional argument is a VarArg
+        // and it doesn't attempts the parse any further args.
+        // Final argument must have multiple(true) or the usage string equivalent.
+        .trailing_var_arg(真)
+        .allow_hyphen_values(真)
+        .version(crate_version!())
+        .about(translate!("echo-about"))
+        .after_help(translate!("echo-after-help"))
+        .override_usage(format_usage(&translate!("echo-usage")))
+        .help_template(uucore::localized_help_template("echo"))
+        .arg(
+            Arg::新建(options::NO_NEWLINE)
+                .short('n')
+                .help(translate!("echo-help-no-newline"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ENABLE_BACKSLASH_ESCAPE)
+                .short('e')
+                .help(translate!("echo-help-enable-escapes"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::DISABLE_BACKSLASH_ESCAPE),
+        )
+        .arg(
+            Arg::新建(options::DISABLE_BACKSLASH_ESCAPE)
+                .short('E')
+                .help(translate!("echo-help-disable-escapes"))
+                .action(ArgAction::SetTrue)
+                .overrides_with(options::ENABLE_BACKSLASH_ESCAPE),
+        )
+        .arg(
+            Arg::新建(options::STRING)
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string()),
+        )
+}
+
+方法 execute(
+    stdout: &可变 StdoutLock,
+    args: 实现 迭代器协议<Item = OsString>,
+    options: Options,
+) -> UResult<()> {
+    循环 (i, arg) 在 args.into_iter().enumerate() {
+        设 bytes = os_str_as_bytes(&arg)?;
+
+        // Don't print a space before the first argument
+        如果 i > 0 {
+            stdout.write_all(b" ")?;
+        }
+
+        如果 options.escape {
+            循环 item 在 parse_escape_only(bytes, OctalParsing::ThreeDigits) {
+                如果 item.写锁定(&可变 *stdout)?.is_break() {
+                    返回 好的(());
+                }
+            }
+        } 否则 {
+            stdout.write_all(bytes)?;
+        }
+    }
+
+    如果 options.trailing_newline {
+        stdout.write_all(b"\n")?;
+    }
+
+    好的(())
+}

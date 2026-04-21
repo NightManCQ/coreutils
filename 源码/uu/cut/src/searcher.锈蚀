@@ -1,0 +1,180 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore multispace
+
+使用 超级::matcher::Matcher;
+
+// Generic searcher that relies on a specific matcher
+公有 结构 Searcher<'a, 'b, M: Matcher> {
+    matcher: &'a M,
+    haystack: &'b [正8],
+    position: 正整数大小,
+}
+
+实现<'a, 'b, M: Matcher> Searcher<'a, 'b, M> {
+    公有 方法 新建(matcher: &'a M, haystack: &'b [正8]) -> 自身类型 {
+        自身类型 {
+            matcher,
+            haystack,
+            position: 0,
+        }
+    }
+}
+
+// Iterate over field delimiters
+// Returns (first, last) positions of each sequence, where `haystack[first..last]`
+// corresponds to the delimiter.
+实现<M: Matcher> 迭代器协议 循环 Searcher<'_, '_, M> {
+    类型 Item = (正整数大小, 正整数大小);
+
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        设 (first, 最后) = 自身.matcher.next_match(&自身.haystack[自身.position..])?;
+        设 result = (first + 自身.position, 最后 + 自身.position);
+        自身.position += 最后;
+
+        一些(result)
+    }
+}
+
+#[cfg(test)]
+模组 exact_searcher_tests {
+
+    使用 超级::超级::matcher::ExactMatcher;
+    使用 超级::*;
+
+    #[test]
+    方法 test_normal() {
+        设 matcher = ExactMatcher::新建("a".as_bytes());
+        设 迭代 = Searcher::新建(&matcher, "a.a.a".as_bytes());
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        相等断言!(向量![(0, 1), (2, 3), (4, 5)], items);
+    }
+
+    #[test]
+    方法 test_empty() {
+        设 matcher = ExactMatcher::新建("a".as_bytes());
+        设 迭代 = Searcher::新建(&matcher, "".as_bytes());
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        断言!(items.为空());
+    }
+
+    方法 test_multibyte(line: &[正8], expected: &[(正整数大小, 正整数大小)]) {
+        设 matcher = ExactMatcher::新建("ab".as_bytes());
+        设 迭代 = Searcher::新建(&matcher, line);
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        相等断言!(expected, items);
+    }
+
+    #[test]
+    方法 test_multibyte_normal() {
+        test_multibyte("...ab...ab...".as_bytes(), &[(3, 5), (8, 10)]);
+    }
+
+    #[test]
+    方法 test_multibyte_needle_head_at_end() {
+        test_multibyte("a".as_bytes(), &[]);
+    }
+
+    #[test]
+    方法 test_multibyte_starting_needle() {
+        test_multibyte("ab...ab...".as_bytes(), &[(0, 2), (5, 7)]);
+    }
+
+    #[test]
+    方法 test_multibyte_trailing_needle() {
+        test_multibyte("...ab...ab".as_bytes(), &[(3, 5), (8, 10)]);
+    }
+
+    #[test]
+    方法 test_multibyte_first_byte_false_match() {
+        test_multibyte("aA..aCaC..ab..aD".as_bytes(), &[(10, 12)]);
+    }
+
+    #[test]
+    方法 test_searcher_with_exact_matcher() {
+        设 matcher = ExactMatcher::新建("<>".as_bytes());
+        设 haystack = "<><>a<>b<><>cd<><>".as_bytes();
+        设 可变 searcher = Searcher::新建(&matcher, haystack);
+        相等断言!(searcher.next(), 一些((0, 2)));
+        相等断言!(searcher.next(), 一些((2, 4)));
+        相等断言!(searcher.next(), 一些((5, 7)));
+        相等断言!(searcher.next(), 一些((8, 10)));
+        相等断言!(searcher.next(), 一些((10, 12)));
+        相等断言!(searcher.next(), 一些((14, 16)));
+        相等断言!(searcher.next(), 一些((16, 18)));
+        相等断言!(searcher.next(), 无);
+        相等断言!(searcher.next(), 无);
+    }
+}
+
+#[cfg(test)]
+模组 whitespace_searcher_tests {
+
+    使用 超级::超级::matcher::WhitespaceMatcher;
+    使用 超级::*;
+
+    #[test]
+    方法 test_space() {
+        设 matcher = WhitespaceMatcher {};
+        设 迭代 = Searcher::新建(&matcher, " . . ".as_bytes());
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        相等断言!(向量![(0, 1), (2, 3), (4, 5)], items);
+    }
+
+    #[test]
+    方法 test_tab() {
+        设 matcher = WhitespaceMatcher {};
+        设 迭代 = Searcher::新建(&matcher, "\t.\t.\t".as_bytes());
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        相等断言!(向量![(0, 1), (2, 3), (4, 5)], items);
+    }
+
+    #[test]
+    方法 test_empty() {
+        设 matcher = WhitespaceMatcher {};
+        设 迭代 = Searcher::新建(&matcher, "".as_bytes());
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        断言!(items.为空());
+    }
+
+    方法 test_multispace(line: &[正8], expected: &[(正整数大小, 正整数大小)]) {
+        设 matcher = WhitespaceMatcher {};
+        设 迭代 = Searcher::新建(&matcher, line);
+        设 items: 向量<(正整数大小, 正整数大小)> = 迭代.收集();
+        相等断言!(expected, items);
+    }
+
+    #[test]
+    方法 test_multispace_normal() {
+        test_multispace(
+            "...  ... \t...\t ... \t ...".as_bytes(),
+            &[(3, 5), (8, 10), (13, 15), (18, 21)],
+        );
+    }
+
+    #[test]
+    方法 test_multispace_begin() {
+        test_multispace(" \t\t...".as_bytes(), &[(0, 3)]);
+    }
+
+    #[test]
+    方法 test_multispace_end() {
+        test_multispace("...\t  ".as_bytes(), &[(3, 6)]);
+    }
+
+    #[test]
+    方法 test_searcher_with_whitespace_matcher() {
+        设 matcher = WhitespaceMatcher {};
+        设 haystack = "\t a b \t cd\t\t".as_bytes();
+        设 可变 searcher = Searcher::新建(&matcher, haystack);
+        相等断言!(searcher.next(), 一些((0, 2)));
+        相等断言!(searcher.next(), 一些((3, 4)));
+        相等断言!(searcher.next(), 一些((5, 8)));
+        相等断言!(searcher.next(), 一些((10, 12)));
+        相等断言!(searcher.next(), 无);
+        相等断言!(searcher.next(), 无);
+    }
+}

@@ -1,0 +1,175 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) COMFOLLOW Chowner RFILE RFILE's derefer dgid nonblank nonprint nonprinting
+
+使用 uucore::display::Quotable;
+使用 uucore::entries;
+使用 uucore::错误::{FromIo, UResult, USimpleError};
+使用 uucore::format_usage;
+使用 uucore::perms::{GidUidOwnerFilter, IfFrom, chown_base, options};
+使用 uucore::translate;
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+
+使用 标准库::文件系统;
+使用 标准库::操作系统::unix::文件系统::MetadataExt;
+
+方法 parse_gid_from_str(group: &字符串切片) -> 结果<正32, 字符串> {
+    如果 设 一些(gid_str) = group.strip_prefix(':') {
+        // Handle :gid format
+        gid_str
+            .parse::<正32>()
+            .map_err(|_| translate!("chgrp-error-invalid-group-id", "gid_str" => gid_str))
+    } 否则 {
+        // Try as group name first
+        匹配 entries::grp2gid(group) {
+            好的(g) => 好的(g),
+            // If group name lookup fails, try parsing as raw number
+            坏的(_) => group
+                .parse::<正32>()
+                .map_err(|_| translate!("chgrp-error-invalid-group", "group" => group)),
+        }
+    }
+}
+
+方法 get_dest_gid(matches: &ArgMatches) -> UResult<(选项<正32>, 字符串)> {
+    设 可变 raw_group = 字符串::新建();
+    设 dest_gid = 如果 设 一些(file) = matches.get_one::<标准库::ffi::OsString>(options::REFERENCE) {
+        设 路径 = 标准库::路径::Path::新建(file);
+        文件系统::metadata(路径)
+            .映射(|meta| {
+                设 gid = meta.gid();
+                raw_group = entries::gid2grp(gid).unwrap_or_else(|_| gid.to_string());
+                一些(gid)
+            })
+            .map_err_context(
+                || translate!("chgrp-error-failed-to-get-attributes", "file" => 路径.quote()),
+            )?
+    } 否则 {
+        设 group = matches
+            .get_one::<字符串>(options::ARG_GROUP)
+            .映射(字符串::as_str)
+            .unwrap_or_default();
+        raw_group = group.to_string();
+        如果 group.为空() {
+            无
+        } 否则 {
+            匹配 parse_gid_from_str(group) {
+                好的(g) => 一些(g),
+                坏的(e) => 返回 坏的(USimpleError::新建(1, e)),
+            }
+        }
+    };
+    好的((dest_gid, raw_group))
+}
+
+方法 parse_gid_and_uid(matches: &ArgMatches) -> UResult<GidUidOwnerFilter> {
+    设 (dest_gid, raw_group) = get_dest_gid(matches)?;
+
+    // Handle --from option
+    设 过滤 = 如果 设 一些(from_group) = matches.get_one::<字符串>(options::FROM) {
+        匹配 parse_gid_from_str(from_group) {
+            好的(g) => IfFrom::Group(g),
+            坏的(_) => {
+                返回 坏的(USimpleError::新建(
+                    1,
+                    translate!("chgrp-error-invalid-user", "from_group" => from_group),
+                ));
+            }
+        }
+    } 否则 {
+        IfFrom::All
+    };
+
+    好的(GidUidOwnerFilter {
+        dest_gid,
+        dest_uid: 无,
+        raw_owner: raw_group,
+        过滤,
+    })
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    chown_base(uu_app(), args, options::ARG_GROUP, parse_gid_and_uid, 真)
+}
+
+公有 方法 uu_app() -> Command {
+    设 cmd = Command::新建("chgrp")
+        .version(uucore::crate_version!())
+        .about(translate!("chgrp-about"))
+        .override_usage(format_usage(&translate!("chgrp-usage")))
+        .infer_long_args(真);
+    uucore::clap_localization::configure_localized_command(cmd)
+        .disable_help_flag(真)
+        .arg(
+            Arg::新建(options::HELP)
+                .long(options::HELP)
+                .help(translate!("chgrp-help-print-help"))
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::新建(options::verbosity::CHANGES)
+                .short('c')
+                .long(options::verbosity::CHANGES)
+                .help(translate!("chgrp-help-changes"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::verbosity::SILENT)
+                .short('f')
+                .long(options::verbosity::SILENT)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::verbosity::QUIET)
+                .long(options::verbosity::QUIET)
+                .help(translate!("chgrp-help-quiet"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::verbosity::VERBOSE)
+                .short('v')
+                .long(options::verbosity::VERBOSE)
+                .help(translate!("chgrp-help-verbose"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::preserve_root::PRESERVE)
+                .long(options::preserve_root::PRESERVE)
+                .help(translate!("chgrp-help-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::preserve_root::NO_PRESERVE)
+                .long(options::preserve_root::NO_PRESERVE)
+                .help(translate!("chgrp-help-no-preserve-root"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::REFERENCE)
+                .long(options::REFERENCE)
+                .value_name("RFILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(clap::value_parser!(标准库::ffi::OsString))
+                .help(translate!("chgrp-help-reference")),
+        )
+        .arg(
+            Arg::新建(options::FROM)
+                .long(options::FROM)
+                .value_name("GROUP")
+                .help(translate!("chgrp-help-from")),
+        )
+        .arg(
+            Arg::新建(options::RECURSIVE)
+                .short('R')
+                .long(options::RECURSIVE)
+                .help(translate!("chgrp-help-recursive"))
+                .action(ArgAction::SetTrue),
+        )
+        // Add common arguments with chgrp, chown & chmod
+        .args(uucore::perms::common_args())
+}

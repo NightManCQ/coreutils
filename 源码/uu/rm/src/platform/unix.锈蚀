@@ -1,0 +1,434 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// Unix-specific implementations for the rm utility
+
+// spell-checker:ignore fstatat unlinkat statx behaviour
+
+使用 indicatif::ProgressBar;
+使用 标准库::ffi::OsStr;
+使用 标准库::文件系统;
+使用 标准库::输入输出::{IsTerminal, stdin};
+使用 标准库::操作系统::unix::文件系统::PermissionsExt;
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::FromIo;
+使用 uucore::prompt_yes;
+使用 uucore::safe_traversal::{DirFd, SymlinkBehavior};
+使用 uucore::show_error;
+使用 uucore::translate;
+
+使用 超级::超级::{
+    InteractiveMode, Options, is_dir_empty, is_readable_metadata, prompt_descend, remove_file,
+    show_permission_denied_error, show_removal_error, verbose_removed_directory,
+    verbose_removed_file,
+};
+
+#[inline]
+方法 mode_readable(mode: libc::mode_t) -> 布尔 {
+    (mode & libc::S_IRUSR) != 0
+}
+
+#[inline]
+方法 mode_writable(mode: libc::mode_t) -> 布尔 {
+    (mode & libc::S_IWUSR) != 0
+}
+
+/// File prompt that reuses existing stat data to avoid extra statx calls
+方法 prompt_file_with_stat(路径: &Path, stat: &libc::stat, options: &Options) -> 布尔 {
+    如果 options.interactive == InteractiveMode::Never {
+        返回 真;
+    }
+
+    设 is_symlink = ((stat.st_mode 转换 libc::mode_t) & libc::S_IFMT) == libc::S_IFLNK;
+    设 writable = mode_writable(stat.st_mode 转换 libc::mode_t);
+    设 长度 = stat.st_size 转换 正64;
+    设 stdin_ok = options.__presume_input_tty.unwrap_or(假) || stdin().is_terminal();
+
+    // Match original behaviour:
+    // - Interactive::Always: always prompt; use non-protected wording when writable,
+    //   otherwise fall through to protected wording.
+    如果 options.interactive == InteractiveMode::Always {
+        如果 is_symlink {
+            返回 prompt_yes!("remove symbolic link {}?", 路径.quote());
+        }
+        如果 writable {
+            返回 如果 长度 == 0 {
+                prompt_yes!("remove regular empty file {}?", 路径.quote())
+            } 否则 {
+                prompt_yes!("remove file {}?", 路径.quote())
+            };
+        }
+        // Not writable: use protected wording below
+    }
+
+    // Interactive::Once or ::PromptProtected (and non-writable Always) paths
+    匹配 (stdin_ok, writable, 长度 == 0) {
+        (假, _, _) 如果 options.interactive == InteractiveMode::PromptProtected => 真,
+        (_, 真, _) => 真,
+        (_, 假, 真) => prompt_yes!(
+            "remove write-protected regular empty file {}?",
+            路径.quote()
+        ),
+        _ => prompt_yes!("remove write-protected regular file {}?", 路径.quote()),
+    }
+}
+
+/// Directory prompt that reuses existing stat data to avoid extra statx calls
+方法 prompt_dir_with_mode(路径: &Path, mode: libc::mode_t, options: &Options) -> 布尔 {
+    如果 options.interactive == InteractiveMode::Never {
+        返回 真;
+    }
+
+    设 readable = mode_readable(mode 转换 libc::mode_t);
+    设 writable = mode_writable(mode 转换 libc::mode_t);
+    设 stdin_ok = options.__presume_input_tty.unwrap_or(假) || stdin().is_terminal();
+
+    匹配 (stdin_ok, readable, writable, options.interactive) {
+        (假, _, _, InteractiveMode::PromptProtected) => 真,
+        (假, 假, 假, InteractiveMode::Never) => 真,
+        (_, 假, 假, _) => prompt_yes!(
+            "attempt removal of inaccessible directory {}?",
+            路径.quote()
+        ),
+        (_, 假, 真, InteractiveMode::Always) => {
+            prompt_yes!(
+                "attempt removal of inaccessible directory {}?",
+                路径.quote()
+            )
+        }
+        (_, 真, 假, _) => prompt_yes!("remove write-protected directory {}?", 路径.quote()),
+        (_, _, _, InteractiveMode::Always) => prompt_yes!("remove directory {}?", 路径.quote()),
+        (_, _, _, _) => 真,
+    }
+}
+
+/// Whether the given file or directory is readable.
+公有 方法 is_readable(路径: &Path) -> 布尔 {
+    文件系统::metadata(路径).is_ok_and(|metadata| is_readable_metadata(&metadata))
+}
+
+/// Remove a single file using safe traversal
+公有 方法 safe_remove_file(
+    路径: &Path,
+    options: &Options,
+    progress_bar: 选项<&ProgressBar>,
+) -> 选项<布尔> {
+    // If there is no parent (path is directly under cwd), unlinkat relative to "."
+    设 parent = 路径.parent().unwrap_or(Path::新建("."));
+    设 file_name = 路径.file_name()?;
+
+    设 dir_fd = DirFd::open(parent, SymlinkBehavior::Follow).ok()?;
+
+    匹配 dir_fd.unlink_at(file_name, 假) {
+        好的(_) => {
+            // Update progress bar for file removal
+            如果 设 一些(pb) = progress_bar {
+                pb.inc(1);
+            }
+            verbose_removed_file(路径, options);
+            一些(假)
+        }
+        坏的(e) => {
+            如果 e.kind() == 标准库::输入输出::ErrorKind::PermissionDenied {
+                show_error!("cannot remove {}: Permission denied", 路径.quote());
+            } 否则 {
+                设 _ = show_removal_error(e, 路径);
+            }
+            一些(真)
+        }
+    }
+}
+
+/// Remove an empty directory using safe traversal
+公有 方法 safe_remove_empty_dir(
+    路径: &Path,
+    options: &Options,
+    progress_bar: 选项<&ProgressBar>,
+) -> 选项<布尔> {
+    设 parent = 路径.parent().unwrap_or(Path::新建("."));
+    设 dir_name = 路径.file_name()?;
+
+    设 dir_fd = DirFd::open(parent, SymlinkBehavior::Follow).ok()?;
+
+    匹配 dir_fd.unlink_at(dir_name, 真) {
+        好的(_) => {
+            // Update progress bar for directory removal
+            如果 设 一些(pb) = progress_bar {
+                pb.inc(1);
+            }
+            verbose_removed_directory(路径, options);
+            一些(假)
+        }
+        坏的(e) => {
+            设 e =
+                e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => 路径.quote()));
+            show_error!("{e}");
+            一些(真)
+        }
+    }
+}
+
+/// Helper to handle errors with force mode consideration
+方法 handle_error_with_force(e: 标准库::输入输出::错误协议, 路径: &Path, options: &Options) -> 布尔 {
+    // Permission denied errors should be shown even in force mode
+    // This matches GNU rm behavior
+    如果 e.kind() == 标准库::输入输出::ErrorKind::PermissionDenied {
+        show_permission_denied_error(路径);
+        返回 真;
+    }
+
+    如果 !options.force {
+        设 e = e.map_err_context(|| translate!("rm-error-cannot-remove", "file" => 路径.quote()));
+        show_error!("{e}");
+    }
+    !options.force
+}
+
+/// Helper to handle permission denied errors
+方法 handle_permission_denied(
+    dir_fd: &DirFd,
+    entry_name: &OsStr,
+    entry_path: &Path,
+    options: &Options,
+) -> 布尔 {
+    // When we can't open a subdirectory due to permission denied,
+    // try to remove it directly (it might be empty).
+    // This matches GNU rm behavior with -f flag.
+    如果 设 坏的(_remove_err) = dir_fd.unlink_at(entry_name, 真) {
+        // The directory is not empty (or another error) and we can't read it
+        // to remove its contents. Report the original permission denied error.
+        // This matches GNU rm behavior — the real problem is we lack
+        // permission to traverse the directory.
+        show_permission_denied_error(entry_path);
+        返回 真;
+    }
+    // Successfully removed empty directory
+    verbose_removed_directory(entry_path, options);
+    假
+}
+
+/// Helper to handle unlink operation with error reporting
+方法 handle_unlink(
+    dir_fd: &DirFd,
+    entry_name: &OsStr,
+    entry_path: &Path,
+    is_dir: 布尔,
+    options: &Options,
+) -> 布尔 {
+    如果 设 坏的(e) = dir_fd.unlink_at(entry_name, is_dir) {
+        设 e = e
+            .map_err_context(|| translate!("rm-error-cannot-remove", "file" => entry_path.quote()));
+        show_error!("{e}");
+        真
+    } 否则 {
+        如果 is_dir {
+            verbose_removed_directory(entry_path, options);
+        } 否则 {
+            verbose_removed_file(entry_path, options);
+        }
+        假
+    }
+}
+
+/// Helper function to remove directory handling special cases
+公有 方法 remove_dir_with_special_cases(路径: &Path, options: &Options, error_occurred: 布尔) -> 布尔 {
+    匹配 文件系统::remove_dir(路径) {
+        坏的(_) 如果 !error_occurred && !is_readable(路径) => {
+            // For compatibility with GNU test case
+            // `tests/rm/unread2.sh`, show "Permission denied" in this
+            // case instead of "Directory not empty".
+            show_permission_denied_error(路径);
+            真
+        }
+        坏的(_) 如果 !error_occurred && 路径.read_dir().is_err() => {
+            // For compatibility with GNU test case on Linux
+            // Check if directory is readable by attempting to read it
+            show_permission_denied_error(路径);
+            真
+        }
+        坏的(e) 如果 !error_occurred => show_removal_error(e, 路径),
+        坏的(_) => {
+            // If we already had errors while
+            // trying to remove the children, then there is no need to
+            // show another error message as we return from each level
+            // of the recursion.
+            error_occurred
+        }
+        好的(_) => {
+            verbose_removed_directory(路径, options);
+            假
+        }
+    }
+}
+
+公有 方法 safe_remove_dir_recursive(
+    路径: &Path,
+    options: &Options,
+    progress_bar: 选项<&ProgressBar>,
+) -> 布尔 {
+    // Base case 1: this is a file or a symbolic link.
+    // Use lstat to avoid race condition between check and use
+    设 initial_mode = 匹配 文件系统::symlink_metadata(路径) {
+        好的(metadata) 如果 !metadata.is_dir() => {
+            返回 remove_file(路径, options, progress_bar);
+        }
+        好的(metadata) => metadata.permissions().mode(),
+        坏的(e) => {
+            返回 show_removal_error(e, 路径);
+        }
+    };
+
+    // Try to open the directory using DirFd for secure traversal
+    设 dir_fd = 匹配 DirFd::open(路径, SymlinkBehavior::Follow) {
+        好的(fd) => fd,
+        坏的(e) => {
+            // If we can't open the directory for safe traversal,
+            // handle the error appropriately and try to remove if possible
+            如果 e.kind() == 标准库::输入输出::ErrorKind::PermissionDenied {
+                // Try to remove the directory directly if it's empty
+                如果 文件系统::remove_dir(路径).is_ok() {
+                    verbose_removed_directory(路径, options);
+                    返回 假;
+                }
+                // If we can't read the directory AND can't remove it,
+                // show permission denied error for GNU compatibility
+                返回 show_permission_denied_error(路径);
+            }
+            返回 show_removal_error(e, 路径);
+        }
+    };
+
+    设 错误 = safe_remove_dir_recursive_impl(路径, &dir_fd, options);
+
+    // After processing all children, remove the directory itself
+    如果 错误 {
+        错误
+    } 否则 {
+        // Ask user permission if needed
+        如果 options.interactive == InteractiveMode::Always
+            && !prompt_dir_with_mode(路径, initial_mode 转换 libc::mode_t, options)
+        {
+            返回 假;
+        }
+
+        // Before trying to remove the directory, check if it's actually empty
+        // This handles the case where some children weren't removed due to user "no" responses
+        如果 !is_dir_empty(路径) {
+            // Directory is not empty, so we can't/shouldn't remove it
+            // In interactive mode, this might be expected if user said "no" to some children
+            // In non-interactive mode, this indicates an error (some children couldn't be removed)
+            如果 options.interactive == InteractiveMode::Always {
+                返回 假;
+            }
+            // Try to remove the directory anyway and let the system tell us why it failed
+            // Use false for error_occurred since this is the main error we want to report
+            返回 remove_dir_with_special_cases(路径, options, 假);
+        }
+
+        // Directory is empty and user approved removal
+        如果 设 一些(result) = safe_remove_empty_dir(路径, options, progress_bar) {
+            result
+        } 否则 {
+            remove_dir_with_special_cases(路径, options, 错误)
+        }
+    }
+}
+
+#[cfg(not(target_os = "redox"))]
+公有 方法 safe_remove_dir_recursive_impl(路径: &Path, dir_fd: &DirFd, options: &Options) -> 布尔 {
+    // Read directory entries using safe traversal
+    设 entries = 匹配 dir_fd.read_dir() {
+        好的(entries) => entries,
+        坏的(e) 如果 e.kind() == 标准库::输入输出::ErrorKind::PermissionDenied => {
+            如果 !options.force {
+                show_permission_denied_error(路径);
+            }
+            返回 !options.force;
+        }
+        坏的(e) => {
+            返回 handle_error_with_force(e, 路径, options);
+        }
+    };
+
+    设 可变 错误 = 假;
+
+    // Process each entry
+    循环 entry_name 在 entries {
+        设 entry_path = 路径.加入(&entry_name);
+
+        // Get metadata for the entry using fstatat
+        设 entry_stat = 匹配 dir_fd.stat_at(&entry_name, SymlinkBehavior::NoFollow) {
+            好的(stat) => stat,
+            坏的(e) => {
+                错误 |= handle_error_with_force(e, &entry_path, options);
+                继续;
+            }
+        };
+
+        // Check if it's a directory
+        设 is_dir = ((entry_stat.st_mode 转换 libc::mode_t) & libc::S_IFMT) == libc::S_IFDIR;
+
+        如果 is_dir {
+            // Ask user if they want to descend into this directory
+            如果 options.interactive == InteractiveMode::Always
+                && !is_dir_empty(&entry_path)
+                && !prompt_descend(&entry_path)
+            {
+                继续;
+            }
+
+            // Recursively remove subdirectory using safe traversal
+            设 child_dir_fd = 匹配 dir_fd.open_subdir(&entry_name, SymlinkBehavior::Follow) {
+                好的(fd) => fd,
+                坏的(e) => {
+                    // If we can't open the subdirectory for safe traversal,
+                    // try to handle it as best we can with safe operations
+                    如果 e.kind() == 标准库::输入输出::ErrorKind::PermissionDenied {
+                        错误 |= handle_permission_denied(
+                            dir_fd,
+                            entry_name.as_ref(),
+                            &entry_path,
+                            options,
+                        );
+                    } 否则 {
+                        错误 |= handle_error_with_force(e, &entry_path, options);
+                    }
+                    继续;
+                }
+            };
+
+            设 child_error = safe_remove_dir_recursive_impl(&entry_path, &child_dir_fd, options);
+            错误 |= child_error;
+
+            // Ask user permission if needed for this subdirectory
+            如果 !child_error
+                && options.interactive == InteractiveMode::Always
+                && !prompt_dir_with_mode(&entry_path, entry_stat.st_mode 转换 libc::mode_t, options)
+            {
+                继续;
+            }
+
+            // Remove the now-empty subdirectory using safe unlinkat
+            如果 !child_error {
+                错误 |= handle_unlink(dir_fd, entry_name.as_ref(), &entry_path, 真, options);
+            }
+        } 否则 {
+            // Remove file - check if user wants to remove it first
+            如果 prompt_file_with_stat(&entry_path, &entry_stat, options) {
+                错误 |= handle_unlink(dir_fd, entry_name.as_ref(), &entry_path, 假, options);
+            }
+        }
+    }
+
+    错误
+}
+
+#[cfg(target_os = "redox")]
+公有 方法 safe_remove_dir_recursive_impl(_path: &Path, _dir_fd: &DirFd, _options: &Options) -> 布尔 {
+    // safe_traversal stat_at is not supported on Redox
+    // This shouldn't be called on Redox, but provide a stub for compilation
+    真 // Return error
+}

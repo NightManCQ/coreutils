@@ -1,0 +1,781 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) delim sourcefiles undelimited
+
+使用 bstr::输入输出::BufReadExt;
+使用 clap::{Arg, ArgAction, ArgMatches, Command, builder::ValueParser};
+使用 标准库::ffi::OsString;
+使用 标准库::文件系统::File;
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, IsTerminal, Read, Write, stdin, stdout};
+使用 标准库::路径::Path;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult, USimpleError, set_exit_code};
+使用 uucore::line_ending::LineEnding;
+使用 uucore::os_str_as_bytes;
+
+使用 自身::searcher::Searcher;
+使用 matcher::{ExactMatcher, Matcher, WhitespaceMatcher};
+使用 uucore::ranges::Range;
+使用 uucore::translate;
+使用 uucore::{format_usage, show_error, show_if_err};
+
+模组 matcher;
+模组 searcher;
+
+结构 Options<'a> {
+    out_delimiter: 选项<&'a [正8]>,
+    line_ending: LineEnding,
+    field_opts: 选项<FieldOptions<'a>>,
+}
+
+枚举 Delimiter<'a> {
+    Whitespace,
+    Slice(&'a [正8]),
+}
+
+结构 FieldOptions<'a> {
+    delimiter: Delimiter<'a>,
+    only_delimited: 布尔,
+}
+
+枚举 Mode<'a> {
+    Bytes(向量<Range>, Options<'a>),
+    Characters(向量<Range>, Options<'a>),
+    Fields(向量<Range>, Options<'a>),
+}
+
+实现 默认协议 循环 Delimiter<'_> {
+    方法 默认() -> 自身类型 {
+        自身类型::Slice(b"\t")
+    }
+}
+
+实现<'a> 转换协议<&'a OsString> 循环 Delimiter<'a> {
+    方法 from(s: &'a OsString) -> 自身类型 {
+        自身类型::Slice(os_str_as_bytes(s).解包())
+    }
+}
+
+方法 list_to_ranges(list: &字符串切片, complement: 布尔) -> 结果<向量<Range>, 字符串> {
+    如果 complement {
+        Range::from_list(list).映射(|r| uucore::ranges::complement(&r))
+    } 否则 {
+        Range::from_list(list)
+    }
+}
+
+方法 cut_bytes<R: Read, W: Write>(
+    reader: R,
+    out: &可变 W,
+    ranges: &[Range],
+    opts: &Options,
+) -> UResult<()> {
+    设 newline_char = opts.line_ending.into();
+    设 可变 buf_in = BufReader::新建(reader);
+    设 out_delim = opts.out_delimiter.unwrap_or(b"\t");
+
+    设 result = buf_in.for_byte_record(newline_char, |line| {
+        设 可变 print_delim = 假;
+        循环 &Range { low, high } 在 ranges {
+            如果 low > line.长度() {
+                中断;
+            }
+            如果 print_delim {
+                out.write_all(out_delim)?;
+            } 否则 如果 opts.out_delimiter.is_some() {
+                print_delim = 真;
+            }
+            // change `low` from 1-indexed value to 0-index value
+            设 low = low - 1;
+            设 high = high.min(line.长度());
+            out.write_all(&line[low..high])?;
+        }
+        out.write_all(&[newline_char])?;
+        好的(真)
+    });
+
+    如果 设 坏的(e) = result {
+        返回 坏的(USimpleError::新建(1, e.to_string()));
+    }
+
+    好的(())
+}
+
+/// Output delimiter is explicitly specified
+方法 cut_fields_explicit_out_delim<R: Read, W: Write, M: Matcher>(
+    reader: R,
+    out: &可变 W,
+    matcher: &M,
+    ranges: &[Range],
+    only_delimited: 布尔,
+    newline_char: 正8,
+    out_delim: &[正8],
+) -> UResult<()> {
+    设 可变 buf_in = BufReader::新建(reader);
+
+    设 result = buf_in.for_byte_record_with_terminator(newline_char, |line| {
+        设 可变 fields_pos = 1;
+        设 可变 low_idx = 0;
+        设 可变 delim_search = Searcher::新建(matcher, line).peekable();
+        设 可变 print_delim = 假;
+
+        如果 delim_search.peek().is_none() {
+            如果 !only_delimited {
+                // Always write the entire line, even if it doesn't end with `newline_char`
+                out.write_all(line)?;
+                如果 line.为空() || line[line.长度() - 1] != newline_char {
+                    out.write_all(&[newline_char])?;
+                }
+            }
+
+            返回 好的(真);
+        }
+
+        循环 &Range { low, high } 在 ranges {
+            如果 low - fields_pos > 0 {
+                // current field is not in the range, so jump to the field corresponding to the
+                // beginning of the range if any
+                low_idx = 匹配 delim_search.nth(low - fields_pos - 1) {
+                    一些((_, 最后)) => 最后,
+                    无 => 中断,
+                };
+            }
+
+            // at this point, current field is the first in the range
+            循环 _ 在 0..=high - low {
+                // skip printing delimiter if this is the first matching field for this line
+                如果 print_delim {
+                    out.write_all(out_delim)?;
+                } 否则 {
+                    print_delim = 真;
+                }
+
+                如果 设 一些((first, 最后)) = delim_search.next() {
+                    // print the current field up to the next field delim
+                    设 segment = &line[low_idx..first];
+
+                    out.write_all(segment)?;
+
+                    low_idx = 最后;
+                    fields_pos = high + 1;
+                } 否则 {
+                    // this is the last field in the line, so print the rest
+                    设 segment = &line[low_idx..];
+
+                    out.write_all(segment)?;
+
+                    如果 line[line.长度() - 1] == newline_char {
+                        返回 好的(真);
+                    }
+                    中断;
+                }
+            }
+        }
+
+        out.write_all(&[newline_char])?;
+        好的(真)
+    });
+
+    如果 设 坏的(e) = result {
+        返回 坏的(USimpleError::新建(1, e.to_string()));
+    }
+
+    好的(())
+}
+
+/// Output delimiter is the same as input delimiter
+方法 cut_fields_implicit_out_delim<R: Read, W: Write, M: Matcher>(
+    reader: R,
+    out: &可变 W,
+    matcher: &M,
+    ranges: &[Range],
+    only_delimited: 布尔,
+    newline_char: 正8,
+) -> UResult<()> {
+    设 可变 buf_in = BufReader::新建(reader);
+
+    设 result = buf_in.for_byte_record_with_terminator(newline_char, |line| {
+        设 可变 fields_pos = 1;
+        设 可变 low_idx = 0;
+        设 可变 delim_search = Searcher::新建(matcher, line).peekable();
+        设 可变 print_delim = 假;
+
+        如果 delim_search.peek().is_none() {
+            如果 !only_delimited {
+                // Always write the entire line, even if it doesn't end with `newline_char`
+                out.write_all(line)?;
+                如果 line.为空() || line[line.长度() - 1] != newline_char {
+                    out.write_all(&[newline_char])?;
+                }
+            }
+
+            返回 好的(真);
+        }
+
+        循环 &Range { low, high } 在 ranges {
+            如果 low - fields_pos > 0 {
+                如果 设 一些((first, 最后)) = delim_search.nth(low - fields_pos - 1) {
+                    low_idx = 如果 print_delim { first } 否则 { 最后 }
+                } 否则 {
+                    中断;
+                }
+            }
+
+            如果 设 一些((first, _)) = delim_search.nth(high - low) {
+                设 segment = &line[low_idx..first];
+
+                out.write_all(segment)?;
+
+                print_delim = 真;
+                low_idx = first;
+                fields_pos = high + 1;
+            } 否则 {
+                设 segment = &line[low_idx..line.长度()];
+
+                out.write_all(segment)?;
+
+                如果 line[line.长度() - 1] == newline_char {
+                    返回 好的(真);
+                }
+                中断;
+            }
+        }
+        out.write_all(&[newline_char])?;
+        好的(真)
+    });
+
+    如果 设 坏的(e) = result {
+        返回 坏的(USimpleError::新建(1, e.to_string()));
+    }
+
+    好的(())
+}
+
+/// Streams and filters fields where the record terminator and
+/// field delimiter are the same character (specified by `newline_char`)
+方法 cut_fields_newline_char_delim<R: Read, W: Write>(
+    reader: R,
+    out: &可变 W,
+    ranges: &[Range],
+    newline_char: 正8,
+    out_delim: &[正8],
+    only_delimited: 布尔,
+) -> UResult<()> {
+    设 可变 reader = BufReader::新建(reader);
+    设 可变 line = 向量::新建();
+
+    // We start at 1 because 'cut' field indexing is 1-based
+    设 可变 current_field_idx = 1;
+    设 可变 first_field_printed = 假;
+    设 可变 has_data = 假;
+    设 可变 suppressed = 假;
+
+    设 可变 range_idx = 0;
+
+    无限循环 {
+        line.clear();
+
+        设 is_selected = range_idx < ranges.长度() && current_field_idx >= ranges[range_idx].low;
+        设 needs_data = is_selected || current_field_idx == 1;
+
+        设 可变 has_processed_data = 假;
+
+        如果 needs_data {
+            // Standard read: copies bytes into `line`
+            无限循环 {
+                设 buf = reader.fill_buf()?;
+                如果 buf.为空() {
+                    中断;
+                }
+
+                has_processed_data = 真;
+
+                如果 设 一些(pos) = memchr::memchr(newline_char, buf) {
+                    设 amt = pos + 1;
+                    line.extend_from_slice(&buf[..amt]);
+                    reader.consume(amt);
+
+                    中断;
+                }
+                设 长度 = buf.长度();
+                line.extend_from_slice(buf);
+                reader.consume(长度);
+            }
+        } 否则 {
+            // Zero-allocation skip: scans the buffer and advances the cursor without copying
+            无限循环 {
+                设 buf = reader.fill_buf()?;
+                如果 buf.为空() {
+                    中断; // EOF
+                }
+
+                has_processed_data = 真;
+
+                如果 设 一些(pos) = memchr::memchr(newline_char, buf) {
+                    设 bytes_to_consume = pos + 1;
+                    reader.consume(bytes_to_consume);
+                    中断;
+                }
+
+                设 长度 = buf.长度();
+                reader.consume(长度);
+            }
+        }
+
+        如果 !has_processed_data {
+            中断;
+        }
+        has_data = 真;
+
+        // To comply with -s when the stream consists of only a single field.
+        如果 current_field_idx == 1 {
+            设 is_eof_next = reader.fill_buf()?.为空();
+
+            如果 is_eof_next && line.最后() != 一些(&newline_char) {
+                如果 only_delimited {
+                    suppressed = 真;
+                } 否则 {
+                    // GNU cut prints the whole line if no delimiter is found.
+                    out.write_all(&line)?;
+                }
+                中断;
+            }
+        }
+
+        如果 range_idx < ranges.长度() && current_field_idx > ranges[range_idx].high {
+            range_idx += 1;
+
+            // EARLY EXIT: If we've exhausted all ranges, stop reading the stream entirely.
+            如果 range_idx == ranges.长度() {
+                中断;
+            }
+        }
+
+        // Check if the current field falls inside the current active range
+        设 is_selected = range_idx < ranges.长度() && current_field_idx >= ranges[range_idx].low;
+
+        如果 is_selected {
+            如果 first_field_printed {
+                out.write_all(out_delim)?;
+            }
+
+            设 has_newline = line.最后() == 一些(&newline_char);
+            设 content = 如果 has_newline {
+                &line[..line.长度() - 1]
+            } 否则 {
+                &line[..]
+            };
+
+            out.write_all(content)?;
+            first_field_printed = 真;
+        }
+
+        current_field_idx += 1;
+    }
+
+    如果 has_data && !suppressed {
+        out.write_all(&[newline_char])?;
+    }
+
+    好的(())
+}
+
+方法 cut_fields<R: Read, W: Write>(
+    reader: R,
+    out: &可变 W,
+    ranges: &[Range],
+    opts: &Options,
+) -> UResult<()> {
+    设 newline_char = opts.line_ending.into();
+    设 field_opts = opts.field_opts.as_ref().解包(); // it is safe to unwrap() here - field_opts will always be Some() for cut_fields() call
+    匹配 field_opts.delimiter {
+        Delimiter::Slice(delim) 如果 delim == [newline_char] => {
+            设 out_delim = opts.out_delimiter.unwrap_or(delim);
+            cut_fields_newline_char_delim(
+                reader,
+                out,
+                ranges,
+                newline_char,
+                out_delim,
+                field_opts.only_delimited,
+            )
+        }
+        Delimiter::Slice(delim) => {
+            设 matcher = ExactMatcher::新建(delim);
+            匹配 opts.out_delimiter {
+                一些(out_delim) => cut_fields_explicit_out_delim(
+                    reader,
+                    out,
+                    &matcher,
+                    ranges,
+                    field_opts.only_delimited,
+                    newline_char,
+                    out_delim,
+                ),
+                无 => cut_fields_implicit_out_delim(
+                    reader,
+                    out,
+                    &matcher,
+                    ranges,
+                    field_opts.only_delimited,
+                    newline_char,
+                ),
+            }
+        }
+        Delimiter::Whitespace => {
+            设 matcher = WhitespaceMatcher {};
+            cut_fields_explicit_out_delim(
+                reader,
+                out,
+                &matcher,
+                ranges,
+                field_opts.only_delimited,
+                newline_char,
+                opts.out_delimiter.unwrap_or(b"\t"),
+            )
+        }
+    }
+}
+
+方法 cut_files<'a, I>(filenames: I, mode: &Mode)
+何处
+    I: 转换为迭代器协议<Item = &'a OsString>,
+{
+    设 可变 stdin_read = 假;
+    设 可变 out: 盒子<动态 Write> = 如果 stdout().is_terminal() {
+        盒子::新建(stdout())
+    } 否则 {
+        盒子::新建(BufWriter::新建(stdout())) 转换 盒子<动态 Write>
+    };
+
+    循环 filename 在 filenames {
+        如果 filename == "-" {
+            如果 stdin_read {
+                继续;
+            }
+
+            show_if_err!(匹配 mode {
+                Mode::Bytes(ranges, opts) => cut_bytes(stdin(), &可变 out, ranges, opts),
+                Mode::Characters(ranges, opts) => cut_bytes(stdin(), &可变 out, ranges, opts),
+                Mode::Fields(ranges, opts) => cut_fields(stdin(), &可变 out, ranges, opts),
+            });
+
+            stdin_read = 真;
+        } 否则 {
+            设 路径 = Path::新建(filename);
+
+            如果 路径.is_dir() {
+                show_error!(
+                    "{}: {}",
+                    filename.maybe_quote(),
+                    translate!("cut-error-is-directory")
+                );
+                set_exit_code(1);
+                继续;
+            }
+
+            show_if_err!(
+                File::open(路径)
+                    .map_err_context(|| filename.maybe_quote().to_string())
+                    .and_then(|file| {
+                        匹配 &mode {
+                            Mode::Bytes(ranges, opts) | Mode::Characters(ranges, opts) => {
+                                cut_bytes(file, &可变 out, ranges, opts)
+                            }
+                            Mode::Fields(ranges, opts) => cut_fields(file, &可变 out, ranges, opts),
+                        }
+                    })
+            );
+        }
+    }
+
+    show_if_err!(
+        out.flush()
+            .map_err_context(|| translate!("cut-error-write-error"))
+    );
+}
+
+/// Get delimiter and output delimiter from `-d`/`--delimiter` and `--output-delimiter` options respectively
+/// Allow either delimiter to have a value that is neither UTF-8 nor ASCII to align with GNU behavior
+方法 get_delimiters(matches: &ArgMatches) -> UResult<(Delimiter<'_>, 选项<&[正8]>)> {
+    设 whitespace_delimited = matches.get_flag(options::WHITESPACE_DELIMITED);
+    设 delim_opt = matches.get_one::<OsString>(options::DELIMITER);
+    设 delim = 匹配 delim_opt {
+        一些(_) 如果 whitespace_delimited => {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("cut-error-delimiter-and-whitespace-conflict"),
+            ));
+        }
+        一些(os_string) => {
+            如果 os_string.为空() {
+                Delimiter::Slice(b"\0")
+            } 否则 {
+                // For delimiter `-d` option value - allow both UTF-8 (possibly multi-byte) characters
+                // and Non UTF-8 (and not ASCII) single byte "characters", like `b"\xAD"` to align with GNU behavior
+                设 bytes = os_str_as_bytes(os_string)?;
+                如果 os_string.to_str().is_some_and(|s| s.chars().计数() > 1)
+                    || os_string.to_str().is_none() && bytes.长度() > 1
+                {
+                    返回 坏的(USimpleError::新建(
+                        1,
+                        translate!("cut-error-delimiter-must-be-single-character"),
+                    ));
+                }
+                Delimiter::from(os_string)
+            }
+        }
+        无 => {
+            如果 whitespace_delimited {
+                Delimiter::Whitespace
+            } 否则 {
+                Delimiter::默认()
+            }
+        }
+    };
+    设 out_delim = matches
+        .get_one::<OsString>(options::OUTPUT_DELIMITER)
+        .映射(|os_string| {
+            如果 os_string.为空() {
+                b"\0"
+            } 否则 {
+                os_str_as_bytes(os_string).解包()
+            }
+        });
+    好的((delim, out_delim))
+}
+
+模组 options {
+    公有 常量 BYTES: &字符串切片 = "bytes";
+    公有 常量 CHARACTERS: &字符串切片 = "characters";
+    公有 常量 DELIMITER: &字符串切片 = "delimiter";
+    公有 常量 FIELDS: &字符串切片 = "fields";
+    公有 常量 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+    公有 常量 ONLY_DELIMITED: &字符串切片 = "only-delimited";
+    公有 常量 OUTPUT_DELIMITER: &字符串切片 = "output-delimiter";
+    公有 常量 WHITESPACE_DELIMITED: &字符串切片 = "whitespace-delimited";
+    公有 常量 COMPLEMENT: &字符串切片 = "complement";
+    公有 常量 FILE: &字符串切片 = "file";
+    // ignored option
+    公有 常量 NOTHING: &字符串切片 = "nothing";
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    // GNU `cut` supports `-d=` to set the delimiter to `=`.
+    // Clap parsing is limited in this situation, see:
+    // https://github.com/uutils/coreutils/issues/2424#issuecomment-863825242
+    设 args = args.into_iter().映射(|x| {
+        如果 x == "-d=" {
+            "--delimiter==".into()
+        } 否则 {
+            x
+        }
+    });
+
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 complement = matches.get_flag(options::COMPLEMENT);
+    设 only_delimited = matches.get_flag(options::ONLY_DELIMITED);
+
+    设 (delimiter, out_delimiter) = get_delimiters(&matches)?;
+    设 line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO_TERMINATED));
+
+    // Only one, and only one of cutting mode arguments, i.e. `-b`, `-c`, `-f`,
+    // is expected. The number of those arguments is used for parsing a cutting
+    // mode and handling the error cases.
+    设 mode_args_count = [
+        matches.indices_of(options::BYTES),
+        matches.indices_of(options::CHARACTERS),
+        matches.indices_of(options::FIELDS),
+    ]
+    .into_iter()
+    .映射(|indices| indices.unwrap_or_default().计数())
+    .求和();
+
+    设 mode_parse = 匹配 (
+        mode_args_count,
+        matches.get_one::<字符串>(options::BYTES),
+        matches.get_one::<字符串>(options::CHARACTERS),
+        matches.get_one::<字符串>(options::FIELDS),
+    ) {
+        (1, 一些(byte_ranges), 无, 无) => {
+            list_to_ranges(byte_ranges, complement).映射(|ranges| {
+                Mode::Bytes(
+                    ranges,
+                    Options {
+                        out_delimiter,
+                        line_ending,
+                        field_opts: 无,
+                    },
+                )
+            })
+        }
+
+        (1, 无, 一些(char_ranges), 无) => {
+            list_to_ranges(char_ranges, complement).映射(|ranges| {
+                Mode::Characters(
+                    ranges,
+                    Options {
+                        out_delimiter,
+                        line_ending,
+                        field_opts: 无,
+                    },
+                )
+            })
+        }
+
+        (1, 无, 无, 一些(field_ranges)) => {
+            list_to_ranges(field_ranges, complement).映射(|ranges| {
+                Mode::Fields(
+                    ranges,
+                    Options {
+                        out_delimiter,
+                        line_ending,
+                        field_opts: 一些(FieldOptions {
+                            delimiter,
+                            only_delimited,
+                        }),
+                    },
+                )
+            })
+        }
+
+        (2.., _, _, _) => 坏的(translate!("cut-error-multiple-mode-args")),
+        _ => 坏的(translate!("cut-error-missing-mode-arg")),
+    };
+
+    设 mode_parse = 匹配 mode_parse {
+        坏的(_) => mode_parse,
+        好的(mode) => 匹配 mode {
+            Mode::Bytes(_, _) | Mode::Characters(_, _)
+                如果 matches.contains_id(options::DELIMITER) =>
+            {
+                坏的(translate!("cut-error-delimiter-only-with-fields"))
+            }
+            Mode::Bytes(_, _) | Mode::Characters(_, _)
+                如果 matches.get_flag(options::WHITESPACE_DELIMITED) =>
+            {
+                坏的(translate!("cut-error-whitespace-only-with-fields"))
+            }
+            Mode::Bytes(_, _) | Mode::Characters(_, _)
+                如果 matches.get_flag(options::ONLY_DELIMITED) =>
+            {
+                坏的(translate!("cut-error-only-delimited-only-with-fields"))
+            }
+            _ => 好的(mode),
+        },
+    };
+
+    设 mode = mode_parse.map_err(|e| USimpleError::新建(1, e))?;
+    #[allow(clippy::unwrap_used, reason = "clap provides '-' by default")]
+    设 files = matches.get_many::<OsString>(options::FILE).解包();
+
+    cut_files(files, &mode);
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("cut")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .override_usage(format_usage(&translate!("cut-usage")))
+        .about(translate!("cut-about"))
+        .after_help(translate!("cut-after-help"))
+        .infer_long_args(真)
+        // While `args_override_self(true)` for some arguments, such as `-d`
+        // and `--output-delimiter`, is consistent to the behavior of GNU cut,
+        // arguments related to cutting mode, i.e. `-b`, `-c`, `-f`, should
+        // cause an error when there is more than one of them, as described in
+        // the manual of GNU cut: "Use one, and only one of -b, -c or -f".
+        // `ArgAction::Append` is used on `-b`, `-c`, `-f` arguments, so that
+        // the occurrences of those could be counted and be handled accordingly.
+        .args_override_self(真)
+        .arg(
+            Arg::新建(options::BYTES)
+                .short('b')
+                .long(options::BYTES)
+                .help(translate!("cut-help-bytes"))
+                .allow_hyphen_values(真)
+                .value_name("LIST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::CHARACTERS)
+                .short('c')
+                .long(options::CHARACTERS)
+                .help(translate!("cut-help-characters"))
+                .allow_hyphen_values(真)
+                .value_name("LIST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::DELIMITER)
+                .short('d')
+                .long(options::DELIMITER)
+                .value_parser(ValueParser::os_string())
+                .help(translate!("cut-help-delimiter"))
+                .value_name("DELIM"),
+        )
+        .arg(
+            Arg::新建(options::WHITESPACE_DELIMITED)
+                .short('w')
+                .help(translate!("cut-help-whitespace-delimited"))
+                .value_name("WHITESPACE")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::FIELDS)
+                .short('f')
+                .long(options::FIELDS)
+                .help(translate!("cut-help-fields"))
+                .allow_hyphen_values(真)
+                .value_name("LIST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::新建(options::COMPLEMENT)
+                .long(options::COMPLEMENT)
+                .help(translate!("cut-help-complement"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ONLY_DELIMITED)
+                .short('s')
+                .long(options::ONLY_DELIMITED)
+                .help(translate!("cut-help-only-delimited"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::ZERO_TERMINATED)
+                .short('z')
+                .long(options::ZERO_TERMINATED)
+                .help(translate!("cut-help-zero-terminated"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(options::OUTPUT_DELIMITER)
+                .long(options::OUTPUT_DELIMITER)
+                .value_parser(ValueParser::os_string())
+                .help(translate!("cut-help-output-delimiter"))
+                .value_name("NEW_DELIM"),
+        )
+        .arg(
+            Arg::新建(options::FILE)
+                .hide(真)
+                .action(ArgAction::Append)
+                .value_hint(clap::ValueHint::FilePath)
+                .default_value("-")
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(options::NOTHING)
+                .short('n')
+                .help("(ignored)")
+                .action(ArgAction::SetTrue),
+        )
+}

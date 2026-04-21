@@ -1,0 +1,31 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 clap::Command;
+使用 platform_info::{PlatformInfo, PlatformInfoAPI, UNameAPI};
+使用 标准库::输入输出::{Write, stdout};
+使用 uucore::错误::{UResult, USimpleError};
+使用 uucore::translate;
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 uts =
+        PlatformInfo::新建().map_err(|_e| USimpleError::新建(1, translate!("cannot-get-system")))?;
+
+    writeln!(stdout(), "{}", uts.machine().to_string_lossy().trim())?;
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("arch")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("arch"))
+        .about(translate!("arch-about"))
+        .after_help(translate!("arch-after-help"))
+        .override_usage(translate!("arch-usage"))
+        .infer_long_args(真)
+}

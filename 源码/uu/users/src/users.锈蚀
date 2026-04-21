@@ -1,0 +1,102 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (paths) wtmp
+
+使用 标准库::ffi::OsString;
+使用 标准库::输入输出::{Write, stdout};
+使用 标准库::路径::Path;
+
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, Command};
+使用 uucore::错误::UResult;
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+#[cfg(target_os = "openbsd")]
+使用 utmp_classic::{UtmpEntry, parse_from_path};
+#[cfg(not(target_os = "openbsd"))]
+使用 uucore::utmpx::{自身, Utmpx};
+
+#[cfg(target_os = "openbsd")]
+常量 OPENBSD_UTMP_FILE: &字符串切片 = "/var/run/utmp";
+
+静态 ARG_FILE: &字符串切片 = "file";
+
+方法 get_long_usage() -> 字符串 {
+    #[cfg(not(target_os = "openbsd"))]
+    设 default_path: &字符串切片 = utmpx::DEFAULT_FILE;
+    #[cfg(target_os = "openbsd")]
+    设 default_path: &字符串切片 = OPENBSD_UTMP_FILE;
+
+    translate!("users-long-usage", "default_path" => default_path)
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 maybe_file: 选项<&Path> = matches.get_one::<OsString>(ARG_FILE).映射(作为引用协议::as_ref);
+
+    设 可变 users: 向量<字符串>;
+
+    // OpenBSD uses the Unix version 1 UTMP, all other Unixes use the newer UTMPX
+    #[cfg(target_os = "openbsd")]
+    {
+        设 filename = maybe_file.unwrap_or(Path::新建(OPENBSD_UTMP_FILE));
+        设 entries = parse_from_path(filename).unwrap_or_default();
+        users = 向量::新建();
+        循环 entry 在 entries {
+            如果 设 UtmpEntry::UTMP {
+                line: _,
+                user,
+                host: _,
+                时间: _,
+            } = entry
+            {
+                如果 !user.为空() {
+                    users.压入(user);
+                }
+            }
+        }
+    };
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        设 filename = maybe_file.unwrap_or(utmpx::DEFAULT_FILE.as_ref());
+
+        users = Utmpx::iter_all_records_from(filename)
+            .过滤(utmpx::UtmpxRecord::is_user_process)
+            .映射(|ut| ut.user())
+            .收集::<向量<_>>();
+    };
+
+    如果 !users.为空() {
+        users.sort();
+        writeln!(stdout().锁定(), "{}", users.加入(" "))?;
+    }
+
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    #[cfg(not(target_env = "musl"))]
+    设 about = translate!("users-about");
+    #[cfg(target_env = "musl")]
+    设 about = translate!("users-about") + &translate!("users-about-musl-warning");
+
+    Command::新建("users")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("users"))
+        .about(about)
+        .override_usage(format_usage(&translate!("users-usage")))
+        .infer_long_args(真)
+        .after_help(get_long_usage())
+        .arg(
+            Arg::新建(ARG_FILE)
+                .num_args(1)
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(ValueParser::os_string()),
+        )
+}

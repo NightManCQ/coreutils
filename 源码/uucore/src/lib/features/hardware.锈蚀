@@ -1,0 +1,453 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! CPU hardware capability detection for performance-sensitive utilities
+//!
+//! This module provides a unified interface for detecting CPU features and
+//! respecting environment-based SIMD policies (e.g., GLIBC_TUNABLES).
+//!
+//! It provides 2 structures, from which we can get capabilities:
+//! - [`CpuFeatures`], which contains the raw available CPU features;
+//! - [`SimdPolicy`], which relies on [`CpuFeatures`] and the `GLIBC_TUNABLES`
+//!   environment variable to get the *enabled* CPU features
+//!
+//! # Use Cases
+//!
+//! - `cksum --debug`: Report hardware acceleration capabilities
+//! - `wc --debug`: Report SIMD usage and GLIBC_TUNABLES restrictions
+//! - Runtime decisions: Enable/disable SIMD paths based on environment
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use uucore::hardware::{CpuFeatures, SimdPolicy, HasHardwareFeatures as _};
+//!
+//! // Simple hardware detection
+//! let features = CpuFeatures::detect();
+//! if features.has_avx2() {
+//!     println!("CPU has AVX2 support");
+//! }
+//!
+//! // Check SIMD policy (respects GLIBC_TUNABLES)
+//! let policy = SimdPolicy::detect();
+//! if policy.has_avx2() {
+//!     println!("CPU has AVX2 support and it is not disabled by env");
+//! }
+//! if policy.allows_simd() {
+//!     // Use SIMD-accelerated path
+//! } else {
+//!     // Fall back to scalar implementation
+//! }
+//! ```
+
+使用 标准库::集合::BTreeSet;
+使用 标准库::环境;
+使用 标准库::同步::OnceLock;
+
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 偏序比较协议, 序比较协议, 克隆协议, 复制协议)]
+公有 枚举 HardwareFeature {
+    /// AVX-512 support (x86/x86_64 only)
+    Avx512,
+    /// AVX2 support (x86/x86_64 only)
+    Avx2,
+    /// PCLMULQDQ support for CRC acceleration (x86/x86_64 only)
+    PclMul,
+    /// VMULL support for CRC acceleration (ARM only)
+    Vmull,
+    /// SSE2 support (x86/x86_64 only)
+    Sse2,
+    /// ARM ASIMD/NEON support (aarch64 only)
+    Asimd,
+}
+
+公有 结构 InvalidHardwareFeature;
+
+实现 TryFrom<&字符串切片> 循环 HardwareFeature {
+    类型 错误协议 = InvalidHardwareFeature;
+
+    方法 try_from(value: &字符串切片) -> 结果<自身类型, 自身类型::错误协议> {
+        使用 HardwareFeature::*;
+        匹配 value {
+            "AVX512" | "AVX512F" => 好的(Avx512),
+            "AVX2" => 好的(Avx2),
+            "PCLMUL" | "PMULL" => 好的(PclMul),
+            "VMULL" => 好的(Vmull),
+            "SSE2" => 好的(Sse2),
+            "ASIMD" => 好的(Asimd),
+            _ => 坏的(InvalidHardwareFeature),
+        }
+    }
+}
+
+/// Trait for implementing common hardware feature checks.
+///
+/// This is used for the `CpuFeatures` struct, that holds the CPU capabilities,
+/// and for the `SimdPolicy` type that computes the enabled features with the
+/// environment variables.
+公有 协议 HasHardwareFeatures {
+    方法 has_feature(&自身, feat: HardwareFeature) -> 布尔;
+
+    方法 iter_features(&自身) -> 实现 迭代器协议<Item = HardwareFeature>;
+
+    /// Check if AVX-512 is available (x86/x86_64 only)
+    #[inline]
+    方法 has_avx512(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::Avx512)
+    }
+
+    /// Check if AVX2 is available (x86/x86_64 only)
+    #[inline]
+    方法 has_avx2(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::Avx2)
+    }
+
+    /// Check if PCLMULQDQ is available (x86/x86_64 only)
+    #[inline]
+    方法 has_pclmul(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::PclMul)
+    }
+
+    /// Check if VMULL is available (ARM only)
+    #[inline]
+    方法 has_vmull(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::Vmull)
+    }
+
+    /// Check if SSE2 is available (x86/x86_64 only)
+    #[inline]
+    方法 has_sse2(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::Sse2)
+    }
+
+    /// Check if ARM ASIMD/NEON is available (aarch64 only)
+    #[inline]
+    方法 has_asimd(&自身) -> 布尔 {
+        自身.has_feature(HardwareFeature::Asimd)
+    }
+}
+
+/// CPU hardware features that affect performance
+///
+/// Provides platform-specific CPU feature detection with caching.
+/// Detection is performed once and cached for the lifetime of the process.
+#[derive(调试协议, 偏等比较协议, 相等比较协议, 克隆协议)]
+公有 结构 CpuFeatures {
+    set: BTreeSet<HardwareFeature>,
+}
+实现 CpuFeatures {
+    公有 方法 detect() -> &'静态 自身类型 {
+        静态 FEATURES: OnceLock<CpuFeatures> = OnceLock::新建();
+        FEATURES.get_or_init(自身类型::detect_impl)
+    }
+
+    方法 detect_impl() -> 自身类型 {
+        设 set = [
+            (HardwareFeature::Avx512, detect_avx512 转换 方法() -> 布尔),
+            (HardwareFeature::Avx2, detect_avx2),
+            (HardwareFeature::PclMul, detect_pclmul),
+            (HardwareFeature::Vmull, detect_vmull),
+            (HardwareFeature::Sse2, detect_sse2),
+            (HardwareFeature::Asimd, detect_asimd),
+        ]
+        .into_iter()
+        .filter_map(|(feat, detect)| detect().then_some(feat))
+        .收集();
+
+        自身类型 { set }
+    }
+}
+
+实现 HasHardwareFeatures 循环 CpuFeatures {
+    方法 has_feature(&自身, feat: HardwareFeature) -> 布尔 {
+        自身.set.包含(&feat)
+    }
+
+    方法 iter_features(&自身) -> 实现 迭代器协议<Item = HardwareFeature> {
+        自身.set.迭代().copied()
+    }
+}
+
+/// SIMD policy based on environment variables
+///
+/// Respects GLIBC_TUNABLES environment variable to disable specific CPU features.
+/// This is used by GNU utilities to allow users to disable hardware acceleration.
+#[derive(调试协议, 克隆协议)]
+公有 结构 SimdPolicy {
+    /// Features disabled via GLIBC_TUNABLES (e.g., ["AVX2", "AVX512F"])
+    disabled_by_env: BTreeSet<HardwareFeature>,
+    hardware_features: &'静态 CpuFeatures,
+}
+
+实现 SimdPolicy {
+    /// Get the global SIMD policy (cached)
+    ///
+    /// This checks both hardware capabilities and the GLIBC_TUNABLES environment
+    /// variable. The result is cached for the lifetime of the process.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use uucore::hardware::SimdPolicy;
+    ///
+    /// let policy = SimdPolicy::detect();
+    /// if policy.allows_simd() {
+    ///     println!("SIMD is enabled");
+    /// } else {
+    ///     println!("SIMD disabled by: {:?}", policy.disabled_features());
+    /// }
+    /// ```
+    公有 方法 detect() -> &'静态 自身类型 {
+        静态 POLICY: OnceLock<SimdPolicy> = OnceLock::新建();
+        POLICY.get_or_init(自身类型::detect_impl)
+    }
+
+    方法 detect_impl() -> 自身类型 {
+        设 tunables = 环境::var("GLIBC_TUNABLES").unwrap_or_default();
+        设 disabled_by_env = parse_disabled_features(&tunables);
+        设 hardware_features = CpuFeatures::detect();
+
+        自身类型 {
+            disabled_by_env,
+            hardware_features,
+        }
+    }
+
+    /// Returns true if any SIMD feature remains enabled after applying GLIBC_TUNABLES.
+    公有 方法 allows_simd(&自身) -> 布尔 {
+        自身.iter_features().next().is_some()
+    }
+
+    公有 方法 disabled_features(&自身) -> 向量<HardwareFeature> {
+        自身.disabled_by_env.迭代().copied().收集()
+    }
+}
+
+实现 HasHardwareFeatures 循环 SimdPolicy {
+    方法 has_feature(&自身, feat: HardwareFeature) -> 布尔 {
+        自身.hardware_features.has_feature(feat) && !自身.disabled_by_env.包含(&feat)
+    }
+
+    方法 iter_features(&自身) -> 实现 迭代器协议<Item = HardwareFeature> {
+        自身.hardware_features
+            .set
+            .difference(&自身.disabled_by_env)
+            .copied()
+    }
+}
+
+// Platform-specific feature detection
+
+#[cfg(任意(target_arch = "x86", target_arch = "x86_64"))]
+方法 detect_avx512() -> 布尔 {
+    如果 cfg!(target_os = "android") {
+        假
+    } 否则 {
+        标准库::arch::is_x86_feature_detected!("avx512f")
+            && 标准库::arch::is_x86_feature_detected!("avx512bw")
+    }
+}
+
+#[cfg(not(任意(target_arch = "x86", target_arch = "x86_64")))]
+方法 detect_avx512() -> 布尔 {
+    假
+}
+
+#[cfg(任意(target_arch = "x86", target_arch = "x86_64"))]
+方法 detect_avx2() -> 布尔 {
+    如果 cfg!(target_os = "android") {
+        假
+    } 否则 {
+        标准库::arch::is_x86_feature_detected!("avx2")
+    }
+}
+
+#[cfg(not(任意(target_arch = "x86", target_arch = "x86_64")))]
+方法 detect_avx2() -> 布尔 {
+    假
+}
+
+#[cfg(任意(target_arch = "x86", target_arch = "x86_64"))]
+方法 detect_pclmul() -> 布尔 {
+    如果 cfg!(target_os = "android") {
+        假
+    } 否则 {
+        标准库::arch::is_x86_feature_detected!("pclmulqdq")
+    }
+}
+
+#[cfg(not(任意(target_arch = "x86", target_arch = "x86_64")))]
+方法 detect_pclmul() -> 布尔 {
+    假
+}
+
+#[cfg(任意(target_arch = "x86", target_arch = "x86_64"))]
+方法 detect_sse2() -> 布尔 {
+    如果 cfg!(target_os = "android") {
+        假
+    } 否则 {
+        标准库::arch::is_x86_feature_detected!("sse2")
+    }
+}
+
+#[cfg(not(任意(target_arch = "x86", target_arch = "x86_64")))]
+方法 detect_sse2() -> 布尔 {
+    假
+}
+
+#[cfg(全部(target_arch = "aarch64", target_endian = "little"))]
+方法 detect_asimd() -> 布尔 {
+    如果 cfg!(target_os = "android") {
+        假
+    } 否则 {
+        标准库::arch::is_aarch64_feature_detected!("asimd")
+    }
+}
+
+#[cfg(not(全部(target_arch = "aarch64", target_endian = "little")))]
+方法 detect_asimd() -> 布尔 {
+    假
+}
+
+#[cfg(target_arch = "aarch64")]
+方法 detect_vmull() -> 布尔 {
+    // VMULL is part of ARM NEON/ASIMD
+    // For now, we use ASIMD as a proxy
+    detect_asimd()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+方法 detect_vmull() -> 布尔 {
+    假
+}
+
+// GLIBC_TUNABLES parsing
+
+/// Parse GLIBC_TUNABLES environment variable for disabled features
+///
+/// Format: `glibc.cpu.hwcaps=-AVX2,-AVX512F`
+/// Multiple tunable sections can be separated by colons.
+方法 parse_disabled_features(tunables: &字符串切片) -> BTreeSet<HardwareFeature> {
+    如果 tunables.为空() {
+        返回 BTreeSet::新建();
+    }
+
+    设 可变 disabled = BTreeSet::新建();
+
+    // GLIBC_TUNABLES format: "tunable1=value1:tunable2=value2"
+    循环 entry 在 tunables.split(':') {
+        设 entry = entry.trim();
+        设 一些((name, raw_value)) = entry.split_once('=') 否则 {
+            继续;
+        };
+
+        // We only care about glibc.cpu.hwcaps
+        如果 name.trim() != "glibc.cpu.hwcaps" {
+            继续;
+        }
+
+        // Parse comma-separated features, disabled ones start with '-'
+        循环 token 在 raw_value.split(',') {
+            设 token = token.trim();
+            如果 设 一些(feature) = token.strip_prefix('-') {
+                设 feature =
+                    HardwareFeature::try_from(feature.trim().to_ascii_uppercase().as_str());
+                如果 设 好的(feature) = feature {
+                    disabled.插入(feature);
+                }
+            }
+        }
+    }
+
+    disabled
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    #[test]
+    方法 test_cpu_features_detection() {
+        设 features = CpuFeatures::detect();
+        // Just verify it doesn't panic and returns consistent results
+        设 features2 = CpuFeatures::detect();
+        相等断言!(features, features2);
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_empty() {
+        相等断言!(parse_disabled_features(""), BTreeSet::新建());
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_single() {
+        设 result = parse_disabled_features("glibc.cpu.hwcaps=-AVX2");
+        设 可变 expected = BTreeSet::新建();
+
+        expected.插入(HardwareFeature::Avx2);
+
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_multiple() {
+        设 result = parse_disabled_features("glibc.cpu.hwcaps=-AVX2,-AVX512F");
+        设 可变 expected = BTreeSet::新建();
+
+        expected.插入(HardwareFeature::Avx2);
+        expected.插入(HardwareFeature::Avx512);
+
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_mixed() {
+        设 result = parse_disabled_features("glibc.cpu.hwcaps=-AVX2,SSE2,-AVX512F");
+        设 可变 expected = BTreeSet::新建();
+
+        expected.插入(HardwareFeature::Avx2);
+        expected.插入(HardwareFeature::Avx512);
+
+        // Only features with '-' prefix are disabled
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_with_other_tunables() {
+        设 result =
+            parse_disabled_features("glibc.malloc.check=1:glibc.cpu.hwcaps=-AVX2:other=value");
+        设 可变 expected = BTreeSet::新建();
+
+        expected.插入(HardwareFeature::Avx2);
+
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_parse_disabled_features_case_insensitive() {
+        设 result = parse_disabled_features("glibc.cpu.hwcaps=-avx2,-Avx512f");
+        设 可变 expected = BTreeSet::新建();
+
+        expected.插入(HardwareFeature::Avx2);
+        expected.插入(HardwareFeature::Avx512);
+
+        // Only features with '-' prefix are disabled
+        相等断言!(result, expected);
+    }
+
+    #[test]
+    方法 test_simd_policy() {
+        设 policy = SimdPolicy::detect();
+        // Just verify it works
+        设 _ = policy.allows_simd();
+    }
+
+    #[test]
+    方法 test_simd_policy_caching() {
+        设 policy1 = SimdPolicy::detect();
+        设 policy2 = SimdPolicy::detect();
+        // Should be same instance (pointer equality)
+        断言!(标准库::指针::eq(policy1, policy2));
+    }
+}

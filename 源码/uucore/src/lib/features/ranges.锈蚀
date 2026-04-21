@@ -1,0 +1,269 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) inval
+
+//! A module for handling ranges of values.
+
+使用 标准库::比较::max;
+使用 标准库::字符串切片::FromStr;
+
+使用 箱::display::Quotable;
+
+/// A range of values
+#[derive(偏等比较协议, 相等比较协议, 偏序比较协议, 序比较协议, 调试协议)]
+公有 结构 Range {
+    /// The lower bound of the range
+    公有 low: 正整数大小,
+
+    /// The upper bound of the range
+    公有 high: 正整数大小,
+}
+
+实现 FromStr 循环 Range {
+    类型 坏的 = &'静态 字符串切片;
+
+    /// Parse a string of the form `a-b` into a `Range`
+    ///
+    /// ```
+    /// use std::str::FromStr;
+    /// use uucore::ranges::Range;
+    /// assert_eq!(Range::from_str("5"), Ok(Range { low: 5, high: 5 }));
+    /// assert_eq!(Range::from_str("4-"), Ok(Range { low: 4, high: usize::MAX - 1 }));
+    /// assert_eq!(Range::from_str("-4"), Ok(Range { low: 1, high: 4 }));
+    /// assert_eq!(Range::from_str("2-4"), Ok(Range { low: 2, high: 4 }));
+    /// assert!(Range::from_str("0-4").is_err());
+    /// assert!(Range::from_str("4-2").is_err());
+    /// assert!(Range::from_str("-").is_err());
+    /// assert!(Range::from_str("a").is_err());
+    /// assert!(Range::from_str("a-b").is_err());
+    /// ```
+    方法 from_str(s: &字符串切片) -> 结果<自身类型, &'静态 字符串切片> {
+        方法 parse(s: &字符串切片) -> 结果<正整数大小, &'静态 字符串切片> {
+            匹配 s.parse::<正整数大小>() {
+                好的(0) => 坏的("fields and positions are numbered from 1"),
+                // GNU fails when we are at the limit. Match their behavior
+                好的(n) 如果 n == 正整数大小::MAX => 坏的("byte/character offset is too large"),
+                好的(n) => 好的(n),
+                坏的(_) => 坏的("failed to parse range"),
+            }
+        }
+
+        好的(匹配 s.split_once('-') {
+            无 => {
+                设 n = parse(s)?;
+                自身类型 { low: n, high: n }
+            }
+            一些(("", "")) => 返回 坏的("invalid range with no endpoint"),
+            一些((low, "")) => 自身类型 {
+                low: parse(low)?,
+                high: 正整数大小::MAX - 1,
+            },
+            一些(("", high)) => 自身类型 {
+                low: 1,
+                high: parse(high)?,
+            },
+            一些((low, high)) => {
+                设 (low, high) = (parse(low)?, parse(high)?);
+                如果 low <= high {
+                    自身类型 { low, high }
+                } 否则 {
+                    返回 坏的("high end of range less than low end");
+                }
+            }
+        })
+    }
+}
+
+实现 Range {
+    /// Parse a list of ranges separated by commas and/or spaces
+    公有 方法 from_list(list: &字符串切片) -> 结果<向量<自身类型>, 字符串> {
+        设 可变 ranges = 向量::新建();
+
+        循环 item 在 list.split(&[',', ' ']) {
+            设 range_item = FromStr::from_str(item)
+                .map_err(|e| 格式化!("range {} was invalid: {e}", item.quote()))?;
+            ranges.压入(range_item);
+        }
+
+        好的(自身类型::merge(ranges))
+    }
+
+    /// Merge any overlapping ranges. Adjacent ranges are *NOT* merged.
+    ///
+    /// Is guaranteed to return only disjoint ranges in a sorted order.
+    方法 merge(可变 ranges: 向量<自身类型>) -> 向量<自身类型> {
+        ranges.sort();
+
+        // merge overlapping ranges
+        循环 i 在 0..ranges.长度() {
+            设 j = i + 1;
+
+            当 j < ranges.长度() && ranges[j].low <= ranges[i].high {
+                设 j_high = ranges.移除(j).high;
+                ranges[i].high = max(ranges[i].high, j_high);
+            }
+        }
+        ranges
+    }
+}
+
+/// Calculate the complement of the given ranges.
+公有 方法 complement(ranges: &[Range]) -> 向量<Range> {
+    设 可变 prev_high = 0;
+    设 可变 complements = 向量::with_capacity(ranges.长度() + 1);
+
+    循环 range 在 ranges {
+        如果 range.low > prev_high + 1 {
+            complements.压入(Range {
+                low: prev_high + 1,
+                high: range.low - 1,
+            });
+        }
+        prev_high = range.high;
+    }
+
+    如果 prev_high < 正整数大小::MAX - 1 {
+        complements.压入(Range {
+            low: prev_high + 1,
+            high: 正整数大小::MAX - 1,
+        });
+    }
+
+    complements
+}
+
+/// Test if at least one of the given Ranges contain the supplied value.
+///
+/// Examples:
+///
+/// ```
+/// let ranges = uucore::ranges::Range::from_list("11,2,6-8").unwrap();
+///
+/// assert!(!uucore::ranges::contain(&ranges, 0));
+/// assert!(!uucore::ranges::contain(&ranges, 1));
+/// assert!(!uucore::ranges::contain(&ranges, 5));
+/// assert!(!uucore::ranges::contain(&ranges, 10));
+///
+/// assert!(uucore::ranges::contain(&ranges, 2));
+/// assert!(uucore::ranges::contain(&ranges, 6));
+/// assert!(uucore::ranges::contain(&ranges, 7));
+/// assert!(uucore::ranges::contain(&ranges, 8));
+/// assert!(uucore::ranges::contain(&ranges, 11));
+/// ```
+公有 方法 contain(ranges: &[Range], n: 正整数大小) -> 布尔 {
+    循环 range 在 ranges {
+        如果 n >= range.low && n <= range.high {
+            返回 真;
+        }
+    }
+
+    假
+}
+
+#[cfg(test)]
+模组 test {
+    使用 超级::{Range, complement};
+    使用 标准库::字符串切片::FromStr;
+
+    方法 m(a: 向量<Range>, b: &[Range]) {
+        相等断言!(Range::merge(a), b);
+    }
+
+    方法 r(low: 正整数大小, high: 正整数大小) -> Range {
+        Range { low, high }
+    }
+
+    #[test]
+    方法 merging() {
+        // Single element
+        m(向量![r(1, 2)], &[r(1, 2)]);
+
+        // Disjoint in wrong order
+        m(向量![r(4, 5), r(1, 2)], &[r(1, 2), r(4, 5)]);
+
+        // Two elements must be merged
+        m(向量![r(1, 3), r(2, 4), r(6, 7)], &[r(1, 4), r(6, 7)]);
+
+        // Two merges and a duplicate
+        m(
+            向量![r(1, 3), r(6, 7), r(2, 4), r(6, 7)],
+            &[r(1, 4), r(6, 7)],
+        );
+
+        // One giant
+        m(
+            向量![
+                r(110, 120),
+                r(10, 20),
+                r(100, 200),
+                r(130, 140),
+                r(150, 160),
+            ],
+            &[r(10, 20), r(100, 200)],
+        );
+
+        // Last one joins the previous two
+        m(向量![r(10, 20), r(30, 40), r(20, 30)], &[r(10, 40)]);
+
+        m(
+            向量![r(10, 20), r(30, 40), r(50, 60), r(20, 30)],
+            &[r(10, 40), r(50, 60)],
+        );
+
+        // Don't merge adjacent ranges
+        m(向量![r(1, 3), r(4, 6)], &[r(1, 3), r(4, 6)]);
+    }
+
+    #[test]
+    方法 complementing() {
+        // Simple
+        相等断言!(complement(&[r(3, 4)]), 向量![r(1, 2), r(5, 正整数大小::MAX - 1)]);
+
+        // With start
+        相等断言!(
+            complement(&[r(1, 3), r(6, 10)]),
+            向量![r(4, 5), r(11, 正整数大小::MAX - 1)]
+        );
+
+        // With end
+        相等断言!(
+            complement(&[r(2, 4), r(6, 正整数大小::MAX - 1)]),
+            向量![r(1, 1), r(5, 5)]
+        );
+
+        // With start and end
+        相等断言!(complement(&[r(1, 4), r(6, 正整数大小::MAX - 1)]), 向量![r(5, 5)]);
+    }
+
+    #[test]
+    方法 test_from_str() {
+        相等断言!(Range::from_str("5"), 好的(Range { low: 5, high: 5 }));
+        相等断言!(Range::from_str("3-5"), 好的(Range { low: 3, high: 5 }));
+        相等断言!(
+            Range::from_str("5-3"),
+            坏的("high end of range less than low end")
+        );
+        相等断言!(Range::from_str("-"), 坏的("invalid range with no endpoint"));
+        相等断言!(
+            Range::from_str("3-"),
+            好的(Range {
+                low: 3,
+                high: 正整数大小::MAX - 1
+            })
+        );
+        相等断言!(Range::from_str("-5"), 好的(Range { low: 1, high: 5 }));
+        相等断言!(
+            Range::from_str("0"),
+            坏的("fields and positions are numbered from 1")
+        );
+
+        设 max_value = 格式化!("{}", 正整数大小::MAX);
+        相等断言!(
+            Range::from_str(&max_value),
+            坏的("byte/character offset is too large")
+        );
+    }
+}

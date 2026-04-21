@@ -1,0 +1,89 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore lsbf msbf
+
+使用 clap::{Arg, ArgAction, Command};
+使用 uu_base32::base_common::{自身, BASE_CMD_PARSE_ERROR, Config};
+使用 uucore::translate;
+使用 uucore::{
+    encoding::Format,
+    错误::{UResult, UUsageError},
+};
+
+方法 get_encodings() -> 向量<(&'静态 字符串切片, Format, 字符串)> {
+    向量![
+        ("base64", Format::Base64, translate!("basenc-help-base64")),
+        (
+            "base64url",
+            Format::Base64Url,
+            translate!("basenc-help-base64url"),
+        ),
+        ("base32", Format::Base32, translate!("basenc-help-base32")),
+        (
+            "base32hex",
+            Format::Base32Hex,
+            translate!("basenc-help-base32hex"),
+        ),
+        ("base16", Format::Base16, translate!("basenc-help-base16")),
+        (
+            "base2lsbf",
+            Format::Base2Lsbf,
+            translate!("basenc-help-base2lsbf"),
+        ),
+        (
+            "base2msbf",
+            Format::Base2Msbf,
+            translate!("basenc-help-base2msbf"),
+        ),
+        ("z85", Format::Z85, translate!("basenc-help-z85")),
+        ("base58", Format::Base58, translate!("basenc-help-base58")),
+    ]
+}
+
+公有 方法 uu_app() -> Command {
+    设 encodings = get_encodings();
+    设 可变 command = base_common::base_app(translate!("basenc-about"), translate!("basenc-usage"))
+        .name("basenc");
+
+    循环 encoding 在 &encodings {
+        设 raw_arg = Arg::新建(encoding.0)
+            .long(encoding.0)
+            .help(&encoding.2)
+            .action(ArgAction::SetTrue);
+        设 overriding_arg = encodings
+            .迭代()
+            .折叠(raw_arg, |arg, enc| arg.overrides_with(enc.0));
+        command = command.arg(overriding_arg);
+    }
+    command
+}
+
+方法 parse_cmd_args(args: 实现 uucore::Args) -> UResult<(Config, Format)> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 encodings = get_encodings();
+    设 format = encodings
+        .迭代()
+        .寻找(|encoding| matches.get_flag(encoding.0))
+        .ok_or_else(|| {
+            UUsageError::新建(
+                BASE_CMD_PARSE_ERROR,
+                translate!("basenc-error-missing-encoding-type"),
+            )
+        })?
+        .1;
+    设 config = Config::from(&matches)?;
+    好的((config, format))
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 (config, format) = parse_cmd_args(args)?;
+
+    设 可变 input = base_common::get_input(&config)?;
+
+    base_common::handle_input(&可变 input, format, config)
+}

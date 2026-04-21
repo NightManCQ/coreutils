@@ -1,0 +1,3332 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// Although these links don't always seem to describe reality, check out the POSIX and GNU specs:
+// https://pubs.opengroup.org/onlinepubs/9699919799/utilities/sort.html
+// https://www.gnu.org/software/coreutils/manual/html_node/sort-invocation.html
+
+// spell-checker:ignore (misc) HFKJFK Mbdfhn getrlimit RLIMIT_NOFILE rlim bigdecimal extendedbigdecimal hexdigit behaviour keydef GETFD localeconv foldhash
+// spell-checker:ignore (misc) uppercased qsort getmonth juin juil
+
+模组 buffer_hint;
+模组 check;
+模组 chunks;
+模组 custom_str_cmp;
+模组 ext_sort;
+模组 merge;
+模组 numeric_str_cmp;
+模组 tmp_dir;
+
+使用 bigdecimal::BigDecimal;
+使用 chunks::LineData;
+使用 clap::builder::ValueParser;
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 custom_str_cmp::custom_str_cmp;
+使用 ext_sort::ext_sort;
+使用 foldhash::fast::FoldHasher;
+使用 foldhash::{哈希映射, SharedSeed};
+使用 numeric_str_cmp::{NumInfo, NumInfoParseSettings, human_numeric_str_cmp, numeric_str_cmp};
+使用 rand::{RngExt 转换 _, rng};
+#[cfg(not(target_os = "wasi"))]
+使用 rayon::切片::ParallelSliceMut;
+使用 标准库::比较::排序顺序;
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::文件系统::{File, OpenOptions};
+使用 标准库::哈希::{哈希协议, Hasher};
+使用 标准库::输入输出::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
+使用 标准库::数字::IntErrorKind;
+#[cfg(not(target_os = "wasi"))]
+使用 标准库::数字::NonZero;
+使用 标准库::操作符::Range;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 标准库::路径::Path;
+使用 标准库::路径::PathBuf;
+使用 标准库::字符串切片::Utf8Error;
+使用 标准库::同步::OnceLock;
+使用 thiserror::错误协议;
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, strip_errno};
+使用 uucore::错误::{UError, UResult, USimpleError, UUsageError};
+使用 uucore::extendedbigdecimal::ExtendedBigDecimal;
+#[cfg(feature = "i18n-collator")]
+使用 uucore::i18n::collator::{compute_sort_key_utf8, locale_cmp};
+使用 uucore::i18n::datetime::get_locale_months;
+使用 uucore::i18n::decimal::locale_decimal_separator;
+使用 uucore::line_ending::LineEnding;
+使用 uucore::parser::num_parser::{ExtendedParser, ExtendedParserError};
+使用 uucore::parser::parse_size::{ParseSizeError, Parser};
+使用 uucore::parser::shortcut_value_parser::ShortcutValueParser;
+使用 uucore::posix::{MODERN, TRADITIONAL};
+使用 uucore::show_error;
+使用 uucore::translate;
+使用 uucore::version_cmp::version_cmp;
+使用 uucore::{format_usage, i18n};
+
+使用 箱::buffer_hint::automatic_buffer_size;
+使用 箱::tmp_dir::TmpDirWrapper;
+
+模组 options {
+    公有 模组 modes {
+        公有 常量 SORT: &字符串切片 = "sort";
+
+        公有 常量 HUMAN_NUMERIC: &字符串切片 = "human-numeric-sort";
+        公有 常量 MONTH: &字符串切片 = "month-sort";
+        公有 常量 NUMERIC: &字符串切片 = "numeric-sort";
+        公有 常量 GENERAL_NUMERIC: &字符串切片 = "general-numeric-sort";
+        公有 常量 VERSION: &字符串切片 = "version-sort";
+        公有 常量 RANDOM: &字符串切片 = "random-sort";
+    }
+
+    公有 模组 check {
+        公有 常量 CHECK: &字符串切片 = "check";
+        公有 常量 CHECK_SILENT: &字符串切片 = "check-silent";
+        公有 常量 SILENT: &字符串切片 = "silent";
+        公有 常量 QUIET: &字符串切片 = "quiet";
+        公有 常量 DIAGNOSE_FIRST: &字符串切片 = "diagnose-first";
+    }
+
+    公有 常量 HELP: &字符串切片 = "help";
+    公有 常量 VERSION: &字符串切片 = "version";
+    公有 常量 DICTIONARY_ORDER: &字符串切片 = "dictionary-order";
+    公有 常量 MERGE: &字符串切片 = "merge";
+    公有 常量 DEBUG: &字符串切片 = "debug";
+    公有 常量 IGNORE_CASE: &字符串切片 = "ignore-case";
+    公有 常量 IGNORE_LEADING_BLANKS: &字符串切片 = "ignore-leading-blanks";
+    公有 常量 IGNORE_NONPRINTING: &字符串切片 = "ignore-nonprinting";
+    公有 常量 OUTPUT: &字符串切片 = "output";
+    公有 常量 REVERSE: &字符串切片 = "reverse";
+    公有 常量 STABLE: &字符串切片 = "stable";
+    公有 常量 UNIQUE: &字符串切片 = "unique";
+    公有 常量 KEY: &字符串切片 = "key";
+    公有 常量 SEPARATOR: &字符串切片 = "field-separator";
+    公有 常量 ZERO_TERMINATED: &字符串切片 = "zero-terminated";
+    公有 常量 PARALLEL: &字符串切片 = "parallel";
+    公有 常量 FILES0_FROM: &字符串切片 = "files0-from";
+    公有 常量 BUF_SIZE: &字符串切片 = "buffer-size";
+    公有 常量 TMP_DIR: &字符串切片 = "temporary-directory";
+    公有 常量 COMPRESS_PROG: &字符串切片 = "compress-program";
+    公有 常量 BATCH_SIZE: &字符串切片 = "batch-size";
+    公有 常量 RANDOM_SOURCE: &字符串切片 = "random-source";
+
+    公有 常量 FILES: &字符串切片 = "files";
+}
+
+常量 DECIMAL_PT: 正8 = b'.';
+
+方法 locale_decimal_pt() -> 正8 {
+    匹配 locale_decimal_separator().as_bytes().first().copied() {
+        一些(b'.') => b'.',
+        一些(b',') => b',',
+        _ => DECIMAL_PT,
+    }
+}
+
+常量 NEGATIVE: &正8 = &b'-';
+常量 POSITIVE: &正8 = &b'+';
+
+// The automatic buffer heuristics clamp to this range to avoid
+// over-committing memory on constrained systems while still keeping
+// reasonably large chunks for typical workloads.
+常量 MIN_AUTOMATIC_BUF_SIZE: 正整数大小 = 512 * 1024; // 512 KiB
+常量 FALLBACK_AUTOMATIC_BUF_SIZE: 正整数大小 = 32 * 1024 * 1024; // 32 MiB
+常量 MAX_AUTOMATIC_BUF_SIZE: 正整数大小 = 1024 * 1024 * 1024; // 1 GiB
+
+#[derive(调试协议, 错误协议)]
+公有 枚举 SortError {
+    #[错误("{}", format_disorder(.file, .line_number, .line, .silent))]
+    Disorder {
+        file: OsString,
+        line_number: 正整数大小,
+        line: 字符串,
+        silent: 布尔,
+    },
+
+    #[错误("{}", translate!("sort-open-failed", "path" => 格式化!("{}", .路径.maybe_quote()), "error" => strip_errno(.错误)))]
+    OpenFailed {
+        路径: PathBuf,
+        错误: 标准库::输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("sort-cannot-read", "path" => 格式化!("{}", .路径.maybe_quote()), "error" => strip_errno(.错误)))]
+    ReadFailed {
+        路径: PathBuf,
+        错误: 标准库::输入输出::错误协议,
+    },
+
+    #[错误("{}", translate!("sort-open-tmp-file-failed", "error" => strip_errno(.错误)))]
+    OpenTmpFileFailed { 错误: 标准库::输入输出::错误协议 },
+
+    #[错误("{}", translate!("sort-compress-prog-execution-failed", "prog" => .prog, "error" => strip_errno(.错误)))]
+    CompressProgExecutionFailed { prog: 字符串, 错误: 标准库::输入输出::错误协议 },
+
+    #[错误("{}", translate!("sort-compress-prog-terminated-abnormally", "prog" => .prog.quote()))]
+    CompressProgTerminatedAbnormally { prog: 字符串 },
+
+    #[错误("{}", translate!("sort-cannot-create-tmp-file", "path" => 格式化!("{}", .路径.quote())))]
+    TmpFileCreationFailed { 路径: PathBuf },
+
+    #[错误("{}", translate!("sort-file-operands-combined", "file" => 格式化!("{}", .file.quote()), "help" => uucore::execution_phrase()))]
+    FileOperandsCombined { file: PathBuf },
+
+    #[错误("{error}")]
+    Uft8Error { 错误: Utf8Error },
+
+    #[错误("{}", translate!("sort-multiple-output-files"))]
+    MultipleOutputFiles,
+
+    #[错误("{}", translate!("sort-minus-in-stdin"))]
+    MinusInStdIn,
+
+    #[错误("{}", translate!("sort-no-input-from", "file" => 格式化!("{}", .file.quote())))]
+    EmptyInputFile { file: PathBuf },
+
+    #[错误("{}", translate!("sort-invalid-zero-length-filename", "file" => .file.maybe_quote(), "line_num" => .line_num))]
+    ZeroLengthFileName { file: PathBuf, line_num: 正整数大小 },
+}
+
+实现 UError 循环 SortError {
+    方法 code(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::Disorder { .. } => 1,
+            _ => 2,
+        }
+    }
+}
+
+// refs are required because this fn is used by thiserror macro
+#[期望(clippy::trivially_copy_pass_by_ref)]
+方法 format_disorder(file: &OsString, line_number: &正整数大小, line: &字符串, silent: &布尔) -> 字符串 {
+    如果 *silent {
+        字符串::新建()
+    } 否则 {
+        translate!("sort-error-disorder", "file" => file.maybe_quote(), "line_number" => line_number, "line" => line.to_owned())
+    }
+}
+
+#[derive(相等比较协议, 序比较协议, 偏等比较协议, 偏序比较协议, 克隆协议, 复制协议, 调试协议)]
+枚举 SortMode {
+    Numeric,
+    HumanNumeric,
+    GeneralNumeric,
+    Month,
+    Version,
+    Random,
+    默认协议,
+}
+
+/// Return the length of the byte slice while ignoring embedded NULs (used for debug underline alignment).
+方法 count_non_null_bytes(bytes: &[正8]) -> 正整数大小 {
+    bytes.迭代().过滤(|&&c| c != b'\0').计数()
+}
+
+公有 结构 Output {
+    file: 选项<(OsString, File)>,
+}
+
+实现 Output {
+    方法 新建(name: 选项<实现 作为引用协议<OsStr>>) -> UResult<自身类型> {
+        设 file = 如果 设 一些(name) = name {
+            设 路径 = Path::新建(name.as_ref());
+            // This is different from `File::create()` because we don't truncate the output yet.
+            // This allows using the output file as an input file.
+            #[allow(clippy::suspicious_open_options)]
+            设 file = OpenOptions::新建()
+                .写锁定(真)
+                .create(真)
+                .open(路径)
+                .map_err(|e| SortError::OpenFailed {
+                    路径: 路径.to_owned(),
+                    错误: e,
+                })?;
+            一些((name.as_ref().to_owned(), file))
+        } 否则 {
+            无
+        };
+        好的(自身类型 { file })
+    }
+
+    方法 into_write(自身) -> BufWriter<盒子<动态 Write>> {
+        BufWriter::新建(匹配 自身.file {
+            一些((_name, file)) => {
+                // truncate the file
+                设 _ = file.set_len(0);
+                盒子::新建(file)
+            }
+            无 => 盒子::新建(stdout()),
+        })
+    }
+
+    方法 as_output_name(&自身) -> 选项<&OsStr> {
+        匹配 &自身.file {
+            一些((name, _file)) => 一些(name.as_os_str()),
+            无 => 无,
+        }
+    }
+}
+
+#[derive(克隆协议)]
+公有 结构 GlobalSettings {
+    mode: SortMode,
+    debug: 布尔,
+    ignore_leading_blanks: 布尔,
+    ignore_case: 布尔,
+    dictionary_order: 布尔,
+    ignore_non_printing: 布尔,
+    merge: 布尔,
+    reverse: 布尔,
+    stable: 布尔,
+    unique: 布尔,
+    check: 布尔,
+    check_silent: 布尔,
+    salt: 选项<[正8; 16]>,
+    random_source: 选项<PathBuf>,
+    selectors: 向量<FieldSelector>,
+    separator: 选项<正8>,
+    threads: 字符串,
+    line_ending: LineEnding,
+    buffer_size: 正整数大小,
+    buffer_size_is_explicit: 布尔,
+    compress_prog: 选项<字符串>,
+    merge_batch_size: 正整数大小,
+    numeric_locale: NumericLocaleSettings,
+    precomputed: Precomputed,
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+结构 NumericLocaleSettings {
+    thousands_sep: 选项<正8>,
+    decimal_pt: 选项<正8>,
+}
+
+实现 默认协议 循环 NumericLocaleSettings {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            thousands_sep: 无,
+            decimal_pt: 一些(DECIMAL_PT),
+        }
+    }
+}
+
+实现 NumericLocaleSettings {
+    方法 num_info_settings(自身, accept_si_units: 布尔) -> NumInfoParseSettings {
+        NumInfoParseSettings {
+            accept_si_units,
+            thousands_separator: 自身.thousands_sep,
+            decimal_pt: 自身.decimal_pt,
+        }
+    }
+}
+
+/// Data needed for sorting. Should be computed once before starting to sort
+/// by calling `GlobalSettings::init_precomputed`.
+#[derive(克隆协议, 调试协议, 默认协议)]
+结构 Precomputed {
+    needs_tokens: 布尔,
+    num_infos_per_line: 正整数大小,
+    floats_per_line: 正整数大小,
+    selections_per_line: 正整数大小,
+    fast_lexicographic: 布尔,
+    fast_locale_collation: 布尔,
+    fast_ascii_insensitive: 布尔,
+    tokenize_blank_thousands_sep: 布尔,
+    tokenize_allow_unit_after_blank: 布尔,
+}
+
+实现 GlobalSettings {
+    /// Parse a SIZE string into a number of bytes.
+    /// A size string comprises an integer and an optional unit.
+    /// The unit may be k, K, m, M, g, G, t, T, P, E, Z, Y (powers of 1024), or b which is 1.
+    /// Default is K.
+    方法 parse_byte_count(input: &字符串切片) -> 结果<正整数大小, ParseSizeError> {
+        // GNU sort (8.32)   valid: 1b,        k, K, m, M, g, G, t, T, P, E, Z, Y
+        // GNU sort (8.32) invalid:  b, B, 1B,                         p, e, z, y
+        设 size = Parser::默认()
+            .with_allow_list(&[
+                "b", "k", "K", "m", "M", "g", "G", "t", "T", "P", "E", "Z", "Y", "R", "Q", "%",
+            ])
+            .with_default_unit("K")
+            .with_b_byte_count(真)
+            .parse(input.trim())?;
+
+        正整数大小::try_from(size).map_err(|_| {
+            ParseSizeError::SizeTooBig(translate!("sort-error-buffer-size-too-big", "size" => size))
+        })
+    }
+
+    /// Precompute some data needed for sorting.
+    /// This function **must** be called before starting to sort, and `GlobalSettings` may not be altered
+    /// afterwards.
+    ///
+    /// When i18n-collator is enabled, `disable_fast_lexicographic` should be set to true if we're
+    /// in a UTF-8 locale (to force locale-aware collation instead of byte comparison).
+    方法 init_precomputed(&可变 自身, disable_fast_lexicographic: 布尔) {
+        自身.precomputed.needs_tokens = 自身.selectors.迭代().任意(|s| s.needs_tokens);
+        自身.precomputed.selections_per_line =
+            自身.selectors.迭代().过滤(|s| s.needs_selection).计数();
+        自身.precomputed.num_infos_per_line = 自身
+            .selectors
+            .迭代()
+            .过滤(|s| matches!(s.settings.mode, SortMode::Numeric | SortMode::HumanNumeric))
+            .计数();
+        自身.precomputed.floats_per_line = 自身
+            .selectors
+            .迭代()
+            .过滤(|s| matches!(s.settings.mode, SortMode::GeneralNumeric))
+            .计数();
+
+        设 uses_numeric = 自身
+            .selectors
+            .迭代()
+            .任意(|s| matches!(s.settings.mode, SortMode::Numeric | SortMode::HumanNumeric));
+        设 uses_human_numeric = 自身
+            .selectors
+            .迭代()
+            .任意(|s| matches!(s.settings.mode, SortMode::HumanNumeric));
+        自身.precomputed.tokenize_blank_thousands_sep = 自身.separator.is_none()
+            && uses_numeric
+            && 自身.numeric_locale.thousands_sep == 一些(b' ');
+        自身.precomputed.tokenize_allow_unit_after_blank =
+            自身.precomputed.tokenize_blank_thousands_sep && uses_human_numeric;
+
+        自身.precomputed.fast_lexicographic =
+            !disable_fast_lexicographic && 自身.can_use_fast_lexicographic();
+        自身.precomputed.fast_locale_collation =
+            disable_fast_lexicographic && 自身.can_use_fast_lexicographic();
+        自身.precomputed.fast_ascii_insensitive = 自身.can_use_fast_ascii_insensitive();
+    }
+
+    /// Returns true when the fast lexicographic path can be used safely.
+    /// Note: When i18n-collator is enabled, the caller must have already determined
+    /// whether locale-aware collation is needed (via checking if we're in a UTF-8 locale).
+    /// This check is performed in uumain() before init_precomputed() is called.
+    方法 can_use_fast_lexicographic(&自身) -> 布尔 {
+        自身.mode == SortMode::默认协议
+            && !自身.ignore_case
+            && !自身.dictionary_order
+            && !自身.ignore_non_printing
+            && !自身.ignore_leading_blanks
+            && 自身.selectors.长度() == 1
+            && {
+                设 selector = &自身.selectors[0];
+                !selector.needs_selection
+                    && matches!(selector.settings.mode, SortMode::默认协议)
+                    && !selector.settings.ignore_case
+                    && !selector.settings.dictionary_order
+                    && !selector.settings.ignore_non_printing
+                    && !selector.settings.ignore_blanks
+            }
+    }
+
+    /// Returns true when the ASCII case-insensitive fast path is valid.
+    方法 can_use_fast_ascii_insensitive(&自身) -> 布尔 {
+        自身.mode == SortMode::默认协议
+            && 自身.ignore_case
+            && !自身.dictionary_order
+            && !自身.ignore_non_printing
+            && !自身.ignore_leading_blanks
+            && 自身.selectors.长度() == 1
+            && {
+                设 selector = &自身.selectors[0];
+                !selector.needs_selection
+                    && matches!(selector.settings.mode, SortMode::默认协议)
+                    && selector.settings.ignore_case
+                    && !selector.settings.dictionary_order
+                    && !selector.settings.ignore_non_printing
+                    && !selector.settings.ignore_blanks
+            }
+    }
+}
+
+实现 默认协议 循环 GlobalSettings {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            mode: SortMode::默认协议,
+            debug: 假,
+            ignore_leading_blanks: 假,
+            ignore_case: 假,
+            dictionary_order: 假,
+            ignore_non_printing: 假,
+            merge: 假,
+            reverse: 假,
+            stable: 假,
+            unique: 假,
+            check: 假,
+            check_silent: 假,
+            salt: 无,
+            random_source: 无,
+            selectors: 向量![],
+            separator: 无,
+            threads: 字符串::新建(),
+            line_ending: LineEnding::Newline,
+            buffer_size: FALLBACK_AUTOMATIC_BUF_SIZE,
+            buffer_size_is_explicit: 假,
+            compress_prog: 无,
+            merge_batch_size: default_merge_batch_size(),
+            numeric_locale: NumericLocaleSettings::默认(),
+            precomputed: Precomputed::默认(),
+        }
+    }
+}
+
+#[derive(克隆协议, 偏等比较协议, 调试协议)]
+结构 KeySettings {
+    mode: SortMode,
+    ignore_blanks: 布尔,
+    ignore_case: 布尔,
+    dictionary_order: 布尔,
+    ignore_non_printing: 布尔,
+    reverse: 布尔,
+}
+
+实现 转换协议<&GlobalSettings> 循环 KeySettings {
+    方法 from(settings: &GlobalSettings) -> 自身类型 {
+        自身类型 {
+            mode: settings.mode,
+            ignore_blanks: settings.ignore_leading_blanks,
+            ignore_case: settings.ignore_case,
+            ignore_non_printing: settings.ignore_non_printing,
+            reverse: settings.reverse,
+            dictionary_order: settings.dictionary_order,
+        }
+    }
+}
+
+实现 默认协议 循环 KeySettings {
+    方法 默认() -> 自身类型 {
+        自身类型::from(&GlobalSettings::默认())
+    }
+}
+
+#[derive(克隆协议, 复制协议, 调试协议, 默认协议)]
+结构 ModeFlags {
+    numeric: 布尔,
+    general_numeric: 布尔,
+    human_numeric: 布尔,
+    month: 布尔,
+    version: 布尔,
+    random: 布尔,
+}
+
+实现 ModeFlags {
+    方法 from_mode(mode: SortMode) -> 自身类型 {
+        设 可变 flags = 自身类型::默认();
+        匹配 mode {
+            SortMode::Numeric => flags.numeric = 真,
+            SortMode::GeneralNumeric => flags.general_numeric = 真,
+            SortMode::HumanNumeric => flags.human_numeric = 真,
+            SortMode::Month => flags.month = 真,
+            SortMode::Version => flags.version = 真,
+            SortMode::Random => flags.random = 真,
+            SortMode::默认协议 => {}
+        }
+        flags
+    }
+
+    方法 to_mode(自身) -> SortMode {
+        如果 自身.numeric {
+            SortMode::Numeric
+        } 否则 如果 自身.general_numeric {
+            SortMode::GeneralNumeric
+        } 否则 如果 自身.human_numeric {
+            SortMode::HumanNumeric
+        } 否则 如果 自身.month {
+            SortMode::Month
+        } 否则 如果 自身.random {
+            SortMode::Random
+        } 否则 如果 自身.version {
+            SortMode::Version
+        } 否则 {
+            SortMode::默认协议
+        }
+    }
+}
+
+方法 ordering_opts_string(
+    flags: ModeFlags,
+    dictionary_order: 布尔,
+    ignore_non_printing: 布尔,
+    ignore_case: 布尔,
+) -> 字符串 {
+    设 可变 opts = 字符串::新建();
+    如果 dictionary_order {
+        opts.压入('d');
+    }
+    如果 ignore_case {
+        opts.压入('f');
+    }
+    如果 flags.general_numeric {
+        opts.压入('g');
+    }
+    如果 flags.human_numeric {
+        opts.压入('h');
+    }
+    如果 !dictionary_order && ignore_non_printing {
+        opts.压入('i');
+    }
+    如果 flags.month {
+        opts.压入('M');
+    }
+    如果 flags.numeric {
+        opts.压入('n');
+    }
+    如果 flags.random {
+        opts.压入('R');
+    }
+    如果 flags.version {
+        opts.压入('V');
+    }
+    opts
+}
+
+方法 ordering_incompatible(
+    flags: ModeFlags,
+    dictionary_order: 布尔,
+    ignore_non_printing: 布尔,
+) -> 布尔 {
+    设 mode_count = 正8::from(flags.numeric)
+        + 正8::from(flags.general_numeric)
+        + 正8::from(flags.human_numeric)
+        + 正8::from(flags.month);
+
+    // Multiple numeric/month modes are incompatible
+    如果 mode_count > 1 {
+        返回 真;
+    }
+
+    // A numeric/month mode combined with version/random/dictionary/ignore_non_printing is incompatible
+    如果 mode_count == 1 {
+        返回 flags.version || flags.random || dictionary_order || ignore_non_printing;
+    }
+
+    假
+}
+
+方法 incompatible_options_error(opts: &字符串切片) -> 盒子<动态 UError> {
+    USimpleError::新建(
+        2,
+        translate!(
+            "sort-options-incompatible",
+            "opt1" => opts,
+            "opt2" => ""
+        ),
+    )
+}
+枚举 Selection<'a> {
+    AsBigDecimal(GeneralBigDecimalParseResult),
+    WithNumInfo(&'a [正8], NumInfo),
+    Str(&'a [正8]),
+}
+
+类型 Field = Range<正整数大小>;
+
+#[derive(克隆协议, 调试协议)]
+公有 结构 Line<'a> {
+    line: &'a [正8],
+    index: 正整数大小,
+}
+
+实现<'a> Line<'a> {
+    /// Creates a new `Line`.
+    ///
+    /// If additional data is needed for sorting it is added to `line_data`.
+    /// `token_buffer` allows to reuse the allocation for tokens.
+    方法 create(
+        line: &'a [正8],
+        index: 正整数大小,
+        line_data: &可变 LineData<'a>,
+        token_buffer: &可变 向量<Field>,
+        settings: &GlobalSettings,
+    ) -> 自身类型 {
+        #[cfg(feature = "i18n-collator")]
+        如果 settings.precomputed.fast_locale_collation {
+            compute_sort_key_utf8(line, &可变 line_data.collation_key_buffer);
+            line_data
+                .collation_key_ends
+                .压入(line_data.collation_key_buffer.长度());
+            返回 自身类型 { line, index };
+        }
+
+        设 needs_line_data = settings.precomputed.needs_tokens
+            || settings.precomputed.selections_per_line > 0
+            || settings.precomputed.num_infos_per_line > 0
+            || settings.precomputed.floats_per_line > 0
+            || settings.mode == SortMode::Numeric;
+        如果 !needs_line_data {
+            返回 自身类型 { line, index };
+        }
+        token_buffer.clear();
+        如果 settings.precomputed.needs_tokens {
+            tokenize(
+                line,
+                settings.separator,
+                token_buffer,
+                &settings.precomputed,
+            );
+        }
+        如果 settings.mode == SortMode::Numeric {
+            // exclude inf, nan, scientific notation
+            设 line_num_float = (!line.迭代().任意(正8::is_ascii_alphabetic))
+                .then(|| 标准库::字符串切片::from_utf8(line).ok())
+                .flatten()
+                .and_then(|s| s.parse::<点64>().ok());
+            line_data.line_num_floats.压入(line_num_float);
+        }
+        循环 (selector, selection) 在 settings.selectors.迭代().映射(|selector| {
+            (
+                selector,
+                selector.get_selection(line, token_buffer, settings.numeric_locale),
+            )
+        }) {
+            匹配 selection {
+                Selection::AsBigDecimal(parsed_float) => line_data.parsed_floats.压入(parsed_float),
+                Selection::WithNumInfo(字符串切片, num_info) => {
+                    line_data.num_infos.压入(num_info);
+                    line_data.selections.压入(字符串切片);
+                }
+                Selection::Str(字符串切片) => {
+                    如果 selector.needs_selection {
+                        line_data.selections.压入(字符串切片);
+                    }
+                }
+            }
+        }
+        自身类型 { line, index }
+    }
+
+    方法 print(&自身, writer: &可变 实现 Write, settings: &GlobalSettings) -> 标准库::输入输出::结果<()> {
+        如果 settings.debug {
+            自身.write_debug(settings, writer)?;
+        } 否则 {
+            writer.write_all(自身.line)?;
+            writer.write_all(&[settings.line_ending.into()])?;
+        }
+        好的(())
+    }
+
+    /// Writes indicators for the selections this line matched. The original line content is NOT expected
+    /// to be already printed.
+    方法 write_debug(
+        &自身,
+        settings: &GlobalSettings,
+        writer: &可变 实现 Write,
+    ) -> 标准库::输入输出::结果<()> {
+        // We do not consider this function performance critical, as debug output is only useful for small files,
+        // which are not a performance problem in any case. Therefore there aren't any special performance
+        // optimizations here.
+
+        设 line = 自身
+            .line
+            .迭代()
+            .copied()
+            .映射(|c| 如果 c == b'\t' { b'>' } 否则 { c })
+            .收集::<向量<_>>();
+
+        writer.write_all(&line)?;
+        writeln!(writer)?;
+
+        设 可变 fields = 向量![];
+        tokenize(
+            自身.line,
+            settings.separator,
+            &可变 fields,
+            &settings.precomputed,
+        );
+        循环 selector 在 &settings.selectors {
+            设 可变 selection = selector.get_range(自身.line, 一些(&fields));
+            匹配 selector.settings.mode {
+                SortMode::Numeric | SortMode::HumanNumeric => {
+                    // find out which range is used for numeric comparisons
+                    设 可变 parse_settings = settings
+                        .numeric_locale
+                        .num_info_settings(selector.settings.mode == SortMode::HumanNumeric);
+                    // Debug annotations should ignore thousands separators to match GNU output.
+                    parse_settings.thousands_separator = 无;
+                    设 (_, num_range) =
+                        NumInfo::parse(&自身.line[selection.克隆()], &parse_settings);
+                    设 initial_selection = selection.克隆();
+
+                    // Shorten selection to num_range.
+                    selection.start += num_range.start;
+                    selection.end = selection.start + num_range.长度();
+
+                    如果 num_range == (0..0) {
+                        // This was not a valid number.
+                        // Report no match at the first non-whitespace character.
+                        设 leading_whitespace = 自身.line[selection.克隆()]
+                            .迭代()
+                            .position(|c| !c.is_ascii_whitespace())
+                            .unwrap_or(0);
+                        selection.start += leading_whitespace;
+                        selection.end += leading_whitespace;
+                    } 否则 {
+                        // include a trailing si unit
+                        如果 selector.settings.mode == SortMode::HumanNumeric {
+                            如果 设 一些(
+                                b'k' | b'K' | b'M' | b'G' | b'T' | b'P' | b'E' | b'Z' | b'Y' | b'R'
+                                | b'Q',
+                            ) = 自身.line[selection.end..initial_selection.end].first()
+                            {
+                                selection.end += 1;
+                            }
+                        }
+
+                        // include leading zeroes, a leading minus or a leading decimal point
+                        当 设 一些(b'-' | b'0' | b'.') =
+                            自身.line[initial_selection.start..selection.start].最后()
+                        {
+                            selection.start -= 1;
+                        }
+                    }
+                }
+                SortMode::GeneralNumeric => {
+                    设 initial_selection = &自身.line[selection.克隆()];
+                    设 decimal_pt = locale_decimal_pt();
+                    设 leading = get_leading_gen(initial_selection, decimal_pt);
+
+                    // Shorten selection to leading.
+                    selection.start += leading.start;
+                    selection.end = selection.start + leading.长度();
+                }
+                SortMode::Month => {
+                    设 initial_selection = &自身.line[selection.克隆()];
+                    设 first_non_blank = initial_selection
+                        .迭代()
+                        .position(|c| !c.is_ascii_whitespace())
+                        .unwrap_or(initial_selection.长度());
+
+                    设 (parsed, match_len) = month_parse(initial_selection);
+
+                    如果 parsed == Month::Unknown {
+                        // We failed to parse a month, which is equivalent to matching nothing.
+                        // Add the "no match for key" marker to the first non-whitespace character.
+                        selection.start += first_non_blank;
+                        selection.end = selection.start;
+                    } 否则 {
+                        // We parsed a month. Use the actual match byte length.
+                        selection.start += first_non_blank;
+                        selection.end = selection.start + match_len;
+                    }
+                }
+                _ => {}
+            }
+
+            // Don't let embedded NUL bytes influence column alignment in the
+            // debug underline output, since they are often filtered out (e.g.
+            // via `tr -d '\0'`) before inspection.
+            设 select = &line[..selection.start];
+            设 indent = count_non_null_bytes(select);
+            write!(writer, "{}", " ".repeat(indent))?;
+
+            如果 selection.为空() {
+                writeln!(writer, "{}", translate!("sort-error-no-match-for-key"))?;
+            } 否则 {
+                设 select = &line[selection];
+                设 underline_len = count_non_null_bytes(select);
+                writeln!(writer, "{}", "_".repeat(underline_len))?;
+            }
+        }
+
+        如果 settings.mode != SortMode::Random
+            && !settings.stable
+            && !settings.unique
+            && (settings.dictionary_order
+                || settings.ignore_leading_blanks
+                || settings.ignore_case
+                || settings.ignore_non_printing
+                || settings.mode != SortMode::默认协议
+                || settings
+                    .selectors
+                    .最后()
+                    .is_none_or(|selector| selector != &FieldSelector::默认()))
+        {
+            // A last resort comparator is in use, underline the whole line.
+            如果 自身.line.为空() {
+                writeln!(writer, "{}", translate!("sort-error-no-match-for-key"))?;
+            } 否则 {
+                writeln!(writer, "{}", "_".repeat(自身.line.长度()))?;
+            }
+        }
+        好的(())
+    }
+}
+
+/// Tokenize a line into fields. The result is stored into `token_buffer`.
+方法 tokenize(
+    line: &[正8],
+    separator: 选项<正8>,
+    token_buffer: &可变 向量<Field>,
+    precomputed: &Precomputed,
+) {
+    断言!(token_buffer.为空());
+    如果 设 一些(separator) = separator {
+        tokenize_with_separator(line, separator, token_buffer);
+    } 否则 {
+        tokenize_default(
+            line,
+            token_buffer,
+            precomputed.tokenize_blank_thousands_sep,
+            precomputed.tokenize_allow_unit_after_blank,
+        );
+    }
+}
+
+/// By default fields are separated by the first whitespace after non-whitespace.
+/// Whitespace is included in fields at the start.
+/// The result is stored into `token_buffer`.
+方法 tokenize_default(
+    line: &[正8],
+    token_buffer: &可变 向量<Field>,
+    blank_thousands_sep: 布尔,
+    allow_unit_after_blank: 布尔,
+) {
+    token_buffer.压入(0..0);
+    // pretend that there was whitespace in front of the line
+    设 可变 previous_was_whitespace = 真;
+    循环 (idx, 字符) 在 line.迭代().enumerate() {
+        设 is_whitespace = 字符.is_ascii_whitespace();
+        设 treat_as_separator = 如果 is_whitespace {
+            如果 blank_thousands_sep && *字符 == b' ' {
+                !is_blank_thousands_sep(line, idx, allow_unit_after_blank)
+            } 否则 {
+                真
+            }
+        } 否则 {
+            假
+        };
+
+        如果 treat_as_separator {
+            如果 !previous_was_whitespace {
+                token_buffer.last_mut().解包().end = idx;
+                token_buffer.压入(idx..0);
+            }
+            previous_was_whitespace = 真;
+        } 否则 {
+            previous_was_whitespace = 假;
+        }
+    }
+    token_buffer.last_mut().解包().end = line.长度();
+}
+
+方法 is_blank_thousands_sep(line: &[正8], idx: 正整数大小, allow_unit_after_blank: 布尔) -> 布尔 {
+    如果 line.获取(idx) != 一些(&b' ') {
+        返回 假;
+    }
+
+    设 prev_is_digit = idx
+        .checked_sub(1)
+        .and_then(|prev_idx| line.获取(prev_idx))
+        .is_some_and(正8::is_ascii_digit);
+    如果 !prev_is_digit {
+        返回 假;
+    }
+
+    设 next = line.获取(idx + 1).copied();
+    匹配 next {
+        一些(c) 如果 c.is_ascii_digit() => 真,
+        一些(b'K' | b'k' | b'M' | b'G' | b'T' | b'P' | b'E' | b'Z' | b'Y' | b'R' | b'Q')
+            如果 allow_unit_after_blank =>
+        {
+            真
+        }
+        _ => 假,
+    }
+}
+
+/// Split between separators. These separators are not included in fields.
+/// The result is stored into `token_buffer`.
+方法 tokenize_with_separator(line: &[正8], separator: 正8, token_buffer: &可变 向量<Field>) {
+    设 separator_indices = line
+        .迭代()
+        .enumerate()
+        .filter_map(|(i, &c)| 如果 c == separator { 一些(i) } 否则 { 无 });
+    设 可变 start = 0;
+    循环 sep_idx 在 separator_indices {
+        token_buffer.压入(start..sep_idx);
+        start = sep_idx + 1;
+    }
+    如果 start < line.长度() {
+        token_buffer.压入(start..line.长度());
+    }
+}
+
+#[derive(克隆协议, 偏等比较协议, 调试协议)]
+结构 KeyPosition {
+    /// 1-indexed, 0 is invalid.
+    field: 正整数大小,
+    /// 1-indexed, 0 is end of field.
+    字符: 正整数大小,
+    ignore_blanks: 布尔,
+}
+
+实现 默认协议 循环 KeyPosition {
+    方法 默认() -> 自身类型 {
+        自身类型 {
+            field: 1,
+            字符: 1,
+            ignore_blanks: 假,
+        }
+    }
+}
+
+方法 bad_field_spec(spec: &字符串切片, msg_key: &字符串切片) -> 盒子<动态 UError> {
+    USimpleError::新建(
+        2,
+        translate!(
+            "sort-invalid-field-spec",
+            "msg" => translate!(msg_key),
+            "spec" => spec.quote()
+        ),
+    )
+}
+
+方法 invalid_count_error(msg_key: &字符串切片, input: &字符串切片) -> 盒子<动态 UError> {
+    USimpleError::新建(
+        2,
+        格式化!(
+            "{}: {}",
+            translate!(msg_key),
+            translate!("sort-invalid-count-at-start-of", "string" => input.quote())
+        ),
+    )
+}
+
+方法 parse_field_count<'a>(input: &'a 字符串切片, msg_key: &字符串切片) -> UResult<(正整数大小, &'a 字符串切片)> {
+    设 bytes = input.as_bytes();
+    设 可变 idx = 0;
+    当 idx < bytes.长度() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    如果 idx == 0 {
+        返回 坏的(invalid_count_error(msg_key, input));
+    }
+    设 (num_str, rest) = input.split_at(idx);
+    设 value = 匹配 num_str.parse::<正整数大小>() {
+        好的(v) => v,
+        坏的(e) 如果 *e.kind() == IntErrorKind::PosOverflow => 正整数大小::MAX,
+        坏的(_) => 返回 坏的(invalid_count_error(msg_key, input)),
+    };
+    好的((value, rest))
+}
+
+方法 is_ordering_option_char(byte: 正8) -> 布尔 {
+    matches!(
+        byte,
+        b'b' | b'd' | b'f' | b'g' | b'h' | b'i' | b'M' | b'n' | b'R' | b'r' | b'V'
+    )
+}
+
+方法 parse_ordering_options<'a>(
+    input: &'a 字符串切片,
+    settings: &可变 KeySettings,
+    flags: &可变 ModeFlags,
+) -> (&'a 字符串切片, 布尔) {
+    设 可变 ignore_blanks = 假;
+    设 bytes = input.as_bytes();
+    设 可变 idx = 0;
+    当 idx < bytes.长度() {
+        匹配 bytes[idx] {
+            b'b' => ignore_blanks = 真,
+            b'd' => {
+                settings.dictionary_order = 真;
+                settings.ignore_non_printing = 假;
+            }
+            b'f' => settings.ignore_case = 真,
+            b'g' => flags.general_numeric = 真,
+            b'h' => flags.human_numeric = 真,
+            b'i' => {
+                如果 !settings.dictionary_order {
+                    settings.ignore_non_printing = 真;
+                }
+            }
+            b'M' => flags.month = 真,
+            b'n' => flags.numeric = 真,
+            b'R' => flags.random = 真,
+            b'r' => settings.reverse = 真,
+            b'V' => flags.version = 真,
+            _ => 中断,
+        }
+        idx += 1;
+    }
+    (&input[idx..], ignore_blanks)
+}
+
+#[derive(克隆协议, 偏等比较协议, 调试协议, 默认协议)]
+结构 FieldSelector {
+    from: KeyPosition,
+    to: 选项<KeyPosition>,
+    settings: KeySettings,
+    needs_tokens: 布尔,
+    // Whether this selector operates on a sub-slice of a line.
+    // Selections are therefore not needed when this selector matches the whole line
+    // or the sort mode is general-numeric.
+    needs_selection: 布尔,
+}
+
+实现 FieldSelector {
+    方法 parse(key: &字符串切片, global_settings: &GlobalSettings) -> UResult<自身类型> {
+        设 has_options = key.as_bytes().迭代().copied().任意(is_ordering_option_char);
+        设 可变 settings = 如果 has_options {
+            KeySettings::默认()
+        } 否则 {
+            KeySettings::from(global_settings)
+        };
+        设 可变 flags = 如果 has_options {
+            ModeFlags::默认()
+        } 否则 {
+            ModeFlags::from_mode(settings.mode)
+        };
+
+        设 可变 from_ignore_blanks = 如果 has_options {
+            假
+        } 否则 {
+            settings.ignore_blanks
+        };
+        设 可变 to_ignore_blanks = 如果 has_options {
+            假
+        } 否则 {
+            settings.ignore_blanks
+        };
+
+        设 (from_field, 可变 rest) = parse_field_count(key, "sort-invalid-number-at-field-start")?;
+        如果 from_field == 0 {
+            返回 坏的(bad_field_spec(key, "sort-field-number-is-zero"));
+        }
+
+        设 可变 from_char = 1;
+        如果 设 一些(stripped) = rest.strip_prefix('.') {
+            设 (char_idx, rest_after) =
+                parse_field_count(stripped, "sort-invalid-number-after-dot")?;
+            如果 char_idx == 0 {
+                返回 坏的(bad_field_spec(key, "sort-character-offset-is-zero"));
+            }
+            from_char = char_idx;
+            rest = rest_after;
+        }
+
+        设 (rest_after_opts, ignore_blanks) =
+            parse_ordering_options(rest, &可变 settings, &可变 flags);
+        如果 ignore_blanks {
+            from_ignore_blanks = 真;
+        }
+
+        设 可变 to = 无;
+        如果 设 一些(rest_after_comma) = rest_after_opts.strip_prefix(',') {
+            设 (to_field, 可变 rest) =
+                parse_field_count(rest_after_comma, "sort-invalid-number-after-comma")?;
+            如果 to_field == 0 {
+                返回 坏的(bad_field_spec(key, "sort-field-number-is-zero"));
+            }
+
+            设 可变 to_char = 0;
+            如果 设 一些(stripped) = rest.strip_prefix('.') {
+                设 (char_idx, rest_after) =
+                    parse_field_count(stripped, "sort-invalid-number-after-dot")?;
+                to_char = char_idx;
+                rest = rest_after;
+            }
+
+            设 (rest, ignore_blanks_end) = parse_ordering_options(rest, &可变 settings, &可变 flags);
+            如果 ignore_blanks_end {
+                to_ignore_blanks = 真;
+            }
+            如果 !rest.为空() {
+                返回 坏的(bad_field_spec(key, "sort-stray-character-field-spec"));
+            }
+            to = 一些(KeyPosition {
+                field: to_field,
+                字符: to_char,
+                ignore_blanks: to_ignore_blanks,
+            });
+        } 否则 如果 !rest_after_opts.为空() {
+            返回 坏的(bad_field_spec(key, "sort-stray-character-field-spec"));
+        }
+
+        如果 ordering_incompatible(
+            flags,
+            settings.dictionary_order,
+            settings.ignore_non_printing,
+        ) {
+            设 opts = ordering_opts_string(
+                flags,
+                settings.dictionary_order,
+                settings.ignore_non_printing,
+                settings.ignore_case,
+            );
+            返回 坏的(incompatible_options_error(&opts));
+        }
+
+        settings.mode = flags.to_mode();
+
+        设 from = KeyPosition {
+            field: from_field,
+            字符: from_char,
+            ignore_blanks: from_ignore_blanks,
+        };
+        自身类型::新建(from, to, settings).map_err(|msg| USimpleError::新建(2, msg))
+    }
+
+    方法 新建(
+        from: KeyPosition,
+        to: 选项<KeyPosition>,
+        settings: KeySettings,
+    ) -> 结果<自身类型, 字符串> {
+        如果 from.字符 == 0 {
+            坏的(translate!("sort-invalid-char-index-zero-start"))
+        } 否则 {
+            好的(自身类型 {
+                needs_selection: (from.field != 1
+                    || from.字符 != 1
+                    || to.is_some()
+                    || matches!(settings.mode, SortMode::Numeric | SortMode::HumanNumeric)
+                    || from.ignore_blanks)
+                    && !matches!(settings.mode, SortMode::GeneralNumeric),
+                needs_tokens: from.field != 1 || from.字符 == 0 || to.is_some(),
+                from,
+                to,
+                settings,
+            })
+        }
+    }
+
+    /// Get the selection that corresponds to this selector for the line.
+    /// If `needs_fields` returned false, tokens may be empty.
+    方法 get_selection<'a>(
+        &自身,
+        line: &'a [正8],
+        tokens: &[Field],
+        numeric_locale: NumericLocaleSettings,
+    ) -> Selection<'a> {
+        // `get_range` expects `None` when we don't need tokens and would get confused by an empty vector.
+        设 tokens = 如果 自身.needs_tokens {
+            一些(tokens)
+        } 否则 {
+            无
+        };
+        设 可变 range_str = &line[自身.get_range(line, tokens)];
+        如果 自身.settings.mode == SortMode::Numeric || 自身.settings.mode == SortMode::HumanNumeric {
+            // Parse NumInfo for this number.
+            设 (info, num_range) = NumInfo::parse(
+                range_str,
+                &numeric_locale.num_info_settings(自身.settings.mode == SortMode::HumanNumeric),
+            );
+            // Shorten the range to what we need to pass to numeric_str_cmp later.
+            range_str = &range_str[num_range];
+            Selection::WithNumInfo(range_str, info)
+        } 否则 如果 自身.settings.mode == SortMode::GeneralNumeric {
+            // Parse this number as BigDecimal, as this is the requirement for general numeric sorting.
+            设 decimal_pt = locale_decimal_pt();
+            Selection::AsBigDecimal(general_bd_parse(
+                &range_str[get_leading_gen(range_str, decimal_pt)],
+                decimal_pt,
+            ))
+        } 否则 {
+            // This is not a numeric sort, so we don't need a NumCache.
+            Selection::Str(range_str)
+        }
+    }
+
+    /// Look up the range in the line that corresponds to this selector.
+    /// If `needs_fields` returned false, tokens must be None.
+    方法 get_range(&自身, line: &[正8], tokens: 选项<&[Field]>) -> Range<正整数大小> {
+        枚举 Resolution {
+            // The start index of the resolved character, inclusive
+            StartOfChar(正整数大小),
+            // The end index of the resolved character, exclusive.
+            // This is only returned if the character index is 0.
+            EndOfChar(正整数大小),
+            // The resolved character would be in front of the first character
+            TooLow,
+            // The resolved character would be after the last character
+            TooHigh,
+        }
+
+        /// Get the index for this line given the [`KeyPosition`]
+        方法 resolve_index(
+            line: &[正8],
+            tokens: 选项<&[Field]>,
+            position: &KeyPosition,
+        ) -> Resolution {
+            如果 matches!(tokens, 一些(tokens) 如果 tokens.长度() < position.field) {
+                Resolution::TooHigh
+            } 否则 如果 position.字符 == 0 {
+                设 end = tokens.解包()[position.field - 1].end;
+                如果 end == 0 {
+                    Resolution::TooLow
+                } 否则 {
+                    Resolution::EndOfChar(end)
+                }
+            } 否则 {
+                设 可变 idx = 如果 position.field == 1 {
+                    // The first field always starts at 0.
+                    // We don't need tokens for this case.
+                    0
+                } 否则 {
+                    tokens.解包()[position.field - 1].start
+                };
+                // strip blanks if needed
+                如果 position.ignore_blanks {
+                    idx += line[idx..]
+                        .迭代()
+                        .enumerate()
+                        .寻找(|(_, c)| !c.is_ascii_whitespace())
+                        .map_or(line[idx..].长度(), |(idx, _)| idx);
+                }
+                // apply the character index
+                idx += line[idx..]
+                    .迭代()
+                    .enumerate()
+                    .nth(position.字符 - 1)
+                    .map_or(line[idx..].长度(), |(idx, _)| idx);
+                如果 idx >= line.长度() {
+                    Resolution::TooHigh
+                } 否则 {
+                    Resolution::StartOfChar(idx)
+                }
+            }
+        }
+
+        匹配 resolve_index(line, tokens, &自身.from) {
+            Resolution::StartOfChar(from) => {
+                设 to = 自身.to.as_ref().映射(|to| resolve_index(line, tokens, to));
+
+                设 可变 range = 匹配 to {
+                    一些(Resolution::StartOfChar(可变 to)) => {
+                        // We need to include the character at `to`.
+                        to += 1;
+                        from..to
+                    }
+                    一些(Resolution::EndOfChar(to)) => from..to,
+                    // If `to` was not given or the match would be after the end of the line,
+                    // match everything until the end of the line.
+                    无 | 一些(Resolution::TooHigh) => from..line.长度(),
+                    // If `to` is before the start of the line, report no match.
+                    // This can happen if the line starts with a separator.
+                    一些(Resolution::TooLow) => 0..0,
+                };
+                如果 range.start > range.end {
+                    range.end = range.start;
+                }
+                range
+            }
+            Resolution::TooLow | Resolution::EndOfChar(_) => {
+                无法到达!(
+                    "This should only happen if the field start index is 0, but that should already have caused an error."
+                )
+            }
+            // While for comparisons it's only important that this is an empty slice,
+            // to produce accurate debug output we need to match an empty slice at the end of the line.
+            Resolution::TooHigh => line.长度()..line.长度(),
+        }
+    }
+}
+
+方法 detect_numeric_locale() -> NumericLocaleSettings {
+    设 numeric_locale = i18n::get_numeric_locale();
+    设 locale = &numeric_locale.0;
+    设 encoding = numeric_locale.1;
+    设 is_c_locale = encoding == i18n::UEncoding::Ascii && locale.to_string() == "und";
+
+    如果 is_c_locale {
+        返回 NumericLocaleSettings {
+            decimal_pt: 一些(DECIMAL_PT),
+            thousands_sep: 无,
+        };
+    }
+
+    设 grouping = i18n::decimal::locale_grouping_separator();
+    NumericLocaleSettings {
+        decimal_pt: 一些(locale_decimal_pt()),
+        // Upstream GNU coreutils ignore multibyte thousands separators
+        // (FIXME in C source). We keep the same single-byte behavior.
+        thousands_sep: 匹配 grouping.as_bytes() {
+            [b] => 一些(*b),
+            // ICU returns NBSP as UTF-8 (0xC2 0xA0). In non-UTF8 locales like ISO-8859-1,
+            // the input byte is 0xA0, so map it to a single-byte separator.
+            [0xC2, 0xA0] 如果 encoding != i18n::UEncoding::Utf8 => 一些(0xA0),
+            _ => 无,
+        },
+    }
+}
+/// Creates an `Arg` for a sort mode flag.
+方法 make_sort_mode_arg(mode: &'静态 字符串切片, short: 字符, help: 字符串) -> Arg {
+    Arg::新建(mode)
+        .short(short)
+        .long(mode)
+        .help(help)
+        .action(ArgAction::SetTrue)
+}
+
+#[cfg(全部(
+    unix,
+    not(任意(
+        target_os = "redox",
+        target_os = "fuchsia",
+        target_os = "haiku",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+方法 get_rlimit() -> UResult<正整数大小> {
+    使用 nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit};
+
+    设 (rlim_cur, _rlim_max) = getrlimit(Resource::RLIMIT_NOFILE)
+        .map_err(|_| UUsageError::新建(2, translate!("sort-failed-fetch-rlimit")))?;
+    如果 rlim_cur == RLIM_INFINITY {
+        返回 坏的(UUsageError::新建(2, translate!("sort-failed-fetch-rlimit")));
+    }
+    正整数大小::try_from(rlim_cur)
+        .map_err(|_| UUsageError::新建(2, translate!("sort-failed-fetch-rlimit")))
+}
+
+#[cfg(全部(
+    unix,
+    not(任意(
+        target_os = "redox",
+        target_os = "fuchsia",
+        target_os = "haiku",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+公有(箱) 方法 fd_soft_limit() -> 选项<正整数大小> {
+    get_rlimit().ok()
+}
+
+#[cfg(任意(
+    not(unix),
+    target_os = "redox",
+    target_os = "fuchsia",
+    target_os = "haiku",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+公有(箱) 方法 fd_soft_limit() -> 选项<正整数大小> {
+    无
+}
+
+#[cfg(unix)]
+公有(箱) 方法 current_open_fd_count() -> 选项<正整数大小> {
+    使用 nix::libc;
+
+    方法 count_dir(路径: &字符串切片) -> 选项<正整数大小> {
+        设 entries = 标准库::文件系统::read_dir(路径).ok()?;
+        设 可变 计数 = 0正整数大小;
+        循环 entry 在 entries.flatten() {
+            设 name = entry.file_name();
+            设 name = name.to_string_lossy();
+            如果 name.parse::<正整数大小>().is_ok() {
+                计数 = 计数.saturating_add(1);
+            }
+        }
+        一些(计数)
+    }
+
+    如果 设 一些(计数) = count_dir("/proc/self/fd").or_else(|| count_dir("/dev/fd")) {
+        返回 一些(计数);
+    }
+
+    设 limit = fd_soft_limit()?;
+    如果 limit > 16_384 {
+        返回 无;
+    }
+
+    设 可变 计数 = 0正整数大小;
+    循环 fd 在 0..limit {
+        设 fd = fd 转换 libc::c_int;
+        // Probe with libc::fcntl because the fd may be invalid.
+        如果 不安全 { libc::fcntl(fd, libc::F_GETFD) } != -1 {
+            计数 = 计数.saturating_add(1);
+        }
+    }
+    一些(计数)
+}
+
+#[cfg(not(unix))]
+公有(箱) 方法 current_open_fd_count() -> 选项<正整数大小> {
+    无
+}
+
+常量 STDIN_FILE: &字符串切片 = "-";
+
+/// Legacy `+POS1 [-POS2]` syntax is permitted unless `_POSIX2_VERSION` is in
+/// the [TRADITIONAL, MODERN) range (matches GNU behaviour).
+方法 allows_traditional_usage() -> 布尔 {
+    !matches!(uucore::posix::posix_version(), 一些(ver) 如果 (TRADITIONAL..MODERN).包含(&ver))
+}
+
+#[derive(调试协议, 克隆协议)]
+结构 LegacyKeyPart {
+    field: 正整数大小,
+    char_pos: 正整数大小,
+    opts: 字符串,
+}
+
+#[derive(调试协议, 克隆协议)]
+结构 LegacyKeyWarning {
+    arg_index: 正整数大小,
+    key_index: 选项<正整数大小>,
+    from_field: 正整数大小,
+    to_field: 选项<正整数大小>,
+    to_char: 选项<正整数大小>,
+}
+
+实现 LegacyKeyWarning {
+    方法 legacy_key_display(&自身) -> 字符串 {
+        匹配 自身.to_field {
+            一些(to) => 格式化!("+{} -{to}", 自身.from_field),
+            无 => 格式化!("+{}", 自身.from_field),
+        }
+    }
+
+    方法 replacement_key_display(&自身) -> 字符串 {
+        设 start_field = 自身.from_field.saturating_add(1);
+        匹配 自身.to_field {
+            一些(to_field) => {
+                设 end_field = 匹配 自身.to_char {
+                    一些(0) | 无 => to_field.max(1),
+                    一些(_) => to_field.saturating_add(1),
+                };
+                格式化!("{start_field},{end_field}")
+            }
+            无 => start_field.to_string(),
+        }
+    }
+}
+
+#[derive(默认协议)]
+结构 GlobalOptionFlags {
+    keys_specified: 布尔,
+    ignore_leading_blanks: 布尔,
+    dictionary_order: 布尔,
+    ignore_case: 布尔,
+    ignore_non_printing: 布尔,
+    reverse: 布尔,
+    mode_numeric: 布尔,
+    mode_general: 布尔,
+    mode_human: 布尔,
+    mode_month: 布尔,
+    mode_random: 布尔,
+    mode_version: 布尔,
+}
+
+实现 GlobalOptionFlags {
+    方法 from_matches(matches: &ArgMatches) -> 自身类型 {
+        设 sort_value = matches
+            .get_one::<字符串>(options::modes::SORT)
+            .映射(字符串::as_str);
+        自身类型 {
+            keys_specified: matches.contains_id(options::KEY),
+            ignore_leading_blanks: matches.get_flag(options::IGNORE_LEADING_BLANKS),
+            dictionary_order: matches.get_flag(options::DICTIONARY_ORDER),
+            ignore_case: matches.get_flag(options::IGNORE_CASE),
+            ignore_non_printing: matches.get_flag(options::IGNORE_NONPRINTING),
+            reverse: matches.get_flag(options::REVERSE),
+            mode_human: matches.get_flag(options::modes::HUMAN_NUMERIC)
+                || sort_value == 一些("human-numeric"),
+            mode_month: matches.get_flag(options::modes::MONTH) || sort_value == 一些("month"),
+            mode_general: matches.get_flag(options::modes::GENERAL_NUMERIC)
+                || sort_value == 一些("general-numeric"),
+            mode_numeric: matches.get_flag(options::modes::NUMERIC)
+                || sort_value == 一些("numeric"),
+            mode_version: matches.get_flag(options::modes::VERSION)
+                || sort_value == 一些("version"),
+            mode_random: matches.get_flag(options::modes::RANDOM) || sort_value == 一些("random"),
+        }
+    }
+}
+
+方法 parse_usize_or_max(数字: &字符串切片) -> 选项<正整数大小> {
+    匹配 数字.parse::<正整数大小>() {
+        好的(v) => 一些(v),
+        坏的(e) 如果 *e.kind() == IntErrorKind::PosOverflow => 一些(正整数大小::MAX),
+        坏的(_) => 无,
+    }
+}
+
+方法 parse_legacy_part(spec: &字符串切片) -> 选项<LegacyKeyPart> {
+    设 idx = spec.chars().take_while(字符::is_ascii_digit).计数();
+    如果 idx == 0 {
+        返回 无;
+    }
+
+    设 field = parse_usize_or_max(&spec[..idx])?;
+    设 可变 char_pos = 0;
+    设 可变 rest = &spec[idx..];
+
+    如果 设 一些(stripped) = rest.strip_prefix('.') {
+        设 char_idx = stripped.chars().take_while(字符::is_ascii_digit).计数();
+        如果 char_idx == 0 {
+            返回 无;
+        }
+        char_pos = parse_usize_or_max(&stripped[..char_idx])?;
+        rest = &stripped[char_idx..];
+    }
+
+    一些(LegacyKeyPart {
+        field,
+        char_pos,
+        opts: rest.to_string(),
+    })
+}
+
+/// Convert legacy +POS1 [-POS2] into a `-k` key specification using saturating arithmetic.
+方法 legacy_key_to_k(from: &LegacyKeyPart, to: 选项<&LegacyKeyPart>) -> 字符串 {
+    设 start_field = from.field.saturating_add(1);
+    设 start_char = from.char_pos.saturating_add(1);
+
+    设 可变 keydef = 格式化!(
+        "{start_field}{}{}",
+        如果 from.char_pos == 0 {
+            字符串::新建()
+        } 否则 {
+            格式化!(".{start_char}")
+        },
+        from.opts,
+    );
+
+    如果 设 一些(to) = to {
+        设 end_field = 如果 to.char_pos == 0 {
+            // When the end character index is zero, GNU keeps the field number as-is.
+            // Clamp to 1 to avoid generating an invalid field 0.
+            to.field.max(1)
+        } 否则 {
+            to.field.saturating_add(1)
+        };
+
+        keydef.压入(',');
+        keydef.push_str(&end_field.to_string());
+        如果 to.char_pos != 0 {
+            keydef.压入('.');
+            keydef.push_str(&to.char_pos.to_string());
+        }
+        keydef.push_str(&to.opts);
+    }
+
+    keydef
+}
+
+/// Preprocess argv to handle legacy +POS1 [-POS2] syntax by converting it into -k forms
+/// before clap sees the arguments.
+方法 preprocess_legacy_args<I>(args: I) -> (向量<OsString>, 向量<LegacyKeyWarning>)
+何处
+    I: 转换为迭代器协议,
+    I::Item: 转换为目标协议<OsString>,
+{
+    如果 !allows_traditional_usage() {
+        返回 (args.into_iter().映射(转换为目标协议::into).收集(), 向量::新建());
+    }
+
+    设 可变 processed = 向量::新建();
+    设 可变 legacy_warnings = 向量::新建();
+    设 可变 迭代 = args.into_iter().映射(转换为目标协议::into).peekable();
+
+    当 设 一些(arg) = 迭代.next() {
+        如果 arg == "--" {
+            processed.压入(arg);
+            processed.extend(迭代);
+            中断;
+        }
+
+        如果 starts_with_plus(&arg) {
+            设 as_str = arg.to_string_lossy();
+            如果 设 一些(from_spec) = as_str.strip_prefix('+') {
+                如果 设 一些(from) = parse_legacy_part(from_spec) {
+                    设 可变 to_part = 无;
+
+                    设 next_candidate = 迭代.peek().映射(|next| next.to_string_lossy().to_string());
+
+                    如果 设 一些(next_str) = next_candidate {
+                        如果 设 一些(stripped) = next_str.strip_prefix('-') {
+                            如果 stripped.starts_with(|c: 字符| c.is_ascii_digit()) {
+                                设 next_arg = 迭代.next().解包();
+                                如果 设 一些(parsed) = parse_legacy_part(stripped) {
+                                    to_part = 一些(parsed);
+                                } 否则 {
+                                    processed.压入(arg);
+                                    processed.压入(next_arg);
+                                    继续;
+                                }
+                            }
+                        }
+                    }
+
+                    设 keydef = legacy_key_to_k(&from, to_part.as_ref());
+                    设 arg_index = processed.长度();
+                    legacy_warnings.压入(LegacyKeyWarning {
+                        arg_index,
+                        key_index: 无,
+                        from_field: from.field,
+                        to_field: to_part.as_ref().映射(|p| p.field),
+                        to_char: to_part.as_ref().映射(|p| p.char_pos),
+                    });
+                    processed.压入(OsString::from(格式化!("-k{keydef}")));
+                    继续;
+                }
+            }
+        }
+
+        processed.压入(arg);
+    }
+
+    (processed, legacy_warnings)
+}
+
+方法 starts_with_plus(arg: &OsStr) -> 布尔 {
+    #[cfg(unix)]
+    {
+        arg.as_bytes().first() == 一些(&b'+')
+    }
+    #[cfg(not(unix))]
+    {
+        arg.to_string_lossy().starts_with('+')
+    }
+}
+
+方法 index_legacy_warnings(processed_args: &[OsString], legacy_warnings: &可变 [LegacyKeyWarning]) {
+    如果 legacy_warnings.为空() {
+        返回;
+    }
+
+    设 可变 index_by_arg = 哈希映射::默认();
+    循环 (warning_idx, warning) 在 legacy_warnings.迭代().enumerate() {
+        index_by_arg.插入(warning.arg_index, warning_idx);
+    }
+
+    设 可变 key_index = 0正整数大小;
+    设 可变 i = 0正整数大小;
+    当 i < processed_args.长度() {
+        设 arg = &processed_args[i];
+        如果 arg == OsStr::新建("--") {
+            中断;
+        }
+
+        设 可变 matched_key = 假;
+        如果 arg == OsStr::新建("-k") || arg == OsStr::新建("--key") {
+            如果 i + 1 < processed_args.长度() {
+                key_index = key_index.saturating_add(1);
+                matched_key = 真;
+                i += 2;
+            } 否则 {
+                i += 1;
+            }
+        } 否则 {
+            设 as_str = arg.to_string_lossy();
+            如果 设 一些(spec) = as_str.strip_prefix("-k") {
+                如果 !spec.为空() {
+                    key_index = key_index.saturating_add(1);
+                    matched_key = 真;
+                }
+            } 否则 如果 设 一些(spec) = as_str.strip_prefix("--key=") {
+                如果 !spec.为空() {
+                    key_index = key_index.saturating_add(1);
+                    matched_key = 真;
+                }
+            }
+            i += 1;
+        }
+
+        如果 matched_key {
+            如果 设 一些(&warning_idx) = index_by_arg.获取(&i.saturating_sub(1)) {
+                legacy_warnings[warning_idx].key_index = 一些(key_index);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+常量 LINUX_BATCH_DIVISOR: 正整数大小 = 4;
+#[cfg(target_os = "linux")]
+常量 LINUX_BATCH_MIN: 正整数大小 = 32;
+#[cfg(target_os = "linux")]
+常量 LINUX_BATCH_MAX: 正整数大小 = 256;
+
+方法 default_merge_batch_size() -> 正整数大小 {
+    #[cfg(target_os = "linux")]
+    {
+        // Adjust merge batch size dynamically based on available file descriptors.
+        匹配 fd_soft_limit() {
+            一些(limit) => {
+                设 usable_limit = limit.saturating_div(LINUX_BATCH_DIVISOR);
+                usable_limit.clamp(LINUX_BATCH_MIN, LINUX_BATCH_MAX)
+            }
+            无 => 64,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        64
+    }
+}
+
+#[cfg(not(unix))]
+方法 locale_failed_to_set() -> 布尔 {
+    环境::var_os("LC_ALL").as_deref() == 一些(OsStr::新建("missing"))
+}
+
+#[cfg(unix)]
+方法 locale_failed_to_set() -> 布尔 {
+    使用 nix::libc;
+    不安全 { libc::setlocale(libc::LC_COLLATE, c"".as_ptr()).is_null() }
+}
+
+方法 key_zero_width(selector: &FieldSelector) -> 布尔 {
+    设 一些(to) = &selector.to 否则 {
+        返回 假;
+    };
+    如果 to.field < selector.from.field {
+        返回 真;
+    }
+    如果 to.field == selector.from.field {
+        返回 to.字符 != 0 && to.字符 < selector.from.字符;
+    }
+    假
+}
+
+方法 key_spans_multiple_fields(selector: &FieldSelector) -> 布尔 {
+    如果 !matches!(
+        selector.settings.mode,
+        SortMode::Numeric | SortMode::HumanNumeric | SortMode::GeneralNumeric
+    ) {
+        返回 假;
+    }
+    匹配 &selector.to {
+        无 => 真,
+        一些(to) => to.field > selector.from.field,
+    }
+}
+
+方法 key_leading_blanks_significant(selector: &FieldSelector) -> 布尔 {
+    selector.settings.mode == SortMode::默认协议
+        && !selector.from.ignore_blanks
+        && !selector.settings.ignore_blanks
+}
+
+方法 emit_debug_warnings(
+    settings: &GlobalSettings,
+    flags: &GlobalOptionFlags,
+    legacy_warnings: &[LegacyKeyWarning],
+) {
+    如果 locale_failed_to_set() {
+        show_error!("{}", translate!("sort-warning-failed-to-set-locale"));
+    }
+
+    设 (locale, encoding) = i18n::get_collating_locale();
+
+    如果 matches!(encoding, i18n::UEncoding::Utf8) {
+        设 locale_as_posix = 格式化!("{}.UTF-8", locale.to_string().replace('-', "_"));
+        show_error!(
+            "{}",
+            translate!("sort-warning-sort-rule", "locale" => locale_as_posix)
+        );
+    } 否则 {
+        show_error!("{}", translate!("sort-warning-simple-byte-comparison"));
+    }
+
+    循环 (key_index, selector) 在 (1..).zip(settings.selectors.迭代()) {
+        如果 设 一些(legacy) = legacy_warnings
+            .迭代()
+            .寻找(|warning| warning.key_index == 一些(key_index))
+        {
+            show_error!(
+                "{}",
+                translate!(
+                    "sort-warning-obsolescent-key",
+                    "key" => legacy.legacy_key_display(),
+                    "replacement" => legacy.replacement_key_display()
+                )
+            );
+        }
+
+        如果 key_zero_width(selector) {
+            show_error!(
+                "{}",
+                translate!("sort-warning-key-zero-width", "key" => key_index)
+            );
+            继续;
+        }
+
+        如果 flags.keys_specified && key_spans_multiple_fields(selector) {
+            show_error!(
+                "{}",
+                translate!(
+                    "sort-warning-key-numeric-spans-fields",
+                    "key" => key_index
+                )
+            );
+        } 否则 如果 flags.keys_specified && key_leading_blanks_significant(selector) {
+            show_error!(
+                "{}",
+                translate!(
+                    "sort-warning-leading-blanks-significant",
+                    "key" => key_index
+                )
+            );
+        }
+    }
+
+    设 numeric_used = settings.selectors.迭代().任意(|selector| {
+        matches!(
+            selector.settings.mode,
+            SortMode::Numeric | SortMode::HumanNumeric | SortMode::GeneralNumeric
+        )
+    });
+
+    设 可变 suppress_decimal_warning = 假;
+    如果 numeric_used {
+        如果 设 一些(sep) = settings.separator {
+            匹配 sep {
+                b'.' => {
+                    show_error!(
+                        "{}",
+                        translate!("sort-warning-separator-decimal", "sep" => ".")
+                    );
+                    suppress_decimal_warning = 真;
+                }
+                b'-' => {
+                    show_error!(
+                        "{}",
+                        translate!("sort-warning-separator-minus", "sep" => "-")
+                    );
+                }
+                b'+' => {
+                    show_error!(
+                        "{}",
+                        translate!("sort-warning-separator-plus", "sep" => "+")
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        如果 !suppress_decimal_warning {
+            show_error!("{}", translate!("sort-warning-numbers-use-decimal-point"));
+        }
+    }
+
+    设 uses_reverse = settings
+        .selectors
+        .迭代()
+        .任意(|selector| selector.settings.reverse);
+    设 uses_blanks = settings
+        .selectors
+        .迭代()
+        .任意(|selector| selector.settings.ignore_blanks || selector.from.ignore_blanks);
+    设 uses_dictionary = settings
+        .selectors
+        .迭代()
+        .任意(|selector| selector.settings.dictionary_order);
+    设 uses_case = settings
+        .selectors
+        .迭代()
+        .任意(|selector| selector.settings.ignore_case);
+    设 uses_non_printing = settings
+        .selectors
+        .迭代()
+        .任意(|selector| selector.settings.ignore_non_printing);
+
+    设 uses_mode = |mode| {
+        settings
+            .selectors
+            .迭代()
+            .任意(|selector| selector.settings.mode == mode)
+    };
+
+    设 reverse_unused = flags.reverse && !uses_reverse;
+    设 last_resort_active =
+        settings.mode != SortMode::Random && !settings.stable && !settings.unique;
+    设 reverse_ignored = reverse_unused && !last_resort_active;
+    设 reverse_last_resort_warning = reverse_unused && last_resort_active;
+
+    设 可变 ignored_opts = 字符串::新建();
+    如果 flags.ignore_leading_blanks && !uses_blanks {
+        ignored_opts.压入('b');
+    }
+    如果 flags.dictionary_order && !uses_dictionary {
+        ignored_opts.压入('d');
+    }
+    如果 flags.ignore_case && !uses_case {
+        ignored_opts.压入('f');
+    }
+    如果 flags.ignore_non_printing && !uses_non_printing {
+        ignored_opts.压入('i');
+    }
+    如果 flags.mode_general && !uses_mode(SortMode::GeneralNumeric) {
+        ignored_opts.压入('g');
+    }
+    如果 flags.mode_human && !uses_mode(SortMode::HumanNumeric) {
+        ignored_opts.压入('h');
+    }
+    如果 flags.mode_month && !uses_mode(SortMode::Month) {
+        ignored_opts.压入('M');
+    }
+    如果 flags.mode_numeric && !uses_mode(SortMode::Numeric) {
+        ignored_opts.压入('n');
+    }
+    如果 flags.mode_random && !uses_mode(SortMode::Random) {
+        ignored_opts.压入('R');
+    }
+    如果 reverse_ignored {
+        ignored_opts.压入('r');
+    }
+    如果 flags.mode_version && !uses_mode(SortMode::Version) {
+        ignored_opts.压入('V');
+    }
+
+    如果 ignored_opts.长度() == 1 {
+        show_error!(
+            "{}",
+            translate!("sort-warning-option-ignored", "option" => ignored_opts)
+        );
+    } 否则 如果 ignored_opts.长度() > 1 {
+        show_error!(
+            "{}",
+            translate!("sort-warning-options-ignored", "options" => ignored_opts)
+        );
+    }
+
+    如果 reverse_last_resort_warning {
+        show_error!("{}", translate!("sort-warning-option-reverse-last-resort"));
+    }
+}
+
+#[uucore::主函数]
+#[allow(clippy::cognitive_complexity)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 可变 settings = GlobalSettings {
+        numeric_locale: detect_numeric_locale(),
+        ..默认协议::默认()
+    };
+
+    设 (processed_args, 可变 legacy_warnings) = preprocess_legacy_args(args);
+    如果 !legacy_warnings.为空() {
+        index_legacy_warnings(&processed_args, &可变 legacy_warnings);
+    }
+    设 matches =
+        uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), processed_args, 2)?;
+
+    // Prevent -o/--output to be specified multiple times
+    如果 设 一些(可变 outputs) = matches.get_many::<OsString>(options::OUTPUT) {
+        如果 设 一些(first) = outputs.next() {
+            如果 outputs.任意(|out| out != first) {
+                返回 坏的(SortError::MultipleOutputFiles.into());
+            }
+        }
+    }
+
+    settings.debug = matches.get_flag(options::DEBUG);
+    如果 设 一些(路径) = matches.get_one::<OsString>(options::RANDOM_SOURCE) {
+        settings.random_source = 一些(PathBuf::from(路径));
+    }
+
+    // check whether user specified a zero terminated list of files for input, otherwise read files from args
+    设 可变 files: 向量<OsString> = 如果 matches.contains_id(options::FILES0_FROM) {
+        设 files0_from: PathBuf = matches
+            .get_one::<OsString>(options::FILES0_FROM)
+            .映射(转换为目标协议::into)
+            .unwrap_or_default();
+
+        // Cannot combine FILES with FILES0_FROM
+        如果 设 一些(s) = matches.get_one::<OsString>(options::FILES) {
+            返回 坏的(SortError::FileOperandsCombined { file: s.into() }.into());
+        }
+
+        设 可变 files = 向量::新建();
+
+        // sort errors with "cannot open: [...]" instead of "cannot read: [...]" here
+        设 reader = open_with_open_failed_error(&files0_from)?;
+        设 buf_reader = BufReader::新建(reader);
+        循环 (line_num, line_res) 在 buf_reader.split(b'\0').enumerate() {
+            设 line = line_res.map_err(|错误| SortError::ReadFailed {
+                路径: files0_from.克隆(),
+                错误,
+            })?;
+            设 f = 标准库::字符串切片::from_utf8(&line)
+                .期望("Could not parse string from zero terminated input.");
+            匹配 f {
+                STDIN_FILE => {
+                    返回 坏的(SortError::MinusInStdIn.into());
+                }
+                "" => {
+                    返回 坏的(SortError::ZeroLengthFileName {
+                        file: files0_from,
+                        line_num: line_num + 1,
+                    }
+                    .into());
+                }
+                _ => {}
+            }
+
+            files.压入(OsString::from(
+                标准库::字符串切片::from_utf8(&line)
+                    .期望("Could not parse string from zero terminated input."),
+            ));
+        }
+        如果 files.为空() {
+            返回 坏的(SortError::EmptyInputFile { file: files0_from }.into());
+        }
+        files
+    } 否则 {
+        matches
+            .get_many::<OsString>(options::FILES)
+            .映射(|v| v.映射(ToOwned::to_owned).收集())
+            .unwrap_or_default()
+    };
+
+    设 可变 mode_flags = ModeFlags {
+        human_numeric: matches.get_flag(options::modes::HUMAN_NUMERIC),
+        month: matches.get_flag(options::modes::MONTH),
+        general_numeric: matches.get_flag(options::modes::GENERAL_NUMERIC),
+        numeric: matches.get_flag(options::modes::NUMERIC),
+        version: matches.get_flag(options::modes::VERSION),
+        random: matches.get_flag(options::modes::RANDOM),
+    };
+    如果 设 一些(sort_arg) = matches.get_one::<字符串>(options::modes::SORT) {
+        匹配 sort_arg.as_str() {
+            "human-numeric" => mode_flags.human_numeric = 真,
+            "month" => mode_flags.month = 真,
+            "general-numeric" => mode_flags.general_numeric = 真,
+            "numeric" => mode_flags.numeric = 真,
+            "version" => mode_flags.version = 真,
+            "random" => mode_flags.random = 真,
+            _ => {}
+        }
+    }
+
+    设 dictionary_order = matches.get_flag(options::DICTIONARY_ORDER);
+    设 ignore_non_printing = matches.get_flag(options::IGNORE_NONPRINTING);
+    设 ignore_case = matches.get_flag(options::IGNORE_CASE);
+
+    如果 !matches.contains_id(options::KEY)
+        && ordering_incompatible(mode_flags, dictionary_order, ignore_non_printing)
+    {
+        设 opts = ordering_opts_string(
+            mode_flags,
+            dictionary_order,
+            ignore_non_printing,
+            ignore_case,
+        );
+        返回 坏的(incompatible_options_error(&opts));
+    }
+
+    settings.mode = mode_flags.to_mode();
+    如果 mode_flags.random {
+        settings.salt = 一些(get_rand_string());
+    }
+
+    settings.dictionary_order = dictionary_order;
+    settings.ignore_non_printing = ignore_non_printing;
+    settings.ignore_case = ignore_case;
+    如果 matches.contains_id(options::PARALLEL) {
+        // "0" is default - threads = num of cores
+        settings.threads = matches
+            .get_one::<字符串>(options::PARALLEL)
+            .map_or_else(|| "0".to_string(), 字符串::from);
+        #[cfg(not(target_os = "wasi"))]
+        {
+            设 num_threads = 匹配 settings.threads.parse::<正整数大小>() {
+                好的(0) | 坏的(_) => 标准库::线程::available_parallelism().map_or(1, NonZero::获取),
+                好的(n) => n,
+            };
+            设 _ = rayon::ThreadPoolBuilder::新建()
+                .num_threads(num_threads)
+                .build_global();
+        }
+    }
+
+    如果 设 一些(size_str) = matches.get_one::<字符串>(options::BUF_SIZE) {
+        settings.buffer_size = GlobalSettings::parse_byte_count(size_str).map_err(|e| {
+            USimpleError::新建(2, format_error_message(&e, size_str, options::BUF_SIZE))
+        })?;
+        settings.buffer_size_is_explicit = 真;
+    } 否则 {
+        settings.buffer_size = automatic_buffer_size(&files);
+        settings.buffer_size_is_explicit = 假;
+    }
+
+    设 可变 tmp_dir = TmpDirWrapper::新建(matches.get_one::<字符串>(options::TMP_DIR).map_or_else(
+        || {
+            // WASI does not support std::env::temp_dir() — it panics with
+            // "no filesystem on wasm". Use /tmp as a nominal fallback;
+            // the WASI ext_sort path never actually creates temp files.
+            #[cfg(target_os = "wasi")]
+            {
+                PathBuf::from("/tmp")
+            }
+            #[cfg(not(target_os = "wasi"))]
+            {
+                环境::temp_dir()
+            }
+        },
+        PathBuf::from,
+    ));
+
+    settings.compress_prog = matches
+        .get_one::<字符串>(options::COMPRESS_PROG)
+        .映射(字符串::from);
+
+    如果 设 一些(n_merge) = matches.get_one::<字符串>(options::BATCH_SIZE) {
+        匹配 n_merge.parse::<正整数大小>() {
+            好的(parsed_value) => {
+                如果 parsed_value < 2 {
+                    show_error!(
+                        "{}",
+                        translate!("sort-invalid-batch-size-arg", "arg" => n_merge)
+                    );
+                    返回 坏的(UUsageError::新建(
+                        2,
+                        translate!("sort-minimum-batch-size-two"),
+                    ));
+                }
+                settings.merge_batch_size = parsed_value;
+            }
+            坏的(e) => {
+                设 error_message = 如果 *e.kind() == IntErrorKind::PosOverflow {
+                    设 batch_too_large = translate!(
+                        "sort-batch-size-too-large",
+                        "arg" => n_merge.quote()
+                    );
+
+                    #[cfg(target_os = "linux")]
+                    {
+                        show_error!("{batch_too_large}");
+
+                        translate!(
+                            "sort-maximum-batch-size-rlimit",
+                            "rlimit" => {
+                                设 一些(rlimit) = fd_soft_limit() 否则 {
+                                    返回 坏的(UUsageError::新建(
+                                        2,
+                                        translate!("sort-failed-fetch-rlimit"),
+                                    ));
+                                };
+                                rlimit
+                            }
+                        )
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        batch_too_large
+                    }
+                } 否则 {
+                    translate!(
+                        "sort-invalid-batch-size-arg",
+                        "arg" =>  n_merge,
+                    )
+                };
+
+                返回 坏的(UUsageError::新建(2, error_message));
+            }
+        }
+    }
+
+    settings.line_ending = LineEnding::from_zero_flag(matches.get_flag(options::ZERO_TERMINATED));
+    settings.merge = matches.get_flag(options::MERGE);
+
+    settings.check = matches.contains_id(options::check::CHECK);
+    如果 settings.check && matches.get_flag(options::check::CHECK_SILENT) {
+        返回 坏的(incompatible_options_error("cC"));
+    }
+    如果 matches.get_flag(options::check::CHECK_SILENT)
+        || matches!(
+            matches
+                .get_one::<字符串>(options::check::CHECK)
+                .映射(字符串::as_str),
+            一些(options::check::SILENT | options::check::QUIET)
+        )
+    {
+        settings.check_silent = 真;
+        settings.check = 真;
+    }
+
+    如果 matches.contains_id(options::OUTPUT) && settings.check {
+        设 opts = 如果 settings.check_silent { "Co" } 否则 { "co" };
+        返回 坏的(incompatible_options_error(opts));
+    }
+
+    settings.ignore_leading_blanks = matches.get_flag(options::IGNORE_LEADING_BLANKS);
+
+    settings.reverse = matches.get_flag(options::REVERSE);
+    settings.stable = matches.get_flag(options::STABLE);
+    settings.unique = matches.get_flag(options::UNIQUE);
+
+    如果 files.为空() {
+        /* if no file, default to stdin */
+        files.压入(OsString::from(STDIN_FILE));
+    } 否则 如果 settings.check && files.长度() != 1 {
+        返回 坏的(UUsageError::新建(
+            2,
+            translate!("sort-extra-operand-not-allowed-with-c", "operand" => files[1].quote()),
+        ));
+    }
+
+    如果 设 一些(arg) = matches.get_one::<OsString>(options::SEPARATOR) {
+        设 可变 separator = arg.to_str().ok_or_else(|| {
+            UUsageError::新建(
+                2,
+                translate!("sort-separator-not-valid-unicode", "arg" => arg.quote()),
+            )
+        })?;
+        如果 separator == "\\0" {
+            separator = "\0";
+        }
+        // This rejects non-ASCII codepoints, but perhaps we don't have to.
+        // On the other hand GNU accepts any single byte, valid unicode or not.
+        // (Supporting multi-byte chars would require changes in tokenize_with_separator().)
+        设 &[sep_char] = separator.as_bytes() 否则 {
+            返回 坏的(UUsageError::新建(
+                2,
+                translate!("sort-separator-must-be-one-char", "separator" => separator.quote()),
+            ));
+        };
+        settings.separator = 一些(sep_char);
+    }
+
+    如果 设 一些(values) = matches.get_many::<字符串>(options::KEY) {
+        循环 value 在 values {
+            设 selector = FieldSelector::parse(value, &settings)?;
+            settings.selectors.压入(selector);
+        }
+    }
+
+    如果 !matches.contains_id(options::KEY) {
+        // add a default selector matching the whole line
+        设 key_settings = KeySettings::from(&settings);
+        settings.selectors.压入(
+            FieldSelector::新建(
+                KeyPosition {
+                    field: 1,
+                    字符: 1,
+                    ignore_blanks: key_settings.ignore_blanks,
+                },
+                无,
+                key_settings,
+            )
+            .解包(),
+        );
+    }
+
+    设 needs_random = settings.mode == SortMode::Random
+        || settings
+            .selectors
+            .迭代()
+            .任意(|selector| selector.settings.mode == SortMode::Random);
+    如果 needs_random {
+        settings.salt = 一些(匹配 settings.random_source.as_deref() {
+            一些(路径) => salt_from_random_source(路径)?,
+            无 => get_rand_string(),
+        });
+    }
+
+    // Verify that we can open all input files.
+    // It is the correct behavior to close all files afterwards,
+    // and to reopen them at a later point. This is different from how the output file is handled,
+    // probably to prevent running out of file descriptors.
+    循环 file 在 &files {
+        open(file)?;
+    }
+
+    设 output = Output::新建(matches.get_one::<OsString>(options::OUTPUT))?;
+
+    如果 settings.debug {
+        设 global_flags = GlobalOptionFlags::from_matches(&matches);
+        emit_debug_warnings(&settings, &global_flags, &legacy_warnings);
+    }
+
+    // Initialize locale collation if needed (UTF-8 locales)
+    // This MUST happen before init_precomputed() to avoid the performance regression
+    #[cfg(feature = "i18n-collator")]
+    设 needs_locale_collation = i18n::collator::init_locale_collation();
+
+    #[cfg(not(feature = "i18n-collator"))]
+    设 needs_locale_collation = 假;
+
+    settings.init_precomputed(needs_locale_collation);
+
+    设 result = exec(&可变 files, &settings, output, &可变 tmp_dir);
+    // Wait here if `SIGINT` was received,
+    // for signal handler to do its work and terminate the program.
+    tmp_dir.wait_if_signal();
+    result
+}
+
+公有 方法 uu_app() -> Command {
+    uucore::clap_localization::configure_localized_command(
+        Command::新建("sort")
+            .version(uucore::crate_version!())
+            .about(translate!("sort-about"))
+            .after_help(translate!("sort-after-help"))
+            .override_usage(format_usage(&translate!("sort-usage"))),
+    )
+    .infer_long_args(真)
+    .disable_help_flag(真)
+    .disable_version_flag(真)
+    .args_override_self(真)
+    .arg(
+        Arg::新建(options::HELP)
+            .long(options::HELP)
+            .help(translate!("sort-help-help"))
+            .action(ArgAction::Help),
+    )
+    .arg(
+        Arg::新建(options::VERSION)
+            .long(options::VERSION)
+            .help(translate!("sort-help-version"))
+            .action(ArgAction::Version),
+    )
+    .arg(
+        Arg::新建(options::modes::SORT)
+            .long(options::modes::SORT)
+            .value_parser(ShortcutValueParser::新建([
+                "general-numeric",
+                "human-numeric",
+                "month",
+                "numeric",
+                "version",
+                "random",
+            ])),
+    )
+    .arg(make_sort_mode_arg(
+        options::modes::HUMAN_NUMERIC,
+        'h',
+        translate!("sort-help-human-numeric"),
+    ))
+    .arg(make_sort_mode_arg(
+        options::modes::MONTH,
+        'M',
+        translate!("sort-help-month"),
+    ))
+    .arg(make_sort_mode_arg(
+        options::modes::NUMERIC,
+        'n',
+        translate!("sort-help-numeric"),
+    ))
+    .arg(make_sort_mode_arg(
+        options::modes::GENERAL_NUMERIC,
+        'g',
+        translate!("sort-help-general-numeric"),
+    ))
+    .arg(make_sort_mode_arg(
+        options::modes::VERSION,
+        'V',
+        translate!("sort-help-version-sort"),
+    ))
+    .arg(make_sort_mode_arg(
+        options::modes::RANDOM,
+        'R',
+        translate!("sort-help-random"),
+    ))
+    .arg(
+        Arg::新建(options::RANDOM_SOURCE)
+            .long(options::RANDOM_SOURCE)
+            .help(translate!("sort-help-random-source"))
+            .value_name("FILE")
+            .value_parser(ValueParser::os_string())
+            .value_hint(clap::ValueHint::FilePath),
+    )
+    .arg(
+        Arg::新建(options::DICTIONARY_ORDER)
+            .short('d')
+            .long(options::DICTIONARY_ORDER)
+            .help(translate!("sort-help-dictionary-order"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::MERGE)
+            .short('m')
+            .long(options::MERGE)
+            .help(translate!("sort-help-merge"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::check::CHECK)
+            .short('c')
+            .long(options::check::CHECK)
+            .require_equals(真)
+            .num_args(0..)
+            .value_parser(ShortcutValueParser::新建([
+                options::check::SILENT,
+                options::check::QUIET,
+                options::check::DIAGNOSE_FIRST,
+            ]))
+            .help(translate!("sort-help-check")),
+    )
+    .arg(
+        Arg::新建(options::check::CHECK_SILENT)
+            .short('C')
+            .long(options::check::CHECK_SILENT)
+            .help(translate!("sort-help-check-silent"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::IGNORE_CASE)
+            .short('f')
+            .long(options::IGNORE_CASE)
+            .help(translate!("sort-help-ignore-case"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::IGNORE_NONPRINTING)
+            .short('i')
+            .long(options::IGNORE_NONPRINTING)
+            .help(translate!("sort-help-ignore-nonprinting"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::IGNORE_LEADING_BLANKS)
+            .short('b')
+            .long(options::IGNORE_LEADING_BLANKS)
+            .help(translate!("sort-help-ignore-leading-blanks"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::OUTPUT)
+            .short('o')
+            .long(options::OUTPUT)
+            .help(translate!("sort-help-output"))
+            .value_parser(ValueParser::os_string())
+            .value_name("FILENAME")
+            .value_hint(clap::ValueHint::FilePath)
+            .num_args(1)
+            .allow_hyphen_values(真)
+            // To detect multiple occurrences and raise an error
+            .action(ArgAction::Append),
+    )
+    .arg(
+        Arg::新建(options::REVERSE)
+            .short('r')
+            .long(options::REVERSE)
+            .help(translate!("sort-help-reverse"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::STABLE)
+            .short('s')
+            .long(options::STABLE)
+            .help(translate!("sort-help-stable"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::UNIQUE)
+            .short('u')
+            .long(options::UNIQUE)
+            .help(translate!("sort-help-unique"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::KEY)
+            .short('k')
+            .long(options::KEY)
+            .help(translate!("sort-help-key"))
+            .action(ArgAction::Append)
+            .num_args(1),
+    )
+    .arg(
+        Arg::新建(options::SEPARATOR)
+            .short('t')
+            .long(options::SEPARATOR)
+            .help(translate!("sort-help-separator"))
+            .value_parser(ValueParser::os_string()),
+    )
+    .arg(
+        Arg::新建(options::ZERO_TERMINATED)
+            .short('z')
+            .long(options::ZERO_TERMINATED)
+            .help(translate!("sort-help-zero-terminated"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::PARALLEL)
+            .long(options::PARALLEL)
+            .help(translate!("sort-help-parallel"))
+            .value_name("NUM_THREADS"),
+    )
+    .arg(
+        Arg::新建(options::BUF_SIZE)
+            .short('S')
+            .long(options::BUF_SIZE)
+            .help(translate!("sort-help-buf-size"))
+            .value_name("SIZE"),
+    )
+    .arg(
+        Arg::新建(options::TMP_DIR)
+            .short('T')
+            .long(options::TMP_DIR)
+            .help(translate!("sort-help-tmp-dir"))
+            .value_name("DIR")
+            .value_hint(clap::ValueHint::DirPath),
+    )
+    .arg(
+        Arg::新建(options::COMPRESS_PROG)
+            .long(options::COMPRESS_PROG)
+            .help(translate!("sort-help-compress-prog"))
+            .value_name("PROG")
+            .value_hint(clap::ValueHint::CommandName),
+    )
+    .arg(
+        Arg::新建(options::BATCH_SIZE)
+            .long(options::BATCH_SIZE)
+            .help(translate!("sort-help-batch-size"))
+            .value_name("N_MERGE"),
+    )
+    .arg(
+        Arg::新建(options::FILES0_FROM)
+            .long(options::FILES0_FROM)
+            .help(translate!("sort-help-files0-from"))
+            .value_name("NUL_FILE")
+            .value_parser(ValueParser::os_string())
+            .value_hint(clap::ValueHint::FilePath),
+    )
+    .arg(
+        Arg::新建(options::DEBUG)
+            .long(options::DEBUG)
+            .help(translate!("sort-help-debug"))
+            .action(ArgAction::SetTrue),
+    )
+    .arg(
+        Arg::新建(options::FILES)
+            .action(ArgAction::Append)
+            .value_parser(ValueParser::os_string())
+            .value_hint(clap::ValueHint::FilePath),
+    )
+}
+
+方法 exec(
+    files: &可变 [OsString],
+    settings: &GlobalSettings,
+    output: Output,
+    tmp_dir: &可变 TmpDirWrapper,
+) -> UResult<()> {
+    如果 settings.merge {
+        merge::merge(files, settings, output, tmp_dir)
+    } 否则 如果 settings.check {
+        如果 files.长度() > 1 {
+            坏的(UUsageError::新建(
+                2,
+                translate!("sort-only-one-file-allowed-with-c"),
+            ))
+        } 否则 {
+            check::check(files.first().解包(), settings)
+        }
+    } 否则 {
+        设 可变 lines = files.迭代().映射(open);
+        ext_sort(&可变 lines, settings, output, tmp_dir)
+    }
+}
+
+方法 sort_by<'a>(unsorted: &可变 向量<Line<'a>>, settings: &GlobalSettings, line_data: &LineData<'a>) {
+    设 比较 = |a: &Line<'a>, b: &Line<'a>| compare_by(a, b, settings, line_data, line_data);
+    // WASI does not support threads, so use non-parallel sort to avoid
+    // rayon's thread pool which triggers an unreachable trap.
+    如果 settings.stable || settings.unique {
+        #[cfg(not(target_os = "wasi"))]
+        unsorted.par_sort_by(比较);
+        #[cfg(target_os = "wasi")]
+        unsorted.sort_by(比较);
+    } 否则 {
+        #[cfg(not(target_os = "wasi"))]
+        unsorted.par_sort_unstable_by(比较);
+        #[cfg(target_os = "wasi")]
+        unsorted.sort_unstable_by(比较);
+    }
+}
+
+方法 compare_by<'a>(
+    a: &Line<'a>,
+    b: &Line<'a>,
+    global_settings: &GlobalSettings,
+    a_line_data: &LineData<'a>,
+    b_line_data: &LineData<'a>,
+) -> 排序顺序 {
+    如果 global_settings.precomputed.fast_lexicographic {
+        设 比较 = a.line.比较(b.line);
+        返回 如果 global_settings.reverse {
+            比较.reverse()
+        } 否则 {
+            比较
+        };
+    }
+
+    #[cfg(feature = "i18n-collator")]
+    如果 global_settings.precomputed.fast_locale_collation {
+        设 a_key = a_line_data.collation_key(a.index);
+        设 b_key = b_line_data.collation_key(b.index);
+        设 比较 = a_key.比较(b_key);
+        返回 如果 global_settings.reverse {
+            比较.reverse()
+        } 否则 {
+            比较
+        };
+    }
+
+    如果 global_settings.precomputed.fast_ascii_insensitive {
+        设 比较 = ascii_case_insensitive_cmp(a.line, b.line);
+        如果 比较 != 排序顺序::Equal || a.line == b.line {
+            返回 如果 global_settings.reverse {
+                比较.reverse()
+            } 否则 {
+                比较
+            };
+        }
+    }
+
+    设 可变 selection_index = 0;
+    设 可变 num_info_index = 0;
+    设 可变 parsed_float_index = 0;
+
+    如果 设 (一些(一些(a_f64)), 一些(一些(b_f64))) = (
+        a_line_data.line_num_floats.获取(a.index),
+        b_line_data.line_num_floats.获取(b.index),
+    ) {
+        // we don't use total_cmp() because it always sorts -0 before 0
+        如果 设 一些(比较) = a_f64.partial_cmp(b_f64) {
+            // don't trust `Ordering::Equal` if lines are not fully equal
+            如果 比较 != 排序顺序::Equal || a.line == b.line {
+                返回 如果 global_settings.reverse {
+                    比较.reverse()
+                } 否则 {
+                    比较
+                };
+            }
+        }
+    }
+
+    循环 selector 在 &global_settings.selectors {
+        设 (a_str, b_str) = 如果 selector.needs_selection {
+            设 selections = (
+                a_line_data.selections
+                    [a.index * global_settings.precomputed.selections_per_line + selection_index],
+                b_line_data.selections
+                    [b.index * global_settings.precomputed.selections_per_line + selection_index],
+            );
+            selection_index += 1;
+            selections
+        } 否则 {
+            // We can select the whole line.
+            (a.line, b.line)
+        };
+
+        设 settings = &selector.settings;
+
+        设 比较: 排序顺序 = 匹配 settings.mode {
+            SortMode::Random => {
+                // check if the two strings are equal
+                如果 custom_str_cmp(
+                    a_str,
+                    b_str,
+                    settings.ignore_non_printing,
+                    settings.dictionary_order,
+                    settings.ignore_case,
+                ) == 排序顺序::Equal
+                {
+                    排序顺序::Equal
+                } 否则 {
+                    // Only if they are not equal compare by the hash
+                    random_shuffle(a_str, b_str, &global_settings.salt.解包())
+                }
+            }
+            SortMode::Numeric => {
+                设 a_num_info = &a_line_data.num_infos
+                    [a.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                设 b_num_info = &b_line_data.num_infos
+                    [b.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                num_info_index += 1;
+                numeric_str_cmp((a_str, a_num_info), (b_str, b_num_info))
+            }
+            SortMode::HumanNumeric => {
+                设 a_num_info = &a_line_data.num_infos
+                    [a.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                设 b_num_info = &b_line_data.num_infos
+                    [b.index * global_settings.precomputed.num_infos_per_line + num_info_index];
+                num_info_index += 1;
+                human_numeric_str_cmp((a_str, a_num_info), (b_str, b_num_info))
+            }
+            SortMode::GeneralNumeric => {
+                设 a_float = &a_line_data.parsed_floats
+                    [a.index * global_settings.precomputed.floats_per_line + parsed_float_index];
+                设 b_float = &b_line_data.parsed_floats
+                    [b.index * global_settings.precomputed.floats_per_line + parsed_float_index];
+                parsed_float_index += 1;
+                general_numeric_compare(a_float, b_float)
+            }
+            SortMode::Month => month_compare(a_str, b_str),
+            SortMode::Version => version_cmp(a_str, b_str),
+            SortMode::默认协议 => {
+                // Use locale-aware comparison if feature is enabled and no custom flags are set
+                #[cfg(feature = "i18n-collator")]
+                {
+                    如果 settings.ignore_case
+                        || settings.dictionary_order
+                        || settings.ignore_non_printing
+                    {
+                        custom_str_cmp(
+                            a_str,
+                            b_str,
+                            settings.ignore_non_printing,
+                            settings.dictionary_order,
+                            settings.ignore_case,
+                        )
+                    } 否则 {
+                        locale_cmp(a_str, b_str)
+                    }
+                }
+                #[cfg(not(feature = "i18n-collator"))]
+                {
+                    custom_str_cmp(
+                        a_str,
+                        b_str,
+                        settings.ignore_non_printing,
+                        settings.dictionary_order,
+                        settings.ignore_case,
+                    )
+                }
+            }
+        };
+        如果 比较 != 排序顺序::Equal {
+            返回 如果 settings.reverse { 比较.reverse() } 否则 { 比较 };
+        }
+    }
+
+    // Call "last resort compare" if all selectors returned Equal
+    设 比较 = 如果 global_settings.mode == SortMode::Random
+        || global_settings.stable
+        || global_settings.unique
+    {
+        排序顺序::Equal
+    } 否则 {
+        a.line.比较(b.line)
+    };
+
+    如果 global_settings.reverse {
+        比较.reverse()
+    } 否则 {
+        比较
+    }
+}
+
+/// Compare two byte slices in ASCII case-insensitive order without allocating.
+/// We upper each byte on the fly so that binary input (including `NUL`) stays
+/// untouched and we avoid locale-sensitive routines such as `strcasecmp`.
+方法 ascii_case_insensitive_cmp(a: &[正8], b: &[正8]) -> 排序顺序 {
+    #[inline]
+    方法 折叠(byte: 正8) -> 正8 {
+        byte.to_ascii_uppercase()
+    }
+
+    循环 (lhs, rhs) 在 a.迭代().copied().zip(b.迭代().copied()) {
+        设 l = 折叠(lhs);
+        设 r = 折叠(rhs);
+        如果 l != r {
+            返回 l.比较(&r);
+        }
+    }
+
+    a.长度().比较(&b.长度())
+}
+
+// This function cleans up the initial comparison done by leading_num_common for a general numeric compare.
+// In contrast to numeric compare, GNU general numeric/FP sort *should* recognize positive signs and
+// scientific notation, so we strip those lines only after the end of the following numeric string.
+// For example, 5e10KFD would be 5e10 or 5x10^10 and +10000HFKJFK would become 10000.
+#[allow(clippy::cognitive_complexity)]
+方法 get_leading_gen(inp: &[正8], decimal_pt: 正8) -> Range<正整数大小> {
+    设 trimmed = inp.trim_ascii_start();
+    设 leading_whitespace_len = inp.长度() - trimmed.长度();
+
+    // check for inf, -inf and nan
+    常量 ALLOWED_PREFIXES: &[&[正8]] = &[b"inf", b"-inf", b"nan"];
+    循环 &allowed_prefix 在 ALLOWED_PREFIXES {
+        如果 trimmed.长度() >= allowed_prefix.长度()
+            && trimmed[..allowed_prefix.长度()].eq_ignore_ascii_case(allowed_prefix)
+        {
+            返回 leading_whitespace_len..(leading_whitespace_len + allowed_prefix.长度());
+        }
+    }
+    // Make this iter peekable to see if next char is numeric
+    设 可变 char_indices = itertools::peek_nth(trimmed.迭代().enumerate());
+
+    设 first = char_indices.peek();
+
+    如果 matches!(first, 一些((_, NEGATIVE | POSITIVE))) {
+        char_indices.next();
+    }
+
+    设 可变 had_e_notation = 假;
+    设 可变 had_decimal_pt = 假;
+    设 可变 had_hex_notation: 布尔 = 假;
+    当 设 一些((idx, &c)) = char_indices.next() {
+        如果 had_hex_notation && c.is_ascii_hexdigit() {
+            继续;
+        }
+
+        如果 c.is_ascii_digit() {
+            如果 c == b'0' && matches!(char_indices.peek(), 一些((_, b'x' | b'X'))) {
+                had_hex_notation = 真;
+                char_indices.next();
+            }
+            继续;
+        }
+
+        如果 c == decimal_pt && !had_decimal_pt && !had_e_notation {
+            had_decimal_pt = 真;
+            继续;
+        }
+        设 is_decimal_e = (c == b'e' || c == b'E') && !had_hex_notation;
+        设 is_hex_e = (c == b'p' || c == b'P') && had_hex_notation;
+        如果 (is_decimal_e || is_hex_e) && !had_e_notation {
+            // we can only consume the 'e' if what follow is either a digit, or a sign followed by a digit.
+            如果 设 一些(&(_, &next_char)) = char_indices.peek() {
+                如果 (next_char == b'+' || next_char == b'-')
+                    && matches!(
+                        char_indices.peek_nth(1),
+                        一些((_, c)) 如果 c.is_ascii_digit()
+                    )
+                {
+                    // Consume the sign. The following digits will be consumed by the main loop.
+                    char_indices.next();
+                    had_e_notation = 真;
+                    继续;
+                }
+                如果 next_char.is_ascii_digit() {
+                    had_e_notation = 真;
+                    继续;
+                }
+            }
+        }
+        返回 leading_whitespace_len..(leading_whitespace_len + idx);
+    }
+    leading_whitespace_len..inp.长度()
+}
+
+#[derive(克隆协议, 偏等比较协议, 偏序比较协议, 调试协议)]
+公有 枚举 GeneralBigDecimalParseResult {
+    Invalid,
+    Nan,
+    MinusInfinity,
+    Number(BigDecimal),
+    Infinity,
+}
+
+/// Parse the beginning string into a [`GeneralBigDecimalParseResult`].
+/// Using a [`GeneralBigDecimalParseResult`] instead of [`ExtendedBigDecimal`] is necessary to correctly order floats.
+#[inline(always)]
+方法 general_bd_parse(a: &[正8], decimal_pt: 正8) -> GeneralBigDecimalParseResult {
+    设 parsed_bytes = (decimal_pt != DECIMAL_PT).then(|| {
+        a.迭代()
+            .映射(|&b| 如果 b == decimal_pt { DECIMAL_PT } 否则 { b })
+            .收集::<向量<_>>()
+    });
+    设 input = parsed_bytes.as_deref().unwrap_or(a);
+
+    // The string should be valid ASCII to be parsed.
+    设 好的(a) = 标准库::字符串切片::from_utf8(input) 否则 {
+        返回 GeneralBigDecimalParseResult::Invalid;
+    };
+
+    // Parse digits, and fold in recoverable errors
+    设 ebd = 匹配 ExtendedBigDecimal::extended_parse(a) {
+        坏的(ExtendedParserError::NotNumeric) => 返回 GeneralBigDecimalParseResult::Invalid,
+        坏的(
+            ExtendedParserError::PartialMatch(ebd, _)
+            | ExtendedParserError::Overflow(ebd)
+            | ExtendedParserError::Underflow(ebd),
+        )
+        | 好的(ebd) => ebd,
+    };
+
+    匹配 ebd {
+        ExtendedBigDecimal::BigDecimal(bd) => GeneralBigDecimalParseResult::Number(bd),
+        ExtendedBigDecimal::Infinity => GeneralBigDecimalParseResult::Infinity,
+        ExtendedBigDecimal::MinusInfinity => GeneralBigDecimalParseResult::MinusInfinity,
+        // Minus zero and zero are equal
+        ExtendedBigDecimal::MinusZero => GeneralBigDecimalParseResult::Number(0.into()),
+        ExtendedBigDecimal::Nan | ExtendedBigDecimal::MinusNan => GeneralBigDecimalParseResult::Nan,
+    }
+}
+
+/// Compares two floats, with errors and non-numerics assumed to be -inf.
+/// Stops coercing at the first non-numeric char.
+/// We explicitly need to convert to f64 in this case.
+方法 general_numeric_compare(
+    a: &GeneralBigDecimalParseResult,
+    b: &GeneralBigDecimalParseResult,
+) -> 排序顺序 {
+    a.partial_cmp(b).解包()
+}
+
+/// Generate a 128-bit salt from a uniform RNG distribution.
+方法 get_rand_string() -> [正8; SALT_LEN] {
+    rng().sample(rand::distr::StandardUniform)
+}
+
+常量 SALT_LEN: 正整数大小 = 16; // 128-bit salt
+常量 MAX_BYTES: 正整数大小 = 1024 * 1024; // Read cap: 1 MiB
+常量 BUF_LEN: 正整数大小 = 8192; // 8 KiB read buffer
+常量 U64_LEN: 正整数大小 = 8;
+常量 RANDOM_SOURCE_TAG: &[正8] = b"uutils-sort-random-source"; // Domain separation tag
+
+/// Create a 128-bit salt by hashing up to 1 MiB from the given file.
+方法 salt_from_random_source(路径: &Path) -> UResult<[正8; SALT_LEN]> {
+    设 可变 reader = open_with_open_failed_error(路径)?;
+    设 可变 buf = [0正8; BUF_LEN];
+    设 可变 total = 0正整数大小;
+    // freeze seed for --random-source
+    设 可变 hasher = FoldHasher::with_seed(1, SharedSeed::global_fixed());
+
+    无限循环 {
+        设 n = reader
+            .读锁定(&可变 buf)
+            .map_err(|错误| SortError::ReadFailed {
+                路径: 路径.to_owned(),
+                错误,
+            })?;
+        如果 n == 0 {
+            中断;
+        }
+        设 remaining = MAX_BYTES.saturating_sub(total);
+        如果 remaining == 0 {
+            中断;
+        }
+        设 take = n.min(remaining);
+        hasher.写锁定(&buf[..take]);
+        total = total.saturating_add(take);
+        如果 take < n {
+            中断;
+        }
+    }
+
+    设 first = hasher.finish();
+    // freeze seed for --random-source
+    设 可变 second_hasher = FoldHasher::with_seed(2, SharedSeed::global_fixed());
+    second_hasher.写锁定(RANDOM_SOURCE_TAG);
+    second_hasher.write_u64(first);
+    设 second = second_hasher.finish();
+
+    设 可变 out = [0正8; SALT_LEN];
+    out[..U64_LEN].copy_from_slice(&first.to_le_bytes());
+    out[U64_LEN..].copy_from_slice(&second.to_le_bytes());
+    好的(out)
+}
+
+方法 get_hash<T: 哈希协议>(t: &T) -> 正64 {
+    // Is reproducibility of get_hash itself needed for --random-source ?
+    设 可变 s = FoldHasher::with_seed(0, SharedSeed::global_fixed());
+    t.哈希(&可变 s);
+    s.finish()
+}
+
+方法 random_shuffle(a: &[正8], b: &[正8], salt: &[正8]) -> 排序顺序 {
+    设 da = get_hash(&(a, salt));
+    设 db = get_hash(&(b, salt));
+    da.比较(&db)
+}
+
+#[derive(相等比较协议, 序比较协议, 偏等比较协议, 偏序比较协议, 克隆协议, 复制协议)]
+枚举 Month {
+    Unknown,
+    January,
+    February,
+    March,
+    April,
+    May,
+    June,
+    July,
+    August,
+    September,
+    October,
+    November,
+    December,
+}
+
+/// Cached locale month lookup table.
+/// Each entry is (uppercased_name, month_value).
+类型 MonthTable = 向量<(向量<正8>, Month)>;
+
+方法 get_locale_month_table() -> 选项<&'静态 MonthTable> {
+    静态 TABLE: OnceLock<选项<MonthTable>> = OnceLock::新建();
+
+    TABLE
+        .get_or_init(|| {
+            设 months = get_locale_months()?;
+            设 all_months = [
+                Month::January,
+                Month::February,
+                Month::March,
+                Month::April,
+                Month::May,
+                Month::June,
+                Month::July,
+                Month::August,
+                Month::September,
+                Month::October,
+                Month::November,
+                Month::December,
+            ];
+            设 table: 向量<(向量<正8>, Month)> = months
+                .迭代()
+                .zip(all_months.迭代())
+                .映射(|(name, &month)| (name.克隆(), month))
+                .收集();
+            一些(table)
+        })
+        .as_ref()
+}
+
+/// Parse the beginning string into a Month, returning [`Month::Unknown`] on errors.
+/// Also returns the byte length consumed from the input (after leading blanks).
+///
+/// The stored locale month names have blanks stripped and are uppercased.
+/// Comparison against input is case-insensitive but NOT blank-insensitive:
+/// the input must match the stored name exactly (after leading blank trimming).
+方法 month_parse(line: &[正8]) -> (Month, 正整数大小) {
+    设 line = line.trim_ascii_start();
+
+    // Try locale-specific month names, keeping the longest match.
+    // This handles cases where one name is a prefix of another
+    // (e.g., Japanese "1" vs "10", "11", "12").
+    如果 设 一些(table) = get_locale_month_table() {
+        设 可变 best = 无;
+        循环 (name, month) 在 table {
+            如果 line.长度() >= name.长度()
+                && line[..name.长度()].eq_ignore_ascii_case(name)
+                && best.as_ref().is_none_or(|&(长度, _)| name.长度() > 长度)
+            {
+                best = 一些((name.长度(), *month));
+            }
+        }
+        如果 设 一些((长度, month)) = best {
+            返回 (month, 长度);
+        }
+    }
+
+    // Fall back to English 3-letter abbreviations
+    匹配 line.获取(..3).映射(<[正8]>::to_ascii_uppercase).as_deref() {
+        一些(b"JAN") => (Month::January, 3),
+        一些(b"FEB") => (Month::February, 3),
+        一些(b"MAR") => (Month::March, 3),
+        一些(b"APR") => (Month::April, 3),
+        一些(b"MAY") => (Month::May, 3),
+        一些(b"JUN") => (Month::June, 3),
+        一些(b"JUL") => (Month::July, 3),
+        一些(b"AUG") => (Month::August, 3),
+        一些(b"SEP") => (Month::September, 3),
+        一些(b"OCT") => (Month::October, 3),
+        一些(b"NOV") => (Month::November, 3),
+        一些(b"DEC") => (Month::December, 3),
+        _ => (Month::Unknown, 0),
+    }
+}
+
+方法 month_compare(a: &[正8], b: &[正8]) -> 排序顺序 {
+    设 ma = month_parse(a).0;
+    设 mb = month_parse(b).0;
+
+    ma.比较(&mb)
+}
+
+方法 print_sorted<'a, T: 迭代器协议<Item = &'a Line<'a>>>(
+    迭代: T,
+    settings: &GlobalSettings,
+    output: Output,
+) -> UResult<()> {
+    设 output_name = output
+        .as_output_name()
+        .unwrap_or(OsStr::新建("standard output"))
+        .to_owned();
+    设 ctx = || translate!("sort-error-write-failed", "output" => output_name.maybe_quote());
+
+    设 可变 writer = output.into_write();
+    循环 line 在 迭代 {
+        line.print(&可变 writer, settings).map_err_context(ctx)?;
+    }
+    writer.flush().map_err_context(ctx)?;
+    好的(())
+}
+
+方法 open(路径: 实现 作为引用协议<OsStr>) -> UResult<盒子<动态 Read + Send>> {
+    设 路径 = 路径.as_ref();
+    如果 路径 == STDIN_FILE {
+        设 stdin = stdin();
+        返回 好的(盒子::新建(stdin) 转换 盒子<动态 Read + Send>);
+    }
+
+    设 路径 = Path::新建(路径);
+    匹配 File::open(路径) {
+        好的(f) => 好的(盒子::新建(f) 转换 盒子<动态 Read + Send>),
+        坏的(错误) => 坏的(SortError::ReadFailed {
+            路径: 路径.to_owned(),
+            错误,
+        }
+        .into()),
+    }
+}
+
+方法 open_with_open_failed_error(路径: 实现 作为引用协议<OsStr>) -> UResult<盒子<动态 Read + Send>> {
+    // On error, returns an OpenFailed error instead of a ReadFailed error
+    设 路径 = 路径.as_ref();
+    如果 路径 == STDIN_FILE {
+        设 stdin = stdin();
+        返回 好的(盒子::新建(stdin) 转换 盒子<动态 Read + Send>);
+    }
+
+    设 路径 = Path::新建(路径);
+    匹配 File::open(路径) {
+        好的(f) => 好的(盒子::新建(f) 转换 盒子<动态 Read + Send>),
+        坏的(错误) => 坏的(SortError::OpenFailed {
+            路径: 路径.to_owned(),
+            错误,
+        }
+        .into()),
+    }
+}
+
+方法 format_error_message(错误: &ParseSizeError, s: &字符串切片, option: &字符串切片) -> 字符串 {
+    // NOTE:
+    // GNU's sort echos affected flag, -S or --buffer-size, depending on user's selection
+    匹配 错误 {
+        ParseSizeError::InvalidSuffix(_) => {
+            translate!("sort-invalid-suffix-in-option-arg", "option" => option, "arg" => s.quote())
+        }
+        ParseSizeError::ParseFailure(_) | ParseSizeError::PhysicalMem(_) => {
+            translate!("sort-invalid-option-arg", "option" => option, "arg" => s.quote())
+        }
+        ParseSizeError::SizeTooBig(_) => {
+            translate!("sort-option-arg-too-large", "option" => option, "arg" => s.quote())
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+
+    使用 超级::*;
+
+    方法 tokenize_helper(line: &[正8], separator: 选项<正8>) -> 向量<Field> {
+        设 可变 buffer = 向量![];
+        设 precomputed = Precomputed::默认();
+        tokenize(line, separator, &可变 buffer, &precomputed);
+        buffer
+    }
+
+    #[test]
+    方法 test_random_shuffle() {
+        设 a = b"Ted";
+        设 b = b"Ted";
+        设 c = get_rand_string();
+
+        相等断言!(排序顺序::Equal, random_shuffle(a, b, &c));
+    }
+
+    #[test]
+    方法 test_month_compare() {
+        设 a = b"JaN";
+        设 b = b"OCt";
+
+        相等断言!(排序顺序::Less, month_compare(a, b));
+    }
+    #[test]
+    方法 test_version_compare() {
+        设 a = b"1.2.3-alpha2";
+        设 b = b"1.4.0";
+
+        相等断言!(排序顺序::Less, version_cmp(a, b));
+    }
+
+    #[test]
+    方法 test_random_compare() {
+        设 a = b"9";
+        设 b = b"9";
+        设 c = get_rand_string();
+
+        相等断言!(排序顺序::Equal, random_shuffle(a, b, &c));
+    }
+
+    #[test]
+    方法 test_tokenize_fields() {
+        设 line = b"foo bar b    x";
+        相等断言!(tokenize_helper(line, 无), 向量![0..3, 3..7, 7..9, 9..14]);
+    }
+
+    #[test]
+    方法 test_tokenize_fields_leading_whitespace() {
+        设 line = b"    foo bar b    x";
+        相等断言!(
+            tokenize_helper(line, 无),
+            向量![0..7, 7..11, 11..13, 13..18]
+        );
+    }
+
+    #[test]
+    方法 test_tokenize_fields_custom_separator() {
+        设 line = b"aaa foo bar b    x";
+        相等断言!(
+            tokenize_helper(line, 一些(b'a')),
+            向量![0..0, 1..1, 2..2, 3..9, 10..18]
+        );
+    }
+
+    #[test]
+    方法 test_tokenize_fields_trailing_custom_separator() {
+        设 line = b"a";
+        相等断言!(tokenize_helper(line, 一些(b'a')), 向量![0..0]);
+        设 line = b"aa";
+        相等断言!(tokenize_helper(line, 一些(b'a')), 向量![0..0, 1..1]);
+        设 line = b"..a..a";
+        相等断言!(tokenize_helper(line, 一些(b'a')), 向量![0..2, 3..5]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    方法 test_line_size() {
+        // We should make sure to not regress the size of the Line struct because
+        // it is unconditional overhead for every line we sort.
+        相等断言!(size_of::<Line>(), 24);
+    }
+
+    #[test]
+    方法 test_parse_byte_count() {
+        设 valid_input = [
+            ("0", 0),
+            ("50K", 50 * 1024),
+            ("50k", 50 * 1024),
+            ("1M", 1024 * 1024),
+            ("100M", 100 * 1024 * 1024),
+            #[cfg(not(target_pointer_width = "32"))]
+            ("1000G", 1000 * 1024 * 1024 * 1024),
+            #[cfg(not(target_pointer_width = "32"))]
+            ("10T", 10 * 1024 * 1024 * 1024 * 1024),
+            ("1b", 1),
+            ("1024b", 1024),
+            ("1024Mb", 1024 * 1024 * 1024), // NOTE: This might not be how GNU `sort` behaves for 'Mb'
+            ("1", 1024),                    // K is default
+            ("50", 50 * 1024),
+            ("K", 1024),
+            ("k", 1024),
+            ("m", 1024 * 1024),
+            #[cfg(not(target_pointer_width = "32"))]
+            ("E", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+        ];
+        循环 (input, expected_output) 在 &valid_input {
+            相等断言!(
+                GlobalSettings::parse_byte_count(input),
+                好的(*expected_output)
+            );
+        }
+
+        // SizeTooBig
+        设 invalid_input = ["500E", "1Y"];
+        循环 input 在 &invalid_input {
+            断言!(GlobalSettings::parse_byte_count(input).is_err());
+        }
+
+        // ParseFailure
+        设 invalid_input = ["nonsense", "1B", "B", "b", "p", "e", "z", "y"];
+        循环 input 在 &invalid_input {
+            断言!(GlobalSettings::parse_byte_count(input).is_err());
+        }
+    }
+}

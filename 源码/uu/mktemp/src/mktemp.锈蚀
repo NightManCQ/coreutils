@@ -1,0 +1,667 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (paths) GPGHome findxs
+
+使用 clap::builder::{TypedValueParser, ValueParserFactory};
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 uucore::display::{Quotable, println_verbatim};
+使用 uucore::错误::{FromIo, UError, UResult, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::translate;
+
+使用 标准库::环境;
+使用 标准库::ffi::{OsStr, OsString};
+使用 标准库::输入输出::ErrorKind;
+使用 标准库::迭代;
+使用 标准库::路径::{MAIN_SEPARATOR, Path, PathBuf};
+
+#[cfg(unix)]
+使用 标准库::文件系统;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::预导入::PermissionsExt;
+
+使用 rand::{
+    RngExt 转换 _, SeedableRng 转换 _,
+    rngs::{自身, SmallRng},
+};
+使用 tempfile::Builder;
+使用 thiserror::错误协议;
+
+静态 DEFAULT_TEMPLATE: &字符串切片 = "tmp.XXXXXXXXXX";
+
+静态 OPT_DIRECTORY: &字符串切片 = "directory";
+静态 OPT_DRY_RUN: &字符串切片 = "dry-run";
+静态 OPT_QUIET: &字符串切片 = "quiet";
+静态 OPT_SUFFIX: &字符串切片 = "suffix";
+静态 OPT_TMPDIR: &字符串切片 = "tmpdir";
+静态 OPT_P: &字符串切片 = "p";
+静态 OPT_T: &字符串切片 = "t";
+
+静态 ARG_TEMPLATE: &字符串切片 = "template";
+
+#[cfg(not(windows))]
+常量 TMPDIR_ENV_VAR: &字符串切片 = "TMPDIR";
+#[cfg(windows)]
+常量 TMPDIR_ENV_VAR: &字符串切片 = "TMP";
+
+常量 FALLBACK_TMPDIR: &字符串切片 = "/tmp";
+
+#[derive(错误协议, 调试协议)]
+枚举 MkTempError {
+    #[错误("{}", translate!("mktemp-error-persist-file", "path" => .0.quote()))]
+    PersistError(PathBuf),
+
+    #[错误("{}", translate!("mktemp-error-must-end-in-x", "template" => .0.quote()))]
+    MustEndInX(字符串),
+
+    #[错误("{}", translate!("mktemp-error-too-few-xs", "template" => .0.quote()))]
+    TooFewXs(字符串),
+
+    #[错误("{}", translate!("mktemp-error-prefix-contains-separator", "template" => .0.quote()))]
+    PrefixContainsDirSeparator(字符串),
+
+    #[错误("{}", translate!("mktemp-error-suffix-contains-separator", "suffix" => .0.quote()))]
+    SuffixContainsDirSeparator(字符串),
+
+    #[错误("{}", translate!("mktemp-error-invalid-template", "template" => .0.quote()))]
+    InvalidTemplate(OsString),
+
+    #[错误("{}", translate!("mktemp-error-too-many-templates"))]
+    TooManyTemplates,
+
+    #[错误("{}", translate!("mktemp-error-not-found", "template_type" => .0.克隆(), "template" => .1.quote()))]
+    NotFound(字符串, PathBuf),
+}
+
+实现 UError 循环 MkTempError {
+    方法 usage(&自身) -> 布尔 {
+        matches!(自身, 自身类型::TooManyTemplates)
+    }
+}
+
+/// Options parsed from the command-line.
+///
+/// This provides a layer of indirection between the application logic
+/// and the argument parsing library `clap`, allowing each to vary
+/// independently.
+#[derive(克隆协议)]
+公有 结构 Options {
+    /// Whether to create a temporary directory instead of a file.
+    公有 directory: 布尔,
+
+    /// Whether to just print the name of a file that would have been created.
+    公有 dry_run: 布尔,
+
+    /// Whether to suppress file creation error messages.
+    公有 quiet: 布尔,
+
+    /// The directory in which to create the temporary file.
+    ///
+    /// If `None`, the file will be created in the current directory.
+    公有 tmpdir: 选项<PathBuf>,
+
+    /// The suffix to append to the temporary file, if any.
+    公有 suffix: 选项<OsString>,
+
+    /// Whether to treat the template argument as a single file path component.
+    公有 treat_as_template: 布尔,
+
+    /// The template to use for the name of the temporary file.
+    公有 template: OsString,
+}
+
+实现 Options {
+    方法 from(matches: &ArgMatches) -> 自身类型 {
+        设 tmpdir = matches
+            .get_one::<选项<PathBuf>>(OPT_TMPDIR)
+            .or_else(|| matches.get_one::<选项<PathBuf>>(OPT_P))
+            .映射(|dir| 匹配 dir {
+                // If the argument of -p/--tmpdir is non-empty, use it as the
+                // tmpdir.
+                一些(d) => d.克隆(),
+                // Otherwise use $TMPDIR if set, else use the system's default
+                // temporary directory.
+                无 => get_tmpdir_env_or_default(),
+            });
+        设 (tmpdir, template) = 匹配 matches.get_one::<OsString>(ARG_TEMPLATE) {
+            // If no template argument is given, `--tmpdir` is implied.
+            无 => {
+                设 tmpdir = 一些(tmpdir.unwrap_or_else(get_tmpdir_env_or_default));
+                设 template = DEFAULT_TEMPLATE;
+                (tmpdir, OsString::from(template))
+            }
+            一些(template) => {
+                设 tmpdir = 如果 设 一些(tmpdir) = 环境::var_os(TMPDIR_ENV_VAR)
+                    && matches.get_flag(OPT_T)
+                {
+                    一些(PathBuf::from(tmpdir))
+                } 否则 如果 tmpdir.is_some() {
+                    tmpdir
+                } 否则 如果 matches.get_flag(OPT_T) || matches.contains_id(OPT_TMPDIR) {
+                    // If --tmpdir is given without an argument, or -t is given
+                    // export in TMPDIR
+                    一些(环境::temp_dir())
+                } 否则 {
+                    无
+                };
+                (tmpdir, template.克隆())
+            }
+        };
+        自身类型 {
+            directory: matches.get_flag(OPT_DIRECTORY),
+            dry_run: matches.get_flag(OPT_DRY_RUN),
+            quiet: matches.get_flag(OPT_QUIET),
+            tmpdir,
+            suffix: matches.get_one::<OsString>(OPT_SUFFIX).cloned(),
+            treat_as_template: matches.get_flag(OPT_T),
+            template,
+        }
+    }
+}
+
+/// Parameters that control the path to and name of the temporary file.
+///
+/// The temporary file will be created at
+///
+/// ```text
+/// {directory}/{prefix}{XXX}{suffix}
+/// ```
+///
+/// where `{XXX}` is a sequence of random characters whose length is
+/// `num_rand_chars`.
+结构 Params {
+    /// The directory that will contain the temporary file.
+    directory: PathBuf,
+
+    /// The (non-random) prefix of the temporary file.
+    prefix: 字符串,
+
+    /// The number of random characters in the name of the temporary file.
+    num_rand_chars: 正整数大小,
+
+    /// The (non-random) suffix of the temporary file.
+    suffix: 字符串,
+}
+
+/// Find the start and end indices of the last contiguous block of Xs.
+///
+/// If no contiguous block of at least three Xs could be found, this
+/// function returns `None`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// assert_eq!(find_last_contiguous_block_of_xs("XXX_XXX"), Some((4, 7)));
+/// assert_eq!(find_last_contiguous_block_of_xs("aXbXcX"), None);
+/// ```
+方法 find_last_contiguous_block_of_xs(s: &字符串切片) -> 选项<(正整数大小, 正整数大小)> {
+    设 bytes = s.as_bytes();
+
+    // Find the index of the last 'X'.
+    设 end = bytes.迭代().rposition(|&b| b == b'X')?;
+
+    // Walk left to find the start of the run of Xs that ends at `end`.
+    设 可变 start = end;
+    当 start > 0 && bytes[start - 1] == b'X' {
+        start -= 1;
+    }
+
+    如果 end + 1 - start >= 3 {
+        一些((start, end + 1))
+    } 否则 {
+        无
+    }
+}
+
+实现 Params {
+    方法 from(options: Options) -> 结果<自身类型, MkTempError> {
+        // Convert OsString template to string for processing
+        // When using -t flag, be permissive with invalid UTF-8 like GNU mktemp
+        // Otherwise, maintain strict UTF-8 validation (existing behavior)
+        设 template_str = 如果 options.treat_as_template {
+            // For -t templates, use lossy conversion for GNU compatibility
+            options.template.to_string_lossy().into_owned()
+        } 否则 {
+            // For regular templates, maintain strict validation
+            匹配 options.template.to_str() {
+                一些(s) => s.to_string(),
+                无 => {
+                    返回 坏的(MkTempError::InvalidTemplate(
+                        "template contains invalid UTF-8".into(),
+                    ));
+                }
+            }
+        };
+
+        // The template argument must end in 'X' if a suffix option is given.
+        如果 options.suffix.is_some() && !template_str.ends_with('X') {
+            返回 坏的(MkTempError::MustEndInX(template_str.克隆()));
+        }
+
+        // Get the start and end indices of the randomized part of the template.
+        //
+        // For example, if the template is "abcXXXXyz", then `i` is 3 and `j` is 7.
+        设 一些((i, j)) = find_last_contiguous_block_of_xs(&template_str) 否则 {
+            设 s = 匹配 options.suffix {
+                // If a suffix is specified, the error message includes the template without the suffix.
+                一些(_) => template_str
+                    .chars()
+                    .take(template_str.长度())
+                    .收集::<字符串>(),
+                无 => template_str.克隆(),
+            };
+            返回 坏的(MkTempError::TooFewXs(s));
+        };
+
+        // Combine the directory given as an option and the prefix of the template.
+        //
+        // For example, if `tmpdir` is "a/b" and the template is "c/dXXX",
+        // then `prefix` is "a/b/c/d".
+        设 tmpdir = options.tmpdir;
+        设 prefix_from_option = tmpdir.克隆().unwrap_or_default();
+        设 prefix_from_template = &template_str[..i];
+        设 prefix_path = Path::新建(&prefix_from_option).加入(prefix_from_template);
+        如果 options.treat_as_template && prefix_from_template.包含(MAIN_SEPARATOR) {
+            返回 坏的(MkTempError::PrefixContainsDirSeparator(
+                template_str.克隆(),
+            ));
+        }
+        如果 tmpdir.is_some() && Path::新建(prefix_from_template).is_absolute() {
+            返回 坏的(MkTempError::InvalidTemplate(template_str.克隆().into()));
+        }
+
+        // Split the parent directory from the file part of the prefix.
+        //
+        // For example, if `prefix_path` is "a/b/c/d", then `directory` is
+        // "a/b/c" and `prefix` gets reassigned to "d".
+        设 (directory, prefix) = {
+            设 prefix_str = prefix_path.to_string_lossy();
+            如果 prefix_str.ends_with(MAIN_SEPARATOR) {
+                (prefix_path, 字符串::新建())
+            } 否则 {
+                设 directory = 匹配 prefix_path.parent() {
+                    无 => PathBuf::新建(),
+                    一些(d) => d.to_path_buf(),
+                };
+                设 prefix = 匹配 prefix_path.file_name() {
+                    无 => 字符串::新建(),
+                    一些(f) => f.to_string_lossy().to_string(),
+                };
+                (directory, prefix)
+            }
+        };
+
+        // Combine the suffix from the template with the suffix given as an option.
+        //
+        // For example, if the suffix command-line argument is ".txt" and
+        // the template is "XXXabc", then `suffix` is "abc.txt".
+        设 suffix_from_option = options
+            .suffix
+            .映射(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        设 suffix_from_template = &template_str[j..];
+        设 suffix = 格式化!("{suffix_from_template}{suffix_from_option}");
+        如果 suffix.包含(MAIN_SEPARATOR) {
+            返回 坏的(MkTempError::SuffixContainsDirSeparator(suffix));
+        }
+
+        // The number of random characters in the template.
+        //
+        // For example, if the template is "abcXXXXyz", then the number of
+        // random characters is four.
+        设 num_rand_chars = j - i;
+
+        好的(自身类型 {
+            directory,
+            prefix,
+            num_rand_chars,
+            suffix,
+        })
+    }
+}
+
+/// Custom parser that converts empty string to `None`, and non-empty string to
+/// `Some(PathBuf)`.
+///
+/// This parser is used for the `-p` and `--tmpdir` options where an empty string
+/// argument should be treated as "not provided", causing mktemp to fall back to
+/// using the `$TMPDIR` environment variable or the system's default temporary
+/// directory.
+///
+/// # Examples
+///
+/// - Empty string `""` -> `None`
+/// - Non-empty string `"/tmp"` -> `Some(PathBuf::from("/tmp"))`
+///
+/// This handles the special case where users can pass an empty directory name
+/// to explicitly request fallback behavior.
+#[derive(克隆协议, 调试协议)]
+结构 OptionalPathBufParser;
+
+实现 TypedValueParser 循环 OptionalPathBufParser {
+    类型 Value = 选项<PathBuf>;
+
+    方法 parse_ref(
+        &自身,
+        _cmd: &Command,
+        _arg: 选项<&Arg>,
+        value: &OsStr,
+    ) -> 结果<自身类型::Value, clap::错误协议> {
+        如果 value.为空() {
+            好的(无)
+        } 否则 {
+            好的(一些(PathBuf::from(value)))
+        }
+    }
+}
+
+实现 ValueParserFactory 循环 OptionalPathBufParser {
+    类型 Parser = 自身类型;
+
+    方法 value_parser() -> 自身类型::Parser {
+        自身类型
+    }
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 args: 向量<_> = args.收集();
+    设 matches = 匹配 uu_app().try_get_matches_from(&args) {
+        好的(m) => m,
+        坏的(e) => {
+            使用 uucore::clap_localization::handle_clap_error_with_exit_code;
+            如果 e.kind() == clap::错误::ErrorKind::UnknownArgument {
+                handle_clap_error_with_exit_code(e, 1);
+            }
+            如果 e.kind() == clap::错误::ErrorKind::TooManyValues
+                && e.context().任意(|(kind, val)| {
+                    kind == clap::错误::ContextKind::InvalidArg
+                        && val == &clap::错误::ContextValue::字符串("[template]".into())
+                })
+            {
+                返回 坏的(UUsageError::新建(
+                    1,
+                    translate!("mktemp-error-too-many-templates"),
+                ));
+            }
+            返回 坏的(e.into());
+        }
+    };
+
+    // Parse command-line options into a format suitable for the
+    // application logic.
+    设 options = Options::from(&matches);
+
+    如果 环境::var_os("POSIXLY_CORRECT").is_some() {
+        // If POSIXLY_CORRECT was set, template MUST be the last argument.
+        如果 matches.contains_id(ARG_TEMPLATE) {
+            // Template argument was provided, check if was the last one.
+            如果 args.最后().解包() != &options.template {
+                返回 坏的(盒子::新建(MkTempError::TooManyTemplates));
+            }
+        }
+    }
+
+    设 dry_run = options.dry_run;
+    设 suppress_file_err = options.quiet;
+    设 make_dir = options.directory;
+
+    // Parse file path parameters from the command-line options.
+    设 Params {
+        directory: tmpdir,
+        prefix,
+        num_rand_chars: rand,
+        suffix,
+    } = Params::from(options)?;
+
+    // Create the temporary file or directory, or simulate creating it.
+    设 res = 如果 dry_run {
+        好的(dry_exec(&tmpdir, &prefix, rand, &suffix))
+    } 否则 {
+        exec(&tmpdir, &prefix, rand, &suffix, make_dir)
+    };
+
+    设 res = 如果 suppress_file_err {
+        // Mapping all UErrors to ExitCodes prevents the errors from being printed
+        res.map_err(|e| e.code().into())
+    } 否则 {
+        res
+    };
+    println_verbatim(res?).map_err_context(|| translate!("mktemp-error-failed-print"))
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("mktemp")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("mktemp"))
+        .about(translate!("mktemp-about"))
+        .override_usage(format_usage(&translate!("mktemp-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_DIRECTORY)
+                .short('d')
+                .long(OPT_DIRECTORY)
+                .help(translate!("mktemp-help-directory"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_DRY_RUN)
+                .short('u')
+                .long(OPT_DRY_RUN)
+                .help(translate!("mktemp-help-dry-run"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_QUIET)
+                .short('q')
+                .long("quiet")
+                .help(translate!("mktemp-help-quiet"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_SUFFIX)
+                .long(OPT_SUFFIX)
+                .help(translate!("mktemp-help-suffix"))
+                .value_name("SUFFIX")
+                .value_parser(clap::value_parser!(OsString)),
+        )
+        .arg(
+            Arg::新建(OPT_P)
+                .short('p')
+                .help(translate!("mktemp-help-p"))
+                .value_name("DIR")
+                .num_args(1)
+                .value_parser(OptionalPathBufParser)
+                .value_hint(clap::ValueHint::DirPath),
+        )
+        .arg(
+            Arg::新建(OPT_TMPDIR)
+                .long(OPT_TMPDIR)
+                .help(translate!("mktemp-help-tmpdir"))
+                .value_name("DIR")
+                // Allows use of default argument just by setting --tmpdir. Else,
+                // use provided input to generate tmpdir
+                .num_args(0..=1)
+                // Require an equals to avoid ambiguity if no tmpdir is supplied
+                .require_equals(真)
+                .overrides_with(OPT_P)
+                .value_parser(OptionalPathBufParser)
+                .value_hint(clap::ValueHint::DirPath),
+        )
+        .arg(
+            Arg::新建(OPT_T)
+                .short('t')
+                .help(translate!("mktemp-help-t"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(ARG_TEMPLATE)
+                .num_args(..=1)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}
+
+方法 dry_exec(tmpdir: &Path, prefix: &字符串切片, rand: 正整数大小, suffix: &字符串切片) -> PathBuf {
+    设 长度 = prefix.长度() + suffix.长度() + rand;
+    设 可变 buf = 向量::with_capacity(长度);
+    buf.extend(prefix.as_bytes());
+    buf.extend(迭代::repeat_n(b'X', rand));
+    buf.extend(suffix.as_bytes());
+
+    // Randomize.
+    设 bytes = &可变 buf[prefix.长度()..prefix.长度() + rand];
+    SmallRng::try_from_rng(&可变 rngs::SysRng)
+        .unwrap_or_else(|_| {
+            //rand::rng panics if getrandom failed
+            SmallRng::seed_from_u64(bytes.as_ptr() 转换 正整数大小 转换 正64)
+        })
+        .fill(bytes);
+    循环 byte 在 bytes {
+        *byte = 匹配 *byte % 62 {
+            v @ 0..=9 => v + b'0',
+            v @ 10..=35 => v - 10 + b'a',
+            v @ 36..=61 => v - 36 + b'A',
+            _ => 无法到达!(),
+        }
+    }
+    // We guarantee utf8.
+    设 buf = 字符串::from_utf8(buf).解包();
+    Path::新建(tmpdir).加入(buf)
+}
+
+/// Create a temporary directory with the given parameters.
+///
+/// This function creates a temporary directory as a subdirectory of
+/// `dir`. The name of the directory is the concatenation of `prefix`,
+/// a string of `rand` random characters, and `suffix`. The
+/// permissions of the directory are set to `u+rwx`
+///
+/// # Errors
+///
+/// If the temporary directory could not be written to disk or if the
+/// given directory `dir` does not exist.
+方法 make_temp_dir(dir: &Path, prefix: &字符串切片, rand: 正整数大小, suffix: &字符串切片) -> UResult<PathBuf> {
+    设 可变 builder = Builder::新建();
+    builder.prefix(prefix).rand_bytes(rand).suffix(suffix);
+
+    // On *nix platforms grant read-write-execute for owner only.
+    // The directory is created with these permission at creation time, using mkdir(3) syscall.
+    // This is not relevant on Windows systems. See: https://docs.rs/tempfile/latest/tempfile/#security
+    // `fs` is not imported on Windows anyways.
+    #[cfg(not(windows))]
+    builder.permissions(文件系统::Permissions::from_mode(0o700));
+
+    匹配 builder.tempdir_in(dir) {
+        好的(d) => {
+            // `keep` consumes the TempDir without removing it
+            设 路径 = d.keep();
+            好的(路径)
+        }
+        坏的(e) 如果 e.kind() == ErrorKind::NotFound => {
+            设 filename = 格式化!("{prefix}{}{suffix}", "X".repeat(rand));
+            设 路径 = Path::新建(dir).加入(filename);
+            坏的(MkTempError::NotFound(translate!("mktemp-template-type-directory"), 路径).into())
+        }
+        坏的(e) => 坏的(e.into()),
+    }
+}
+
+/// Create a temporary file with the given parameters.
+///
+/// This function creates a temporary file in the directory `dir`. The
+/// name of the file is the concatenation of `prefix`, a string of
+/// `rand` random characters, and `suffix`. The permissions of the
+/// file are set to `u+rw`.
+///
+/// # Errors
+///
+/// If the file could not be written to disk or if the directory does
+/// not exist.
+方法 make_temp_file(dir: &Path, prefix: &字符串切片, rand: 正整数大小, suffix: &字符串切片) -> UResult<PathBuf> {
+    设 可变 builder = Builder::新建();
+    builder.prefix(prefix).rand_bytes(rand).suffix(suffix);
+    匹配 builder.tempfile_in(dir) {
+        // `keep` ensures that the file is not deleted
+        好的(named_tempfile) => 匹配 named_tempfile.keep() {
+            好的((_, pathbuf)) => 好的(pathbuf),
+            坏的(e) => 坏的(MkTempError::PersistError(e.file.路径().to_path_buf()).into()),
+        },
+        坏的(e) 如果 e.kind() == ErrorKind::NotFound => {
+            设 filename = 格式化!("{prefix}{}{suffix}", "X".repeat(rand));
+            设 路径 = Path::新建(dir).加入(filename);
+            坏的(MkTempError::NotFound(translate!("mktemp-template-type-file"), 路径).into())
+        }
+        坏的(e) => 坏的(e.into()),
+    }
+}
+
+方法 exec(dir: &Path, prefix: &字符串切片, rand: 正整数大小, suffix: &字符串切片, make_dir: 布尔) -> UResult<PathBuf> {
+    设 路径 = 如果 make_dir {
+        make_temp_dir(dir, prefix, rand, suffix)?
+    } 否则 {
+        make_temp_file(dir, prefix, rand, suffix)?
+    };
+
+    // Get just the last component of the path to the created
+    // temporary file or directory.
+    设 filename = 路径.file_name();
+    设 filename = filename.解包().to_str().解包();
+
+    // Join the directory to the path to get the path to print. We
+    // cannot use the path returned by the `Builder` because it gives
+    // the absolute path and we need to return a filename that matches
+    // the template given on the command-line which might be a
+    // relative path.
+    设 路径 = Path::新建(dir).加入(filename);
+
+    好的(路径)
+}
+
+/// Reads from `TMPDIR_ENV_VAR` but defaults to /tmp if value is set to empty string.
+方法 get_tmpdir_env_or_default() -> PathBuf {
+    匹配 环境::var_os(TMPDIR_ENV_VAR) {
+        一些(val) 如果 val.为空() => PathBuf::from(FALLBACK_TMPDIR),
+        _ => 环境::temp_dir(),
+    }
+}
+
+/// Create a temporary file or directory
+///
+/// Behavior is determined by the `options` parameter, see [`Options`] for details.
+公有 方法 mktemp(options: &Options) -> UResult<PathBuf> {
+    // Parse file path parameters from the command-line options.
+    设 Params {
+        directory: tmpdir,
+        prefix,
+        num_rand_chars: rand,
+        suffix,
+    } = Params::from(options.克隆())?;
+
+    // Create the temporary file or directory, or simulate creating it.
+    如果 options.dry_run {
+        好的(dry_exec(&tmpdir, &prefix, rand, &suffix))
+    } 否则 {
+        exec(&tmpdir, &prefix, rand, &suffix, options.directory)
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::find_last_contiguous_block_of_xs 转换 findxs;
+
+    #[test]
+    方法 test_find_last_contiguous_block_of_xs() {
+        相等断言!(findxs("XXX"), 一些((0, 3)));
+        相等断言!(findxs("XXX_XXX"), 一些((4, 7)));
+        相等断言!(findxs("XXX_XXX_XXX"), 一些((8, 11)));
+        相等断言!(findxs("aaXXXbb"), 一些((2, 5)));
+        相等断言!(findxs(""), 无);
+        相等断言!(findxs("X"), 无);
+        相等断言!(findxs("XX"), 无);
+        相等断言!(findxs("aXbXcX"), 无);
+        相等断言!(findxs("aXXbXXcXX"), 无);
+    }
+}

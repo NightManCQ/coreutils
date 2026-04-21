@@ -1,0 +1,72 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore SIGSEGV
+
+//! A collection of procedural macros for uutils.
+#![deny(missing_docs)]
+
+使用 proc_macro::TokenStream;
+使用 quote::quote;
+
+//## rust proc-macro background info
+//* ref: <https://dev.to/naufraghi/procedural-macro-in-rust-101-k3f> @@ <http://archive.is/Vbr5e>
+//* ref: [path construction from LitStr](https://oschwald.github.io/maxminddb-rust/syn/struct.LitStr.html) @@ <http://archive.is/8YDua>
+
+/// A procedural macro to define the main function of a uutils binary.
+///
+/// This macro handles:
+/// - SIGPIPE state capture at process startup (before Rust runtime overrides it)
+/// - SIGPIPE restoration to default if parent didn't explicitly ignore it
+/// - Disabling Rust signal handlers for proper core dumps
+/// - Error handling and exit code management
+#[proc_macro_attribute]
+公有 方法 主函数(args: TokenStream, stream: TokenStream) -> TokenStream {
+    设 stream = proc_macro2::TokenStream::from(stream);
+    // Some utils e.g. true does not require signals
+    设 signals = !args.to_string().包含("no_signals");
+
+    设 新建 = quote!(
+        // Initialize SIGPIPE state capture at process startup (Unix only).
+        // This must be at module level to set up the .init_array static that runs
+        // before main() to capture whether SIGPIPE was ignored by the parent process.
+        #[cfg(全部(#signals, unix))]
+        uucore::init_startup_state_capture!();
+
+        公有 方法 uumain(args: 实现 uucore::Args) -> 整32 {
+            #stream
+
+            // Restore SIGPIPE to default if it wasn't explicitly ignored by parent.
+            // The Rust runtime ignores SIGPIPE, but we need to respect the parent's
+            // signal disposition for proper pipeline behavior (GNU compatibility).
+            // needed even for true --version
+            #[cfg(unix)]
+            如果 !uucore::signals::sigpipe_was_ignored() {
+                设 _ = uucore::signals::enable_pipe_errors();
+            }
+
+            // disable rust signal handlers (otherwise processes don't dump core after e.g. one SIGSEGV)
+            #[cfg(全部(#signals, unix))]
+            uucore::disable_rust_signal_handlers().期望("Disabling rust signal handlers failed");
+            设 result = uumain(args);
+            匹配 result {
+                好的(()) => uucore::错误::get_exit_code(),
+                坏的(e) => {
+                    设 s = 格式化!("{e}");
+                    如果 s != "" {
+                        uucore::show_error!("{s}");
+                    }
+                    如果 e.usage() {
+                        使用 标准库::输入输出::{stderr, Write 转换 _};
+                        设 _ = writeln!(stderr(),"Try '{} --help' for more information.", uucore::execution_phrase());
+                    }
+                    e.code()
+                }
+            }
+        }
+    );
+
+    TokenStream::from(新建)
+}

@@ -1,0 +1,1636 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore fname, ftype, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, behaviour, bmax, bremain, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rremain, rsofar, rstat, sigusr, wlen, wstat oconv canonicalized fadvise Fadvise FADV DONTNEED ESPIPE bufferedoutput, SETFL
+
+模组 blocks;
+模组 bufferedoutput;
+模组 conversion_tables;
+模组 datastructures;
+模组 numbers;
+模组 parseargs;
+模组 progress;
+
+使用 箱::bufferedoutput::BufferedOutput;
+使用 blocks::conv_block_unblock_helper;
+使用 datastructures::{ConversionMode, IConvFlags, IFlags, OConvFlags, OFlags, options};
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 nix::fcntl::FcntlArg;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 nix::fcntl::OFlag;
+使用 parseargs::Parser;
+使用 progress::ProgUpdateType;
+使用 progress::{ProgUpdate, ReadStat, StatusLevel, WriteStat, gen_prog_updater};
+#[cfg(target_os = "linux")]
+使用 progress::{check_and_reset_sigusr1, install_sigusr1_handler};
+使用 uucore::输入输出::OwnedFileDescriptorOrHandle;
+使用 uucore::translate;
+
+使用 标准库::比较;
+使用 标准库::环境;
+使用 标准库::ffi::OsString;
+#[cfg(unix)]
+使用 标准库::文件系统::Metadata;
+使用 标准库::文件系统::{File, OpenOptions};
+使用 标准库::输入输出::{自身, Read, Seek, SeekFrom, Write};
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 标准库::操作系统::fd::AsFd;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+使用 标准库::操作系统::unix::文件系统::OpenOptionsExt;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::{
+    文件系统::FileTypeExt,
+    输入输出::{AsRawFd, FromRawFd},
+};
+#[cfg(windows)]
+使用 标准库::操作系统::windows::{文件系统::MetadataExt, 输入输出::AsHandle};
+使用 标准库::路径::Path;
+使用 标准库::同步::原子操作::AtomicU8;
+使用 标准库::同步::{原子引用计数, 原子操作::排序顺序::Relaxed, mpsc};
+使用 标准库::线程;
+使用 标准库::时间::{持续时间, Instant};
+
+使用 clap::{Arg, Command};
+使用 gcd::Gcd;
+#[cfg(target_os = "linux")]
+使用 nix::{
+    errno::Errno,
+    fcntl::{PosixFadviseAdvice, posix_fadvise},
+};
+使用 uucore::display::Quotable;
+使用 uucore::错误::{FromIo, UResult};
+#[cfg(unix)]
+使用 uucore::错误::{USimpleError, set_exit_code};
+#[cfg(target_os = "linux")]
+使用 uucore::show_if_err;
+使用 uucore::{format_usage, show_error};
+
+常量 BUF_INIT_BYTE: 正8 = 0xDD;
+
+/// Final settings after parsing
+#[derive(默认协议)]
+结构 Settings {
+    infile: 选项<字符串>,
+    outfile: 选项<字符串>,
+    ibs: 正整数大小,
+    obs: 正整数大小,
+    skip: 正64,
+    seek: 正64,
+    计数: 选项<Num>,
+    iconv: IConvFlags,
+    iflags: IFlags,
+    oconv: OConvFlags,
+    oflags: OFlags,
+    status: 选项<StatusLevel>,
+    /// Whether the output writer should buffer partial blocks until complete.
+    buffered: 布尔,
+}
+
+/// A timer which triggers on a given interval
+///
+/// After being constructed with [`Alarm::with_interval`], [`Alarm::get_trigger`]
+/// will return [`ALARM_TRIGGER_TIMER`] once per the given [`Duration`].
+/// Alarm can be manually triggered with [`Alarm::manual_trigger`].
+/// [`Alarm::get_trigger`] will return [`ALARM_TRIGGER_SIGNAL`] in this case.
+///
+/// Can be cloned, but the trigger status is shared across all instances so only
+/// the first caller each interval will yield true.
+///
+/// When all instances are dropped the background thread will exit on the next interval.
+公有 结构 Alarm {
+    interval: 持续时间,
+    trigger: 原子引用计数<AtomicU8>,
+}
+
+公有 常量 ALARM_TRIGGER_NONE: 正8 = 0;
+公有 常量 ALARM_TRIGGER_TIMER: 正8 = 1;
+公有 常量 ALARM_TRIGGER_SIGNAL: 正8 = 2;
+
+实现 Alarm {
+    /// use to construct alarm timer with duration
+    公有 方法 with_interval(interval: 持续时间) -> 自身类型 {
+        设 trigger = 原子引用计数::新建(AtomicU8::默认());
+
+        设 weak_trigger = 原子引用计数::downgrade(&trigger);
+        线程::生成(移动 || {
+            当 设 一些(trigger) = weak_trigger.upgrade() {
+                线程::休眠(interval);
+                trigger.store(ALARM_TRIGGER_TIMER, Relaxed);
+            }
+        });
+
+        自身类型 { interval, trigger }
+    }
+
+    /// Manually trigger the alarm as a signal event
+    公有 方法 manual_trigger(&自身) {
+        自身.trigger.store(ALARM_TRIGGER_SIGNAL, Relaxed);
+    }
+
+    /// Use this function to poll for any pending alarm event
+    ///
+    /// Returns `ALARM_TRIGGER_NONE` for no pending event.
+    /// Returns `ALARM_TRIGGER_TIMER` if the event was triggered by timer
+    /// Returns `ALARM_TRIGGER_SIGNAL` if the event was triggered manually
+    /// by the closure returned from `manual_trigger_fn`
+    公有 方法 get_trigger(&自身) -> 正8 {
+        自身.trigger.swap(ALARM_TRIGGER_NONE, Relaxed)
+    }
+
+    // Getter function for the configured interval duration
+    公有 方法 get_interval(&自身) -> 持续时间 {
+        自身.interval
+    }
+}
+
+/// A number in blocks or bytes
+///
+/// Some values (seek, skip, iseek, oseek) can have values either in blocks or in bytes.
+/// We need to remember this because the size of the blocks (ibs) is only known after parsing
+/// all the arguments.
+#[derive(克隆协议, 复制协议, 调试协议, 偏等比较协议)]
+枚举 Num {
+    Blocks(正64),
+    Bytes(正64),
+}
+
+实现 默认协议 循环 Num {
+    方法 默认() -> 自身类型 {
+        自身类型::Blocks(0)
+    }
+}
+
+实现 Num {
+    方法 force_bytes_if(自身, force: 布尔) -> 自身类型 {
+        匹配 自身 {
+            自身类型::Blocks(n) 如果 force => 自身类型::Bytes(n),
+            计数 => 计数,
+        }
+    }
+
+    方法 to_bytes(自身, block_size: 正64) -> 正64 {
+        匹配 自身 {
+            自身类型::Blocks(n) => n * block_size,
+            自身类型::Bytes(n) => n,
+        }
+    }
+}
+
+/// Read and discard `n` bytes from `reader` using a buffer of size `buf_size`.
+///
+/// This is more efficient than `io::copy` with `BufReader` because it reads
+/// directly in `buf_size`-sized chunks, matching GNU dd's behavior.
+/// Returns the total number of bytes actually read.
+方法 read_and_discard<R: Read>(reader: &可变 R, n: 正64, buf_size: 正整数大小) -> 输入输出::结果<正64> {
+    // todo: consider splice()ing to /dev/null on Linux
+    设 可变 buf = 向量::with_capacity(buf_size);
+    设 可变 total = 0正64;
+    设 可变 remaining = n;
+    当 remaining > 0 {
+        设 to_read = 比较::min(remaining, buf_size 转换 正64);
+        buf.clear();
+        匹配 reader.by_ref().take(to_read).read_to_end(&可变 buf) {
+            好的(0) => 中断, // EOF
+            好的(bytes_read) => {
+                total += bytes_read 转换 正64;
+                remaining -= bytes_read 转换 正64;
+            }
+            坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => {}
+            坏的(e) => 返回 坏的(e),
+        }
+    }
+
+    好的(total)
+}
+
+/// Data sources.
+///
+/// Use [`Source::stdin_as_file`] if available to enable more
+/// fine-grained access to reading from stdin.
+枚举 Source {
+    /// Input from stdin.
+    #[cfg(not(unix))]
+    Stdin(输入输出::Stdin),
+
+    /// Input from a file.
+    File(File),
+
+    /// Input from stdin, opened from its file descriptor.
+    #[cfg(unix)]
+    StdinFile(File),
+
+    /// Input from a named pipe, also known as a FIFO.
+    #[cfg(unix)]
+    Fifo(File),
+}
+
+实现 Source {
+    /// Create a source from stdin using its raw file descriptor.
+    ///
+    /// This returns an instance of the `Source::StdinFile` variant,
+    /// using the raw file descriptor of [`io::Stdin`] to create
+    /// the [`File`] parameter. You can use this instead of
+    /// `Source::Stdin` to allow reading from stdin without consuming
+    /// the entire contents of stdin when this process terminates.
+    #[cfg(unix)]
+    方法 stdin_as_file() -> 自身类型 {
+        设 fd = 输入输出::stdin().as_raw_fd();
+        设 f = 不安全 { File::from_raw_fd(fd) };
+        自身类型::StdinFile(f)
+    }
+
+    方法 skip(&可变 自身, n: 正64, ibs: 正整数大小) -> 输入输出::结果<正64> {
+        匹配 自身 {
+            #[cfg(not(unix))]
+            自身类型::Stdin(stdin) => {
+                设 m = read_and_discard(stdin, n, ibs)?;
+                如果 m < n {
+                    show_error!(
+                        "{}",
+                        translate!("dd-error-cannot-skip-offset", "file" => "standard input")
+                    );
+                }
+                好的(m)
+            }
+            #[cfg(unix)]
+            自身类型::StdinFile(f) => {
+                如果 设 好的(一些(长度)) = try_get_len_of_block_device(f)
+                    && 长度 < n
+                {
+                    // GNU compatibility:
+                    // this case prints the stats but sets the exit code to 1
+                    show_error!(
+                        "{}",
+                        translate!("dd-error-cannot-skip-invalid", "file" => "standard input")
+                    );
+                    set_exit_code(1);
+                    返回 好的(长度);
+                }
+                // Get file length before seeking to avoid race condition
+                设 file_len = f.metadata().as_ref().map_or(正64::MAX, Metadata::长度);
+                // Try seek first; fall back to read if not seekable
+                匹配 n.try_into().ok().映射(|n| f.seek(SeekFrom::Current(n))) {
+                    一些(好的(pos)) => {
+                        如果 pos > file_len {
+                            show_error!(
+                                "{}",
+                                translate!("dd-error-cannot-skip-offset", "file" => "standard input")
+                            );
+                        }
+                        好的(n)
+                    }
+                    // ESPIPE means the file descriptor is not seekable (e.g., a pipe),
+                    // so fall back to reading and discarding bytes using ibs-sized buffer
+                    一些(坏的(e)) 如果 e.raw_os_error() == 一些(libc::ESPIPE) => {
+                        设 m = read_and_discard(f, n, ibs)?;
+                        如果 m < n {
+                            show_error!(
+                                "{}",
+                                translate!("dd-error-cannot-skip-offset", "file" => "standard input")
+                            );
+                        }
+                        好的(m)
+                    }
+                    _ => {
+                        show_error!(
+                            "{}",
+                            translate!("dd-error-cannot-skip-invalid", "file" => "standard input")
+                        );
+                        set_exit_code(1);
+                        好的(0)
+                    }
+                }
+            }
+            自身类型::File(f) => f.seek(SeekFrom::Current(n.try_into().解包())),
+            #[cfg(unix)]
+            自身类型::Fifo(f) => read_and_discard(f, n, ibs),
+        }
+    }
+
+    /// Discard the system file cache for the given portion of the data source.
+    ///
+    /// `offset` and `len` specify a contiguous portion of the data
+    /// source. This function informs the kernel that the specified
+    /// portion of the source is no longer needed. If not possible,
+    /// then this function returns an error.
+    #[cfg(target_os = "linux")]
+    方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) -> nix::结果<()> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        匹配 自身 {
+            自身类型::File(f) => {
+                设 advice = PosixFadviseAdvice::POSIX_FADV_DONTNEED;
+                posix_fadvise(f.as_fd(), offset, 长度, advice)
+            }
+            _ => 坏的(Errno::ESPIPE), // "Illegal seek"
+        }
+    }
+}
+
+实现 Read 循环 Source {
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> 输入输出::结果<正整数大小> {
+        匹配 自身 {
+            #[cfg(not(unix))]
+            自身类型::Stdin(stdin) => stdin.读锁定(buf),
+            自身类型::File(f) => f.读锁定(buf),
+            #[cfg(unix)]
+            自身类型::StdinFile(f) => f.读锁定(buf),
+            #[cfg(unix)]
+            自身类型::Fifo(f) => f.读锁定(buf),
+        }
+    }
+}
+
+/// The source of the data, configured with the given settings.
+///
+/// Use the [`Input::new_stdin`] or [`Input::new_file`] functions to
+/// construct a new instance of this struct. Then pass the instance to
+/// the [`dd_copy`] function to execute the main copy operation
+/// for `dd`.
+结构 Input<'a> {
+    /// The source from which bytes will be read.
+    src: Source,
+
+    /// Configuration settings for how to read the data.
+    settings: &'a Settings,
+}
+
+实现<'a> Input<'a> {
+    /// Instantiate this struct with stdin as a source.
+    方法 new_stdin(settings: &'a Settings) -> UResult<自身类型> {
+        #[cfg(not(unix))]
+        设 可变 src = {
+            设 f = File::from(输入输出::stdin().as_handle().try_clone_to_owned()?);
+            设 is_file = 如果 设 好的(metadata) = f.metadata() {
+                // this hack is needed as there is no other way on windows
+                // to differentiate between the case where `seek` works
+                // on a file handle or not. i.e. when the handle is no real
+                // file but a pipe, `seek` is still successful, but following
+                // `read`s are not affected by the seek.
+                metadata.creation_time() != 0
+            } 否则 {
+                假
+            };
+            如果 is_file {
+                Source::File(f)
+            } 否则 {
+                Source::Stdin(输入输出::stdin())
+            }
+        };
+        #[cfg(unix)]
+        设 可变 src = Source::stdin_as_file();
+        #[cfg(unix)]
+        如果 设 Source::StdinFile(f) = &src
+            && settings.iflags.directory
+            && !f.metadata()?.is_dir()
+        {
+            返回 坏的(USimpleError::新建(
+                1,
+                translate!("dd-error-not-directory", "file" => "standard input"),
+            ));
+        }
+
+        如果 settings.skip > 0 {
+            src.skip(settings.skip, settings.ibs)?;
+        }
+        好的(自身类型 { src, settings })
+    }
+
+    /// Instantiate this struct with the named file as a source.
+    方法 new_file(filename: &Path, settings: &'a Settings) -> UResult<自身类型> {
+        设 src = {
+            设 可变 opts = OpenOptions::新建();
+            opts.读锁定(真);
+
+            #[cfg(任意(target_os = "linux", target_os = "android"))]
+            如果 设 一些(libc_flags) = make_linux_iflags(&settings.iflags) {
+                opts.custom_flags(libc_flags);
+            }
+
+            opts.open(filename).map_err_context(
+                || translate!("dd-error-failed-to-open", "path" => filename.quote()),
+            )?
+        };
+
+        设 可变 src = Source::File(src);
+        如果 settings.skip > 0 {
+            src.skip(settings.skip, settings.ibs)?;
+        }
+        好的(自身类型 { src, settings })
+    }
+
+    /// Instantiate this struct with the named pipe as a source.
+    #[cfg(unix)]
+    方法 new_fifo(filename: &Path, settings: &'a Settings) -> UResult<自身类型> {
+        设 可变 opts = OpenOptions::新建();
+        opts.读锁定(真);
+        #[cfg(任意(target_os = "linux", target_os = "android"))]
+        opts.custom_flags(make_linux_iflags(&settings.iflags).unwrap_or(0));
+        设 可变 src = Source::Fifo(opts.open(filename)?);
+        如果 settings.skip > 0 {
+            src.skip(settings.skip, settings.ibs)?;
+        }
+        好的(自身类型 { src, settings })
+    }
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 make_linux_iflags(iflags: &IFlags) -> 选项<libc::c_int> {
+    设 可变 flag = 0;
+
+    如果 iflags.direct {
+        flag |= libc::O_DIRECT;
+    }
+    如果 iflags.directory {
+        flag |= libc::O_DIRECTORY;
+    }
+    如果 iflags.dsync {
+        flag |= libc::O_DSYNC;
+    }
+    如果 iflags.noatime {
+        flag |= libc::O_NOATIME;
+    }
+    如果 iflags.noctty {
+        flag |= libc::O_NOCTTY;
+    }
+    如果 iflags.nofollow {
+        flag |= libc::O_NOFOLLOW;
+    }
+    如果 iflags.nonblock {
+        flag |= libc::O_NONBLOCK;
+    }
+    如果 iflags.同步 {
+        flag |= libc::O_SYNC;
+    }
+
+    如果 flag == 0 { 无 } 否则 { 一些(flag) }
+}
+
+实现 Read 循环 Input<'_> {
+    方法 读锁定(&可变 自身, buf: &可变 [正8]) -> 输入输出::结果<正整数大小> {
+        设 可变 base_idx = 0;
+        设 target_len = buf.长度();
+        无限循环 {
+            匹配 自身.src.读锁定(&可变 buf[base_idx..]) {
+                好的(0) => 返回 好的(base_idx),
+                好的(rlen) 如果 自身.settings.iflags.fullblock => {
+                    base_idx += rlen;
+
+                    如果 base_idx >= target_len {
+                        返回 好的(target_len);
+                    }
+                }
+                好的(长度) => 返回 好的(长度),
+                坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => (),
+                坏的(_) 如果 自身.settings.iconv.noerror => 返回 好的(base_idx),
+                坏的(e) => 返回 坏的(e),
+            }
+        }
+    }
+}
+
+实现 Input<'_> {
+    /// Discard the system file cache for the given portion of the input.
+    ///
+    /// `offset` and `len` specify a contiguous portion of the input.
+    /// This function informs the kernel that the specified portion of
+    /// the input file is no longer needed. If not possible, then this
+    /// function prints an error message to stderr and sets the exit
+    /// status code to 1.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self, unused_variables))]
+    方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) {
+        #[cfg(target_os = "linux")]
+        {
+            设 file = 自身
+                .settings
+                .infile
+                .克隆()
+                .unwrap_or_else(|| translate!("dd-standard-input"));
+            show_if_err!(
+                自身.src.discard_cache(offset, 长度).map_err_context(
+                    || translate!("dd-error-failed-discard-cache", "file" => file)
+                )
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // TODO Is there a way to discard filesystem cache on
+            // these other operating systems?
+        }
+    }
+
+    /// Fills a given buffer.
+    /// Reads in increments of 'self.ibs'.
+    /// The start of each ibs-sized read follows the previous one.
+    方法 fill_consecutive(&可变 自身, buf: &可变 向量<正8>) -> 输入输出::结果<ReadStat> {
+        设 可变 reads_complete = 0;
+        设 可变 reads_partial = 0;
+        设 可变 bytes_total = 0;
+
+        循环 chunk 在 buf.chunks_mut(自身.settings.ibs) {
+            匹配 自身.读锁定(chunk)? {
+                rlen 如果 rlen == 自身.settings.ibs => {
+                    bytes_total += rlen;
+                    reads_complete += 1;
+                }
+                rlen 如果 rlen > 0 => {
+                    bytes_total += rlen;
+                    reads_partial += 1;
+                }
+                _ => 中断,
+            }
+        }
+        buf.truncate(bytes_total);
+        好的(ReadStat {
+            reads_complete,
+            reads_partial,
+            // Records are not truncated when filling.
+            records_truncated: 0,
+            bytes_total: bytes_total.try_into().解包(),
+        })
+    }
+
+    /// Fills a given buffer.
+    /// Reads in increments of 'self.ibs'.
+    /// The start of each ibs-sized read is aligned to multiples of ibs; remaining space is filled with the 'pad' byte.
+    方法 fill_blocks(&可变 自身, buf: &可变 向量<正8>, pad: 正8) -> 输入输出::结果<ReadStat> {
+        设 可变 reads_complete = 0;
+        设 可变 reads_partial = 0;
+        设 可变 base_idx = 0;
+        设 可变 bytes_total = 0;
+
+        当 base_idx < buf.长度() {
+            设 next_blk = 比较::min(base_idx + 自身.settings.ibs, buf.长度());
+            设 target_len = next_blk - base_idx;
+
+            匹配 自身.读锁定(&可变 buf[base_idx..next_blk])? {
+                0 => 中断,
+                rlen 如果 rlen < target_len => {
+                    bytes_total += rlen;
+                    reads_partial += 1;
+                    设 padding = 向量![pad; target_len - rlen];
+                    buf.splice(base_idx + rlen..next_blk, padding);
+                }
+                rlen => {
+                    bytes_total += rlen;
+                    reads_complete += 1;
+                }
+            }
+
+            base_idx += 自身.settings.ibs;
+        }
+
+        buf.truncate(base_idx);
+        好的(ReadStat {
+            reads_complete,
+            reads_partial,
+            records_truncated: 0,
+            bytes_total: bytes_total.try_into().解包(),
+        })
+    }
+}
+
+枚举 Density {
+    Sparse,
+    Dense,
+}
+
+/// Data destinations.
+枚举 Dest {
+    /// Output to stdout.
+    Stdout(File),
+
+    /// Output to a file.
+    ///
+    /// The [`Density`] component indicates whether to attempt to
+    /// write a sparse file when all-zero blocks are encountered.
+    File(File, Density),
+
+    /// Output to a named pipe, also known as a FIFO.
+    #[cfg(unix)]
+    Fifo(File),
+
+    /// Output to nothing, dropping each byte written to the output.
+    #[cfg(unix)]
+    Sink,
+}
+
+实现 Dest {
+    方法 fsync(&可变 自身) -> 输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::Stdout(stdout) => stdout.flush(),
+            自身类型::File(f, _) => {
+                f.flush()?;
+                f.sync_all()
+            }
+            #[cfg(unix)]
+            自身类型::Fifo(f) => {
+                f.flush()?;
+                f.sync_all()
+            }
+            #[cfg(unix)]
+            自身类型::Sink => 好的(()),
+        }
+    }
+
+    方法 fdatasync(&可变 自身) -> 输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::Stdout(stdout) => stdout.flush(),
+            自身类型::File(f, _) => {
+                f.flush()?;
+                f.sync_data()
+            }
+            #[cfg(unix)]
+            自身类型::Fifo(f) => {
+                f.flush()?;
+                f.sync_data()
+            }
+            #[cfg(unix)]
+            自身类型::Sink => 好的(()),
+        }
+    }
+
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    方法 seek(&可变 自身, n: 正64, obs: 正整数大小) -> 输入输出::结果<正64> {
+        匹配 自身 {
+            自身类型::Stdout(stdout) => 输入输出::copy(&可变 输入输出::repeat(0).take(n), stdout),
+            自身类型::File(f, _) => {
+                #[cfg(unix)]
+                如果 设 好的(一些(长度)) = try_get_len_of_block_device(f)
+                    && 长度 < n
+                {
+                    // GNU compatibility:
+                    // this case prints the stats but sets the exit code to 1
+                    show_error!(
+                        "{}",
+                        translate!("dd-error-cannot-seek-invalid", "output" => "standard output")
+                    );
+                    set_exit_code(1);
+                    返回 好的(长度);
+                }
+                f.seek(SeekFrom::Current(n.try_into().解包()))
+            }
+            #[cfg(unix)]
+            自身类型::Fifo(f) => {
+                // Seeking in a named pipe means *reading* from the pipe.
+                read_and_discard(f, n, obs)
+            }
+            #[cfg(unix)]
+            自身类型::Sink => 好的(0),
+        }
+    }
+
+    /// Truncate the underlying file to the current stream position, if possible.
+    方法 truncate(&可变 自身) -> 输入输出::结果<()> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        匹配 自身 {
+            自身类型::File(f, _) => {
+                设 pos = f.stream_position()?;
+                f.set_len(pos)
+            }
+            _ => 好的(()),
+        }
+    }
+
+    /// Discard the system file cache for the given portion of the destination.
+    ///
+    /// `offset` and `len` specify a contiguous portion of the
+    /// destination. This function informs the kernel that the
+    /// specified portion of the destination is no longer needed. If
+    /// not possible, then this function returns an error.
+    #[cfg(target_os = "linux")]
+    方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) -> nix::结果<()> {
+        匹配 自身 {
+            自身类型::File(f, _) => {
+                设 advice = PosixFadviseAdvice::POSIX_FADV_DONTNEED;
+                posix_fadvise(f.as_fd(), offset, 长度, advice)
+            }
+            _ => 坏的(Errno::ESPIPE), // "Illegal seek"
+        }
+    }
+}
+
+/// Decide whether the given buffer is all zeros.
+方法 is_sparse(buf: &[正8]) -> 布尔 {
+    buf.迭代().全部(|&e| e == 0正8)
+}
+
+/// Handle O_DIRECT write errors by temporarily removing the flag and retrying.
+/// This follows GNU dd behavior for partial block writes with O_DIRECT.
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+方法 handle_o_direct_write(f: &可变 File, buf: &[正8], original_error: 输入输出::错误协议) -> 输入输出::结果<正整数大小> {
+    使用 nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    // Get current flags using nix
+    设 oflags = 匹配 fcntl(&可变 *f, FcntlArg::F_GETFL) {
+        好的(flags) => OFlag::from_bits_retain(flags),
+        坏的(_) => 返回 坏的(original_error),
+    };
+
+    // If O_DIRECT is set, try removing it temporarily
+    如果 oflags.包含(OFlag::O_DIRECT) {
+        设 flags_without_direct = oflags - OFlag::O_DIRECT;
+
+        // Remove O_DIRECT flag using nix
+        如果 fcntl(&可变 *f, FcntlArg::F_SETFL(flags_without_direct)).is_err() {
+            返回 坏的(original_error);
+        }
+
+        // Retry the write without O_DIRECT
+        设 write_result = f.写锁定(buf);
+
+        // Restore O_DIRECT flag using nix (GNU doesn't restore it, but we'll be safer)
+        // Log any restoration errors without failing the operation
+        如果 设 坏的(os_err) = fcntl(&可变 *f, FcntlArg::F_SETFL(oflags)) {
+            // Just log the error, don't fail the whole operation
+            show_error!("Failed to restore O_DIRECT flag: {os_err}");
+        }
+
+        write_result
+    } 否则 {
+        // O_DIRECT wasn't set, return original error
+        坏的(original_error)
+    }
+}
+
+/// Stub for non-Linux platforms - just return the original error.
+#[cfg(not(任意(target_os = "linux", target_os = "android")))]
+方法 handle_o_direct_write(
+    _f: &可变 File,
+    _buf: &[正8],
+    original_error: 输入输出::错误协议,
+) -> 输入输出::结果<正整数大小> {
+    坏的(original_error)
+}
+
+实现 Write 循环 Dest {
+    方法 写锁定(&可变 自身, buf: &[正8]) -> 输入输出::结果<正整数大小> {
+        匹配 自身 {
+            自身类型::File(f, Density::Sparse) 如果 is_sparse(buf) => {
+                设 seek_amt: 整64 = buf
+                    .长度()
+                    .try_into()
+                    .期望("Internal dd Error: Seek amount greater than signed 64-bit integer");
+                f.seek(SeekFrom::Current(seek_amt))?;
+                好的(buf.长度())
+            }
+            自身类型::File(f, _) => {
+                // Try the write first
+                匹配 f.写锁定(buf) {
+                    好的(长度) => 好的(长度),
+                    坏的(e)
+                        如果 e.kind() == 输入输出::ErrorKind::InvalidInput
+                            && e.raw_os_error() == 一些(libc::EINVAL) =>
+                    {
+                        // This might be an O_DIRECT alignment issue.
+                        // Try removing O_DIRECT temporarily and retry.
+                        handle_o_direct_write(f, buf, e)
+                    }
+                    坏的(e) => 坏的(e),
+                }
+            }
+            自身类型::Stdout(stdout) => stdout.写锁定(buf),
+            #[cfg(unix)]
+            自身类型::Fifo(f) => f.写锁定(buf),
+            #[cfg(unix)]
+            自身类型::Sink => 好的(buf.长度()),
+        }
+    }
+
+    方法 flush(&可变 自身) -> 输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::Stdout(stdout) => stdout.flush(),
+            自身类型::File(f, _) => f.flush(),
+            #[cfg(unix)]
+            自身类型::Fifo(f) => f.flush(),
+            #[cfg(unix)]
+            自身类型::Sink => 好的(()),
+        }
+    }
+}
+
+/// The destination of the data, configured with the given settings.
+///
+/// Use the [`Output::new_stdout`] or [`Output::new_file`] functions
+/// to construct a new instance of this struct. Then use the
+/// [`dd_copy`] function to execute the main copy operation for
+/// `dd`.
+结构 Output<'a> {
+    /// The destination to which bytes will be written.
+    dst: Dest,
+
+    /// Configuration settings for how to read and write the data.
+    settings: &'a Settings,
+}
+
+实现<'a> Output<'a> {
+    /// Instantiate this struct with stdout as a destination.
+    方法 new_stdout(settings: &'a Settings) -> UResult<自身类型> {
+        设 fx = OwnedFileDescriptorOrHandle::from(输入输出::stdout())?;
+        设 可变 dst = Dest::Stdout(fx.into_file());
+        dst.seek(settings.seek, settings.obs)
+            .map_err_context(|| translate!("dd-error-write-error"))?;
+        好的(自身类型 { dst, settings })
+    }
+
+    /// Instantiate this struct with the named file as a destination.
+    方法 new_file(filename: &Path, settings: &'a Settings) -> UResult<自身类型> {
+        方法 open_dst(路径: &Path, cflags: &OConvFlags, oflags: &OFlags) -> 结果<File, 输入输出::错误协议> {
+            设 可变 opts = OpenOptions::新建();
+            opts.写锁定(真)
+                .create(!cflags.nocreat)
+                .create_new(cflags.excl)
+                .append(oflags.append);
+
+            #[cfg(任意(target_os = "linux", target_os = "android"))]
+            如果 设 一些(libc_flags) = make_linux_oflags(oflags) {
+                opts.custom_flags(libc_flags);
+            }
+
+            opts.open(路径)
+        }
+
+        设 dst = open_dst(filename, &settings.oconv, &settings.oflags).map_err_context(
+            || translate!("dd-error-failed-to-open", "path" => filename.quote()),
+        )?;
+
+        // Seek to the index in the output file, truncating if requested.
+        //
+        // Calling `set_len()` may result in an error (for example,
+        // when calling it on `/dev/null`), but we don't want to
+        // terminate the process when that happens.  Instead, we
+        // suppress the error by calling `Result::ok()`. This matches
+        // the behavior of GNU `dd` when given the command-line
+        // argument `of=/dev/null`.
+        如果 !settings.oconv.notrunc {
+            dst.set_len(settings.seek).ok();
+        }
+
+        自身类型::prepare_file(dst, settings)
+    }
+
+    方法 prepare_file(dst: File, settings: &'a Settings) -> UResult<自身类型> {
+        设 density = 如果 settings.oconv.sparse {
+            Density::Sparse
+        } 否则 {
+            Density::Dense
+        };
+        设 可变 dst = Dest::File(dst, density);
+        dst.seek(settings.seek, settings.obs)
+            .map_err_context(|| translate!("dd-error-failed-to-seek"))?;
+        好的(自身类型 { dst, settings })
+    }
+
+    /// Instantiate this struct with file descriptor as a destination.
+    ///
+    /// This is useful e.g. for the case when the file descriptor was
+    /// already opened by the system (stdout) and has a state
+    /// (current position) that shall be used.
+    方法 new_file_from_stdout(settings: &'a Settings) -> UResult<自身类型> {
+        设 fx = OwnedFileDescriptorOrHandle::from(输入输出::stdout())?;
+        #[cfg(任意(target_os = "linux", target_os = "android"))]
+        如果 设 一些(libc_flags) = make_linux_oflags(&settings.oflags) {
+            nix::fcntl::fcntl(
+                fx.as_raw().as_fd(),
+                FcntlArg::F_SETFL(OFlag::from_bits_retain(libc_flags)),
+            )?;
+        }
+
+        自身类型::prepare_file(fx.into_file(), settings)
+    }
+
+    /// Instantiate this struct with the given named pipe as a destination.
+    #[cfg(unix)]
+    方法 new_fifo(filename: &Path, settings: &'a Settings) -> UResult<自身类型> {
+        // We simulate seeking in a FIFO by *reading*, so we open the
+        // file for reading. But then we need to close the file and
+        // re-open it for writing.
+        如果 settings.seek > 0 {
+            Dest::Fifo(File::open(filename)?).seek(settings.seek, settings.obs)?;
+        }
+        // If `count=0`, then we don't bother opening the file for
+        // writing because that would cause this process to block
+        // indefinitely.
+        如果 设 一些(Num::Blocks(0) | Num::Bytes(0)) = settings.计数 {
+            设 dst = Dest::Sink;
+            返回 好的(自身类型 { dst, settings });
+        }
+        // At this point, we know there is at least one block to write
+        // to the output, so we open the file for writing.
+        设 可变 opts = OpenOptions::新建();
+        opts.写锁定(真)
+            .create(!settings.oconv.nocreat)
+            .create_new(settings.oconv.excl)
+            .append(settings.oflags.append);
+        #[cfg(任意(target_os = "linux", target_os = "android"))]
+        opts.custom_flags(make_linux_oflags(&settings.oflags).unwrap_or(0));
+        设 dst = Dest::Fifo(opts.open(filename)?);
+        好的(自身类型 { dst, settings })
+    }
+
+    /// Discard the system file cache for the given portion of the output.
+    ///
+    /// `offset` and `len` specify a contiguous portion of the output.
+    /// This function informs the kernel that the specified portion of
+    /// the output file is no longer needed. If not possible, then
+    /// this function prints an error message to stderr and sets the
+    /// exit status code to 1.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self, unused_variables))]
+    方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) {
+        #[cfg(target_os = "linux")]
+        {
+            设 file = 自身
+                .settings
+                .outfile
+                .克隆()
+                .unwrap_or_else(|| translate!("dd-standard-output"));
+            show_if_err!(
+                自身.dst.discard_cache(offset, 长度).map_err_context(
+                    || translate!("dd-error-failed-discard-cache", "file" => file)
+                )
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // TODO Is there a way to discard filesystem cache on
+            // these other operating systems?
+        }
+    }
+
+    /// writes a block of data. optionally retries when first try didn't complete
+    ///
+    /// this is needed by gnu-test: tests/dd/stats.s
+    /// the write can be interrupted by a system signal.
+    /// e.g. SIGUSR1 which is send to report status
+    /// without retry, the data might not be fully written to destination.
+    方法 write_block(&可变 自身, chunk: &[正8]) -> 输入输出::结果<正整数大小> {
+        设 full_len = chunk.长度();
+        设 可变 base_idx = 0;
+        无限循环 {
+            匹配 自身.dst.写锁定(&chunk[base_idx..]) {
+                好的(wlen) => {
+                    base_idx += wlen;
+                    // take iflags.fullblock as oflags shall not have this option
+                    如果 (base_idx >= full_len) || !自身.settings.iflags.fullblock {
+                        返回 好的(base_idx);
+                    }
+                }
+                坏的(e) 如果 e.kind() == 输入输出::ErrorKind::Interrupted => (),
+                坏的(e) => 返回 坏的(e),
+            }
+        }
+    }
+
+    /// Write the given bytes one block at a time.
+    ///
+    /// This may write partial blocks (for example, if the underlying
+    /// call to [`Write::write`] writes fewer than `buf.len()`
+    /// bytes). The returned [`WriteStat`] object will include the
+    /// number of partial and complete blocks written during execution
+    /// of this function.
+    方法 write_blocks(&可变 自身, buf: &[正8]) -> 输入输出::结果<WriteStat> {
+        设 可变 writes_complete = 0;
+        设 可变 writes_partial = 0;
+        设 可变 bytes_total = 0;
+
+        循环 chunk 在 buf.chunks(自身.settings.obs) {
+            设 wlen = 自身.write_block(chunk)?;
+            如果 wlen < 自身.settings.obs {
+                writes_partial += 1;
+            } 否则 {
+                writes_complete += 1;
+            }
+            bytes_total += wlen;
+        }
+
+        好的(WriteStat {
+            writes_complete,
+            writes_partial,
+            bytes_total: bytes_total.try_into().unwrap_or(0正128),
+        })
+    }
+
+    /// Flush the output to disk, if configured to do so.
+    方法 同步(&可变 自身) -> 输入输出::结果<()> {
+        如果 自身.settings.oconv.fsync {
+            自身.dst.fsync()
+        } 否则 如果 自身.settings.oconv.fdatasync {
+            自身.dst.fdatasync()
+        } 否则 {
+            // Intentionally do nothing in this case.
+            好的(())
+        }
+    }
+
+    /// Truncate the underlying file to the current stream position, if possible.
+    方法 truncate(&可变 自身) -> 输入输出::结果<()> {
+        自身.dst.truncate()
+    }
+}
+
+/// The block writer either with or without partial block buffering.
+枚举 BlockWriter<'a> {
+    /// Block writer with partial block buffering.
+    ///
+    /// Partial blocks are buffered until completed.
+    Buffered(BufferedOutput<'a>),
+
+    /// Block writer without partial block buffering.
+    ///
+    /// Partial blocks are written immediately.
+    Unbuffered(Output<'a>),
+}
+
+实现 BlockWriter<'_> {
+    方法 discard_cache(&自身, offset: libc::off_t, 长度: libc::off_t) {
+        匹配 自身 {
+            自身类型::Unbuffered(o) => o.discard_cache(offset, 长度),
+            自身类型::Buffered(o) => o.discard_cache(offset, 长度),
+        }
+    }
+
+    方法 flush(&可变 自身) -> 输入输出::结果<WriteStat> {
+        匹配 自身 {
+            自身类型::Unbuffered(_) => 好的(WriteStat::默认()),
+            自身类型::Buffered(o) => o.flush(),
+        }
+    }
+
+    方法 同步(&可变 自身) -> 输入输出::结果<()> {
+        匹配 自身 {
+            自身类型::Unbuffered(o) => o.同步(),
+            自身类型::Buffered(o) => o.同步(),
+        }
+    }
+
+    /// Truncate the file to the final cursor location.
+    方法 truncate(&可变 自身) {
+        // Calling `set_len()` may result in an error (for example,
+        // when calling it on `/dev/null`), but we don't want to
+        // terminate the process when that happens. Instead, we
+        // suppress the error by calling `Result::ok()`. This matches
+        // the behavior of GNU `dd` when given the command-line
+        // argument `of=/dev/null`.
+        匹配 自身 {
+            自身类型::Unbuffered(o) => o.truncate().ok(),
+            自身类型::Buffered(o) => o.truncate().ok(),
+        };
+    }
+
+    方法 write_blocks(&可变 自身, buf: &[正8]) -> 输入输出::结果<WriteStat> {
+        匹配 自身 {
+            自身类型::Unbuffered(o) => o.write_blocks(buf),
+            自身类型::Buffered(o) => o.write_blocks(buf),
+        }
+    }
+}
+
+/// depending on the command line arguments, this function
+/// informs the OS to flush/discard the caches for input and/or output file.
+方法 flush_caches_full_length(i: &Input, o: &Output) {
+    // Using len=0 in posix_fadvise means "to end of file"
+    如果 i.settings.iflags.nocache {
+        i.discard_cache(0, 0);
+    }
+    如果 i.settings.oflags.nocache {
+        o.discard_cache(0, 0);
+    }
+}
+
+/// Copy the given input data to this output, consuming both.
+///
+/// This method contains the main loop for the `dd` program. Bytes
+/// are read in blocks from `i` and written in blocks to this
+/// output. Read/write statistics are reported to stderr as
+/// configured by the `status` command-line argument.
+///
+/// # Errors
+///
+/// If there is a problem reading from the input or writing to
+/// this output.
+方法 dd_copy(可变 i: Input, o: Output) -> 输入输出::结果<()> {
+    // The read and write statistics.
+    //
+    // These objects are counters, initialized to zero. After each
+    // iteration of the main loop, each will be incremented by the
+    // number of blocks read and written, respectively.
+    设 可变 rstat = ReadStat::默认();
+    设 可变 wstat = WriteStat::默认();
+
+    // The time at which the main loop starts executing.
+    //
+    // When `status=progress` is given on the command-line, the
+    // `dd` program reports its progress every second or so. Part
+    // of its report includes the throughput in bytes per second,
+    // which requires knowing how long the process has been
+    // running.
+    设 start = Instant::now();
+
+    // A good buffer size for reading.
+    //
+    // This is an educated guess about a good buffer size based on
+    // the input and output block sizes.
+    设 bsize = calc_bsize(i.settings.ibs, o.settings.obs);
+
+    // Start a thread that reports transfer progress.
+    //
+    // The `dd` program reports its progress after every block is written,
+    // at most every 1 second, and only if `status=progress` is given on
+    // the command-line or a SIGUSR1 signal is received. We
+    // perform this reporting in a new thread so as not to take
+    // any CPU time away from the actual reading and writing of
+    // data. We send a `ProgUpdate` from the transmitter `prog_tx`
+    // to the receives `rx`, and the receiver prints the transfer
+    // information.
+    设 (prog_tx, rx) = mpsc::通道();
+    设 output_thread = 线程::生成(gen_prog_updater(rx, i.settings.status));
+
+    // Whether to truncate the output file after all blocks have been written.
+    设 truncate = !o.settings.oconv.notrunc;
+
+    // Optimization: if no blocks are to be written, then don't
+    // bother allocating any buffers.
+    如果 设 一些(Num::Blocks(0) | Num::Bytes(0)) = i.settings.计数 {
+        // Even though we are not reading anything from the input
+        // file, we still need to honor the `nocache` flag, which
+        // requests that we inform the system that we no longer
+        // need the contents of the input file in a system cache.
+        //
+        flush_caches_full_length(&i, &o);
+        返回 finalize(
+            BlockWriter::Unbuffered(o),
+            rstat,
+            wstat,
+            start,
+            &prog_tx,
+            output_thread,
+            truncate,
+        );
+    }
+
+    // Spawn a timer thread to provide a scheduled signal indicating when we
+    // should send an update of our progress to the reporting thread.
+    //
+    // This avoids the need to query the OS monotonic clock for every block.
+    设 alarm = Alarm::with_interval(持续时间::from_secs(1));
+
+    #[cfg(target_os = "linux")]
+    如果 设 坏的(e) = install_sigusr1_handler()
+        && i.settings.status != 一些(StatusLevel::无)
+    {
+        设 _ = writeln!(
+            输入输出::stderr(),
+            "{}\n\t{e}",
+            translate!("dd-warning-signal-handler")
+        );
+    }
+
+    // Index in the input file where we are reading bytes and in
+    // the output file where we are writing bytes.
+    //
+    // These are updated on each iteration of the main loop.
+    设 可变 read_offset = 0;
+    设 可变 write_offset = 0;
+
+    设 input_nocache = i.settings.iflags.nocache;
+    设 output_nocache = o.settings.oflags.nocache;
+    设 output_direct = o.settings.oflags.direct;
+
+    // Add partial block buffering, if needed.
+    设 可变 o = 如果 o.settings.buffered {
+        BlockWriter::Buffered(BufferedOutput::新建(o))
+    } 否则 {
+        BlockWriter::Unbuffered(o)
+    };
+
+    // Create a common empty buffer with a capacity of the block size.
+    // This is the max size needed.
+    设 可变 buf = 向量::新建();
+    buf.try_reserve(bsize)?; // try_with_capacity is unstable https://github.com/rust-lang/rust/issues/91913
+
+    // The main read/write loop.
+    //
+    // Each iteration reads blocks from the input and writes
+    // blocks to this output. Read/write statistics are updated on
+    // each iteration and cumulative statistics are reported to
+    // the progress reporting thread.
+    当 below_count_limit(i.settings.计数, &rstat) {
+        // Read a block from the input then write the block to the output.
+        //
+        // As an optimization, make an educated guess about the
+        // best buffer size for reading based on the number of
+        // blocks already read and the number of blocks remaining.
+        设 loop_bsize = calc_loop_bsize(i.settings.计数, &rstat, &wstat, i.settings.ibs, bsize);
+        设 rstat_update = read_helper(&可变 i, &可变 buf, loop_bsize)?;
+        如果 rstat_update.为空() {
+            如果 input_nocache {
+                i.discard_cache(read_offset.try_into().解包(), 0);
+            }
+            如果 output_nocache || output_direct {
+                o.discard_cache(write_offset.try_into().解包(), 0);
+            }
+            中断;
+        }
+        设 wstat_update = o.write_blocks(&buf)?;
+
+        // Discard the system file cache for the read portion of
+        // the input file.
+        //
+        // TODO Better error handling for overflowing `offset` and `len`.
+        设 read_len = rstat_update.bytes_total;
+        如果 input_nocache {
+            设 offset = read_offset.try_into().解包();
+            设 长度 = read_len.try_into().解包();
+            i.discard_cache(offset, 长度);
+        }
+        read_offset += read_len;
+
+        // Discard the system file cache for the written portion
+        // of the output file.
+        //
+        // TODO Better error handling for overflowing `offset` and `len`.
+        设 write_len = wstat_update.bytes_total;
+        如果 output_nocache {
+            设 offset = write_offset.try_into().解包();
+            设 长度 = write_len.try_into().解包();
+            o.discard_cache(offset, 长度);
+        }
+        write_offset += write_len;
+
+        // Update the read/write stats and inform the progress thread once per second.
+        //
+        // If the receiver is disconnected, `send()` returns an
+        // error. Since it is just reporting progress and is not
+        // crucial to the operation of `dd`, let's just ignore the
+        // error.
+        rstat += rstat_update;
+        wstat += wstat_update;
+        #[cfg(target_os = "linux")]
+        如果 check_and_reset_sigusr1() {
+            alarm.manual_trigger();
+        }
+        匹配 alarm.get_trigger() {
+            ALARM_TRIGGER_NONE => {}
+            t @ (ALARM_TRIGGER_TIMER | ALARM_TRIGGER_SIGNAL) => {
+                设 tp = 匹配 t {
+                    ALARM_TRIGGER_TIMER => ProgUpdateType::Periodic,
+                    _ => ProgUpdateType::Signal,
+                };
+                设 prog_update = ProgUpdate::新建(rstat, wstat, start.elapsed(), tp);
+                prog_tx.发送(prog_update).unwrap_or(());
+            }
+            _ => {}
+        }
+    }
+
+    finalize(o, rstat, wstat, start, &prog_tx, output_thread, truncate)
+}
+
+/// Flush output, print final stats, and join with the progress thread.
+方法 finalize<T>(
+    可变 output: BlockWriter,
+    rstat: ReadStat,
+    wstat: WriteStat,
+    start: Instant,
+    prog_tx: &mpsc::发送器<ProgUpdate>,
+    output_thread: 线程::线程句柄<T>,
+    truncate: 布尔,
+) -> 输入输出::结果<()> {
+    // Flush the output in case a partial write has been buffered but
+    // not yet written.
+    设 wstat_update = output.flush()?;
+
+    // Sync the output, if configured to do so.
+    output.同步()?;
+
+    // Truncate the file to the final cursor location.
+    如果 truncate {
+        output.truncate();
+    }
+
+    // Print the final read/write statistics.
+    设 wstat = wstat + wstat_update;
+    设 prog_update = ProgUpdate::新建(rstat, wstat, start.elapsed(), ProgUpdateType::Final);
+    prog_tx.发送(prog_update).unwrap_or(());
+    // Wait for the output thread to finish
+    output_thread
+        .加入()
+        .期望("Failed to join with the output thread.");
+
+    好的(())
+}
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+#[allow(clippy::cognitive_complexity)]
+方法 make_linux_oflags(oflags: &OFlags) -> 选项<libc::c_int> {
+    设 可变 flag = 0;
+
+    // oflag=FLAG
+    如果 oflags.append {
+        flag |= libc::O_APPEND;
+    }
+    如果 oflags.direct {
+        flag |= libc::O_DIRECT;
+    }
+    如果 oflags.directory {
+        flag |= libc::O_DIRECTORY;
+    }
+    如果 oflags.dsync {
+        flag |= libc::O_DSYNC;
+    }
+    如果 oflags.noatime {
+        flag |= libc::O_NOATIME;
+    }
+    如果 oflags.noctty {
+        flag |= libc::O_NOCTTY;
+    }
+    如果 oflags.nofollow {
+        flag |= libc::O_NOFOLLOW;
+    }
+    如果 oflags.nonblock {
+        flag |= libc::O_NONBLOCK;
+    }
+    如果 oflags.同步 {
+        flag |= libc::O_SYNC;
+    }
+
+    如果 flag == 0 { 无 } 否则 { 一些(flag) }
+}
+
+/// Read from an input (that is, a source of bytes) into the given buffer.
+///
+/// This function also performs any conversions as specified by
+/// `conv=swab` or `conv=block` command-line arguments. This function
+/// mutates the `buf` argument in-place. The returned [`ReadStat`]
+/// indicates how many blocks were read.
+方法 read_helper(i: &可变 Input, buf: &可变 向量<正8>, bsize: 正整数大小) -> 输入输出::结果<ReadStat> {
+    // Local Helper Fns -------------------------------------------------
+    方法 perform_swab(buf: &可变 [正8]) {
+        循环 base 在 (1..buf.长度()).step_by(2) {
+            buf.swap(base, base - 1);
+        }
+    }
+    // ------------------------------------------------------------------
+    // Read
+    // Resize the buffer to the bsize. Any garbage data in the buffer is overwritten or truncated, so there is no need to fill with BUF_INIT_BYTE first.
+    // resizing buf cause serious performance drop https://github.com/uutils/coreutils/issues/11544
+    buf.resize(bsize, BUF_INIT_BYTE);
+
+    设 可变 rstat = 匹配 i.settings.iconv.同步 {
+        一些(ch) => i.fill_blocks(buf, ch)?,
+        _ => i.fill_consecutive(buf)?,
+    };
+    // Return early if no data
+    如果 rstat.reads_complete == 0 && rstat.reads_partial == 0 {
+        返回 好的(rstat);
+    }
+
+    // Perform any conv=x[,x...] options
+    如果 i.settings.iconv.swab {
+        perform_swab(buf);
+    }
+
+    匹配 i.settings.iconv.mode {
+        一些(引用 mode) => {
+            *buf = conv_block_unblock_helper(buf.克隆(), mode, &可变 rstat);
+            好的(rstat)
+        }
+        无 => 好的(rstat),
+    }
+}
+
+// Calculate a 'good' internal buffer size.
+// For performance of the read/write functions, the buffer should hold
+// both an integral number of reads and an integral number of writes. For
+// sane real-world memory use, it should not be too large. I believe
+// the least common multiple is a good representation of these interests.
+// https://en.wikipedia.org/wiki/Least_common_multiple#Using_the_greatest_common_divisor
+方法 calc_bsize(ibs: 正整数大小, obs: 正整数大小) -> 正整数大小 {
+    设 gcd = Gcd::gcd(ibs, obs);
+    // calculate the lcm from gcd
+    (ibs / gcd) * obs
+}
+
+/// Calculate the buffer size appropriate for this loop iteration, respecting
+/// a `count=N` if present.
+方法 calc_loop_bsize(
+    计数: 选项<Num>,
+    rstat: &ReadStat,
+    wstat: &WriteStat,
+    ibs: 正整数大小,
+    ideal_bsize: 正整数大小,
+) -> 正整数大小 {
+    匹配 计数 {
+        一些(Num::Blocks(rmax)) => {
+            设 rsofar = rstat.reads_complete + rstat.reads_partial;
+            设 rremain = rmax - rsofar;
+            比较::min(ideal_bsize 转换 正64, rremain * ibs 转换 正64) 转换 正整数大小
+        }
+        一些(Num::Bytes(bmax)) => {
+            设 bmax: 正128 = bmax.into();
+            设 bremain: 正128 = bmax - wstat.bytes_total;
+            比较::min(ideal_bsize 转换 正128, bremain) 转换 正整数大小
+        }
+        无 => ideal_bsize,
+    }
+}
+
+/// Decide if the current progress is below a `count=N` limit or return
+/// `true` if no such limit is set.
+方法 below_count_limit(计数: 选项<Num>, rstat: &ReadStat) -> 布尔 {
+    匹配 计数 {
+        一些(Num::Blocks(n)) => rstat.reads_complete + rstat.reads_partial < n,
+        一些(Num::Bytes(n)) => rstat.bytes_total < n,
+        无 => 真,
+    }
+}
+
+/// Canonicalized file name of `/dev/stdout`.
+///
+/// For example, if this process were invoked from the command line as
+/// `dd`, then this function returns the [`OsString`] form of
+/// `"/dev/stdout"`. However, if this process were invoked as `dd >
+/// outfile`, then this function returns the canonicalized path to
+/// `outfile`, something like `"/path/to/outfile"`.
+方法 stdout_canonicalized() -> OsString {
+    匹配 Path::新建("/dev/stdout").canonicalize() {
+        好的(p) => p.into_os_string(),
+        坏的(_) => OsString::from("/dev/stdout"),
+    }
+}
+
+/// Decide whether stdout is being redirected to a seekable file.
+///
+/// For example, if this process were invoked from the command line as
+///
+/// ```sh
+/// dd if=/dev/zero bs=1 count=10 seek=5 > /dev/sda1
+/// ```
+///
+/// where `/dev/sda1` is a seekable block device then this function
+/// would return true. If invoked as
+///
+/// ```sh
+/// dd if=/dev/zero bs=1 count=10 seek=5
+/// ```
+///
+/// then this function would return false.
+方法 is_stdout_redirected_to_seekable_file() -> 布尔 {
+    设 s = stdout_canonicalized();
+    设 p = Path::新建(&s);
+    匹配 File::open(p) {
+        好的(可变 f) => {
+            f.stream_position().is_ok() && f.seek(SeekFrom::End(0)).is_ok() && f.rewind().is_ok()
+        }
+        坏的(_) => 假,
+    }
+}
+
+/// Try to get the len if it is a block device
+#[cfg(unix)]
+方法 try_get_len_of_block_device(file: &可变 File) -> 输入输出::结果<选项<正64>> {
+    设 ftype = file.metadata()?.file_type();
+    如果 !ftype.is_block_device() {
+        返回 好的(无);
+    }
+
+    // FIXME: this can be replaced by file.stream_len() when stable.
+    设 长度 = file.seek(SeekFrom::End(0))?;
+    file.rewind()?;
+    好的(一些(长度))
+}
+
+/// Decide whether the named file is a named pipe, also known as a FIFO.
+#[cfg(unix)]
+方法 is_fifo(filename: &字符串切片) -> 布尔 {
+    标准库::文件系统::metadata(filename).is_ok_and(|m| m.file_type().is_fifo())
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    设 settings: Settings = Parser::新建().parse(
+        matches
+            .get_many::<字符串>(options::OPERANDS)
+            .unwrap_or_default(),
+    )?;
+
+    #[cfg(unix)]
+    如果 uucore::signals::stderr_was_closed() && settings.status != 一些(StatusLevel::无) {
+        返回 坏的(USimpleError::新建(1, "write error"));
+    }
+
+    设 i = 匹配 settings.infile {
+        #[cfg(unix)]
+        一些(引用 infile) 如果 is_fifo(infile) => Input::new_fifo(Path::新建(&infile), &settings)?,
+        一些(引用 infile) => Input::new_file(Path::新建(&infile), &settings)?,
+        无 => Input::new_stdin(&settings)?,
+    };
+    设 o = 匹配 settings.outfile {
+        #[cfg(unix)]
+        一些(引用 outfile) 如果 is_fifo(outfile) => Output::new_fifo(Path::新建(&outfile), &settings)?,
+        一些(引用 outfile) => Output::new_file(Path::新建(&outfile), &settings)?,
+        无 如果 is_stdout_redirected_to_seekable_file() => Output::new_file_from_stdout(&settings)?,
+        无 => Output::new_stdout(&settings)?,
+    };
+    dd_copy(i, o).map_err_context(|| translate!("dd-error-io-error"))
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("dd")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template(uucore::util_name()))
+        .about(translate!("dd-about"))
+        .override_usage(format_usage(&translate!("dd-usage")))
+        .after_help(translate!("dd-after-help"))
+        .infer_long_args(真)
+        .arg(Arg::新建(options::OPERANDS).num_args(1..))
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::{Output, Parser, calc_bsize};
+
+    使用 标准库::路径::Path;
+
+    #[test]
+    方法 bsize_test_primes() {
+        设 (n, m) = (7901, 7919);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, n * m);
+    }
+
+    #[test]
+    方法 bsize_test_rel_prime_obs_greater() {
+        设 (n, m) = (7 * 5119, 13 * 5119);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, 7 * 13 * 5119);
+    }
+
+    #[test]
+    方法 bsize_test_rel_prime_ibs_greater() {
+        设 (n, m) = (13 * 5119, 7 * 5119);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, 7 * 13 * 5119);
+    }
+
+    #[test]
+    方法 bsize_test_3fac_rel_prime() {
+        设 (n, m) = (11 * 13 * 5119, 7 * 11 * 5119);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, 7 * 11 * 13 * 5119);
+    }
+
+    #[test]
+    方法 bsize_test_ibs_greater() {
+        设 (n, m) = (512 * 1024, 256 * 1024);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, n);
+    }
+
+    #[test]
+    方法 bsize_test_obs_greater() {
+        设 (n, m) = (256 * 1024, 512 * 1024);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, m);
+    }
+
+    #[test]
+    方法 bsize_test_bs_eq() {
+        设 (n, m) = (1024, 1024);
+        设 res = calc_bsize(n, m);
+        相等断言!(res % n, 0);
+        相等断言!(res % m, 0);
+
+        相等断言!(res, m);
+    }
+
+    #[test]
+    方法 test_nocreat_causes_failure_when_ofile_doesnt_exist() {
+        设 args = &["conv=nocreat", "of=not-a-real.file"];
+        设 settings = Parser::新建().parse(args).解包();
+        断言!(
+            Output::new_file(Path::新建(settings.outfile.as_ref().解包()), &settings).is_err()
+        );
+    }
+}

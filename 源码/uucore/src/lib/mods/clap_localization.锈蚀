@@ -1,0 +1,706 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore (path) osrelease myutil
+
+//! Helper clap functions to localize error handling and options
+//!
+//! This module provides utilities for handling clap errors with localization support.
+//! It uses clap's error context API to extract structured information from errors
+//! instead of parsing error strings, providing a more robust solution.
+//!
+
+使用 箱::错误::{UResult, USimpleError};
+使用 箱::locale::translate;
+
+使用 clap::错误::{ContextKind, ErrorKind};
+使用 clap::{ArgMatches, Command, 错误协议};
+
+使用 标准库::错误::错误协议 转换 StdError;
+使用 标准库::ffi::OsString;
+
+使用 标准库::输入输出::Write 转换 _;
+使用 标准库::输入输出::stderr;
+
+/// Color enum for consistent styling
+#[derive(调试协议, 克隆协议, 复制协议)]
+公有 枚举 Color {
+    Red,
+    Yellow,
+    Green,
+}
+
+实现 Color {
+    方法 code(自身) -> &'静态 字符串切片 {
+        匹配 自身 {
+            自身类型::Red => "31",
+            自身类型::Yellow => "33",
+            自身类型::Green => "32",
+        }
+    }
+}
+
+/// Determine color choice based on environment variables
+方法 get_color_choice() -> clap::ColorChoice {
+    如果 标准库::环境::var("NO_COLOR").is_ok() {
+        clap::ColorChoice::Never
+    } 否则 如果 标准库::环境::var("CLICOLOR_FORCE").is_ok() || 标准库::环境::var("FORCE_COLOR").is_ok() {
+        clap::ColorChoice::Always
+    } 否则 {
+        clap::ColorChoice::Auto
+    }
+}
+
+/// Generic helper to check if colors should be enabled for a given stream
+方法 should_use_color_for_stream<S: 标准库::输入输出::IsTerminal>(stream: &S) -> 布尔 {
+    匹配 get_color_choice() {
+        clap::ColorChoice::Always => 真,
+        clap::ColorChoice::Never => 假,
+        clap::ColorChoice::Auto => {
+            stream.is_terminal() && 标准库::环境::var("TERM").unwrap_or_default() != "dumb"
+        }
+    }
+}
+
+/// Manages color output based on environment settings
+结构 ColorManager(布尔);
+
+实现 ColorManager {
+    /// Create a new ColorManager based on environment variables
+    方法 from_env() -> 自身类型 {
+        自身类型(should_use_color_for_stream(&stderr()))
+    }
+
+    /// Apply color to text if colors are enabled
+    方法 colorize(&自身, text: &字符串切片, color: Color) -> 字符串 {
+        如果 自身.0 {
+            格式化!("\x1b[{}m{text}\x1b[0m", color.code())
+        } 否则 {
+            text.to_string()
+        }
+    }
+}
+
+/// Unified error formatter that handles all error types consistently
+公有 结构 ErrorFormatter<'a> {
+    color_mgr: ColorManager,
+    util_name: &'a 字符串切片,
+}
+
+实现<'a> ErrorFormatter<'a> {
+    公有 方法 新建(util_name: &'a 字符串切片) -> 自身类型 {
+        自身类型 {
+            color_mgr: ColorManager::from_env(),
+            util_name,
+        }
+    }
+
+    /// Print error and exit with the specified code
+    方法 print_error_and_exit(&自身, err: &错误协议, exit_code: 整32) -> ! {
+        自身.print_error_and_exit_with_callback(err, exit_code, || {})
+    }
+
+    /// Print error with optional callback before exit
+    公有 方法 print_error_and_exit_with_callback<F>(
+        &自身,
+        err: &错误协议,
+        exit_code: 整32,
+        callback: F,
+    ) -> !
+    何处
+        F: FnOnce(),
+    {
+        设 code = 自身.print_error(err, exit_code);
+        callback();
+        标准库::进程::exit(code);
+    }
+
+    /// Print error and return exit code (no exit call)
+    公有 方法 print_error(&自身, err: &错误协议, exit_code: 整32) -> 整32 {
+        匹配 err.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 自身.handle_display_errors(err),
+            ErrorKind::UnknownArgument => 自身.handle_unknown_argument(err, exit_code),
+            ErrorKind::InvalidValue | ErrorKind::ValueValidation => {
+                自身.handle_invalid_value(err, exit_code)
+            }
+            ErrorKind::MissingRequiredArgument => 自身.handle_missing_required(err, exit_code),
+            ErrorKind::TooFewValues | ErrorKind::TooManyValues | ErrorKind::WrongNumberOfValues => {
+                // These need full clap formatting
+                设 _ = write!(stderr(), "{}", err.render());
+                exit_code
+            }
+            _ => 自身.handle_generic_error(err, exit_code),
+        }
+    }
+
+    /// Handle help and version display
+    方法 handle_display_errors(&自身, err: &错误协议) -> 整32 {
+        打印!("{}", err.render());
+        0
+    }
+
+    /// Handle unknown argument errors
+    方法 handle_unknown_argument(&自身, err: &错误协议, exit_code: 整32) -> 整32 {
+        如果 设 一些(invalid_arg) = err.获取(ContextKind::InvalidArg) {
+            设 arg_str = invalid_arg.to_string();
+            设 error_word = translate!("common-error");
+
+            // Print main error
+            设 _ = write!(
+                stderr(),
+                "{}\n\n",
+                translate!(
+                    "clap-error-unexpected-argument",
+                    "arg" => 自身.color_mgr.colorize(&arg_str, Color::Yellow),
+                    "error_word" => 自身.color_mgr.colorize(&error_word, Color::Red)
+                )
+            );
+
+            // Show suggestion if available
+            如果 设 一些(suggested_arg) = err.获取(ContextKind::SuggestedArg) {
+                设 tip_word = translate!("common-tip");
+                设 _ = write!(
+                    stderr(),
+                    "{}\n\n",
+                    translate!(
+                        "clap-error-similar-argument",
+                        "tip_word" => 自身.color_mgr.colorize(&tip_word, Color::Green),
+                        "suggestion" => 自身.color_mgr.colorize(&suggested_arg.to_string(), Color::Green)
+                    )
+                );
+            } 否则 {
+                // Look for other tips from clap
+                自身.print_clap_tips(err);
+            }
+
+            自身.print_usage_and_help();
+        } 否则 {
+            自身.print_simple_error_msg(&translate!("clap-error-unexpected-argument-simple"));
+        }
+        exit_code
+    }
+
+    /// Handle invalid value errors
+    方法 handle_invalid_value(&自身, err: &错误协议, exit_code: 整32) -> 整32 {
+        设 invalid_arg = err.获取(ContextKind::InvalidArg);
+        设 invalid_value = err.获取(ContextKind::InvalidValue);
+
+        如果 设 (一些(arg), 一些(value)) = (invalid_arg, invalid_value) {
+            设 option = arg.to_string();
+            设 value = value.to_string();
+
+            如果 value.为空() {
+                // Value required but not provided
+                设 error_word = translate!("common-error");
+                设 _ = writeln!(
+                    stderr(),
+                    "{}",
+                    translate!("clap-error-value-required",
+                        "error_word" => 自身.color_mgr.colorize(&error_word, Color::Red),
+                        "option" => 自身.color_mgr.colorize(&option, Color::Green))
+                );
+            } 否则 {
+                // Invalid value provided
+                设 error_word = translate!("common-error");
+                设 error_msg = translate!(
+                    "clap-error-invalid-value",
+                    "error_word" => 自身.color_mgr.colorize(&error_word, Color::Red),
+                    "value" => 自身.color_mgr.colorize(&value, Color::Yellow),
+                    "option" => 自身.color_mgr.colorize(&option, Color::Green)
+                );
+                // Include validation error if present
+                匹配 err.source() {
+                    一些(source) 如果 matches!(err.kind(), ErrorKind::ValueValidation) => {
+                        设 _ = writeln!(stderr(), "{error_msg}: {source}");
+                    }
+                    _ => 错误打印行!("{error_msg}"),
+                }
+            }
+
+            // Show possible values for InvalidValue errors
+            如果 matches!(err.kind(), ErrorKind::InvalidValue) {
+                如果 设 一些(valid_values) = err.获取(ContextKind::ValidValue) {
+                    如果 !valid_values.to_string().为空() {
+                        设 _ = writeln!(
+                            stderr(),
+                            "\n  [{}: {valid_values}]",
+                            translate!("clap-error-possible-values")
+                        );
+                    }
+                }
+            }
+            设 _ = writeln!(stderr(), "\n{}", translate!("common-help-suggestion"));
+        } 否则 {
+            自身.print_simple_error_msg(&err.render().to_string());
+        }
+
+        // InvalidValue errors traditionally use exit code 1 for backward compatibility
+        // But if a utility explicitly requests a high exit code (>= 125), respect it
+        // This allows utilities like runcon (125) to override the default while preserving
+        // the standard behavior for utilities using normal error codes (1, 2, etc.)
+        如果 matches!(err.kind(), ErrorKind::InvalidValue) && exit_code < 125 {
+            1 // Force exit code 1 for InvalidValue unless using special exit codes
+        } 否则 {
+            exit_code // Respect the requested exit code for special cases
+        }
+    }
+
+    /// Handle missing required argument errors
+    方法 handle_missing_required(&自身, err: &错误协议, exit_code: 整32) -> 整32 {
+        设 rendered_str = err.render().to_string();
+        设 lines: 向量<&字符串切片> = rendered_str.lines().收集();
+
+        匹配 lines.first() {
+            一些(first_line)
+                如果 first_line
+                    .starts_with("error: the following required arguments were not provided:") =>
+            {
+                设 error_word = translate!("common-error");
+                设 _ = writeln!(
+                    stderr(),
+                    "{}",
+                    translate!(
+                        "clap-error-missing-required-arguments",
+                        "error_word" => 自身.color_mgr.colorize(&error_word, Color::Red)
+                    )
+                );
+
+                // Print the missing arguments
+                循环 line 在 lines.迭代().skip(1) {
+                    如果 line.starts_with("  ") {
+                        设 _ = writeln!(stderr(), "{line}");
+                    } 否则 如果 line.starts_with("Usage:") || line.starts_with("For more information")
+                    {
+                        中断;
+                    }
+                }
+                设 _ = writeln!(stderr());
+
+                // Print usage
+                lines
+                    .迭代()
+                    .skip_while(|line| !line.starts_with("Usage:"))
+                    .for_each(|line| {
+                        如果 line.starts_with("For more information, try '--help'.") {
+                            设 _ = writeln!(stderr(), "{}", translate!("common-help-suggestion"));
+                        } 否则 {
+                            设 _ = writeln!(stderr(), "{line}");
+                        }
+                    });
+            }
+            _ => 错误打印!("{}", err.render()),
+        }
+        exit_code
+    }
+
+    /// Handle generic errors
+    方法 handle_generic_error(&自身, err: &错误协议, exit_code: 整32) -> 整32 {
+        设 rendered_str = err.render().to_string();
+        如果 设 一些(main_error_line) = rendered_str.lines().next() {
+            自身.print_localized_error_line(main_error_line);
+            设 _ = writeln!(stderr(), "\n{}", translate!("common-help-suggestion"));
+        } 否则 {
+            设 _ = write!(stderr(), "{}", err.render());
+        }
+        exit_code
+    }
+
+    /// Print a simple error message (no exit)
+    方法 print_simple_error_msg(&自身, message: &字符串切片) {
+        设 error_word = translate!("common-error");
+        设 _ = writeln!(
+            stderr(),
+            "{}: {message}",
+            自身.color_mgr.colorize(&error_word, Color::Red)
+        );
+    }
+
+    /// Print error line with localized "error:" prefix
+    方法 print_localized_error_line(&自身, line: &字符串切片) {
+        设 error_word = translate!("common-error");
+        设 colored_error = 自身.color_mgr.colorize(&error_word, Color::Red);
+
+        如果 设 一些(colon_pos) = line.寻找(':') {
+            设 after_colon = &line[colon_pos..];
+            设 _ = writeln!(stderr(), "{colored_error}{after_colon}");
+        } 否则 {
+            设 _ = writeln!(stderr(), "{line}");
+        }
+    }
+
+    /// Extract and print clap's built-in tips
+    方法 print_clap_tips(&自身, err: &错误协议) {
+        设 rendered_str = err.render().to_string();
+        循环 line 在 rendered_str.lines() {
+            设 trimmed = line.trim_start();
+            如果 trimmed.starts_with("tip:") && !line.包含("similar argument") {
+                设 tip_word = translate!("common-tip");
+                如果 设 一些(colon_pos) = trimmed.寻找(':') {
+                    设 after_colon = &trimmed[colon_pos..];
+                    设 _ = writeln!(
+                        stderr(),
+                        "  {}{after_colon}",
+                        自身.color_mgr.colorize(&tip_word, Color::Green)
+                    );
+                } 否则 {
+                    设 _ = writeln!(stderr(), "{line}");
+                }
+                设 _ = writeln!(stderr());
+            }
+        }
+    }
+
+    /// Print usage information and help suggestion
+    方法 print_usage_and_help(&自身) {
+        设 usage_key = 格式化!("{}-usage", 自身.util_name);
+        设 usage_text = translate!(&usage_key);
+        设 formatted_usage = 箱::format_usage(&usage_text);
+        设 usage_label = translate!("common-usage");
+        设 _ = writeln!(
+            stderr(),
+            "{usage_label}: {formatted_usage}\n\n{}",
+            translate!("common-help-suggestion")
+        );
+    }
+}
+
+/// Handles clap command parsing results with proper localization support.
+///
+/// This is the main entry point for processing command-line arguments with localized error messages.
+/// It parses the provided arguments and returns either the parsed matches or handles errors with
+/// localized messages.
+///
+/// # Arguments
+///
+/// * `cmd` - The clap `Command` to parse arguments against
+/// * `itr` - An iterator of command-line arguments to parse
+///
+/// # Returns
+///
+/// * `Ok(ArgMatches)` - Successfully parsed command-line arguments
+/// * `Err` - For help/version display (preserves original styling)
+///
+/// # Examples
+///
+/// ```no_run
+/// use clap::Command;
+/// use uucore::clap_localization::handle_clap_result;
+///
+/// let cmd = Command::new("myutil");
+/// let args = vec!["myutil", "--help"];
+/// let result = handle_clap_result(cmd, args);
+/// ```
+公有 方法 handle_clap_result<I, T>(cmd: Command, itr: I) -> UResult<ArgMatches>
+何处
+    I: 转换为迭代器协议<Item = T>,
+    T: 转换为目标协议<OsString> + 克隆协议,
+{
+    handle_clap_result_with_exit_code(cmd, itr, 1)
+}
+
+/// Handles clap command parsing with a custom exit code for errors.
+///
+/// Similar to `handle_clap_result` but allows specifying a custom exit code
+/// for error conditions. This is useful for utilities that need specific
+/// exit codes for different error types.
+///
+/// # Arguments
+///
+/// * `cmd` - The clap `Command` to parse arguments against
+/// * `itr` - An iterator of command-line arguments to parse
+/// * `exit_code` - The exit code to use when exiting due to an error
+///
+/// # Returns
+///
+/// * `Ok(ArgMatches)` - Successfully parsed command-line arguments
+/// * `Err` - For help/version display (preserves original styling)
+///
+/// # Exit Behavior
+///
+/// This function will call `std::process::exit()` with the specified exit code
+/// when encountering parsing errors (except help/version which use exit code 0).
+///
+/// # Examples
+///
+/// ```no_run
+/// use clap::Command;
+/// use uucore::clap_localization::handle_clap_result_with_exit_code;
+///
+/// let cmd = Command::new("myutil");
+/// let args = vec!["myutil", "--invalid"];
+/// let result = handle_clap_result_with_exit_code(cmd, args, 125);
+/// ```
+公有 方法 handle_clap_result_with_exit_code<I, T>(
+    cmd: Command,
+    itr: I,
+    exit_code: 整32,
+) -> UResult<ArgMatches>
+何处
+    I: 转换为迭代器协议<Item = T>,
+    T: 转换为目标协议<OsString> + 克隆协议,
+{
+    cmd.try_get_matches_from(itr).map_err(|e| {
+        如果 e.exit_code() == 0 {
+            e.into() // Preserve help/version
+        } 否则 {
+            设 formatter = ErrorFormatter::新建(箱::util_name());
+            设 code = formatter.print_error(&e, exit_code);
+            USimpleError::新建(code, "")
+        }
+    })
+}
+
+/// Handles a clap error directly with a custom exit code.
+///
+/// This function processes a clap error and exits the program with the specified
+/// exit code. It formats error messages with proper localization and color support
+/// based on environment variables.
+///
+/// # Arguments
+///
+/// * `err` - The clap `Error` to handle
+/// * `exit_code` - The exit code to use when exiting
+///
+/// # Panics
+///
+/// This function never returns - it always calls `std::process::exit()`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use clap::Command;
+/// use uucore::clap_localization::handle_clap_error_with_exit_code;
+///
+/// let cmd = Command::new("myutil");
+/// match cmd.try_get_matches() {
+///     Ok(matches) => { /* handle matches */ },
+///     Err(e) => handle_clap_error_with_exit_code(e, 1),
+/// }
+/// ```
+公有 方法 handle_clap_error_with_exit_code(err: 错误协议, exit_code: 整32) -> ! {
+    设 formatter = ErrorFormatter::新建(箱::util_name());
+    formatter.print_error_and_exit(&err, exit_code);
+}
+
+/// Configures a clap `Command` with proper localization and color settings.
+///
+/// This function sets up a `Command` with:
+/// - Appropriate color settings based on environment variables (`NO_COLOR`, `CLICOLOR_FORCE`, etc.)
+/// - Localized help template with proper formatting
+/// - TTY detection for automatic color enabling/disabling
+///
+/// # Arguments
+///
+/// * `cmd` - The clap `Command` to configure
+///
+/// # Returns
+///
+/// The configured `Command` with localization and color settings applied.
+///
+/// # Environment Variables
+///
+/// The following environment variables affect color output:
+/// - `NO_COLOR` - Disables all color output
+/// - `CLICOLOR_FORCE` or `FORCE_COLOR` - Forces color output even when not in a TTY
+/// - `TERM` - If set to "dumb", colors are disabled in auto mode
+///
+/// # Examples
+///
+/// ```no_run
+/// use clap::Command;
+/// use uucore::clap_localization::configure_localized_command;
+///
+/// let cmd = Command::new("myutil")
+///     .arg(clap::Arg::new("input").short('i'));
+/// let configured_cmd = configure_localized_command(cmd);
+/// ```
+公有 方法 configure_localized_command(可变 cmd: Command) -> Command {
+    设 color_choice = get_color_choice();
+    cmd = cmd.color(color_choice);
+
+    // For help output (stdout), we check stdout TTY status
+    设 colors_enabled = should_use_color_for_stream(&标准库::输入输出::stdout());
+
+    cmd = cmd.help_template(箱::localized_help_template_with_colors(
+        箱::util_name(),
+        colors_enabled,
+    ));
+    cmd
+}
+
+/* spell-checker: disable */
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+    使用 clap::{Arg, Command};
+    使用 标准库::ffi::OsString;
+
+    #[test]
+    方法 test_color_codes() {
+        相等断言!(Color::Red.code(), "31");
+        相等断言!(Color::Yellow.code(), "33");
+        相等断言!(Color::Green.code(), "32");
+    }
+
+    #[test]
+    方法 test_color_manager() {
+        设 mgr = ColorManager(真);
+        设 red_text = mgr.colorize("error", Color::Red);
+        相等断言!(red_text, "\x1b[31merror\x1b[0m");
+
+        设 mgr_disabled = ColorManager(假);
+        设 plain_text = mgr_disabled.colorize("error", Color::Red);
+        相等断言!(plain_text, "error");
+    }
+
+    方法 create_test_command() -> Command {
+        Command::新建("test")
+            .arg(
+                Arg::新建("input")
+                    .short('i')
+                    .long("input")
+                    .value_name("FILE")
+                    .help("Input file"),
+            )
+            .arg(
+                Arg::新建("output")
+                    .short('o')
+                    .long("output")
+                    .value_name("FILE")
+                    .help("Output file"),
+            )
+            .arg(
+                Arg::新建("format")
+                    .long("format")
+                    .value_parser(["json", "xml", "csv"])
+                    .help("Output format"),
+            )
+    }
+
+    #[test]
+    方法 test_handle_clap_result_with_valid_args() {
+        设 cmd = create_test_command();
+        设 result = handle_clap_result(cmd, 向量!["test", "--input", "file.txt"]);
+        断言!(result.is_ok());
+        设 matches = result.解包();
+        相等断言!(matches.get_one::<字符串>("input").解包(), "file.txt");
+    }
+
+    #[test]
+    方法 test_handle_clap_result_with_osstring() {
+        设 args: 向量<OsString> = 向量!["test".into(), "--output".into(), "out.txt".into()];
+        设 cmd = create_test_command();
+        设 result = handle_clap_result(cmd, args);
+        断言!(result.is_ok());
+        设 matches = result.解包();
+        相等断言!(matches.get_one::<字符串>("output").解包(), "out.txt");
+    }
+
+    #[test]
+    方法 test_configure_localized_command() {
+        设 cmd = Command::新建("test");
+        设 configured = configure_localized_command(cmd);
+        // The command should have color and help template configured
+        // We can't easily test the internal state, but we can verify it doesn't panic
+        相等断言!(configured.get_name(), "test");
+    }
+
+    #[test]
+    方法 test_color_environment_vars() {
+        使用 标准库::环境;
+
+        // Test NO_COLOR disables colors
+        不安全 {
+            环境::set_var("NO_COLOR", "1");
+        }
+        相等断言!(get_color_choice(), clap::ColorChoice::Never);
+        断言!(!should_use_color_for_stream(&stderr()));
+        设 mgr = ColorManager::from_env();
+        断言!(!mgr.0);
+        不安全 {
+            环境::remove_var("NO_COLOR");
+        }
+
+        // Test CLICOLOR_FORCE enables colors
+        不安全 {
+            环境::set_var("CLICOLOR_FORCE", "1");
+        }
+        相等断言!(get_color_choice(), clap::ColorChoice::Always);
+        断言!(should_use_color_for_stream(&stderr()));
+        设 mgr = ColorManager::from_env();
+        断言!(mgr.0);
+        不安全 {
+            环境::remove_var("CLICOLOR_FORCE");
+        }
+
+        // Test FORCE_COLOR also enables colors
+        不安全 {
+            环境::set_var("FORCE_COLOR", "1");
+        }
+        相等断言!(get_color_choice(), clap::ColorChoice::Always);
+        断言!(should_use_color_for_stream(&stderr()));
+        不安全 {
+            环境::remove_var("FORCE_COLOR");
+        }
+    }
+
+    #[test]
+    方法 test_error_formatter_creation() {
+        设 formatter = ErrorFormatter::新建("test");
+        相等断言!(formatter.util_name, "test");
+        // Color manager should be created based on environment
+    }
+
+    #[test]
+    方法 test_localization_keys_exist() {
+        使用 箱::locale::{get_message, setup_localization};
+
+        设 _ = setup_localization("test");
+
+        设 required_keys = [
+            "common-error",
+            "common-usage",
+            "common-tip",
+            "common-help-suggestion",
+            "clap-error-unexpected-argument",
+            "clap-error-invalid-value",
+            "clap-error-missing-required-arguments",
+            "clap-error-similar-argument",
+            "clap-error-possible-values",
+            "clap-error-value-required",
+        ];
+
+        循环 key 在 &required_keys {
+            设 message = get_message(key);
+            不相等断言!(message, *key, "Translation missing for key: {key}");
+        }
+    }
+
+    #[test]
+    方法 test_french_localization() {
+        使用 箱::locale::{get_message, setup_localization};
+        使用 标准库::环境;
+
+        设 original_lang = 环境::var_os("LANG").unwrap_or_default();
+
+        不安全 {
+            环境::set_var("LANG", "fr_FR.UTF-8");
+        }
+
+        如果 setup_localization("test").is_ok() {
+            相等断言!(get_message("common-error"), "erreur");
+            相等断言!(get_message("common-usage"), "Utilisation");
+            相等断言!(get_message("common-tip"), "conseil");
+        }
+
+        不安全 {
+            如果 original_lang.为空() {
+                环境::remove_var("LANG");
+            } 否则 {
+                环境::set_var("LANG", original_lang);
+            }
+        }
+    }
+}
+/* spell-checker: enable */

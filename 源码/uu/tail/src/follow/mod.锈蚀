@@ -1,0 +1,72 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#[cfg(not(target_os = "wasi"))]
+模组 files;
+#[cfg(not(target_os = "wasi"))]
+模组 watch;
+
+#[cfg(not(target_os = "wasi"))]
+公有 使用 watch::{Observer, follow};
+
+// WASI: notify/inotify are unavailable, so `tail -f` cannot work.
+// Provide minimal stubs matching the real Observer API so tail compiles.
+#[cfg(target_os = "wasi")]
+模组 wasi_stubs {
+    使用 箱::args::Settings;
+    使用 标准库::输入输出::BufRead;
+    使用 标准库::路径::Path;
+    使用 uucore::错误::{UResult, USimpleError};
+
+    公有 结构 Observer {
+        公有 use_polling: 布尔,
+    }
+
+    实现 Observer {
+        公有 方法 from(_settings: &Settings) -> 自身类型 {
+            自身类型 { use_polling: 假 }
+        }
+
+        #[allow(clippy::unnecessary_wraps)]
+        公有 方法 start(&可变 自身, _settings: &Settings) -> UResult<()> {
+            好的(())
+        }
+
+        #[allow(clippy::unnecessary_wraps)]
+        公有 方法 add_path(
+            &可变 自身,
+            _path: &Path,
+            _display_name: &字符串切片,
+            _reader: 选项<盒子<动态 BufRead>>,
+            _update_last: 布尔,
+        ) -> UResult<()> {
+            好的(())
+        }
+
+        #[allow(clippy::unnecessary_wraps)]
+        公有 方法 add_bad_path(
+            &可变 自身,
+            _path: &Path,
+            _display_name: &字符串切片,
+            _update_last: 布尔,
+        ) -> UResult<()> {
+            好的(())
+        }
+
+        公有 方法 follow_name_retry(&自身) -> 布尔 {
+            假
+        }
+    }
+
+    公有 方法 follow(_observer: Observer, _settings: &Settings) -> UResult<()> {
+        坏的(USimpleError::新建(
+            1,
+            "follow mode is not supported on this platform",
+        ))
+    }
+}
+
+#[cfg(target_os = "wasi")]
+公有 使用 wasi_stubs::{Observer, follow};

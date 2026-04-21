@@ -1,0 +1,47 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+#[cfg(unix)]
+公有 使用 自身::unix::instantiate_current_writer;
+#[cfg(unix)]
+公有 使用 自身::unix::paths_refer_to_same_file;
+
+#[cfg(windows)]
+公有 使用 自身::windows::instantiate_current_writer;
+#[cfg(windows)]
+公有 使用 自身::windows::paths_refer_to_same_file;
+
+// WASI: no process spawning (filter) or device/inode comparison.
+#[cfg(target_os = "wasi")]
+公有 方法 paths_refer_to_same_file(_p1: &标准库::ffi::OsStr, _p2: &标准库::ffi::OsStr) -> 布尔 {
+    假
+}
+
+#[cfg(target_os = "wasi")]
+公有 方法 instantiate_current_writer(
+    _filter: 选项<&字符串切片>,
+    filename: &标准库::ffi::OsStr,
+    is_new: 布尔,
+) -> 标准库::输入输出::结果<标准库::输入输出::BufWriter<盒子<动态 标准库::输入输出::Write>>> {
+    设 file = 如果 is_new {
+        标准库::文件系统::OpenOptions::新建()
+            .写锁定(真)
+            .create(真)
+            .truncate(真)
+            .open(标准库::路径::Path::新建(filename))?
+    } 否则 {
+        标准库::文件系统::OpenOptions::新建()
+            .append(真)
+            .open(标准库::路径::Path::新建(filename))?
+    };
+    好的(标准库::输入输出::BufWriter::新建(
+        盒子::新建(file) 转换 盒子<动态 标准库::输入输出::Write>
+    ))
+}
+
+#[cfg(unix)]
+模组 unix;
+
+#[cfg(windows)]
+模组 windows;

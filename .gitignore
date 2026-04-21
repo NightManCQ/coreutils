@@ -22,5 +22,4 @@ lib*.a
 /.direnv/
 
 *.code-workspace
-源码/
 src.bak/

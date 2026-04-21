@@ -1,0 +1,1083 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) somegroup nlink tabsize dired subdired dtype colorterm stringly
+// spell-checker:ignore nohash strtime clocale
+
+使用 标准库::{
+    borrow::Cow,
+    ffi::{OsStr, OsString},
+    输入输出::{IsTerminal, stdout},
+    数字::IntErrorKind,
+};
+
+使用 glob::Pattern;
+使用 lscolors::LsColors;
+使用 term_grid::SPACES_IN_TAB;
+
+使用 uucore::{
+    display::Quotable, 错误::UResult, format::human::SizeFormat, fsext::MetadataTimeField,
+    line_ending::LineEnding, parser::parse_block_size, parser::parse_glob,
+    parser::parse_size::parse_size_non_zero_u64, quoting_style::QuotingStyle, show_error,
+    show_warning, 时间::format, translate,
+};
+
+使用 箱::{
+    LsError,
+    colors::{LsColorsParseError, validate_ls_colors_env},
+    dired::is_dired_arg_present,
+    display::{Format, IndicatorStyle, LocaleQuoting, LongFormat},
+    options::QUOTING_STYLE,
+};
+
+公有 模组 options {
+    公有 模组 format {
+        公有 静态 ONE_LINE: &字符串切片 = "1";
+        公有 静态 LONG: &字符串切片 = "long";
+        公有 静态 COLUMNS: &字符串切片 = "C";
+        公有 静态 ACROSS: &字符串切片 = "x";
+        公有 静态 TAB_SIZE: &字符串切片 = "tabsize";
+        公有 静态 COMMAS: &字符串切片 = "m";
+        公有 静态 LONG_NO_OWNER: &字符串切片 = "g";
+        公有 静态 LONG_NO_GROUP: &字符串切片 = "o";
+        公有 静态 LONG_NUMERIC_UID_GID: &字符串切片 = "numeric-uid-gid";
+    }
+
+    公有 模组 files {
+        公有 静态 ALL: &字符串切片 = "all";
+        公有 静态 ALMOST_ALL: &字符串切片 = "almost-all";
+        公有 静态 UNSORTED_ALL: &字符串切片 = "f";
+    }
+
+    公有 模组 sort {
+        公有 静态 SIZE: &字符串切片 = "S";
+        公有 静态 TIME: &字符串切片 = "t";
+        公有 静态 NONE: &字符串切片 = "U";
+        公有 静态 VERSION: &字符串切片 = "v";
+        公有 静态 EXTENSION: &字符串切片 = "X";
+    }
+
+    公有 模组 时间 {
+        公有 静态 ACCESS: &字符串切片 = "u";
+        公有 静态 CHANGE: &字符串切片 = "c";
+    }
+
+    公有 模组 size {
+        公有 静态 ALLOCATION_SIZE: &字符串切片 = "size";
+        公有 静态 BLOCK_SIZE: &字符串切片 = "block-size";
+        公有 静态 HUMAN_READABLE: &字符串切片 = "human-readable";
+        公有 静态 SI: &字符串切片 = "si";
+        公有 静态 KIBIBYTES: &字符串切片 = "kibibytes";
+    }
+
+    公有 模组 quoting {
+        公有 静态 ESCAPE: &字符串切片 = "escape";
+        公有 静态 LITERAL: &字符串切片 = "literal";
+        公有 静态 C: &字符串切片 = "quote-name";
+    }
+
+    公有 模组 indicator_style {
+        公有 静态 SLASH: &字符串切片 = "p";
+        公有 静态 FILE_TYPE: &字符串切片 = "file-type";
+        公有 静态 CLASSIFY: &字符串切片 = "classify";
+    }
+
+    公有 模组 dereference {
+        公有 静态 ALL: &字符串切片 = "dereference";
+        公有 静态 ARGS: &字符串切片 = "dereference-command-line";
+        公有 静态 DIR_ARGS: &字符串切片 = "dereference-command-line-symlink-to-dir";
+    }
+
+    公有 静态 HELP: &字符串切片 = "help";
+    公有 静态 QUOTING_STYLE: &字符串切片 = "quoting-style";
+    公有 静态 HIDE_CONTROL_CHARS: &字符串切片 = "hide-control-chars";
+    公有 静态 SHOW_CONTROL_CHARS: &字符串切片 = "show-control-chars";
+    公有 静态 WIDTH: &字符串切片 = "width";
+    公有 静态 AUTHOR: &字符串切片 = "author";
+    公有 静态 NO_GROUP: &字符串切片 = "no-group";
+    公有 静态 FORMAT: &字符串切片 = "format";
+    公有 静态 SORT: &字符串切片 = "sort";
+    公有 静态 TIME: &字符串切片 = "time";
+    公有 静态 IGNORE_BACKUPS: &字符串切片 = "ignore-backups";
+    公有 静态 DIRECTORY: &字符串切片 = "directory";
+    公有 静态 INODE: &字符串切片 = "inode";
+    公有 静态 REVERSE: &字符串切片 = "reverse";
+    公有 静态 RECURSIVE: &字符串切片 = "recursive";
+    公有 静态 COLOR: &字符串切片 = "color";
+    公有 静态 PATHS: &字符串切片 = "paths";
+    公有 静态 INDICATOR_STYLE: &字符串切片 = "indicator-style";
+    公有 静态 TIME_STYLE: &字符串切片 = "time-style";
+    公有 静态 FULL_TIME: &字符串切片 = "full-time";
+    公有 静态 HIDE: &字符串切片 = "hide";
+    公有 静态 IGNORE: &字符串切片 = "ignore";
+    公有 静态 CONTEXT: &字符串切片 = "context";
+    公有 静态 GROUP_DIRECTORIES_FIRST: &字符串切片 = "group-directories-first";
+    公有 静态 ZERO: &字符串切片 = "zero";
+    公有 静态 DIRED: &字符串切片 = "dired";
+    公有 静态 HYPERLINK: &字符串切片 = "hyperlink";
+}
+
+常量 DEFAULT_TERM_WIDTH: 正16 = 80;
+常量 POSIXLY_CORRECT_BLOCK_SIZE: 正64 = 512;
+常量 DEFAULT_BLOCK_SIZE: 正64 = 1024;
+常量 DEFAULT_FILE_SIZE_BLOCK_SIZE: 正64 = 1;
+
+/// Resolve `(file_size_block_size, block_size)` from environment variables.
+///
+/// `LS_BLOCK_SIZE` and `BLOCK_SIZE` affect both values.
+/// `BLOCKSIZE` only affects `block_size` (allocation display with `-s`).
+/// `POSIXLY_CORRECT` sets `block_size` to 512 as a last resort.
+/// `-k` (`opt_kb`) forces `block_size` to `DEFAULT_BLOCK_SIZE`.
+方法 resolve_block_sizes_from_env(opt_kb: 布尔) -> (正64, 正64) {
+    匹配 parse_block_size::block_size_from_env(&["LS_BLOCK_SIZE", "BLOCK_SIZE"]) {
+        parse_block_size::BlockSizeEnv::Found(size) => {
+            如果 opt_kb {
+                (size, DEFAULT_BLOCK_SIZE)
+            } 否则 {
+                (size, size)
+            }
+        }
+        parse_block_size::BlockSizeEnv::SetButInvalid => (DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE),
+        parse_block_size::BlockSizeEnv::NotSet => {
+            // Neither LS_BLOCK_SIZE nor BLOCK_SIZE was set; check BLOCKSIZE
+            // which only affects allocation display, not file size.
+            匹配 parse_block_size::block_size_from_env(&["BLOCKSIZE"]) {
+                parse_block_size::BlockSizeEnv::Found(size) => {
+                    如果 opt_kb {
+                        (DEFAULT_FILE_SIZE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+                    } 否则 {
+                        (DEFAULT_FILE_SIZE_BLOCK_SIZE, size)
+                    }
+                }
+                parse_block_size::BlockSizeEnv::SetButInvalid => {
+                    // BLOCKSIZE was set but invalid: stop lookup, use defaults.
+                    (DEFAULT_FILE_SIZE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+                }
+                parse_block_size::BlockSizeEnv::NotSet => {
+                    如果 标准库::环境::var_os("POSIXLY_CORRECT").is_some() && !opt_kb {
+                        (DEFAULT_FILE_SIZE_BLOCK_SIZE, POSIXLY_CORRECT_BLOCK_SIZE)
+                    } 否则 {
+                        (DEFAULT_FILE_SIZE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+                    }
+                }
+            }
+        }
+    }
+}
+
+公有(箱) 枚举 Dereference {
+    无,
+    DirArgs,
+    Args,
+    All,
+}
+
+#[derive(偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 Sort {
+    无,
+    Name,
+    Size,
+    Time,
+    Version,
+    Extension,
+    Width,
+}
+
+#[derive(偏等比较协议, 相等比较协议)]
+公有(箱) 枚举 Files {
+    All,
+    AlmostAll,
+    Normal,
+}
+
+公有 结构 Config {
+    // Dir and vdir needs access to this field
+    公有 format: Format,
+    公有(箱) files: Files,
+    公有(箱) sort: Sort,
+    公有(箱) recursive: 布尔,
+    公有(箱) reverse: 布尔,
+    公有(箱) dereference: Dereference,
+    公有(箱) ignore_patterns: 向量<Pattern>,
+    公有(箱) size_format: SizeFormat,
+    公有(箱) directory: 布尔,
+    公有(箱) 时间: MetadataTimeField,
+    #[cfg(unix)]
+    公有(箱) inode: 布尔,
+    公有(箱) color: 选项<LsColors>,
+    公有(箱) long: LongFormat,
+    公有(箱) alloc_size: 布尔,
+    公有(箱) file_size_block_size: 正64,
+    #[allow(dead_code)]
+    公有(箱) block_size: 正64, // is never read on Windows
+    公有(箱) width: 正16,
+    // Dir and vdir needs access to this field
+    公有 quoting_style: QuotingStyle,
+    公有(箱) locale_quoting: 选项<LocaleQuoting>,
+    公有(箱) indicator_style: IndicatorStyle,
+    公有(箱) time_format_recent: 字符串, // Time format for recent dates
+    公有(箱) time_format_older: 选项<字符串>, // Time format for older dates (optional, if not present, time_format_recent is used)
+    公有(箱) context: 布尔,
+    #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+    公有(箱) selinux_supported: 布尔,
+    #[cfg(全部(feature = "smack", target_os = "linux"))]
+    公有(箱) smack_supported: 布尔,
+    公有(箱) group_directories_first: 布尔,
+    公有(箱) line_ending: LineEnding,
+    公有(箱) dired: 布尔,
+    公有(箱) hyperlink: 布尔,
+    公有(箱) tab_size: 正整数大小,
+}
+
+/// Extracts the format to display the information based on the options provided.
+///
+/// # Returns
+///
+/// A tuple containing the Format variant and an Option containing a &'static str
+/// which corresponds to the option used to define the format.
+方法 extract_format(options: &clap::ArgMatches) -> (Format, 选项<&'静态 字符串切片>) {
+    如果 设 一些(format_) = options.get_one::<字符串>(options::FORMAT) {
+        (
+            匹配 format_.as_str() {
+                "long" | "verbose" => Format::Long,
+                "single-column" => Format::OneLine,
+                "columns" | "vertical" => Format::Columns,
+                "across" | "horizontal" => Format::Across,
+                "commas" => Format::Commas,
+                // below should never happen as clap already restricts the values.
+                _ => 无法到达!("Invalid field for --format"),
+            },
+            一些(options::FORMAT),
+        )
+    } 否则 如果 options.get_flag(options::format::LONG) {
+        (Format::Long, 一些(options::format::LONG))
+    } 否则 如果 options.get_flag(options::format::ACROSS) {
+        (Format::Across, 一些(options::format::ACROSS))
+    } 否则 如果 options.get_flag(options::format::COMMAS) {
+        (Format::Commas, 一些(options::format::COMMAS))
+    } 否则 如果 options.get_flag(options::format::COLUMNS) {
+        (Format::Columns, 一些(options::format::COLUMNS))
+    } 否则 如果 stdout().is_terminal() {
+        (Format::Columns, 无)
+    } 否则 {
+        (Format::OneLine, 无)
+    }
+}
+
+/// Extracts the type of files to display
+///
+/// # Returns
+///
+/// A Files variant representing the type of files to display.
+方法 extract_files(options: &clap::ArgMatches) -> Files {
+    设 get_last_index = |flag: &字符串切片| -> 正整数大小 {
+        如果 options.value_source(flag) == 一些(clap::parser::ValueSource::CommandLine) {
+            options.index_of(flag).unwrap_or(0)
+        } 否则 {
+            0
+        }
+    };
+
+    设 all_index = get_last_index(options::files::ALL);
+    设 almost_all_index = get_last_index(options::files::ALMOST_ALL);
+    设 unsorted_all_index = get_last_index(options::files::UNSORTED_ALL);
+
+    设 max_index = all_index.max(almost_all_index).max(unsorted_all_index);
+
+    如果 max_index == 0 {
+        Files::Normal
+    } 否则 如果 max_index == almost_all_index {
+        Files::AlmostAll
+    } 否则 {
+        // Either -a or -f wins, both show all files
+        Files::All
+    }
+}
+
+/// Extracts the sorting method to use based on the options provided.
+///
+/// # Returns
+///
+/// A Sort variant representing the sorting method to use.
+方法 extract_sort(options: &clap::ArgMatches) -> Sort {
+    设 get_last_index = |flag: &字符串切片| -> 正整数大小 {
+        如果 options.value_source(flag) == 一些(clap::parser::ValueSource::CommandLine) {
+            options.index_of(flag).unwrap_or(0)
+        } 否则 {
+            0
+        }
+    };
+
+    设 sort_index = options
+        .get_one::<字符串>(options::SORT)
+        .and_then(|_| options.indices_of(options::SORT))
+        .map_or(0, |可变 indices| indices.next_back().unwrap_or(0));
+    设 time_index = get_last_index(options::sort::TIME);
+    设 size_index = get_last_index(options::sort::SIZE);
+    设 none_index = get_last_index(options::sort::NONE);
+    设 version_index = get_last_index(options::sort::VERSION);
+    设 extension_index = get_last_index(options::sort::EXTENSION);
+    设 unsorted_all_index = get_last_index(options::files::UNSORTED_ALL);
+
+    设 max_sort_index = sort_index
+        .max(time_index)
+        .max(size_index)
+        .max(none_index)
+        .max(version_index)
+        .max(extension_index)
+        .max(unsorted_all_index);
+
+    匹配 max_sort_index {
+        0 => {
+            // No sort flags specified, use default behavior
+            如果 !options.get_flag(options::format::LONG)
+                && (options.get_flag(options::时间::ACCESS)
+                    || options.get_flag(options::时间::CHANGE)
+                    || options.get_one::<字符串>(options::TIME).is_some())
+            {
+                Sort::Time
+            } 否则 {
+                Sort::Name
+            }
+        }
+        idx 如果 idx == unsorted_all_index || idx == none_index => Sort::无,
+        idx 如果 idx == sort_index => {
+            如果 设 一些(field) = options.get_one::<字符串>(options::SORT) {
+                匹配 field.as_str() {
+                    "none" => Sort::无,
+                    "name" => Sort::Name,
+                    "time" => Sort::Time,
+                    "size" => Sort::Size,
+                    "version" => Sort::Version,
+                    "extension" => Sort::Extension,
+                    "width" => Sort::Width,
+                    _ => 无法到达!("Invalid field for --sort"),
+                }
+            } 否则 {
+                Sort::Name
+            }
+        }
+        idx 如果 idx == time_index => Sort::Time,
+        idx 如果 idx == size_index => Sort::Size,
+        idx 如果 idx == version_index => Sort::Version,
+        idx 如果 idx == extension_index => Sort::Extension,
+        _ => Sort::Name,
+    }
+}
+
+/// Extracts the time to use based on the options provided.
+///
+/// # Returns
+///
+/// A `MetadataTimeField` variant representing the time to use.
+方法 extract_time(options: &clap::ArgMatches) -> MetadataTimeField {
+    如果 设 一些(field) = options.get_one::<字符串>(options::TIME) {
+        field.as_str().into()
+    } 否则 如果 options.get_flag(options::时间::ACCESS) {
+        MetadataTimeField::Access
+    } 否则 如果 options.get_flag(options::时间::CHANGE) {
+        MetadataTimeField::Change
+    } 否则 {
+        MetadataTimeField::Modification
+    }
+}
+
+/// Some env variables can be passed
+/// For now, we are only verifying if empty or not and known for `TERM`
+方法 is_color_compatible_term() -> 布尔 {
+    设 term = 标准库::环境::var_os("TERM");
+    设 colorterm = 标准库::环境::var_os("COLORTERM");
+
+    // Search function in the TERM struct to manage the wildcards
+    设 term_matches = |term: &OsStr| -> 布尔 {
+        uucore::colors::TERMS.迭代().任意(|&pattern| {
+            term == pattern
+                || (pattern.ends_with('*')
+                    && term
+                        .as_encoded_bytes()
+                        .starts_with(&pattern.as_bytes()[..pattern.长度() - 1]))
+        })
+    };
+
+    匹配 (term, colorterm) {
+        (一些(t), 一些(c)) 如果 t.为空() && c.为空() => 假,
+        (一些(t), _) 如果 !t.为空() => term_matches(&t),
+        _ => 真,
+    }
+}
+
+/// Extracts the color option to use based on the options provided.
+///
+/// # Returns
+///
+/// A boolean representing whether or not to use color.
+方法 extract_color(options: &clap::ArgMatches) -> 布尔 {
+    如果 !is_color_compatible_term() {
+        返回 假;
+    }
+
+    设 get_last_index = |flag: &字符串切片| -> 正整数大小 {
+        如果 options.value_source(flag) == 一些(clap::parser::ValueSource::CommandLine) {
+            options.index_of(flag).unwrap_or(0)
+        } 否则 {
+            0
+        }
+    };
+
+    设 color_index = options
+        .get_one::<字符串>(options::COLOR)
+        .and_then(|_| options.indices_of(options::COLOR))
+        .map_or(0, |可变 indices| indices.next_back().unwrap_or(0));
+    设 unsorted_all_index = get_last_index(options::files::UNSORTED_ALL);
+
+    设 color_enabled = 匹配 options.get_one::<字符串>(options::COLOR) {
+        无 => options.contains_id(options::COLOR),
+        一些(val) => 匹配 val.as_str() {
+            "" | "always" | "yes" | "force" => 真,
+            "auto" | "tty" | "if-tty" => stdout().is_terminal(),
+            /* "never" | "no" | "none" | */ _ => 假,
+        },
+    };
+
+    // If --color was explicitly specified, always honor it regardless of -f
+    // Otherwise, if -f is present without explicit color, disable color
+    如果 color_index > 0 {
+        // Color was explicitly specified
+        color_enabled
+    } 否则 如果 unsorted_all_index > 0 {
+        // -f present without explicit color, disable implicit color
+        假
+    } 否则 {
+        color_enabled
+    }
+}
+
+/// Extracts the hyperlink option to use based on the options provided.
+///
+/// # Returns
+///
+/// A boolean representing whether to hyperlink files.
+方法 extract_hyperlink(options: &clap::ArgMatches) -> 布尔 {
+    设 hyperlink = options
+        .get_one::<字符串>(options::HYPERLINK)
+        .解包()
+        .as_str();
+
+    匹配 hyperlink {
+        "always" | "yes" | "force" => 真,
+        "auto" | "tty" | "if-tty" => stdout().is_terminal(),
+        "never" | "no" | "none" => 假,
+        _ => 无法到达!("should be handled by clap"),
+    }
+}
+
+/// Match the argument given to --quoting-style or the [`QUOTING_STYLE`] env variable.
+///
+/// # Arguments
+///
+/// * `style`: the actual argument string
+/// * `show_control` - A boolean value representing whether to show control characters.
+///
+/// # Returns
+///
+/// * An option with None if the style string is invalid, or a `QuotingStyle` wrapped in `Some`.
+结构 QuotingStyleSpec {
+    style: QuotingStyle,
+    fixed_control: 布尔,
+    locale: 选项<LocaleQuoting>,
+}
+
+实现 QuotingStyleSpec {
+    方法 新建(style: QuotingStyle) -> 自身类型 {
+        自身类型 {
+            style,
+            fixed_control: 假,
+            locale: 无,
+        }
+    }
+
+    方法 with_locale(style: QuotingStyle, locale: LocaleQuoting) -> 自身类型 {
+        自身类型 {
+            style,
+            fixed_control: 真,
+            locale: 一些(locale),
+        }
+    }
+}
+方法 match_quoting_style_name(
+    style: &字符串切片,
+    show_control: 布尔,
+) -> 选项<(QuotingStyle, 选项<LocaleQuoting>)> {
+    设 spec = 匹配 style {
+        "literal" => QuotingStyleSpec::新建(QuotingStyle::Literal {
+            show_control: 假,
+        }),
+        "shell" => QuotingStyleSpec::新建(QuotingStyle::SHELL),
+        "shell-always" => QuotingStyleSpec::新建(QuotingStyle::SHELL_QUOTE),
+        "shell-escape" => QuotingStyleSpec::新建(QuotingStyle::SHELL_ESCAPE),
+        "shell-escape-always" => QuotingStyleSpec::新建(QuotingStyle::SHELL_ESCAPE_QUOTE),
+        "c" => QuotingStyleSpec::新建(QuotingStyle::C_DOUBLE),
+        "escape" => QuotingStyleSpec::新建(QuotingStyle::C_NO_QUOTES),
+        "locale" => QuotingStyleSpec {
+            style: QuotingStyle::Literal {
+                show_control: 假,
+            },
+            fixed_control: 真,
+            locale: 一些(LocaleQuoting::Single),
+        },
+        "clocale" => QuotingStyleSpec::with_locale(QuotingStyle::C_DOUBLE, LocaleQuoting::Double),
+        _ => 返回 无,
+    };
+
+    设 style = 如果 spec.fixed_control {
+        spec.style
+    } 否则 {
+        spec.style.show_control(show_control)
+    };
+
+    一些((style, spec.locale))
+}
+
+/// Extracts the quoting style to use based on the options provided.
+/// If no options are given, it looks if a default quoting style is provided
+/// through the [`QUOTING_STYLE`] environment variable.
+///
+/// # Arguments
+///
+/// * `options` - A reference to a [`clap::ArgMatches`] object containing command line arguments.
+/// * `show_control` - A boolean value representing whether or not to show control characters.
+///
+/// # Returns
+///
+/// A [`QuotingStyle`] variant representing the quoting style to use.
+方法 extract_quoting_style(
+    options: &clap::ArgMatches,
+    show_control: 布尔,
+) -> (QuotingStyle, 选项<LocaleQuoting>) {
+    设 opt_quoting_style = options.get_one::<字符串>(QUOTING_STYLE);
+
+    如果 设 一些(style) = opt_quoting_style {
+        匹配 match_quoting_style_name(style, show_control) {
+            一些(pair) => pair,
+            无 => 无法到达!("Should have been caught by Clap"),
+        }
+    } 否则 如果 options.get_flag(options::quoting::LITERAL) {
+        (QuotingStyle::Literal { show_control }, 无)
+    } 否则 如果 options.get_flag(options::quoting::ESCAPE) {
+        (QuotingStyle::C_NO_QUOTES, 无)
+    } 否则 如果 options.get_flag(options::quoting::C) {
+        (QuotingStyle::C_DOUBLE, 无)
+    } 否则 如果 options.get_flag(options::DIRED) {
+        (QuotingStyle::Literal { show_control }, 无)
+    } 否则 {
+        // If set, the QUOTING_STYLE environment variable specifies a default style.
+        如果 设 好的(style) = 标准库::环境::var("QUOTING_STYLE") {
+            匹配 match_quoting_style_name(style.as_str(), show_control) {
+                一些(pair) => 返回 pair,
+                无 => 错误打印行!(
+                    "{}",
+                    translate!("ls-invalid-quoting-style", "program" => 标准库::环境::args().next().unwrap_or_else(|| "ls".to_string()), "style" => style.克隆())
+                ),
+            }
+        }
+
+        // By default, `ls` uses Shell escape quoting style when writing to a terminal file
+        // descriptor and Literal otherwise.
+        如果 stdout().is_terminal() {
+            (QuotingStyle::SHELL_ESCAPE.show_control(show_control), 无)
+        } 否则 {
+            (QuotingStyle::Literal { show_control }, 无)
+        }
+    }
+}
+
+/// Extracts the indicator style to use based on the options provided.
+///
+/// # Returns
+///
+/// An [`IndicatorStyle`] variant representing the indicator style to use.
+方法 extract_indicator_style(options: &clap::ArgMatches) -> IndicatorStyle {
+    如果 设 一些(field) = options.get_one::<字符串>(options::INDICATOR_STYLE) {
+        匹配 field.as_str() {
+            "none" => IndicatorStyle::无,
+            "file-type" => IndicatorStyle::FileType,
+            "classify" => IndicatorStyle::Classify,
+            "slash" => IndicatorStyle::Slash,
+            &_ => IndicatorStyle::无,
+        }
+    } 否则 如果 设 一些(field) = options.get_one::<字符串>(options::indicator_style::CLASSIFY) {
+        匹配 field.as_str() {
+            "never" | "no" | "none" => IndicatorStyle::无,
+            "always" | "yes" | "force" => IndicatorStyle::Classify,
+            "auto" | "tty" | "if-tty" => {
+                如果 stdout().is_terminal() {
+                    IndicatorStyle::Classify
+                } 否则 {
+                    IndicatorStyle::无
+                }
+            }
+            &_ => IndicatorStyle::无,
+        }
+    } 否则 如果 options.get_flag(options::indicator_style::SLASH) {
+        IndicatorStyle::Slash
+    } 否则 如果 options.get_flag(options::indicator_style::FILE_TYPE) {
+        IndicatorStyle::FileType
+    } 否则 {
+        IndicatorStyle::无
+    }
+}
+
+/// Parses the width value from either the command line arguments or the environment variables.
+方法 parse_width(width_match: 选项<&字符串>) -> 结果<正16, LsError> {
+    设 parse_width_from_args = |s: &字符串切片| -> 结果<正16, LsError> {
+        设 radix = 如果 s.starts_with('0') && s.长度() > 1 {
+            8
+        } 否则 {
+            10
+        };
+        匹配 正16::from_str_radix(s, radix) {
+            好的(x) => 好的(x),
+            坏的(e) => 匹配 e.kind() {
+                IntErrorKind::PosOverflow => 好的(正16::MAX),
+                _ => 坏的(LsError::InvalidLineWidth(s.into())),
+            },
+        }
+    };
+
+    设 parse_width_from_env = |columns: OsString| {
+        如果 设 一些(columns) = columns.to_str().and_then(|s| s.parse().ok()) {
+            columns
+        } 否则 {
+            show_error!(
+                "{}",
+                translate!("ls-invalid-columns-width", "width" => columns.quote())
+            );
+            DEFAULT_TERM_WIDTH
+        }
+    };
+
+    设 calculate_term_size = || 匹配 terminal_size::terminal_size() {
+        一些((width, _)) => width.0,
+        无 => DEFAULT_TERM_WIDTH,
+    };
+
+    设 ret = 匹配 width_match {
+        一些(x) => parse_width_from_args(x)?,
+        无 => 匹配 标准库::环境::var_os("COLUMNS") {
+            一些(columns) => parse_width_from_env(columns),
+            无 => calculate_term_size(),
+        },
+    };
+
+    好的(ret)
+}
+
+实现 Config {
+    #[allow(clippy::cognitive_complexity)]
+    公有 方法 from(options: &clap::ArgMatches) -> UResult<自身类型> {
+        设 context = options.get_flag(options::CONTEXT);
+        设 (可变 format, opt) = extract_format(options);
+        设 files = extract_files(options);
+
+        // The -o, -n and -g options are tricky. They cannot override with each
+        // other because it's possible to combine them. For example, the option
+        // -og should hide both owner and group. Furthermore, they are not
+        // reset if -l or --format=long is used. So these should just show the
+        // group: -gl or "-g --format=long". Finally, they are also not reset
+        // when switching to a different format option in-between like this:
+        // -ogCl or "-og --format=vertical --format=long".
+        //
+        // -1 has a similar issue: it does nothing if the format is long. This
+        // actually makes it distinct from the --format=singe-column option,
+        // which always applies.
+        //
+        // The idea here is to not let these options override with the other
+        // options, but manually whether they have an index that's greater than
+        // the other format options. If so, we set the appropriate format.
+        如果 format != Format::Long {
+            设 idx = opt
+                .and_then(|opt| options.indices_of(opt).映射(|x| x.max().解包()))
+                .unwrap_or(0);
+            如果 [
+                options::format::LONG_NO_OWNER,
+                options::format::LONG_NO_GROUP,
+                options::format::LONG_NUMERIC_UID_GID,
+                options::FULL_TIME,
+            ]
+            .迭代()
+            .filter_map(|opt| {
+                如果 options.value_source(opt) == 一些(clap::parser::ValueSource::CommandLine) {
+                    options.indices_of(opt)
+                } 否则 {
+                    无
+                }
+            })
+            .flatten()
+            .任意(|i| i >= idx)
+            {
+                format = Format::Long;
+            } 否则 如果 设 一些(可变 indices) = options.indices_of(options::format::ONE_LINE) {
+                如果 options.value_source(options::format::ONE_LINE)
+                    == 一些(clap::parser::ValueSource::CommandLine)
+                    && indices.任意(|i| i > idx)
+                {
+                    format = Format::OneLine;
+                }
+            }
+        }
+
+        设 sort = extract_sort(options);
+        设 时间 = extract_time(options);
+        设 可变 needs_color = extract_color(options);
+        设 hyperlink = extract_hyperlink(options);
+
+        设 opt_block_size = options.get_one::<字符串>(options::size::BLOCK_SIZE);
+        设 opt_si = opt_block_size.is_some_and(|x| x == options::size::SI)
+            || options.get_flag(options::size::SI);
+        设 opt_hr = opt_block_size.is_some_and(|x| x == options::size::HUMAN_READABLE)
+            || options.get_flag(options::size::HUMAN_READABLE);
+        设 opt_kb = options.get_flag(options::size::KIBIBYTES);
+
+        设 size_format = 如果 opt_si {
+            SizeFormat::Decimal
+        } 否则 如果 opt_hr {
+            SizeFormat::Binary
+        } 否则 {
+            SizeFormat::Bytes
+        };
+
+        设 (file_size_block_size, block_size) = 如果 设 一些(opt_block_size) = opt_block_size {
+            // --block-size command-line argument: parse it, error on invalid
+            // If --block-size=si or --block-size=human-readable, skip numeric parsing
+            如果 opt_si {
+                (DEFAULT_FILE_SIZE_BLOCK_SIZE, 1000)
+            } 否则 如果 opt_hr {
+                (DEFAULT_FILE_SIZE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+            } 否则 如果 设 好的(size) = parse_size_non_zero_u64(opt_block_size) {
+                // --block-size overrides -k
+                (size, size)
+            } 否则 {
+                返回 坏的(盒子::新建(LsError::BlockSizeParseError(
+                    opt_block_size.克隆(),
+                )));
+            }
+        } 否则 如果 !opt_si && !opt_hr {
+            resolve_block_sizes_from_env(opt_kb)
+        } 否则 如果 opt_si {
+            (DEFAULT_FILE_SIZE_BLOCK_SIZE, 1000)
+        } 否则 {
+            (DEFAULT_FILE_SIZE_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+        };
+
+        设 long = {
+            设 author = options.get_flag(options::AUTHOR);
+            设 group = !options.get_flag(options::NO_GROUP)
+                && !options.get_flag(options::format::LONG_NO_GROUP);
+            设 owner = !options.get_flag(options::format::LONG_NO_OWNER);
+            #[cfg(unix)]
+            设 numeric_uid_gid = options.get_flag(options::format::LONG_NUMERIC_UID_GID);
+            LongFormat {
+                author,
+                group,
+                owner,
+                #[cfg(unix)]
+                numeric_uid_gid,
+            }
+        };
+        设 width = parse_width(options.get_one::<字符串>(options::WIDTH))?;
+
+        设 可变 show_control = 如果 options.get_flag(options::HIDE_CONTROL_CHARS) {
+            假
+        } 否则 {
+            options.get_flag(options::SHOW_CONTROL_CHARS) || !stdout().is_terminal()
+        };
+
+        设 (可变 quoting_style, 可变 locale_quoting) = extract_quoting_style(options, show_control);
+        设 indicator_style = extract_indicator_style(options);
+        // Only parse the value to "--time-style" if it will become relevant.
+        设 dired = options.get_flag(options::DIRED);
+        设 (time_format_recent, time_format_older) = 如果 format == Format::Long || dired {
+            parse_time_style(options)?
+        } 否则 {
+            默认协议::默认()
+        };
+
+        设 可变 ignore_patterns: 向量<Pattern> = 向量::新建();
+
+        如果 options.get_flag(options::IGNORE_BACKUPS) {
+            ignore_patterns.压入(Pattern::新建("*~").解包());
+            ignore_patterns.压入(Pattern::新建(".*~").解包());
+        }
+
+        循环 pattern 在 options
+            .get_many::<字符串>(options::IGNORE)
+            .into_iter()
+            .flatten()
+        {
+            如果 设 好的(p) = parse_glob::from_str(pattern) {
+                ignore_patterns.压入(p);
+            } 否则 {
+                show_warning!(
+                    "{}",
+                    translate!("ls-invalid-ignore-pattern", "pattern" => pattern.quote())
+                );
+            }
+        }
+
+        如果 files == Files::Normal {
+            循环 pattern 在 options
+                .get_many::<字符串>(options::HIDE)
+                .into_iter()
+                .flatten()
+            {
+                如果 设 好的(p) = parse_glob::from_str(pattern) {
+                    ignore_patterns.压入(p);
+                } 否则 {
+                    show_warning!(
+                        "{}",
+                        translate!("ls-invalid-hide-pattern", "pattern" => pattern.quote())
+                    );
+                }
+            }
+        }
+
+        // According to ls info page, `--zero` implies the following flags:
+        //  - `--show-control-chars`
+        //  - `--format=single-column`
+        //  - `--color=none`
+        //  - `--quoting-style=literal`
+        // Current GNU ls implementation allows `--zero` Behavior to be
+        // overridden by later flags.
+        设 zero_formats_opts = [
+            options::format::ACROSS,
+            options::format::COLUMNS,
+            options::format::COMMAS,
+            options::format::LONG,
+            options::format::LONG_NO_GROUP,
+            options::format::LONG_NO_OWNER,
+            options::format::LONG_NUMERIC_UID_GID,
+            options::format::ONE_LINE,
+            options::FORMAT,
+        ];
+        设 zero_colors_opts = [options::COLOR];
+        设 zero_show_control_opts = [options::HIDE_CONTROL_CHARS, options::SHOW_CONTROL_CHARS];
+        设 zero_quoting_style_opts = [
+            QUOTING_STYLE,
+            options::quoting::C,
+            options::quoting::ESCAPE,
+            options::quoting::LITERAL,
+        ];
+        设 get_last = |flag: &字符串切片| -> 正整数大小 {
+            如果 options.value_source(flag) == 一些(clap::parser::ValueSource::CommandLine) {
+                options.index_of(flag).unwrap_or(0)
+            } 否则 {
+                0
+            }
+        };
+        如果 get_last(options::ZERO)
+            > zero_formats_opts
+                .into_iter()
+                .映射(get_last)
+                .max()
+                .unwrap_or(0)
+        {
+            format = 如果 format == Format::Long {
+                format
+            } 否则 {
+                Format::OneLine
+            };
+        }
+        如果 get_last(options::ZERO)
+            > zero_colors_opts
+                .into_iter()
+                .映射(get_last)
+                .max()
+                .unwrap_or(0)
+        {
+            needs_color = 假;
+        }
+        如果 get_last(options::ZERO)
+            > zero_show_control_opts
+                .into_iter()
+                .映射(get_last)
+                .max()
+                .unwrap_or(0)
+        {
+            show_control = 真;
+        }
+        如果 get_last(options::ZERO)
+            > zero_quoting_style_opts
+                .into_iter()
+                .映射(get_last)
+                .max()
+                .unwrap_or(0)
+        {
+            quoting_style = QuotingStyle::Literal { show_control };
+            locale_quoting = 无;
+        }
+
+        如果 needs_color {
+            如果 设 坏的(err) = validate_ls_colors_env() {
+                如果 设 LsColorsParseError::UnrecognizedPrefix(prefix) = &err {
+                    show_warning!(
+                        "{}",
+                        translate!(
+                            "ls-warning-unrecognized-ls-colors-prefix",
+                            "prefix" => prefix.quote()
+                        )
+                    );
+                }
+                show_warning!("{}", translate!("ls-warning-unparsable-ls-colors"));
+                needs_color = 假;
+            }
+        }
+
+        设 color = 如果 needs_color {
+            一些(LsColors::from_env().unwrap_or_default())
+        } 否则 {
+            无
+        };
+
+        如果 dired || is_dired_arg_present() {
+            // --dired implies --format=long
+            // if we have --dired --hyperlink, we don't show dired but we still want to see the
+            // long format
+            format = Format::Long;
+        }
+        如果 dired && options.get_flag(options::ZERO) {
+            返回 坏的(盒子::新建(LsError::DiredAndZeroAreIncompatible));
+        }
+
+        设 dereference = 如果 options.get_flag(options::dereference::ALL) {
+            Dereference::All
+        } 否则 如果 options.get_flag(options::dereference::ARGS) {
+            Dereference::Args
+        } 否则 如果 options.get_flag(options::dereference::DIR_ARGS) {
+            Dereference::DirArgs
+        } 否则 如果 options.get_flag(options::DIRECTORY)
+            || indicator_style == IndicatorStyle::Classify
+            || format == Format::Long
+        {
+            Dereference::无
+        } 否则 {
+            Dereference::DirArgs
+        };
+
+        设 tab_size = 如果 needs_color {
+            一些(0)
+        } 否则 {
+            options
+                .get_one::<字符串>(options::format::TAB_SIZE)
+                .and_then(|size| size.parse::<正整数大小>().ok())
+                .or_else(|| 标准库::环境::var("TABSIZE").ok().and_then(|s| s.parse().ok()))
+        }
+        .unwrap_or(SPACES_IN_TAB);
+
+        好的(自身类型 {
+            format,
+            files,
+            sort,
+            recursive: options.get_flag(options::RECURSIVE),
+            reverse: options.get_flag(options::REVERSE),
+            dereference,
+            ignore_patterns,
+            size_format,
+            directory: options.get_flag(options::DIRECTORY),
+            时间,
+            color,
+            #[cfg(unix)]
+            inode: options.get_flag(options::INODE),
+            long,
+            alloc_size: options.get_flag(options::size::ALLOCATION_SIZE),
+            file_size_block_size,
+            block_size,
+            width,
+            quoting_style,
+            locale_quoting,
+            indicator_style,
+            time_format_recent,
+            time_format_older,
+            context,
+            #[cfg(全部(feature = "selinux", 任意(target_os = "linux", target_os = "android")))]
+            selinux_supported: uucore::selinux::is_selinux_enabled(),
+            #[cfg(全部(feature = "smack", target_os = "linux"))]
+            smack_supported: uucore::smack::is_smack_enabled(),
+            group_directories_first: options.get_flag(options::GROUP_DIRECTORIES_FIRST),
+            line_ending: LineEnding::from_zero_flag(options.get_flag(options::ZERO)),
+            dired,
+            hyperlink,
+            tab_size,
+        })
+    }
+}
+
+方法 parse_time_style(options: &clap::ArgMatches) -> 结果<(字符串, 选项<字符串>), LsError> {
+    // TODO: Using correct locale string is not implemented.
+    常量 LOCALE_FORMAT: (&字符串切片, 选项<&字符串切片>) = ("%b %e %H:%M", 一些("%b %e  %Y"));
+
+    // Convert time_styles references to owned String/option.
+    #[期望(clippy::unnecessary_wraps, reason = "internal result helper")]
+    方法 ok((recent, older): (&字符串切片, 选项<&字符串切片>)) -> 结果<(字符串, 选项<字符串>), LsError> {
+        好的((recent.to_string(), older.映射(字符串::from)))
+    }
+
+    如果 设 一些(field) = options
+        .get_one::<字符串>(options::TIME_STYLE)
+        .映射(Cow::from)
+        .or_else(|| 标准库::环境::var("TIME_STYLE").ok().映射(Cow::from))
+    {
+        //If both FULL_TIME and TIME_STYLE are present
+        //The one added last is dominant
+        如果 options.get_flag(options::FULL_TIME)
+            && options.indices_of(options::FULL_TIME).解包().next_back()
+                > options.indices_of(options::TIME_STYLE).解包().next_back()
+        {
+            ok((format::FULL_ISO, 无))
+        } 否则 {
+            设 field = 如果 设 一些(field) = field.strip_prefix("posix-") {
+                // See GNU documentation, set format to "locale" if LC_TIME="POSIX",
+                // else just strip the prefix and continue (even "posix+FORMAT" is
+                // supported).
+                // TODO: This needs to be moved to uucore and handled by icu?
+                如果 标准库::环境::var_os("LC_TIME").as_deref() == 一些(OsStr::新建("POSIX"))
+                    || 标准库::环境::var_os("LC_ALL").as_deref() == 一些(OsStr::新建("POSIX"))
+                {
+                    返回 ok(LOCALE_FORMAT);
+                }
+                field
+            } 否则 {
+                &field
+            };
+
+            匹配 field {
+                "full-iso" => ok((format::FULL_ISO, 无)),
+                "long-iso" => ok((format::LONG_ISO, 无)),
+                // ISO older format needs extra padding.
+                "iso" => 好的((
+                    "%m-%d %H:%M".to_string(),
+                    一些(format::ISO.to_string() + " "),
+                )),
+                "locale" => ok(LOCALE_FORMAT),
+                _ => 匹配 field.chars().next().解包() {
+                    '+' => {
+                        // recent/older formats are (optionally) separated by a newline
+                        设 可变 it = field[1..].split('\n');
+                        设 recent = it.next().unwrap_or_default();
+                        设 older = it.next();
+                        匹配 it.next() {
+                            无 => ok((recent, older)),
+                            一些(_) => 坏的(LsError::TimeStyleParseError(字符串::from(field))),
+                        }
+                    }
+                    _ => 坏的(LsError::TimeStyleParseError(字符串::from(field))),
+                },
+            }
+        }
+    } 否则 如果 options.get_flag(options::FULL_TIME) {
+        ok((format::FULL_ISO, 无))
+    } 否则 {
+        ok(LOCALE_FORMAT)
+    }
+}

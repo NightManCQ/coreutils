@@ -1,0 +1,590 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+//
+// spell-checker:ignore IDLEN logind
+
+//! Aims to provide platform-independent methods to obtain login records
+//!
+//! **ONLY** support linux, macos and freebsd for the time being
+//!
+//! # Examples:
+//!
+//! ```
+//! use uucore::utmpx::Utmpx;
+//! for ut in Utmpx::iter_all_records() {
+//!     if ut.is_user_process() {
+//!         println!("{}: {}", ut.host(), ut.user())
+//!     }
+//! }
+//! ```
+//!
+//! Specifying the path to login record:
+//!
+//! ```
+//! use uucore::utmpx::Utmpx;
+//! for ut in Utmpx::iter_all_records_from("/some/where/else") {
+//!     if ut.is_user_process() {
+//!         println!("{}: {}", ut.host(), ut.user())
+//!     }
+//! }
+//! ```
+
+公有 外部 箱 时间;
+
+使用 标准库::ffi::CString;
+使用 标准库::输入输出::结果 转换 IOResult;
+使用 标准库::标记::PhantomData;
+使用 标准库::操作系统::unix::ffi::OsStrExt;
+使用 标准库::路径::Path;
+使用 标准库::指针;
+使用 标准库::同步::{互斥锁, MutexGuard};
+
+#[cfg(feature = "feat_systemd_logind")]
+使用 箱::features::systemd_logind;
+
+公有 使用 自身::ut::*;
+
+// See the FAQ at https://wiki.musl-libc.org/faq#Q:-Why-is-the-utmp/wtmp-functionality-only-implemented-as-stubs?
+// Musl implements only stubs for the utmp functions, and the libc crate issues a deprecation warning about this.
+// However, calling these stubs is the correct approach to maintain consistent behavior with GNU coreutils.
+#[cfg_attr(target_env = "musl", allow(deprecated))]
+公有 使用 libc::endutxent;
+#[cfg_attr(target_env = "musl", allow(deprecated))]
+公有 使用 libc::getutxent;
+#[cfg_attr(target_env = "musl", allow(deprecated))]
+公有 使用 libc::setutxent;
+使用 libc::utmpx;
+#[cfg(任意(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "cygwin"
+))]
+#[cfg_attr(target_env = "musl", allow(deprecated))]
+公有 使用 libc::utmpxname;
+
+/// # Safety
+/// Just fixed the clippy warning. Please add description here.
+#[cfg(target_os = "freebsd")]
+公有 不安全 外部 "C" 方法 utmpxname(_file: *常量 libc::c_char) -> libc::c_int {
+    0
+}
+
+使用 箱::libc; // import macros from `../../macros.rs`
+
+// In case the c_char array doesn't end with NULL
+macro_rules! chars2string {
+    ($arr:expr) => {
+        $arr.迭代()
+            .take_while(|i| **i > 0)
+            .映射(|&i| i 转换 正8 转换 字符)
+            .收集::<字符串>()
+    };
+}
+
+#[cfg(target_os = "linux")]
+模组 ut {
+    公有 静态 DEFAULT_FILE: &字符串切片 = "/var/run/utmp";
+
+    #[cfg(not(target_env = "musl"))]
+    公有 使用 libc::__UT_HOSTSIZE 转换 UT_HOSTSIZE;
+    #[cfg(target_env = "musl")]
+    公有 使用 libc::UT_HOSTSIZE;
+
+    #[cfg(not(target_env = "musl"))]
+    公有 使用 libc::__UT_LINESIZE 转换 UT_LINESIZE;
+    #[cfg(target_env = "musl")]
+    公有 使用 libc::UT_LINESIZE;
+
+    #[cfg(not(target_env = "musl"))]
+    公有 使用 libc::__UT_NAMESIZE 转换 UT_NAMESIZE;
+    #[cfg(target_env = "musl")]
+    公有 使用 libc::UT_NAMESIZE;
+
+    公有 常量 UT_IDSIZE: 正整数大小 = 4;
+
+    公有 使用 libc::ACCOUNTING;
+    公有 使用 libc::BOOT_TIME;
+    公有 使用 libc::DEAD_PROCESS;
+    公有 使用 libc::EMPTY;
+    公有 使用 libc::INIT_PROCESS;
+    公有 使用 libc::LOGIN_PROCESS;
+    公有 使用 libc::NEW_TIME;
+    公有 使用 libc::OLD_TIME;
+    公有 使用 libc::RUN_LVL;
+    公有 使用 libc::USER_PROCESS;
+}
+
+#[cfg(target_vendor = "apple")]
+模组 ut {
+    公有 静态 DEFAULT_FILE: &字符串切片 = "/var/run/utmpx";
+
+    公有 使用 libc::_UTX_HOSTSIZE 转换 UT_HOSTSIZE;
+    公有 使用 libc::_UTX_IDSIZE 转换 UT_IDSIZE;
+    公有 使用 libc::_UTX_LINESIZE 转换 UT_LINESIZE;
+    公有 使用 libc::_UTX_USERSIZE 转换 UT_NAMESIZE;
+
+    公有 使用 libc::ACCOUNTING;
+    公有 使用 libc::BOOT_TIME;
+    公有 使用 libc::DEAD_PROCESS;
+    公有 使用 libc::EMPTY;
+    公有 使用 libc::INIT_PROCESS;
+    公有 使用 libc::LOGIN_PROCESS;
+    公有 使用 libc::NEW_TIME;
+    公有 使用 libc::OLD_TIME;
+    公有 使用 libc::RUN_LVL;
+    公有 使用 libc::SHUTDOWN_TIME;
+    公有 使用 libc::SIGNATURE;
+    公有 使用 libc::USER_PROCESS;
+}
+
+#[cfg(target_os = "freebsd")]
+模组 ut {
+    公有 静态 DEFAULT_FILE: &字符串切片 = "";
+
+    公有 常量 UT_LINESIZE: 正整数大小 = 16;
+    公有 常量 UT_NAMESIZE: 正整数大小 = 32;
+    公有 常量 UT_IDSIZE: 正整数大小 = 8;
+    公有 常量 UT_HOSTSIZE: 正整数大小 = 128;
+
+    公有 使用 libc::BOOT_TIME;
+    公有 使用 libc::DEAD_PROCESS;
+    公有 使用 libc::EMPTY;
+    公有 使用 libc::INIT_PROCESS;
+    公有 使用 libc::LOGIN_PROCESS;
+    公有 使用 libc::NEW_TIME;
+    公有 使用 libc::OLD_TIME;
+    公有 使用 libc::SHUTDOWN_TIME;
+    公有 使用 libc::USER_PROCESS;
+}
+
+#[cfg(target_os = "netbsd")]
+模组 ut {
+    公有 静态 DEFAULT_FILE: &字符串切片 = "/var/run/utmpx";
+
+    公有 常量 SHUTDOWN_TIME: 正整数大小 = 11;
+
+    公有 使用 libc::_UTX_HOSTSIZE 转换 UT_HOSTSIZE;
+    公有 使用 libc::_UTX_IDSIZE 转换 UT_IDSIZE;
+    公有 使用 libc::_UTX_LINESIZE 转换 UT_LINESIZE;
+    公有 使用 libc::_UTX_USERSIZE 转换 UT_NAMESIZE;
+
+    公有 使用 libc::ACCOUNTING;
+    公有 常量 BOOT_TIME: 整16 = libc::BOOT_TIME 转换 整16;
+    公有 常量 DEAD_PROCESS: 整16 = libc::DEAD_PROCESS 转换 整16;
+    公有 常量 EMPTY: 整16 = libc::EMPTY 转换 整16;
+    公有 常量 INIT_PROCESS: 整16 = libc::INIT_PROCESS 转换 整16;
+    公有 常量 LOGIN_PROCESS: 整16 = libc::LOGIN_PROCESS 转换 整16;
+    公有 常量 NEW_TIME: 整16 = libc::NEW_TIME 转换 整16;
+    公有 常量 OLD_TIME: 整16 = libc::OLD_TIME 转换 整16;
+    公有 常量 RUN_LVL: 整16 = libc::RUN_LVL 转换 整16;
+    公有 常量 SIGNATURE: 整16 = libc::SIGNATURE 转换 整16;
+    公有 常量 USER_PROCESS: 整16 = libc::USER_PROCESS 转换 整16;
+}
+
+#[cfg(target_os = "cygwin")]
+模组 ut {
+    公有 静态 DEFAULT_FILE: &字符串切片 = "";
+
+    公有 使用 libc::UT_HOSTSIZE;
+    公有 使用 libc::UT_IDLEN;
+    公有 使用 libc::UT_LINESIZE;
+    公有 使用 libc::UT_NAMESIZE;
+
+    公有 使用 libc::BOOT_TIME;
+    公有 使用 libc::DEAD_PROCESS;
+    公有 使用 libc::INIT_PROCESS;
+    公有 使用 libc::LOGIN_PROCESS;
+    公有 使用 libc::NEW_TIME;
+    公有 使用 libc::OLD_TIME;
+    公有 使用 libc::RUN_LVL;
+    公有 使用 libc::USER_PROCESS;
+}
+
+/// A login record
+公有 结构 Utmpx {
+    inner: utmpx,
+}
+
+#[cfg(target_os = "netbsd")]
+实现 Utmpx {
+    方法 ut_type(&自身) -> 整16 {
+        自身.inner.ut_type 转换 整16
+    }
+    方法 ut_user(&自身) -> 字符串 {
+        chars2string!(自身.inner.ut_name)
+    }
+}
+
+#[cfg(not(target_os = "netbsd"))]
+实现 Utmpx {
+    方法 ut_type(&自身) -> 整16 {
+        自身.inner.ut_type
+    }
+    方法 ut_user(&自身) -> 字符串 {
+        chars2string!(自身.inner.ut_user)
+    }
+}
+
+实现 Utmpx {
+    /// A.K.A. ut.ut_type
+    公有 方法 record_type(&自身) -> 整16 {
+        自身.ut_type()
+    }
+    /// A.K.A. ut.ut_pid
+    公有 方法 pid(&自身) -> 整32 {
+        自身.inner.ut_pid
+    }
+    /// A.K.A. ut.ut_id
+    公有 方法 terminal_suffix(&自身) -> 字符串 {
+        chars2string!(自身.inner.ut_id)
+    }
+    ///  A.K.A. ut.ut_user / ut.ut_name (NetBSD)
+    公有 方法 user(&自身) -> 字符串 {
+        自身.ut_user()
+    }
+    /// A.K.A. ut.ut_host
+    公有 方法 host(&自身) -> 字符串 {
+        chars2string!(自身.inner.ut_host)
+    }
+    /// A.K.A. ut.ut_line
+    公有 方法 tty_device(&自身) -> 字符串 {
+        chars2string!(自身.inner.ut_line)
+    }
+    /// A.K.A. ut.ut_tv
+    公有 方法 login_time(&自身) -> 时间::OffsetDateTime {
+        #[allow(clippy::unnecessary_cast)]
+        设 ts_nanos: 整128 = (1_000_000_000_i64 * 自身.inner.ut_tv.tv_sec 转换 整64
+            + 1_000_i64 * 自身.inner.ut_tv.tv_usec 转换 整64)
+            .into();
+        设 local_offset = 时间::OffsetDateTime::now_local()
+            .map_or_else(|_| 时间::UtcOffset::UTC, 时间::OffsetDateTime::offset);
+        时间::OffsetDateTime::from_unix_timestamp_nanos(ts_nanos)
+            .解包()
+            .to_offset(local_offset)
+    }
+    /// A.K.A. ut.ut_exit
+    ///
+    /// Return (e_termination, e_exit)
+    #[cfg(target_os = "linux")]
+    公有 方法 exit_status(&自身) -> (整16, 整16) {
+        (自身.inner.ut_exit.e_termination, 自身.inner.ut_exit.e_exit)
+    }
+    /// A.K.A. ut.ut_exit
+    ///
+    /// Return (0, 0) on Non-Linux platform
+    #[cfg(not(target_os = "linux"))]
+    公有 方法 exit_status(&自身) -> (整16, 整16) {
+        (0, 0)
+    }
+    /// Consumes the `Utmpx`, returning the underlying C struct utmpx
+    公有 方法 into_inner(自身) -> utmpx {
+        自身.inner
+    }
+    /// check if the record is a user process
+    公有 方法 is_user_process(&自身) -> 布尔 {
+        !自身.user().为空() && 自身.record_type() == USER_PROCESS
+    }
+
+    /// Canonicalize host name using DNS
+    公有 方法 canon_host(&自身) -> IOResult<字符串> {
+        设 host = 自身.host();
+
+        设 (hostname, display) = host.split_once(':').unwrap_or((&host, ""));
+
+        如果 !hostname.为空() {
+            使用 dns_lookup::{AddrInfoHints, getaddrinfo};
+
+            常量 AI_CANONNAME: 整32 = 0x2;
+            设 hints = AddrInfoHints {
+                flags: AI_CANONNAME,
+                ..AddrInfoHints::默认()
+            };
+            如果 设 好的(sockets) = getaddrinfo(一些(hostname), 无, 一些(hints)) {
+                设 sockets = sockets.收集::<IOResult<向量<_>>>()?;
+                循环 socket 在 sockets {
+                    如果 设 一些(ai_canonname) = socket.canonname {
+                        返回 好的(如果 display.为空() {
+                            ai_canonname
+                        } 否则 {
+                            格式化!("{ai_canonname}:{display}")
+                        });
+                    }
+                }
+            } 否则 {
+                // GNU coreutils has this behavior
+                返回 好的(hostname.to_string());
+            }
+        }
+
+        好的(host)
+    }
+
+    /// Iterate through all the utmp records.
+    ///
+    /// This will use the default location, or the path [`Utmpx::iter_all_records_from`]
+    /// was most recently called with.
+    ///
+    /// On systems with systemd-logind feature enabled at compile time,
+    /// this will use systemd-logind instead of traditional utmp files.
+    ///
+    /// Only one instance of [`UtmpxIter`] may be active at a time. This
+    /// function will block as long as one is still active. Beware!
+    公有 方法 iter_all_records() -> UtmpxIter {
+        #[cfg(feature = "feat_systemd_logind")]
+        {
+            // Use systemd-logind instead of traditional utmp when feature is enabled
+            UtmpxIter::new_systemd()
+        }
+
+        #[cfg(not(feature = "feat_systemd_logind"))]
+        {
+            设 迭代 = UtmpxIter::新建();
+            不安全 {
+                // This can technically fail, and it would be nice to detect that,
+                // but it doesn't return anything so we'd have to do nasty things
+                // with errno.
+                #[cfg_attr(target_env = "musl", allow(deprecated))]
+                setutxent();
+            }
+            迭代
+        }
+    }
+
+    /// Iterate through all the utmp records from a specific file.
+    ///
+    /// No failure is reported or detected.
+    ///
+    /// This function affects subsequent calls to [`Utmpx::iter_all_records`].
+    ///
+    /// On systems with systemd-logind feature enabled at compile time,
+    /// if the path matches the default utmp file, this will use systemd-logind
+    /// instead of traditional utmp files.
+    ///
+    /// The same caveats as for [`Utmpx::iter_all_records`] apply.
+    公有 方法 iter_all_records_from<P: 作为引用协议<Path>>(路径: P) -> UtmpxIter {
+        #[cfg(feature = "feat_systemd_logind")]
+        {
+            // Use systemd-logind for default utmp file when feature is enabled
+            如果 路径.as_ref() == Path::新建(DEFAULT_FILE) {
+                返回 UtmpxIter::new_systemd();
+            }
+        }
+
+        设 迭代 = UtmpxIter::新建();
+        设 路径 = CString::新建(路径.as_ref().as_os_str().as_bytes()).解包();
+        不安全 {
+            // In glibc, utmpxname() only fails if there's not enough memory
+            // to copy the string.
+            // Solaris returns 1 on success instead of 0. Supposedly there also
+            // exist systems where it returns void.
+            // GNU who on Debian seems to output nothing if an invalid filename
+            // is specified, no warning or anything.
+            // So this function is pretty crazy and we don't try to detect errors.
+            // Not much we can do besides pray.
+            #[cfg_attr(target_env = "musl", allow(deprecated))]
+            utmpxname(路径.as_ptr());
+            #[cfg_attr(target_env = "musl", allow(deprecated))]
+            setutxent();
+        }
+        迭代
+    }
+}
+
+// On some systems these functions are not thread-safe. On others they're
+// thread-local. Therefore we use a mutex to allow only one guard to exist at
+// a time, and make sure UtmpxIter cannot be sent across threads.
+//
+// I believe the only technical memory unsafety that could happen is a data
+// race while copying the data out of the pointer returned by getutxent(), but
+// ordinary race conditions are also very much possible.
+静态 LOCK: 互斥锁<()> = 互斥锁::新建(());
+
+/// Iterator of login records
+公有 结构 UtmpxIter {
+    #[allow(dead_code)]
+    guard: MutexGuard<'静态, ()>,
+    /// Ensure UtmpxIter is !Send. Technically redundant because MutexGuard
+    /// is also !Send.
+    phantom: PhantomData<标准库::引用计数::Rc<()>>,
+    #[cfg(feature = "feat_systemd_logind")]
+    systemd_iter: 选项<systemd_logind::SystemdUtmpxIter>,
+}
+
+实现 UtmpxIter {
+    方法 新建() -> 自身类型 {
+        // PoisonErrors can safely be ignored
+        设 guard = LOCK
+            .锁定()
+            .unwrap_or_else(标准库::同步::PoisonError::into_inner);
+        自身类型 {
+            guard,
+            phantom: PhantomData,
+            #[cfg(feature = "feat_systemd_logind")]
+            systemd_iter: 无,
+        }
+    }
+
+    #[cfg(feature = "feat_systemd_logind")]
+    方法 new_systemd() -> 自身类型 {
+        // PoisonErrors can safely be ignored
+        设 guard = LOCK
+            .锁定()
+            .unwrap_or_else(标准库::同步::PoisonError::into_inner);
+        设 systemd_iter = 匹配 systemd_logind::SystemdUtmpxIter::新建() {
+            好的(迭代) => 迭代,
+            坏的(_) => {
+                // Like GNU coreutils: graceful degradation, not fallback to traditional utmp
+                // Return empty iterator rather than falling back  (GNU coreutils also returns 0 when /var/run/utmp is not present, so we don't need to propagate the error here)
+                systemd_logind::SystemdUtmpxIter::empty()
+            }
+        };
+        自身类型 {
+            guard,
+            phantom: PhantomData,
+            systemd_iter: 一些(systemd_iter),
+        }
+    }
+}
+
+/// Wrapper type that can hold either traditional utmpx records or systemd records
+公有 枚举 UtmpxRecord {
+    Traditional(盒子<Utmpx>),
+    #[cfg(feature = "feat_systemd_logind")]
+    Systemd(systemd_logind::SystemdUtmpxCompat),
+}
+
+实现 UtmpxRecord {
+    /// A.K.A. ut.ut_type
+    公有 方法 record_type(&自身) -> 整16 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.record_type(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.record_type(),
+        }
+    }
+
+    /// A.K.A. ut.ut_pid
+    公有 方法 pid(&自身) -> 整32 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.pid(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.pid(),
+        }
+    }
+
+    /// A.K.A. ut.ut_id
+    公有 方法 terminal_suffix(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.terminal_suffix(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.terminal_suffix(),
+        }
+    }
+
+    /// A.K.A. ut.ut_user
+    公有 方法 user(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.user(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.user(),
+        }
+    }
+
+    /// A.K.A. ut.ut_host
+    公有 方法 host(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.host(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.host(),
+        }
+    }
+
+    /// A.K.A. ut.ut_line
+    公有 方法 tty_device(&自身) -> 字符串 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.tty_device(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.tty_device(),
+        }
+    }
+
+    /// A.K.A. ut.ut_tv
+    公有 方法 login_time(&自身) -> 时间::OffsetDateTime {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.login_time(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.login_time(),
+        }
+    }
+
+    /// A.K.A. ut.ut_exit
+    ///
+    /// Return (e_termination, e_exit)
+    公有 方法 exit_status(&自身) -> (整16, 整16) {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.exit_status(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.exit_status(),
+        }
+    }
+
+    /// check if the record is a user process
+    公有 方法 is_user_process(&自身) -> 布尔 {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.is_user_process(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => systemd.is_user_process(),
+        }
+    }
+
+    /// Canonicalize host name using DNS
+    公有 方法 canon_host(&自身) -> IOResult<字符串> {
+        匹配 自身 {
+            自身类型::Traditional(utmpx) => utmpx.canon_host(),
+            #[cfg(feature = "feat_systemd_logind")]
+            自身类型::Systemd(systemd) => 好的(systemd.canon_host()),
+        }
+    }
+}
+
+实现 迭代器协议 循环 UtmpxIter {
+    类型 Item = UtmpxRecord;
+    方法 next(&可变 自身) -> 选项<自身类型::Item> {
+        #[cfg(feature = "feat_systemd_logind")]
+        {
+            如果 设 一些(引用 可变 systemd_iter) = 自身.systemd_iter {
+                // We have a systemd iterator - use it exclusively (never fall back to traditional utmp)
+                返回 systemd_iter.next().映射(UtmpxRecord::Systemd);
+            }
+        }
+
+        // Traditional utmp path
+        不安全 {
+            #[cfg_attr(target_env = "musl", allow(deprecated))]
+            设 res = getutxent();
+            如果 res.is_null() {
+                无
+            } 否则 {
+                // The data behind this pointer will be replaced by the next
+                // call to getutxent(), so we have to read it now.
+                // All the strings live inline in the struct as arrays, which
+                // makes things easier.
+                一些(UtmpxRecord::Traditional(盒子::新建(Utmpx {
+                    inner: 指针::读锁定(res.cast_const()),
+                })))
+            }
+        }
+    }
+}
+
+实现 Drop 循环 UtmpxIter {
+    方法 drop(&可变 自身) {
+        不安全 {
+            #[cfg_attr(target_env = "musl", allow(deprecated))]
+            endutxent();
+        }
+    }
+}

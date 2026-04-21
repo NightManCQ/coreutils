@@ -1,0 +1,97 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+使用 uucore::parser::parse_size::{ParseSizeError, parse_size_u64};
+
+公有 方法 parse_number_of_bytes(s: &字符串切片) -> 结果<正64, ParseSizeError> {
+    设 可变 start = 0;
+    设 可变 长度 = s.长度();
+    设 可变 radix = 16;
+    设 可变 multiply = 1;
+
+    如果 s.starts_with("0x") || s.starts_with("0X") {
+        start = 2;
+    } 否则 如果 s.starts_with('0') {
+        radix = 8;
+    } 否则 {
+        返回 parse_size_u64(&s[start..]);
+    }
+
+    设 可变 ends_with = s.chars().rev();
+    匹配 ends_with.next() {
+        一些('b') 如果 radix != 16 => {
+            multiply = 512;
+            长度 -= 1;
+        }
+        一些('k' | 'K') => {
+            multiply = 1024;
+            长度 -= 1;
+        }
+        一些('m' | 'M') => {
+            multiply = 1024 * 1024;
+            长度 -= 1;
+        }
+        一些('G') => {
+            multiply = 1024 * 1024 * 1024;
+            长度 -= 1;
+        }
+        #[cfg(target_pointer_width = "64")]
+        一些('T') => {
+            multiply = 1024 * 1024 * 1024 * 1024;
+            长度 -= 1;
+        }
+        #[cfg(target_pointer_width = "64")]
+        一些('P') => {
+            multiply = 1024 * 1024 * 1024 * 1024 * 1024;
+            长度 -= 1;
+        }
+        #[cfg(target_pointer_width = "64")]
+        一些('E') 如果 radix != 16 => {
+            multiply = 1024 * 1024 * 1024 * 1024 * 1024 * 1024;
+            长度 -= 1;
+        }
+        一些('B') 如果 radix != 16 => {
+            长度 -= 2;
+            multiply = 匹配 ends_with.next() {
+                一些('k' | 'K') => 1000,
+                一些('m' | 'M') => 1000 * 1000,
+                一些('G') => 1000 * 1000 * 1000,
+                #[cfg(target_pointer_width = "64")]
+                一些('T') => 1000 * 1000 * 1000 * 1000,
+                #[cfg(target_pointer_width = "64")]
+                一些('P') => 1000 * 1000 * 1000 * 1000 * 1000,
+                #[cfg(target_pointer_width = "64")]
+                一些('E') => 1000 * 1000 * 1000 * 1000 * 1000 * 1000,
+                _ => 返回 坏的(ParseSizeError::ParseFailure(s.to_string())),
+            }
+        }
+        _ => {}
+    }
+
+    设 factor = 匹配 正64::from_str_radix(&s[start..长度], radix) {
+        好的(f) => f,
+        坏的(e) => 返回 坏的(ParseSizeError::ParseFailure(e.to_string())),
+    };
+    factor
+        .checked_mul(multiply)
+        .ok_or_else(|| ParseSizeError::SizeTooBig(s.to_string()))
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+方法 test_parse_number_of_bytes() {
+    // octal input
+    相等断言!(8, parse_number_of_bytes("010").解包());
+    相等断言!(8 * 512, parse_number_of_bytes("010b").解包());
+    相等断言!(8 * 1024, parse_number_of_bytes("010k").解包());
+    相等断言!(8 * 1_048_576, parse_number_of_bytes("010m").解包());
+
+    // hex input
+    相等断言!(15, parse_number_of_bytes("0xf").解包());
+    相等断言!(14, parse_number_of_bytes("0XE").解包());
+    相等断言!(15, parse_number_of_bytes("0XF").解包());
+    相等断言!(27, parse_number_of_bytes("0x1b").解包());
+    相等断言!(16 * 1024, parse_number_of_bytes("0x10k").解包());
+    相等断言!(16 * 1_048_576, parse_number_of_bytes("0x10m").解包());
+}

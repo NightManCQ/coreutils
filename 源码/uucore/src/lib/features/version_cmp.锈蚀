@@ -1,0 +1,372 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! Compare two version strings.
+
+使用 标准库::比较::排序顺序;
+
+/// Compares the non-digit parts of a version.
+/// Special cases: ~ are before everything else, even ends ("a~" < "a")
+/// Letters are before non-letters
+方法 version_non_digit_cmp(a: &[正8], b: &[正8]) -> 排序顺序 {
+    设 可变 a_chars = a.迭代();
+    设 可变 b_chars = b.迭代();
+    无限循环 {
+        匹配 (a_chars.next(), b_chars.next()) {
+            (一些(c1), 一些(c2)) 如果 c1 == c2 => {}
+            (无, 无) => 返回 排序顺序::Equal,
+            (_, 一些(b'~')) => 返回 排序顺序::Greater,
+            (一些(b'~'), _) => 返回 排序顺序::Less,
+            (无, 一些(_)) => 返回 排序顺序::Less,
+            (一些(_), 无) => 返回 排序顺序::Greater,
+            (一些(c1), 一些(c2)) 如果 c1.is_ascii_alphabetic() && !c2.is_ascii_alphabetic() => {
+                返回 排序顺序::Less;
+            }
+            (一些(c1), 一些(c2)) 如果 !c1.is_ascii_alphabetic() && c2.is_ascii_alphabetic() => {
+                返回 排序顺序::Greater;
+            }
+            (一些(c1), 一些(c2)) => 返回 c1.比较(c2),
+        }
+    }
+}
+
+/// Remove file endings matching the regex `(\.[A-Za-z~][A-Za-z0-9~]*)*$`
+方法 remove_file_ending(a: &[正8]) -> &[正8] {
+    设 可变 ending_start = 无;
+    设 可变 prev_was_dot = 假;
+    循环 (idx, &字符) 在 a.迭代().enumerate() {
+        如果 字符 == b'.' {
+            如果 ending_start.is_none() || prev_was_dot {
+                ending_start = 一些(idx);
+            }
+            prev_was_dot = 真;
+        } 否则 如果 prev_was_dot {
+            prev_was_dot = 假;
+            如果 !字符.is_ascii_alphabetic() && 字符 != b'~' {
+                ending_start = 无;
+            }
+        } 否则 如果 !字符.is_ascii_alphanumeric() && 字符 != b'~' {
+            ending_start = 无;
+        }
+    }
+    如果 prev_was_dot {
+        ending_start = 无;
+    }
+    如果 设 一些(ending_start) = ending_start {
+        &a[..ending_start]
+    } 否则 {
+        a
+    }
+}
+
+/// Compare two version strings.
+公有 方法 version_cmp(可变 a: &[正8], 可变 b: &[正8]) -> 排序顺序 {
+    设 str_cmp = a.比较(b);
+    如果 str_cmp == 排序顺序::Equal {
+        返回 str_cmp;
+    }
+
+    // Special cases:
+    // 1. Empty strings
+    匹配 (a.为空(), b.为空()) {
+        (真, 假) => 返回 排序顺序::Less,
+        (假, 真) => 返回 排序顺序::Greater,
+        (真, 真) => 无法到达!(),
+        (假, 假) => {}
+    }
+    // 2. Dots
+    匹配 (a == b".", b == b".") {
+        (真, 假) => 返回 排序顺序::Less,
+        (假, 真) => 返回 排序顺序::Greater,
+        (真, 真) => 无法到达!(),
+        (假, 假) => {}
+    }
+    // 3. Two Dots
+    匹配 (a == b"..", b == b"..") {
+        (真, 假) => 返回 排序顺序::Less,
+        (假, 真) => 返回 排序顺序::Greater,
+        (真, 真) => 无法到达!(),
+        (假, 假) => {}
+    }
+    // 4. Strings starting with a dot
+    匹配 (a.starts_with(b"."), b.starts_with(b".")) {
+        (真, 假) => 返回 排序顺序::Less,
+        (假, 真) => 返回 排序顺序::Greater,
+        (真, 真) => {
+            // Strip the leading dot for later comparisons
+            a = &a[1..];
+            b = &b[1..];
+        }
+        _ => {}
+    }
+
+    // Try to strip file extensions
+    设 (可变 a, 可变 b) = 匹配 (remove_file_ending(a), remove_file_ending(b)) {
+        (a_stripped, b_stripped) 如果 a_stripped == b_stripped => {
+            // If both would be the same after stripping file extensions, don't strip them.
+            (a, b)
+        }
+        stripped => stripped,
+    };
+
+    // 1. Compare leading non-numerical part
+    // 2. Compare leading numerical part
+    // 3. Repeat
+    当 !a.为空() || !b.为空() {
+        设 a_numerical_start = a.迭代().position(正8::is_ascii_digit).unwrap_or(a.长度());
+        设 b_numerical_start = b.迭代().position(正8::is_ascii_digit).unwrap_or(b.长度());
+
+        设 a_str = &a[..a_numerical_start];
+        设 b_str = &b[..b_numerical_start];
+
+        匹配 version_non_digit_cmp(a_str, b_str) {
+            排序顺序::Equal => {}
+            ord => 返回 ord,
+        }
+
+        a = &a[a_numerical_start..];
+        b = &b[a_numerical_start..];
+
+        设 a_numerical_end = a
+            .迭代()
+            .position(|c| !c.is_ascii_digit())
+            .unwrap_or(a.长度());
+        设 b_numerical_end = b
+            .迭代()
+            .position(|c| !c.is_ascii_digit())
+            .unwrap_or(b.长度());
+
+        设 a_str = &a[a.迭代().position(|&c| c != b'0').unwrap_or(a.长度())..a_numerical_end];
+        设 b_str = &b[b.迭代().position(|&c| c != b'0').unwrap_or(b.长度())..b_numerical_end];
+
+        匹配 a_str.长度().比较(&b_str.长度()) {
+            排序顺序::Equal => {}
+            ord => 返回 ord,
+        }
+
+        匹配 a_str.比较(b_str) {
+            排序顺序::Equal => {}
+            ord => 返回 ord,
+        }
+
+        a = &a[a_numerical_end..];
+        b = &b[b_numerical_end..];
+    }
+
+    排序顺序::Equal
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::version_cmp::version_cmp;
+    使用 标准库::比较::排序顺序;
+    #[test]
+    方法 test_version_cmp() {
+        // Identical strings
+        相等断言!(version_cmp(b"hello", b"hello"), 排序顺序::Equal);
+
+        相等断言!(version_cmp(b"file12", b"file12"), 排序顺序::Equal);
+
+        相等断言!(
+            version_cmp(b"file12-suffix", b"file12-suffix"),
+            排序顺序::Equal
+        );
+
+        相等断言!(
+            version_cmp(b"file12-suffix24", b"file12-suffix24"),
+            排序顺序::Equal
+        );
+
+        // Shortened names
+        相等断言!(version_cmp(b"world", b"wo"), 排序顺序::Greater);
+
+        相等断言!(version_cmp(b"hello10wo", b"hello10world"), 排序顺序::Less);
+
+        // Simple names
+        相等断言!(version_cmp(b"world", b"hello"), 排序顺序::Greater);
+
+        相等断言!(version_cmp(b"hello", b"world"), 排序顺序::Less);
+
+        相等断言!(version_cmp(b"apple", b"ant"), 排序顺序::Greater);
+
+        相等断言!(version_cmp(b"ant", b"apple"), 排序顺序::Less);
+
+        // Uppercase letters
+        相等断言!(
+            version_cmp(b"Beef", b"apple"),
+            排序顺序::Less,
+            "Uppercase letters are sorted before all lowercase letters"
+        );
+
+        相等断言!(version_cmp(b"Apple", b"apple"), 排序顺序::Less);
+
+        相等断言!(version_cmp(b"apple", b"aPple"), 排序顺序::Greater);
+
+        // Numbers
+        相等断言!(
+            version_cmp(b"100", b"20"),
+            排序顺序::Greater,
+            "Greater numbers are greater even if they start with a smaller digit",
+        );
+
+        相等断言!(
+            version_cmp(b"20", b"20"),
+            排序顺序::Equal,
+            "Equal numbers are equal"
+        );
+
+        相等断言!(
+            version_cmp(b"15", b"200"),
+            排序顺序::Less,
+            "Small numbers are smaller"
+        );
+
+        // Comparing numbers with other characters
+        相等断言!(
+            version_cmp(b"1000", b"apple"),
+            排序顺序::Less,
+            "Numbers are sorted before other characters"
+        );
+
+        相等断言!(
+            // spell-checker:disable-next-line
+            version_cmp(b"file1000", b"fileapple"),
+            排序顺序::Less,
+            "Numbers in the middle of the name are sorted before other characters"
+        );
+
+        // Leading zeroes
+        相等断言!(
+            version_cmp(b"012", b"12"),
+            排序顺序::Equal,
+            "A single leading zero does not make a difference"
+        );
+
+        相等断言!(
+            version_cmp(b"000800", b"0000800"),
+            排序顺序::Equal,
+            "Multiple leading zeros do not make a difference"
+        );
+
+        // Numbers and other characters combined
+        相等断言!(version_cmp(b"ab10", b"aa11"), 排序顺序::Greater);
+
+        相等断言!(
+            version_cmp(b"aa10", b"aa11"),
+            排序顺序::Less,
+            "Numbers after other characters are handled correctly."
+        );
+
+        相等断言!(
+            version_cmp(b"aa2", b"aa100"),
+            排序顺序::Less,
+            "Numbers after alphabetical characters are handled correctly."
+        );
+
+        相等断言!(
+            version_cmp(b"aa10bb", b"aa11aa"),
+            排序顺序::Less,
+            "Number is used even if alphabetical characters after it differ."
+        );
+
+        相等断言!(
+            version_cmp(b"aa10aa0010", b"aa11aa1"),
+            排序顺序::Less,
+            "Second number is ignored if the first number differs."
+        );
+
+        相等断言!(
+            version_cmp(b"aa10aa0010", b"aa10aa1"),
+            排序顺序::Greater,
+            "Second number is used if the rest is equal."
+        );
+
+        相等断言!(
+            version_cmp(b"aa10aa0010", b"aa00010aa1"),
+            排序顺序::Greater,
+            "Second number is used if the rest is equal up to leading zeroes of the first number."
+        );
+
+        相等断言!(
+            version_cmp(b"aa10aa0022", b"aa010aa022"),
+            排序顺序::Equal,
+            "Test multiple numeric values with leading zeros"
+        );
+
+        相等断言!(
+            version_cmp(b"file-1.4", b"file-1.13"),
+            排序顺序::Less,
+            "Periods are handled as normal text, not as a decimal point."
+        );
+
+        // Greater than u64::Max
+        // u64 == 18446744073709551615 so this should be plenty:
+        //        20000000000000000000000
+        相等断言!(
+            version_cmp(
+                b"aa2000000000000000000000bb",
+                b"aa002000000000000000000001bb"
+            ),
+            排序顺序::Less,
+            "Numbers larger than u64::MAX are handled correctly without crashing"
+        );
+
+        相等断言!(
+            version_cmp(
+                b"aa2000000000000000000000bb",
+                b"aa002000000000000000000000bb"
+            ),
+            排序顺序::Equal,
+            "Leading zeroes for numbers larger than u64::MAX are \
+            handled correctly without crashing"
+        );
+
+        相等断言!(
+            version_cmp(b"  a", b"a"),
+            排序顺序::Greater,
+            "Whitespace is after letters because letters are before non-letters"
+        );
+
+        相等断言!(
+            version_cmp(b"a~", b"ab"),
+            排序顺序::Less,
+            "A tilde is before other letters"
+        );
+
+        相等断言!(
+            version_cmp(b"a~", b"a"),
+            排序顺序::Less,
+            "A tilde is before the line end"
+        );
+        相等断言!(
+            version_cmp(b"~", b""),
+            排序顺序::Greater,
+            "A tilde is after the empty string"
+        );
+        相等断言!(
+            version_cmp(b".f", b".1"),
+            排序顺序::Greater,
+            "if both start with a dot it is ignored for the comparison"
+        );
+
+        // The following tests are incompatible with GNU as of 2021/06.
+        // I think that's because of a bug in GNU, reported as https://lists.gnu.org/archive/html/bug-coreutils/2021-06/msg00045.html
+        相等断言!(
+            version_cmp(b"a..a", b"a.+"),
+            排序顺序::Less,
+            ".a is stripped before the comparison"
+        );
+        相等断言!(
+            version_cmp(b"a.", b"a+"),
+            排序顺序::Greater,
+            ". is not stripped before the comparison"
+        );
+        相等断言!(
+            version_cmp(b"a\0a", b"a"),
+            排序顺序::Greater,
+            "NULL bytes are handled comparison"
+        );
+    }
+}

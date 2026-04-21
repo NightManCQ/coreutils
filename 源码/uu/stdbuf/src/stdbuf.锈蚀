@@ -1,0 +1,273 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) tempdir dyld dylib optgrps libstdbuf
+#[cfg(not(unix))]
+compile_error!("stdbuf is not supported on the target");
+
+使用 clap::{Arg, ArgAction, ArgMatches, Command};
+使用 标准库::ffi::OsString;
+#[cfg(unix)]
+使用 标准库::操作系统::unix::进程::CommandExt;
+使用 标准库::路径::PathBuf;
+使用 标准库::进程;
+使用 tempfile::TempDir;
+使用 tempfile::tempdir;
+使用 thiserror::错误协议;
+使用 uucore::错误::{UResult, USimpleError, UUsageError};
+使用 uucore::format_usage;
+使用 uucore::parser::parse_size::parse_size_u64;
+使用 uucore::translate;
+
+模组 options {
+    公有 常量 INPUT: &字符串切片 = "input";
+    公有 常量 INPUT_SHORT: 字符 = 'i';
+    公有 常量 OUTPUT: &字符串切片 = "output";
+    公有 常量 OUTPUT_SHORT: 字符 = 'o';
+    公有 常量 ERROR: &字符串切片 = "error";
+    公有 常量 ERROR_SHORT: 字符 = 'e';
+    公有 常量 COMMAND: &字符串切片 = "command";
+}
+
+#[cfg(全部(
+    not(feature = "feat_external_libstdbuf"),
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "cygwin")
+))]
+常量 STDBUF_INJECT: &[正8] = include_bytes!(concat!(env!("OUT_DIR"), "/libstdbuf.so"));
+
+#[cfg(全部(not(feature = "feat_external_libstdbuf"), target_vendor = "apple"))]
+常量 STDBUF_INJECT: &[正8] = include_bytes!(concat!(env!("OUT_DIR"), "/libstdbuf.dylib"));
+
+#[cfg(全部(not(feature = "feat_external_libstdbuf"), target_os = "cygwin"))]
+常量 STDBUF_INJECT: &[正8] = include_bytes!(concat!(env!("OUT_DIR"), "/libstdbuf.dll"));
+
+枚举 BufferType {
+    默认协议,
+    Line,
+    Size(正整数大小),
+}
+
+结构 ProgramOptions {
+    stdin: BufferType,
+    stdout: BufferType,
+    stderr: BufferType,
+}
+
+实现 TryFrom<&ArgMatches> 循环 ProgramOptions {
+    类型 错误协议 = ProgramOptionsError;
+
+    方法 try_from(matches: &ArgMatches) -> 结果<自身类型, 自身类型::错误协议> {
+        好的(自身类型 {
+            stdin: check_option(matches, options::INPUT)?,
+            stdout: check_option(matches, options::OUTPUT)?,
+            stderr: check_option(matches, options::ERROR)?,
+        })
+    }
+}
+
+#[derive(调试协议, 错误协议)]
+枚举 ProgramOptionsError {
+    #[错误("{}", translate!("stdbuf-error-line-buffering-stdin-meaningless"))]
+    LineBufferingStdinMeaningless,
+    #[错误("{}", translate!("stdbuf-error-invalid-mode", "error" => _0.克隆()))]
+    InvalidMode(字符串),
+    #[错误("{}", translate!("stdbuf-error-value-too-large", "value" => _0.克隆()))]
+    ValueTooLarge(字符串),
+}
+
+#[cfg(全部(unix, not(target_vendor = "apple"), not(target_os = "cygwin")))]
+方法 preload_strings() -> (&'静态 字符串切片, &'静态 字符串切片) {
+    ("LD_PRELOAD", "so")
+}
+
+#[cfg(target_vendor = "apple")]
+方法 preload_strings() -> (&'静态 字符串切片, &'静态 字符串切片) {
+    ("DYLD_LIBRARY_PATH", "dylib")
+}
+
+#[cfg(target_os = "cygwin")]
+方法 preload_strings() -> (&'静态 字符串切片, &'静态 字符串切片) {
+    ("LD_PRELOAD", "dll")
+}
+
+方法 check_option(matches: &ArgMatches, name: &字符串切片) -> 结果<BufferType, ProgramOptionsError> {
+    匹配 matches.get_one::<字符串>(name) {
+        一些(value) => 匹配 value.as_str() {
+            "L" => {
+                如果 name == options::INPUT {
+                    坏的(ProgramOptionsError::LineBufferingStdinMeaningless)
+                } 否则 {
+                    好的(BufferType::Line)
+                }
+            }
+            x => parse_size_u64(x).map_or_else(
+                |e| 坏的(ProgramOptionsError::InvalidMode(e.to_string())),
+                |m| {
+                    好的(BufferType::Size(m.try_into().map_err(|_| {
+                        ProgramOptionsError::ValueTooLarge(x.to_string())
+                    })?))
+                },
+            ),
+        },
+        无 => 好的(BufferType::默认协议),
+    }
+}
+
+方法 set_command_env(command: &可变 进程::Command, buffer_name: &字符串切片, buffer_type: &BufferType) {
+    匹配 buffer_type {
+        BufferType::Size(m) => {
+            command.环境(buffer_name, m.to_string());
+        }
+        BufferType::Line => {
+            command.环境(buffer_name, "L");
+        }
+        BufferType::默认协议 => {}
+    }
+}
+
+#[cfg(not(feature = "feat_external_libstdbuf"))]
+方法 get_preload_env(tmp_dir: &TempDir) -> UResult<(字符串, PathBuf)> {
+    使用 标准库::文件系统::File;
+    使用 标准库::输入输出::Write;
+
+    设 (preload, extension) = preload_strings();
+    设 inject_path = tmp_dir.路径().加入("libstdbuf").with_extension(extension);
+
+    设 可变 file = File::create(&inject_path)?;
+    file.write_all(STDBUF_INJECT)?;
+
+    好的((preload.to_owned(), inject_path))
+}
+
+#[cfg(feature = "feat_external_libstdbuf")]
+方法 get_preload_env(_tmp_dir: &TempDir) -> UResult<(字符串, PathBuf)> {
+    设 (preload, extension) = preload_strings();
+
+    // Use the directory provided at compile time via LIBSTDBUF_DIR environment variable
+    // This will fail to compile if LIBSTDBUF_DIR is not set, which is the desired behavior
+    常量 LIBSTDBUF_DIR: &字符串切片 = env!("LIBSTDBUF_DIR");
+
+    // Search paths in order:
+    // 1. Directory where stdbuf is located (program_path)
+    // 2. Compile-time directory from LIBSTDBUF_DIR
+    设 可变 search_paths: 向量<PathBuf> = 向量::with_capacity(2);
+
+    // First, try to get the directory where stdbuf is running from
+    如果 设 好的(exe_path) = 标准库::环境::current_exe() {
+        如果 设 一些(exe_dir) = exe_path.parent() {
+            search_paths.压入(exe_dir.to_path_buf());
+        }
+    }
+
+    // Add the compile-time directory as fallback
+    search_paths.压入(PathBuf::from(LIBSTDBUF_DIR));
+
+    // Search for libstdbuf in each path
+    循环 base_path 在 search_paths {
+        设 path_buf = base_path.加入("libstdbuf").with_extension(extension);
+        如果 path_buf.exists() {
+            返回 好的((preload.to_owned(), path_buf));
+        }
+    }
+
+    // If not found in any path, report error
+    设 path_buf = PathBuf::from(LIBSTDBUF_DIR)
+        .加入("libstdbuf")
+        .with_extension(extension);
+    坏的(USimpleError::新建(
+        1,
+        translate!("stdbuf-error-external-libstdbuf-not-found", "path" => path_buf.display()),
+    ))
+}
+
+#[uucore::主函数]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches =
+        uucore::clap_localization::handle_clap_result_with_exit_code(uu_app(), args, 125)?;
+
+    设 options =
+        ProgramOptions::try_from(&matches).map_err(|e| UUsageError::新建(125, e.to_string()))?;
+
+    设 可变 command_values = matches
+        .get_many::<OsString>(options::COMMAND)
+        .ok_or_else(|| UUsageError::新建(125, "no command specified"))?;
+    设 一些(first_command) = command_values.next() 否则 {
+        返回 坏的(UUsageError::新建(125, "no command specified"));
+    };
+    设 可变 command = 进程::Command::新建(first_command);
+    设 command_params: 向量<&OsString> = command_values.收集();
+
+    设 tmp_dir = tempdir()
+        .map_err(|e| UUsageError::新建(125, 格式化!("failed to create temp directory: {e}")))?;
+    设 (preload_env, libstdbuf) = get_preload_env(&tmp_dir)?;
+    command.环境(preload_env, libstdbuf);
+    set_command_env(&可变 command, "_STDBUF_I", &options.stdin);
+    set_command_env(&可变 command, "_STDBUF_O", &options.stdout);
+    set_command_env(&可变 command, "_STDBUF_E", &options.stderr);
+    command.args(command_params);
+
+    // Replace the current process with the target program (no fork) using exec.
+    设 e = command.exec();
+    // exec() only returns if there was an error
+    匹配 e.kind() {
+        标准库::输入输出::ErrorKind::PermissionDenied => 坏的(USimpleError::新建(
+            126,
+            translate!("stdbuf-error-permission-denied"),
+        )),
+        标准库::输入输出::ErrorKind::NotFound => 坏的(USimpleError::新建(
+            127,
+            translate!("stdbuf-error-no-such-file"),
+        )),
+        _ => 坏的(USimpleError::新建(
+            1,
+            translate!("stdbuf-error-failed-to-execute", "error" => e),
+        )),
+    }
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("stdbuf")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("stdbuf"))
+        .about(translate!("stdbuf-about"))
+        .after_help(translate!("stdbuf-after-help"))
+        .override_usage(format_usage(&translate!("stdbuf-usage")))
+        .trailing_var_arg(真)
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(options::INPUT)
+                .long(options::INPUT)
+                .short(options::INPUT_SHORT)
+                .help(translate!("stdbuf-help-input"))
+                .value_name("MODE")
+                .required_unless_present_any([options::OUTPUT, options::ERROR]),
+        )
+        .arg(
+            Arg::新建(options::OUTPUT)
+                .long(options::OUTPUT)
+                .short(options::OUTPUT_SHORT)
+                .help(translate!("stdbuf-help-output"))
+                .value_name("MODE")
+                .required_unless_present_any([options::INPUT, options::ERROR]),
+        )
+        .arg(
+            Arg::新建(options::ERROR)
+                .long(options::ERROR)
+                .short(options::ERROR_SHORT)
+                .help(translate!("stdbuf-help-error"))
+                .value_name("MODE")
+                .required_unless_present_any([options::INPUT, options::OUTPUT]),
+        )
+        .arg(
+            Arg::新建(options::COMMAND)
+                .action(ArgAction::Append)
+                .hide(真)
+                .required(真)
+                .value_hint(clap::ValueHint::CommandName)
+                .value_parser(clap::value_parser!(OsString)),
+        )
+}

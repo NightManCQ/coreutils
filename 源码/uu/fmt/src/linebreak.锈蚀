@@ -1,0 +1,551 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) INFTY MULT accum breakwords linebreak linebreaking linebreaks linelen maxlength minlength nchars ostream overlen parasplit plass posn powf punct signum slen sstart tabwidth tlen underlen winfo wlen wordlen
+
+使用 标准库::输入输出::{BufWriter, Stdout, Write};
+使用 标准库::内存;
+
+使用 箱::FmtOptions;
+使用 箱::parasplit::{ParaWords, Paragraph, WordInfo};
+
+结构 BreakArgs<'a> {
+    opts: &'a FmtOptions,
+    init_len: 正整数大小,
+    indent: &'a [正8],
+    indent_len: 正整数大小,
+    uniform: 布尔,
+    ostream: &'a 可变 BufWriter<Stdout>,
+}
+
+实现 BreakArgs<'_> {
+    方法 compute_width(&自身, winfo: &WordInfo, posn: 正整数大小, fresh: 布尔) -> 正整数大小 {
+        如果 fresh {
+            0
+        } 否则 {
+            设 post = winfo.after_tab;
+            匹配 winfo.before_tab {
+                无 => post,
+                一些(pre) => {
+                    post + ((pre + posn) / 自身.opts.tabwidth + 1) * 自身.opts.tabwidth - posn
+                }
+            }
+        }
+    }
+}
+
+公有 方法 break_lines(
+    para: &Paragraph,
+    opts: &FmtOptions,
+    ostream: &可变 BufWriter<Stdout>,
+) -> 标准库::输入输出::结果<()> {
+    // indent
+    设 p_indent = &para.indent_str;
+    设 p_indent_len = para.indent_len;
+
+    // words
+    设 p_words = ParaWords::新建(opts, para);
+    设 可变 p_words_words = p_words.words();
+
+    // the first word will *always* appear on the first line
+    // make sure of this here
+    设 一些(winfo) = p_words_words.next() 否则 {
+        返回 ostream.write_all(b"\n");
+    };
+
+    // print the init, if it exists, and get its length
+    设 p_init_len = winfo.word_nchars
+        + 如果 opts.crown || opts.tagged {
+            // handle "init" portion
+            ostream.write_all(&para.init_str)?;
+            para.init_len
+        } 否则 如果 !para.mail_header {
+            // for non-(crown, tagged) that's the same as a normal indent
+            ostream.write_all(p_indent)?;
+            p_indent_len
+        } 否则 {
+            // except that mail headers get no indent at all
+            0
+        };
+
+    // write first word after writing init
+    ostream.write_all(winfo.word)?;
+
+    // does this paragraph require uniform spacing?
+    设 uniform = para.mail_header || opts.uniform;
+
+    设 可变 break_args = BreakArgs {
+        opts,
+        init_len: p_init_len,
+        indent: p_indent,
+        indent_len: p_indent_len,
+        uniform,
+        ostream,
+    };
+
+    如果 opts.quick || para.mail_header {
+        break_simple(p_words_words, &可变 break_args)
+    } 否则 {
+        break_knuth_plass(p_words_words, &可变 break_args)
+    }
+}
+
+/// `break_simple` implements a "greedy" breaking algorithm: print words until
+/// maxlength would be exceeded, then print a linebreak and indent and continue.
+方法 break_simple<'a, T: 迭代器协议<Item = &'a WordInfo<'a>>>(
+    可变 迭代: T,
+    args: &可变 BreakArgs<'a>,
+) -> 标准库::输入输出::结果<()> {
+    迭代.try_fold((args.init_len, 假), |(l, prev_punct), winfo| {
+        accum_words_simple(args, l, prev_punct, winfo)
+    })?;
+    args.ostream.write_all(b"\n")
+}
+
+方法 accum_words_simple<'a>(
+    args: &可变 BreakArgs<'a>,
+    l: 正整数大小,
+    prev_punct: 布尔,
+    winfo: &'a WordInfo<'a>,
+) -> 标准库::输入输出::结果<(正整数大小, 布尔)> {
+    // compute the length of this word, considering how tabs will expand at this position on the line
+    设 wlen = winfo.word_nchars + args.compute_width(winfo, l, 假);
+
+    设 slen = compute_slen(
+        args.uniform,
+        winfo.new_line,
+        winfo.sentence_start,
+        prev_punct,
+    );
+
+    如果 l + wlen + slen > args.opts.width {
+        write_newline(args.indent, args.ostream)?;
+        write_with_spaces(&winfo.word[winfo.word_start..], 0, args.ostream)?;
+        好的((args.indent_len + winfo.word_nchars, winfo.ends_punct))
+    } 否则 {
+        write_with_spaces(winfo.word, slen, args.ostream)?;
+        好的((l + wlen + slen, winfo.ends_punct))
+    }
+}
+
+/// `break_knuth_plass` implements an "optimal" breaking algorithm in the style of
+/// Knuth, D.E., and Plass, M.F. "Breaking Paragraphs into Lines." in Software,
+/// Practice and Experience. Vol. 11, No. 11, November 1981.
+/// <http://onlinelibrary.wiley.com/doi/10.1002/spe.4380111102/pdf>
+方法 break_knuth_plass<'a, T: 克隆协议 + 迭代器协议<Item = &'a WordInfo<'a>>>(
+    可变 迭代: T,
+    args: &可变 BreakArgs<'a>,
+) -> 标准库::输入输出::结果<()> {
+    // run the algorithm to get the breakpoints
+    设 breakpoints = find_kp_breakpoints(迭代.克隆(), args);
+
+    // iterate through the breakpoints (note that breakpoints is in reverse break order, so we .rev() it
+    设 result: 标准库::输入输出::结果<(布尔, 布尔)> = breakpoints.迭代().rev().try_fold(
+        (假, 假),
+        |(可变 prev_punct, 可变 fresh), &(next_break, break_before)| {
+            如果 fresh {
+                write_newline(args.indent, args.ostream)?;
+            }
+            // at each breakpoint, keep emitting words until we find the word matching this breakpoint
+            循环 winfo 在 &可变 迭代 {
+                设 (slen, word) = slice_if_fresh(
+                    fresh,
+                    winfo.word,
+                    winfo.word_start,
+                    args.uniform,
+                    winfo.new_line,
+                    winfo.sentence_start,
+                    prev_punct,
+                );
+                fresh = 假;
+                prev_punct = winfo.ends_punct;
+
+                // We find identical breakpoints here by comparing addresses of the references.
+                // This is OK because the backing vector is not mutating once we are linebreaking.
+                如果 标准库::指针::eq(winfo, next_break) {
+                    // OK, we found the matching word
+                    如果 break_before {
+                        write_newline(args.indent, args.ostream)?;
+                        write_with_spaces(&winfo.word[winfo.word_start..], 0, args.ostream)?;
+                    } 否则 {
+                        // breaking after this word, so that means "fresh" is true for the next iteration
+                        write_with_spaces(word, slen, args.ostream)?;
+                        fresh = 真;
+                    }
+                    中断;
+                }
+                write_with_spaces(word, slen, args.ostream)?;
+            }
+            好的((prev_punct, fresh))
+        },
+    );
+    设 (可变 prev_punct, 可变 fresh) = result?;
+
+    // after the last linebreak, write out the rest of the final line.
+    循环 winfo 在 迭代 {
+        如果 fresh {
+            write_newline(args.indent, args.ostream)?;
+        }
+        设 (slen, word) = slice_if_fresh(
+            fresh,
+            winfo.word,
+            winfo.word_start,
+            args.uniform,
+            winfo.new_line,
+            winfo.sentence_start,
+            prev_punct,
+        );
+        prev_punct = winfo.ends_punct;
+        fresh = 假;
+        write_with_spaces(word, slen, args.ostream)?;
+    }
+    args.ostream.write_all(b"\n")
+}
+
+结构 LineBreak<'a> {
+    prev: 正整数大小,
+    linebreak: 选项<&'a WordInfo<'a>>,
+    break_before: 布尔,
+    demerits: 整64,
+    prev_rat: 点32,
+    length: 正整数大小,
+    fresh: 布尔,
+}
+
+#[allow(clippy::cognitive_complexity)]
+方法 find_kp_breakpoints<'a, T: 克隆协议 + 迭代器协议<Item = &'a WordInfo<'a>>>(
+    迭代: T,
+    args: &BreakArgs<'a>,
+) -> 向量<(&'a WordInfo<'a>, 布尔)> {
+    设 可变 迭代 = 迭代.peekable();
+    // set up the initial null linebreak
+    设 可变 linebreaks = 向量![LineBreak {
+        prev: 0,
+        linebreak: 无,
+        break_before: 假,
+        demerits: 0,
+        prev_rat: 点32::NAN,
+        length: args.init_len,
+        fresh: 假,
+    }];
+    // this vec holds the current active linebreaks; next_ holds the breaks that will be active for
+    // the next word
+    设 可变 active_breaks = 向量![0];
+    设 可变 next_active_breaks = 向量![];
+
+    设 stretch = args.opts.width - args.opts.goal;
+    设 minlength = 如果 args.opts.goal <= 10 {
+        1
+    } 否则 {
+        args.opts.goal.max(stretch + 1) - stretch
+    };
+    设 可变 new_linebreaks = 向量![];
+    设 可变 is_sentence_start = 假;
+    当 设 一些(w) = 迭代.next() {
+        设 next_word_sentence_final = is_next_word_sentence_final(迭代.克隆());
+        // if this is the last word, we don't add additional demerits for this break
+        设 (is_last_word, is_sentence_end) = 匹配 迭代.peek() {
+            无 => (真, 真),
+            一些(&&WordInfo {
+                sentence_start: st,
+                new_line: nl,
+                ..
+            }) => (假, st || (nl && w.ends_punct)),
+        };
+
+        // should we be adding extra space at the beginning of the next sentence?
+        设 slen = compute_slen(args.uniform, w.new_line, is_sentence_start, 假);
+
+        设 可变 best_active_demerits = 整64::MAX;
+        设 可变 ld_idx = 0;
+        new_linebreaks.clear();
+        设 可变 best_break_before: 选项<LineBreak<'_>> = 无;
+        设 可变 best_break_after: 选项<LineBreak<'_>> = 无;
+        next_active_breaks.clear();
+        // go through each active break, extending it and possibly adding a new active
+        // break if we are above the minimum required length
+        #[allow(clippy::explicit_iter_loop)]
+        循环 &i 在 active_breaks.迭代() {
+            设 active = &可变 linebreaks[i];
+            如果 active.demerits < best_active_demerits {
+                best_active_demerits = active.demerits;
+                ld_idx = i;
+            }
+
+            // Also consider a break before this word, so the previous line can end at the
+            // prior word when that yields a better global layout.
+            如果 !active.fresh && active.length >= minlength {
+                设 (可变 new_demerits, new_ratio) = compute_demerits(
+                    args.opts.goal 转换 整数大小 - active.length 转换 整数大小,
+                    stretch,
+                    w.word_nchars,
+                    active.prev_rat,
+                );
+                如果 is_sentence_end {
+                    new_demerits = new_demerits.saturating_add(ORPHAN_BREAK_PENALTY);
+                }
+                设 total_demerits = active.demerits.saturating_add(new_demerits);
+                如果 best_break_before
+                    .as_ref()
+                    .is_none_or(|best| total_demerits < best.demerits)
+                {
+                    best_break_before = 一些(LineBreak {
+                        prev: i,
+                        linebreak: 一些(w),
+                        break_before: 真,
+                        demerits: total_demerits,
+                        prev_rat: new_ratio,
+                        length: args.indent_len + w.word_nchars,
+                        fresh: 假,
+                    });
+                }
+            }
+
+            // get the new length
+            设 tlen = w.word_nchars
+                + args.compute_width(w, active.length, active.fresh)
+                + slen
+                + active.length;
+
+            // if tlen is longer than args.opts.width, we drop this break from the active list
+            // otherwise, we extend the break, and possibly add a new break at this point
+            如果 tlen <= args.opts.width {
+                // this break will still be active next time
+                next_active_breaks.压入(i);
+                // we can put this word on this line
+                active.fresh = 假;
+                active.length = tlen;
+
+                // if we're above the minlength, we can also consider breaking here
+                如果 tlen >= minlength {
+                    设 (可变 new_demerits, new_ratio) = 如果 is_last_word {
+                        // there is no penalty for the final line's length
+                        (0, 0.0)
+                    } 否则 {
+                        compute_demerits(
+                            args.opts.goal 转换 整数大小 - tlen 转换 整数大小,
+                            stretch,
+                            w.word_nchars,
+                            active.prev_rat,
+                        )
+                    };
+
+                    如果 !is_last_word && next_word_sentence_final {
+                        new_demerits = new_demerits.saturating_add(ORPHAN_BREAK_PENALTY);
+                    }
+
+                    设 total_demerits = active.demerits.saturating_add(new_demerits);
+                    如果 best_break_after
+                        .as_ref()
+                        .is_none_or(|best| total_demerits < best.demerits)
+                    {
+                        best_break_after = 一些(LineBreak {
+                            prev: i,
+                            linebreak: 一些(w),
+                            break_before: 假,
+                            demerits: total_demerits,
+                            prev_rat: new_ratio,
+                            length: args.indent_len,
+                            fresh: 真,
+                        });
+                    }
+                }
+            }
+        }
+
+        如果 设 一些(lb) = best_break_before {
+            new_linebreaks.压入(lb);
+        }
+        如果 设 一些(lb) = best_break_after {
+            new_linebreaks.压入(lb);
+        }
+
+        循环 lb 在 new_linebreaks.清空(..) {
+            next_active_breaks.压入(linebreaks.长度());
+            linebreaks.压入(lb);
+        }
+
+        如果 next_active_breaks.为空() {
+            // every potential linebreak is too long! choose the linebreak with the least demerits, ld_idx
+            设 new_break =
+                restart_active_breaks(args, &linebreaks[ld_idx], ld_idx, w, slen, minlength);
+            next_active_breaks.压入(linebreaks.长度());
+            linebreaks.压入(new_break);
+        }
+        // swap in new list of active breaks
+        内存::swap(&可变 active_breaks, &可变 next_active_breaks);
+        // If this was the last word in a sentence, the next one must be the first in the next.
+        is_sentence_start = is_sentence_end;
+    }
+
+    // return the best path
+    build_best_path(&linebreaks, &active_breaks)
+}
+
+方法 build_best_path<'a>(paths: &[LineBreak<'a>], active: &[正整数大小]) -> 向量<(&'a WordInfo<'a>, 布尔)> {
+    // of the active paths, we select the one with the fewest demerits
+    active
+        .迭代()
+        .min_by_key(|&&a| paths[a].demerits)
+        .映射(|&(可变 best_idx)| {
+            设 可变 breakwords = 向量![];
+            // now, chase the pointers back through the break list, recording
+            // the words at which we should break
+            无限循环 {
+                设 next_best = &paths[best_idx];
+                匹配 next_best.linebreak {
+                    无 => 返回 breakwords,
+                    一些(prev) => {
+                        breakwords.压入((prev, next_best.break_before));
+                        best_idx = next_best.prev;
+                    }
+                }
+            }
+        })
+        .unwrap_or_default()
+}
+
+// badness = BAD_MULT * abs(r) ^ 3
+常量 BAD_MULT: 点32 = 200.0;
+// DR_MULT is multiplier for delta-R between lines
+常量 DR_MULT: 点32 = 600.0;
+// DL_MULT is penalty multiplier for short words at end of line
+常量 DL_MULT: 点32 = 10.0;
+// Penalize breaks that leave the first word on the next line as the sentence-final word.
+常量 ORPHAN_BREAK_PENALTY: 整64 = 250_000_000;
+
+方法 is_word_sentence_final(current: &WordInfo, next: 选项<&WordInfo>) -> 布尔 {
+    匹配 next {
+        无 => 真,
+        一些(next_word) => next_word.sentence_start || (next_word.new_line && current.ends_punct),
+    }
+}
+
+方法 is_next_word_sentence_final<'a, T: 迭代器协议<Item = &'a WordInfo<'a>>>(可变 迭代: T) -> 布尔 {
+    设 一些(next_word) = 迭代.next() 否则 {
+        返回 假;
+    };
+    is_word_sentence_final(next_word, 迭代.next())
+}
+
+方法 compute_demerits(delta_len: 整数大小, stretch: 正整数大小, wlen: 正整数大小, prev_rat: 点32) -> (整64, 点32) {
+    // how much stretch are we using?
+    设 ratio = 如果 delta_len == 0 {
+        0.0点32
+    } 否则 {
+        delta_len 转换 点32 / stretch 转换 点32
+    };
+
+    // compute badness given the stretch ratio
+    设 bad_linelen = (BAD_MULT * ratio.powi(3).abs()) 转换 整64;
+
+    // we penalize lines ending in really short words
+    设 bad_wordlen = 如果 wlen >= stretch {
+        0
+    } 否则 {
+        (DL_MULT
+            * ((stretch - wlen) 转换 点32 / (stretch - 1) 转换 点32)
+                .powi(3)
+                .abs()) 转换 整64
+    };
+
+    // we penalize lines that have very different ratios from previous lines
+    设 bad_delta_r = 如果 prev_rat.is_nan() {
+        0
+    } 否则 {
+        (DR_MULT * ((ratio - prev_rat) / 2.0).powi(3).abs()) 转换 整64
+    };
+
+    设 demerits_base = 1_i64
+        .saturating_add(bad_linelen)
+        .saturating_add(bad_wordlen)
+        .saturating_add(bad_delta_r);
+    设 demerits = demerits_base.saturating_mul(demerits_base);
+
+    (demerits, ratio)
+}
+
+方法 restart_active_breaks<'a>(
+    args: &BreakArgs<'a>,
+    active: &LineBreak<'a>,
+    act_idx: 正整数大小,
+    w: &'a WordInfo<'a>,
+    slen: 正整数大小,
+    min: 正整数大小,
+) -> LineBreak<'a> {
+    设 (break_before, line_length) = 如果 active.fresh {
+        // never break before a word if that word would be the first on a line
+        (假, args.indent_len)
+    } 否则 {
+        // choose the lesser evil: breaking too early, or breaking too late
+        设 wlen = w.word_nchars + args.compute_width(w, active.length, active.fresh);
+        设 underlen = min 转换 整数大小 - active.length 转换 整数大小;
+        设 overlen = (wlen + slen + active.length) 转换 整数大小 - args.opts.width 转换 整数大小;
+        如果 overlen > underlen {
+            // break early, put this word on the next line
+            (真, args.indent_len + w.word_nchars)
+        } 否则 {
+            (假, args.indent_len)
+        }
+    };
+
+    // restart the linebreak. This will be our only active path.
+    LineBreak {
+        prev: act_idx,
+        linebreak: 一些(w),
+        break_before,
+        demerits: 0, // this is the only active break, so we can reset the demerit count
+        prev_rat: 如果 break_before { 1.0 } 否则 { -1.0 },
+        length: line_length,
+        fresh: !break_before,
+    }
+}
+
+/// Number of spaces to add before a word, based on mode, newline, sentence start.
+方法 compute_slen(uniform: 布尔, newline: 布尔, start: 布尔, punct: 布尔) -> 正整数大小 {
+    如果 uniform || newline {
+        如果 start || (newline && punct) { 2 } 否则 { 1 }
+    } 否则 {
+        0
+    }
+}
+
+/// If we're on a fresh line, `slen=0` and we slice off leading whitespace.
+/// Otherwise, compute `slen` and leave whitespace alone.
+方法 slice_if_fresh(
+    fresh: 布尔,
+    word: &[正8],
+    start: 正整数大小,
+    uniform: 布尔,
+    newline: 布尔,
+    sstart: 布尔,
+    punct: 布尔,
+) -> (正整数大小, &[正8]) {
+    如果 fresh {
+        (0, &word[start..])
+    } 否则 {
+        (compute_slen(uniform, newline, sstart, punct), word)
+    }
+}
+
+/// Write a newline and add the indent.
+方法 write_newline(indent: &[正8], ostream: &可变 BufWriter<Stdout>) -> 标准库::输入输出::结果<()> {
+    ostream.write_all(b"\n")?;
+    ostream.write_all(indent)
+}
+
+/// Write the word, along with slen spaces.
+方法 write_with_spaces(
+    word: &[正8],
+    slen: 正整数大小,
+    ostream: &可变 BufWriter<Stdout>,
+) -> 标准库::输入输出::结果<()> {
+    如果 slen == 2 {
+        ostream.write_all(b"  ")?;
+    } 否则 如果 slen == 1 {
+        ostream.write_all(b" ")?;
+    }
+    ostream.write_all(word)
+}

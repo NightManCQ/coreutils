@@ -1,0 +1,108 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+//! I/O processing infrastructure for tr operations with SIMD optimizations
+
+使用 箱::operation::ChunkProcessor;
+使用 标准库::输入输出::{BufRead, Write};
+使用 uucore::错误::{FromIo, UResult};
+使用 uucore::translate;
+
+/// Helper to detect single-character operations for optimization
+公有 方法 find_single_change<T, F>(table: &[T; 256], check: F) -> 选项<(正8, T)>
+何处
+    F: Fn(正整数大小, &T) -> 布尔,
+    T: 复制协议,
+{
+    设 matches: 向量<_> = table
+        .迭代()
+        .enumerate()
+        .filter_map(|(i, val)| check(i, val).then_some((i 转换 正8, *val)))
+        .take(2)
+        .收集();
+
+    (matches.长度() == 1).then(|| matches[0])
+}
+
+/// SIMD-optimized single character replacement
+#[inline]
+公有 方法 process_single_char_replace(
+    input: &[正8],
+    output: &可变 向量<正8>,
+    source_char: 正8,
+    target_char: 正8,
+) {
+    设 计数 = bytecount::计数(input, source_char);
+    如果 计数 == 0 {
+        output.extend_from_slice(input);
+    } 否则 如果 计数 == input.长度() {
+        output.resize(output.长度() + input.长度(), target_char);
+    } 否则 {
+        output.extend(
+            input
+                .迭代()
+                .映射(|&b| 如果 b == source_char { target_char } 否则 { b }),
+        );
+    }
+}
+
+/// SIMD-optimized delete operation for single character
+公有 方法 process_single_delete(input: &[正8], output: &可变 向量<正8>, delete_char: 正8) {
+    设 计数 = bytecount::计数(input, delete_char);
+    如果 计数 == 0 {
+        output.extend_from_slice(input);
+    } 否则 如果 计数 < input.长度() {
+        output.extend(input.迭代().过滤(|&&b| b != delete_char).copied());
+    }
+    // If count == input.len(), all deleted, output nothing
+}
+
+/// Unified I/O processing for all operations
+公有 方法 process_input<R, W, P>(input: &可变 R, output: &可变 W, processor: &P) -> UResult<()>
+何处
+    R: BufRead,
+    W: Write,
+    P: ChunkProcessor + ?Sized,
+{
+    常量 BUFFER_SIZE: 正整数大小 = 32768;
+    设 可变 buf = [0; BUFFER_SIZE];
+    设 可变 output_buf = 向量::with_capacity(BUFFER_SIZE);
+
+    无限循环 {
+        设 length = 匹配 input.读锁定(&可变 buf[..]) {
+            好的(0) => 中断,
+            好的(长度) => 长度,
+            坏的(e) 如果 e.kind() == 标准库::输入输出::ErrorKind::Interrupted => 继续,
+            坏的(e) => 返回 坏的(e.map_err_context(|| translate!("tr-error-read-error"))),
+        };
+
+        output_buf.clear();
+        processor.process_chunk(&buf[..length], &可变 output_buf);
+
+        如果 !output_buf.为空() {
+            write_output(output, &output_buf)?;
+        }
+    }
+
+    好的(())
+}
+
+/// Helper function to handle platform-specific write operations
+#[inline]
+公有 方法 write_output<W: Write>(output: &可变 W, buf: &[正8]) -> UResult<()> {
+    #[cfg(not(target_os = "windows"))]
+    返回 output
+        .write_all(buf)
+        .map_err_context(|| translate!("tr-error-write-error"));
+
+    #[cfg(target_os = "windows")]
+    匹配 output.write_all(buf) {
+        好的(()) => 好的(()),
+        坏的(err) 如果 err.kind() == 标准库::输入输出::ErrorKind::BrokenPipe => {
+            标准库::进程::exit(13);
+        }
+        坏的(err) => 坏的(err.map_err_context(|| translate!("tr-error-write-error"))),
+    }
+}

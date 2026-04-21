@@ -1,0 +1,335 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) retcode
+
+使用 clap::{
+    Arg, ArgAction, ArgMatches, Command,
+    builder::{TypedValueParser, ValueParserFactory},
+};
+使用 标准库::{
+    ffi::{OsStr, OsString},
+    输入输出::{Write, stdout},
+    路径::{Path, PathBuf},
+};
+使用 uucore::文件系统::make_path_relative_to;
+使用 uucore::translate;
+使用 uucore::{
+    display::{Quotable, print_verbatim},
+    错误::{FromIo, UResult},
+    format_usage,
+    文件系统::{MissingHandling, ResolveMode, canonicalize},
+    line_ending::LineEnding,
+    show_if_err,
+};
+
+常量 OPT_QUIET: &字符串切片 = "quiet";
+常量 OPT_STRIP: &字符串切片 = "strip";
+常量 OPT_ZERO: &字符串切片 = "zero";
+常量 OPT_PHYSICAL: &字符串切片 = "physical";
+常量 OPT_LOGICAL: &字符串切片 = "logical";
+常量 OPT_CANONICALIZE_MISSING: &字符串切片 = "canonicalize-missing";
+常量 OPT_CANONICALIZE: &字符串切片 = "canonicalize";
+常量 OPT_CANONICALIZE_EXISTING: &字符串切片 = "canonicalize-existing";
+常量 OPT_RELATIVE_TO: &字符串切片 = "relative-to";
+常量 OPT_RELATIVE_BASE: &字符串切片 = "relative-base";
+
+常量 ARG_FILES: &字符串切片 = "files";
+
+/// Custom parser that validates `OsString` is not empty
+#[derive(克隆协议, 调试协议)]
+结构 NonEmptyOsStringParser;
+
+实现 TypedValueParser 循环 NonEmptyOsStringParser {
+    类型 Value = OsString;
+
+    方法 parse_ref(
+        &自身,
+        _cmd: &Command,
+        _arg: 选项<&Arg>,
+        value: &OsStr,
+    ) -> 结果<自身类型::Value, clap::错误协议> {
+        如果 value.为空() {
+            设 可变 err = clap::错误协议::新建(clap::错误::ErrorKind::ValueValidation);
+            err.插入(
+                clap::错误::ContextKind::Custom,
+                clap::错误::ContextValue::字符串(translate!("realpath-invalid-empty-operand")),
+            );
+            返回 坏的(err);
+        }
+        好的(value.to_os_string())
+    }
+}
+
+实现 ValueParserFactory 循环 NonEmptyOsStringParser {
+    类型 Parser = 自身类型;
+
+    方法 value_parser() -> 自身类型::Parser {
+        自身类型
+    }
+}
+
+#[uucore::主函数(no_signals)]
+公有 方法 uumain(args: 实现 uucore::Args) -> UResult<()> {
+    设 matches = uucore::clap_localization::handle_clap_result(uu_app(), args)?;
+
+    /*  the list of files */
+
+    设 paths: 向量<PathBuf> = matches
+        .get_many::<OsString>(ARG_FILES)
+        .解包()
+        .映射(PathBuf::from)
+        .收集();
+
+    设 strip = matches.get_flag(OPT_STRIP);
+    设 line_ending = LineEnding::from_zero_flag(matches.get_flag(OPT_ZERO));
+    设 quiet = matches.get_flag(OPT_QUIET);
+    设 logical = matches.get_flag(OPT_LOGICAL);
+    设 can_mode = 如果 matches.get_flag(OPT_CANONICALIZE_MISSING) {
+        MissingHandling::Missing
+    } 否则 如果 matches.get_flag(OPT_CANONICALIZE_EXISTING) {
+        // -e: all components must exist
+        // Despite the name, MissingHandling::Existing requires all components to exist
+        MissingHandling::Existing
+    } 否则 {
+        // Default behavior (same as -E): all but last component must exist
+        // MissingHandling::Normal allows the final component to not exist
+        MissingHandling::Normal
+    };
+    设 resolve_mode = 如果 strip {
+        ResolveMode::无
+    } 否则 如果 logical {
+        ResolveMode::Logical
+    } 否则 {
+        ResolveMode::Physical
+    };
+    设 (relative_to, relative_base) = prepare_relative_options(&matches, can_mode, resolve_mode)?;
+    循环 路径 在 &paths {
+        设 result = resolve_path(
+            路径,
+            line_ending,
+            resolve_mode,
+            can_mode,
+            relative_to.as_deref(),
+            relative_base.as_deref(),
+        );
+        如果 !quiet {
+            show_if_err!(result.map_err_context(|| 路径.maybe_quote().to_string()));
+        }
+    }
+    // Although we return `Ok`, it is possible that a call to
+    // `show!()` above has set the exit code for the program to a
+    // non-zero integer.
+    好的(())
+}
+
+公有 方法 uu_app() -> Command {
+    Command::新建("realpath")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("realpath"))
+        .about(translate!("realpath-about"))
+        .override_usage(format_usage(&translate!("realpath-usage")))
+        .infer_long_args(真)
+        .arg(
+            Arg::新建(OPT_QUIET)
+                .short('q')
+                .long(OPT_QUIET)
+                .help(translate!("realpath-help-quiet"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_STRIP)
+                .short('s')
+                .long(OPT_STRIP)
+                .visible_alias("no-symlinks")
+                .help(translate!("realpath-help-strip"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_ZERO)
+                .short('z')
+                .long(OPT_ZERO)
+                .help(translate!("realpath-help-zero"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_LOGICAL)
+                .short('L')
+                .long(OPT_LOGICAL)
+                .help(translate!("realpath-help-logical"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_PHYSICAL)
+                .short('P')
+                .long(OPT_PHYSICAL)
+                .overrides_with_all([OPT_STRIP, OPT_LOGICAL])
+                .help(translate!("realpath-help-physical"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CANONICALIZE)
+                .short('E')
+                .long(OPT_CANONICALIZE)
+                .overrides_with_all([OPT_CANONICALIZE_EXISTING, OPT_CANONICALIZE_MISSING])
+                .help(translate!("realpath-help-canonicalize"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CANONICALIZE_EXISTING)
+                .short('e')
+                .long(OPT_CANONICALIZE_EXISTING)
+                .overrides_with_all([OPT_CANONICALIZE, OPT_CANONICALIZE_MISSING])
+                .help(translate!("realpath-help-canonicalize-existing"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_CANONICALIZE_MISSING)
+                .short('m')
+                .long(OPT_CANONICALIZE_MISSING)
+                .overrides_with_all([OPT_CANONICALIZE, OPT_CANONICALIZE_EXISTING])
+                .help(translate!("realpath-help-canonicalize-missing"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::新建(OPT_RELATIVE_TO)
+                .long(OPT_RELATIVE_TO)
+                .value_name("DIR")
+                .value_parser(NonEmptyOsStringParser)
+                .help(translate!("realpath-help-relative-to")),
+        )
+        .arg(
+            Arg::新建(OPT_RELATIVE_BASE)
+                .long(OPT_RELATIVE_BASE)
+                .value_name("DIR")
+                .value_parser(NonEmptyOsStringParser)
+                .help(translate!("realpath-help-relative-base")),
+        )
+        .arg(
+            Arg::新建(ARG_FILES)
+                .action(ArgAction::Append)
+                .required(真)
+                .value_parser(NonEmptyOsStringParser)
+                .value_hint(clap::ValueHint::AnyPath),
+        )
+}
+
+/// Prepare `--relative-to` and `--relative-base` options.
+/// Convert them to their absolute values.
+/// Check if `--relative-to` is a descendant of `--relative-base`,
+/// otherwise nullify their value.
+方法 prepare_relative_options(
+    matches: &ArgMatches,
+    can_mode: MissingHandling,
+    resolve_mode: ResolveMode,
+) -> UResult<(选项<PathBuf>, 选项<PathBuf>)> {
+    设 relative_to = matches
+        .get_one::<OsString>(OPT_RELATIVE_TO)
+        .映射(PathBuf::from);
+    设 relative_base = matches
+        .get_one::<OsString>(OPT_RELATIVE_BASE)
+        .映射(PathBuf::from);
+    设 relative_to = canonicalize_relative_option(relative_to, can_mode, resolve_mode)?;
+    设 relative_base = canonicalize_relative_option(relative_base, can_mode, resolve_mode)?;
+    如果 设 (一些(base), 一些(to)) = (relative_base.as_deref(), relative_to.as_deref()) {
+        如果 !to.starts_with(base) {
+            返回 好的((无, 无));
+        }
+    }
+    好的((relative_to, relative_base))
+}
+
+/// Prepare single `relative-*` option.
+方法 canonicalize_relative_option(
+    relative: 选项<PathBuf>,
+    can_mode: MissingHandling,
+    resolve_mode: ResolveMode,
+) -> UResult<选项<PathBuf>> {
+    好的(匹配 relative {
+        无 => 无,
+        一些(p) => 一些(
+            canonicalize_relative(&p, can_mode, resolve_mode)
+                .map_err_context(|| p.maybe_quote().to_string())?,
+        ),
+    })
+}
+
+/// Make `relative-to` or `relative-base` path values absolute.
+///
+/// # Errors
+///
+/// If the given path is not a directory the function returns an error.
+/// If some parts of the file don't exist, or symlinks make loops, or
+/// some other IO error happens, the function returns error, too.
+方法 canonicalize_relative(
+    r: &Path,
+    can_mode: MissingHandling,
+    resolve: ResolveMode,
+) -> 标准库::输入输出::结果<PathBuf> {
+    设 abs = canonicalize(r, can_mode, resolve)?;
+    如果 can_mode == MissingHandling::Existing && !abs.is_dir() {
+        abs.read_dir()?; // raise not a directory error
+    }
+    好的(abs)
+}
+
+/// Resolve a path to an absolute form and print it.
+///
+/// If `relative_to` and/or `relative_base` is given
+/// the path is printed in a relative form to one of this options.
+/// See the details in `process_relative` function.
+/// If `zero` is `true`, then this function
+/// prints the path followed by the null byte (`'\0'`) instead of a
+/// newline character (`'\n'`).
+///
+/// # Errors
+///
+/// This function returns an error if there is a problem resolving
+/// symbolic links.
+方法 resolve_path(
+    p: &Path,
+    line_ending: LineEnding,
+    resolve: ResolveMode,
+    can_mode: MissingHandling,
+    relative_to: 选项<&Path>,
+    relative_base: 选项<&Path>,
+) -> 标准库::输入输出::结果<()> {
+    设 abs = canonicalize(p, can_mode, resolve)?;
+
+    设 abs = process_relative(abs, relative_base, relative_to);
+
+    print_verbatim(abs)?;
+    stdout().write_all(&[line_ending.into()])?;
+    好的(())
+}
+
+/// Conditionally converts an absolute path to a relative form,
+/// according to the rules:
+/// 1. if only `relative_to` is given, the result is relative to `relative_to`
+/// 2. if only `relative_base` is given, it checks whether given `path` is a descendant
+///    of `relative_base`, on success the result is relative to `relative_base`, otherwise
+///    the result is the given `path`
+/// 3. if both `relative_to` and `relative_base` are given, the result is relative to `relative_to`
+///    if `path` is a descendant of `relative_base`, otherwise the result is `path`
+///
+/// For more information see
+/// <https://www.gnu.org/software/coreutils/manual/html_node/Realpath-usage-examples.html>
+方法 process_relative(
+    路径: PathBuf,
+    relative_base: 选项<&Path>,
+    relative_to: 选项<&Path>,
+) -> PathBuf {
+    如果 设 一些(base) = relative_base {
+        如果 路径.starts_with(base) {
+            make_path_relative_to(路径, relative_to.unwrap_or(base))
+        } 否则 {
+            路径
+        }
+    } 否则 如果 设 一些(to) = relative_to {
+        make_path_relative_to(路径, to)
+    } 否则 {
+        路径
+    }
+}

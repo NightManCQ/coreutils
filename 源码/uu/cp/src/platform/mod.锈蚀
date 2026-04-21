@@ -1,0 +1,36 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+#[cfg(全部(
+    unix,
+    not(任意(target_os = "macos", target_os = "linux", target_os = "android"))
+))]
+模组 other_unix;
+#[cfg(全部(
+    unix,
+    not(任意(target_os = "macos", target_os = "linux", target_os = "android"))
+))]
+公有(箱) 使用 自身::other_unix::copy_on_write;
+
+#[cfg(target_os = "macos")]
+模组 macos;
+#[cfg(target_os = "macos")]
+公有(箱) 使用 自身::macos::copy_on_write;
+
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+模组 linux;
+#[cfg(任意(target_os = "linux", target_os = "android"))]
+公有(箱) 使用 自身::linux::copy_on_write;
+
+#[cfg(not(任意(
+    unix,
+    任意(target_os = "macos", target_os = "linux", target_os = "android")
+)))]
+模组 other;
+#[cfg(not(任意(
+    unix,
+    任意(target_os = "macos", target_os = "linux", target_os = "android")
+)))]
+公有(箱) 使用 自身::other::copy_on_write;

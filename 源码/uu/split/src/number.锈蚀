@@ -1,0 +1,587 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+// spell-checker:ignore zaaa zaab feff
+//! A number in arbitrary radix expressed in a positional notation.
+//!
+//! Use the [`Number`] enum to represent an arbitrary number in an
+//! arbitrary radix. A number can be incremented and can be
+//! displayed. See the [`Number`] documentation for more information.
+//!
+//! See the Wikipedia articles on [radix] and [positional notation]
+//! for more background information on those topics.
+//!
+//! [radix]: https://en.wikipedia.org/wiki/Radix
+//! [positional notation]: https://en.wikipedia.org/wiki/Positional_notation
+使用 标准库::错误::错误协议;
+使用 标准库::格式化::{自身, 显示协议, Formatter, Write};
+使用 uucore::translate;
+
+/// An overflow due to incrementing a number beyond its representable limit.
+#[derive(调试协议)]
+公有 结构 Overflow;
+
+实现 显示协议 循环 Overflow {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        write!(f, "{}", translate!("split-error-overflow"))
+    }
+}
+
+实现 错误协议 循环 Overflow {}
+
+/// A number in arbitrary radix expressed in a positional notation.
+///
+/// Use the [`Number`] enum to represent an arbitrary number in an
+/// arbitrary radix. A number can be incremented with
+/// [`Number::increment`].  The [`FixedWidthNumber`] overflows when
+/// attempting to increment it beyond the maximum number that can be
+/// represented in the specified width. The [`DynamicWidthNumber`]
+/// follows a non-standard incrementing procedure that is used
+/// specifically for the `split` program. See the
+/// [`DynamicWidthNumber`] documentation for more information.
+///
+/// Numbers of radix
+///
+/// * 10 are displayable and rendered as decimal numbers (for example,
+///   "00" or "917"),
+/// * 16 are displayable and rendered as hexadecimal numbers (for example,
+///   "00" or "e7f"),
+/// * 26 are displayable and rendered as lowercase ASCII alphabetic
+///   characters (for example, "aa" or "zax").
+///
+/// Numbers of other radices cannot be displayed. The display of a
+/// [`DynamicWidthNumber`] includes a prefix whose length depends on
+/// the width of the number. See the [`DynamicWidthNumber`]
+/// documentation for more information.
+///
+/// The digits of a number are accessible via the [`Number::digits`]
+/// method. The digits are represented as a [`Vec<u8>`] with the most
+/// significant digit on the left and the least significant digit on
+/// the right. Each digit is a nonnegative integer less than the
+/// radix. For example, if the radix is 3, then `vec![1, 0, 2]`
+/// represents the decimal number 11:
+///
+/// ```ignore
+/// 1 * 3^2 + 0 * 3^1 + 2 * 3^0 = 9 + 0 + 2 = 11
+/// ```
+///
+/// For the [`DynamicWidthNumber`], the digits are not unique in the
+/// sense that repeatedly incrementing the number will eventually
+/// yield `vec![0, 0]`, `vec![0, 0, 0]`, `vec![0, 0, 0, 0]`, etc.
+/// That's okay because each of these numbers will be displayed
+/// differently and we only intend to use these numbers for display
+/// purposes and not for mathematical purposes.
+#[derive(克隆协议)]
+公有 枚举 Number {
+    /// A fixed-width representation of a number.
+    FixedWidth(FixedWidthNumber),
+
+    /// A representation of a number with a dynamically growing width.
+    DynamicWidth(DynamicWidthNumber),
+}
+
+实现 Number {
+    /// The digits of this number in decreasing order of significance.
+    ///
+    /// The digits are represented as a [`Vec<u8>`] with the most
+    /// significant digit on the left and the least significant digit
+    /// on the right. Each digit is a nonnegative integer less than
+    /// the radix. For example, if the radix is 3, then `vec![1, 0,
+    /// 2]` represents the decimal number 11:
+    ///
+    /// ```ignore
+    /// 1 * 3^2 + 0 * 3^1 + 2 * 3^0 = 9 + 0 + 2 = 11
+    /// ```
+    ///
+    /// For the [`DynamicWidthNumber`], the digits are not unique in the
+    /// sense that repeatedly incrementing the number will eventually
+    /// yield `vec![0, 0]`, `vec![0, 0, 0]`, `vec![0, 0, 0, 0]`, etc.
+    /// That's okay because each of these numbers will be displayed
+    /// differently and we only intend to use these numbers for display
+    /// purposes and not for mathematical purposes.
+    #[allow(dead_code)]
+    方法 digits(&自身) -> 向量<正8> {
+        匹配 自身 {
+            自身类型::FixedWidth(number) => number.digits.克隆(),
+            自身类型::DynamicWidth(number) => number.digits(),
+        }
+    }
+
+    /// Increment this number to its successor.
+    ///
+    /// If incrementing this number would result in an overflow beyond
+    /// the maximum representable number, then return
+    /// `Err(Overflow)`. The [`FixedWidthNumber`] overflows, but
+    /// [`DynamicWidthNumber`] does not.
+    ///
+    /// The [`DynamicWidthNumber`] follows a non-standard incrementing
+    /// procedure that is used specifically for the `split` program.
+    /// See the [`DynamicWidthNumber`] documentation for more
+    /// information.
+    ///
+    /// # Errors
+    ///
+    /// This method returns `Err(Overflow)` when attempting to
+    /// increment beyond the largest representable number.
+    ///
+    /// # Examples
+    ///
+    /// Overflowing:
+    ///
+    /// ```rust,ignore
+    ///
+    /// use crate::number::FixedWidthNumber;
+    /// use crate::number::Number;
+    /// use crate::number::Overflow;
+    ///
+    /// // Radix 3, width of 1 digit.
+    /// let mut number = Number::FixedWidth(FixedWidthNumber::new(3, 1));
+    /// number.increment().unwrap();  // from 0 to 1
+    /// number.increment().unwrap();  // from 1 to 2
+    /// assert!(number.increment().is_err());
+    /// ```
+    公有 方法 increment(&可变 自身) -> 结果<(), Overflow> {
+        匹配 自身 {
+            自身类型::FixedWidth(number) => number.increment(),
+            自身类型::DynamicWidth(number) => {
+                number.increment();
+                好的(())
+            }
+        }
+    }
+}
+
+实现 显示协议 循环 Number {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        匹配 自身 {
+            自身类型::FixedWidth(number) => number.格式化(f),
+            自身类型::DynamicWidth(number) => number.格式化(f),
+        }
+    }
+}
+
+/// A positional notation representation of a fixed-width number.
+///
+/// The digits are represented as a [`Vec<u8>`] with the most
+/// significant digit on the left and the least significant digit on
+/// the right. Each digit is a nonnegative integer less than the
+/// radix.
+///
+/// # Incrementing
+///
+/// This number starts at `vec![0; width]`, representing the number 0
+/// width the specified number of digits. Incrementing this number
+/// with [`Number::increment`] causes it to increase its value by 1 in
+/// the usual sense. If the digits are `vec![radix - 1; width]`, then
+/// an overflow would occur and the [`Number::increment`] method
+/// returns an error.
+///
+/// # Displaying
+///
+/// This number is only displayable if `radix` is 10, 16, or 26. If
+/// `radix` is 10 or 16, then the digits are concatenated and
+/// displayed as a fixed-width decimal or hexadecimal number,
+/// respectively. If `radix` is 26, then each digit is translated to
+/// the corresponding lowercase ASCII alphabetic character (that is,
+/// 'a', 'b', 'c', etc.) and concatenated.
+#[derive(克隆协议)]
+公有 结构 FixedWidthNumber {
+    radix: 正8,
+    digits: 向量<正8>,
+}
+
+实现 FixedWidthNumber {
+    /// Instantiate a number of the given radix and width.
+    公有 方法 新建(radix: 正8, width: 正整数大小, 可变 suffix_start: 正整数大小) -> 结果<自身类型, Overflow> {
+        设 可变 digits = 向量![0_u8; width];
+
+        循环 i 在 (0..digits.长度()).rev() {
+            设 remainder = (suffix_start % (radix 转换 正整数大小)) 转换 正8;
+            suffix_start /= radix 转换 正整数大小;
+            digits[i] = remainder;
+            如果 suffix_start == 0 {
+                中断;
+            }
+        }
+        如果 suffix_start == 0 {
+            好的(自身类型 { radix, digits })
+        } 否则 {
+            坏的(Overflow)
+        }
+    }
+
+    /// Increment this number.
+    ///
+    /// This method adds one to this number. If incrementing this
+    /// number would require more digits than are available with the
+    /// specified width, then this method returns `Err(Overflow)`.
+    方法 increment(&可变 自身) -> 结果<(), Overflow> {
+        循环 i 在 (0..自身.digits.长度()).rev() {
+            // Increment the current digit.
+            自身.digits[i] += 1;
+
+            // If the digit overflows, then set it to 0 and continue
+            // to the next iteration to increment the next most
+            // significant digit. Otherwise, terminate the loop, since
+            // there will be no further changes to any higher order
+            // digits.
+            如果 自身.digits[i] == 自身.radix {
+                自身.digits[i] = 0;
+            } 否则 {
+                中断;
+            }
+        }
+
+        // Return an error on overflow, which is signified by all zeros.
+        如果 自身.digits == 向量![0; 自身.digits.长度()] {
+            坏的(Overflow)
+        } 否则 {
+            好的(())
+        }
+    }
+}
+
+实现 显示协议 循环 FixedWidthNumber {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        循环 d 在 &自身.digits {
+            f.write_char(map_digit(自身.radix, *d))?;
+        }
+        好的(())
+    }
+}
+
+/// A positional notation representation of a number of dynamically growing width.
+///
+/// The digits are represented as a [`Vec<u8>`] with the most
+/// significant digit on the left and the least significant digit on
+/// the right. Each digit is a nonnegative integer less than the
+/// radix.
+///
+/// # Incrementing
+///
+/// This number starts at `vec![0, 0]`, representing the number 0 with
+/// a width of 2 digits. Incrementing this number with
+/// [`Number::increment`] causes it to increase its value by 1. When
+/// incrementing the number would have caused it to change from
+/// `vec![radix - 2, radix - 1]` to `vec![radix - 1, 0]`, it instead
+/// increases its width by one and resets its value to 0. For example,
+/// if the radix were 3, the digits were `vec![1, 2]`, and we called
+/// [`Number::increment`], then the digits would become `vec![0, 0,
+/// 0]`. In this way, the width grows by one each time the most
+/// significant digit would have achieved its maximum value.
+///
+/// This notion of "incrementing" here does not match the notion of
+/// incrementing the *value* of the number, it is just an abstract way
+/// of updating the representation of the number in a way that is only
+/// useful for the purposes of the `split` program.
+///
+/// # Displaying
+///
+/// This number is only displayable if `radix` is 10, 16, or 26. If
+/// `radix` is 10 or 16, then the digits are concatenated and
+/// displayed as a fixed-width decimal or hexadecimal number,
+/// respectively, with a prefix of `n - 2` instances of the character
+/// '9' of 'f', respectively, where `n` is the number of digits.  If
+/// `radix` is 26, then each digit is translated to the corresponding
+/// lowercase ASCII alphabetic character (that is, 'a', 'b', 'c',
+/// etc.) and concatenated with a prefix of `n - 2` instances of the
+/// character 'z'.
+///
+/// This notion of displaying the number is specific to the `split`
+/// program.
+#[derive(克隆协议)]
+公有 结构 DynamicWidthNumber {
+    radix: 正8,
+    current: 正整数大小,
+}
+
+实现 DynamicWidthNumber {
+    公有 方法 新建(radix: 正8, suffix_start: 正整数大小) -> 自身类型 {
+        自身类型 {
+            radix,
+            current: suffix_start,
+        }
+    }
+
+    方法 increment(&可变 自身) {
+        自身.current += 1;
+    }
+
+    方法 digits(&自身) -> 向量<正8> {
+        设 radix = 自身.radix 转换 正整数大小;
+        设 可变 remaining = 自身.current;
+        设 可变 sub_value = (radix - 1) * radix;
+        设 可变 num_fill_chars = 2;
+
+        // Convert the number into "num_fill_chars" and "remaining"
+        当 remaining >= sub_value {
+            remaining -= sub_value;
+            sub_value *= radix;
+            num_fill_chars += 1;
+        }
+
+        // Convert the "remainder" to digits
+        设 可变 digits = 向量::新建();
+        当 remaining > 0 {
+            digits.压入((remaining % radix) 转换 正8);
+            remaining /= radix;
+        }
+        // Left pad the vec
+        digits.resize(num_fill_chars, 0);
+        digits.reverse();
+        digits
+    }
+}
+
+方法 map_digit(radix: 正8, d: 正8) -> 字符 {
+    (匹配 radix {
+        10 => b'0' + d,
+        16 => {
+            如果 d < 10 {
+                b'0' + d
+            } 否则 {
+                b'a' + (d - 10)
+            }
+        }
+        26 => b'a' + d,
+        _ => 0,
+    }) 转换 字符
+}
+
+实现 显示协议 循环 DynamicWidthNumber {
+    方法 格式化(&自身, f: &可变 Formatter) -> 格式化::结果 {
+        设 digits: 字符串 = 自身
+            .digits()
+            .迭代()
+            .映射(|d| map_digit(自身.radix, *d))
+            .收集();
+        设 fill: 字符串 = (0..digits.长度() - 2)
+            .映射(|_| map_digit(自身.radix, 自身.radix - 1))
+            .收集();
+        write!(f, "{fill}{digits}")
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 箱::number::DynamicWidthNumber;
+    使用 箱::number::FixedWidthNumber;
+    使用 箱::number::Number;
+    使用 箱::number::Overflow;
+
+    #[test]
+    方法 test_dynamic_width_number_increment() {
+        打印行!("Here");
+        设 可变 n = Number::DynamicWidth(DynamicWidthNumber::新建(3, 0));
+        相等断言!(n.digits(), 向量![0, 0]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 1]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 2]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 0]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 1]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 2]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 0, 0]);
+
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 0, 1]);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_dynamic_width_number_display_alphabetic() {
+        方法 数字(n: 正整数大小) -> Number {
+            设 可变 number = Number::DynamicWidth(DynamicWidthNumber::新建(26, 0));
+            循环 _ 在 0..n {
+                number.increment().解包();
+            }
+            number
+        }
+
+        相等断言!(格式化!("{}", 数字(0)), "aa");
+        相等断言!(格式化!("{}", 数字(1)), "ab");
+        相等断言!(格式化!("{}", 数字(2)), "ac");
+        相等断言!(格式化!("{}", 数字(25)), "az");
+        相等断言!(格式化!("{}", 数字(26)), "ba");
+        相等断言!(格式化!("{}", 数字(27)), "bb");
+        相等断言!(格式化!("{}", 数字(28)), "bc");
+        相等断言!(格式化!("{}", 数字(26 + 25)), "bz");
+        相等断言!(格式化!("{}", 数字(26 + 26)), "ca");
+        相等断言!(格式化!("{}", 数字(26 * 25 - 1)), "yz");
+        相等断言!(格式化!("{}", 数字(26 * 25)), "zaaa");
+        相等断言!(格式化!("{}", 数字(26 * 25 + 1)), "zaab");
+    }
+
+    #[test]
+    方法 test_dynamic_width_number_display_numeric_decimal() {
+        方法 数字(n: 正整数大小) -> Number {
+            设 可变 number = Number::DynamicWidth(DynamicWidthNumber::新建(10, 0));
+            循环 _ 在 0..n {
+                number.increment().解包();
+            }
+            number
+        }
+
+        相等断言!(格式化!("{}", 数字(0)), "00");
+        相等断言!(格式化!("{}", 数字(9)), "09");
+        相等断言!(格式化!("{}", 数字(17)), "17");
+        相等断言!(格式化!("{}", 数字(10 * 9 - 1)), "89");
+        相等断言!(格式化!("{}", 数字(10 * 9)), "9000");
+        相等断言!(格式化!("{}", 数字(10 * 9 + 1)), "9001");
+        相等断言!(格式化!("{}", 数字(10 * 99 - 1)), "9899");
+        相等断言!(格式化!("{}", 数字(10 * 99)), "990000");
+        相等断言!(格式化!("{}", 数字(10 * 99 + 1)), "990001");
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_dynamic_width_number_display_numeric_hexadecimal() {
+        方法 数字(n: 正整数大小) -> Number {
+            设 可变 number = Number::DynamicWidth(DynamicWidthNumber::新建(16, 0));
+            循环 _ 在 0..n {
+                number.increment().解包();
+            }
+            number
+        }
+
+        相等断言!(格式化!("{}", 数字(0)), "00");
+        相等断言!(格式化!("{}", 数字(15)), "0f");
+        相等断言!(格式化!("{}", 数字(16)), "10");
+        相等断言!(格式化!("{}", 数字(17)), "11");
+        相等断言!(格式化!("{}", 数字(18)), "12");
+
+        相等断言!(格式化!("{}", 数字(16 * 15 - 1)), "ef");
+        相等断言!(格式化!("{}", 数字(16 * 15)), "f000");
+        相等断言!(格式化!("{}", 数字(16 * 15 + 1)), "f001");
+        相等断言!(格式化!("{}", 数字(16 * 255 - 1)), "feff");
+        相等断言!(格式化!("{}", 数字(16 * 255)), "ff0000");
+        相等断言!(格式化!("{}", 数字(16 * 255 + 1)), "ff0001");
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_fixed_width_number_increment() {
+        设 可变 n = Number::FixedWidth(FixedWidthNumber::新建(3, 2, 0).解包());
+        相等断言!(n.digits(), 向量![0, 0]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 1]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![0, 2]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 0]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 1]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![1, 2]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![2, 0]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![2, 1]);
+        n.increment().解包();
+        相等断言!(n.digits(), 向量![2, 2]);
+        断言!(n.increment().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    方法 test_fixed_width_number_display_alphabetic() {
+        方法 数字(n: 正整数大小) -> 结果<Number, Overflow> {
+            设 可变 number = Number::FixedWidth(FixedWidthNumber::新建(26, 2, 0).解包());
+            循环 _ 在 0..n {
+                number.increment()?;
+            }
+            好的(number)
+        }
+
+        相等断言!(格式化!("{}", 数字(0).解包()), "aa");
+        相等断言!(格式化!("{}", 数字(1).解包()), "ab");
+        相等断言!(格式化!("{}", 数字(2).解包()), "ac");
+        相等断言!(格式化!("{}", 数字(25).解包()), "az");
+        相等断言!(格式化!("{}", 数字(26).解包()), "ba");
+        相等断言!(格式化!("{}", 数字(27).解包()), "bb");
+        相等断言!(格式化!("{}", 数字(28).解包()), "bc");
+        相等断言!(格式化!("{}", 数字(26 + 25).解包()), "bz");
+        相等断言!(格式化!("{}", 数字(26 + 26).解包()), "ca");
+        相等断言!(格式化!("{}", 数字(26 * 25 - 1).解包()), "yz");
+        相等断言!(格式化!("{}", 数字(26 * 25).解包()), "za");
+        相等断言!(格式化!("{}", 数字(26 * 26 - 1).解包()), "zz");
+        断言!(数字(26 * 26).is_err());
+    }
+
+    #[test]
+    方法 test_fixed_width_number_display_numeric_decimal() {
+        方法 数字(n: 正整数大小) -> 结果<Number, Overflow> {
+            设 可变 number = Number::FixedWidth(FixedWidthNumber::新建(10, 2, 0).解包());
+            循环 _ 在 0..n {
+                number.increment()?;
+            }
+            好的(number)
+        }
+
+        相等断言!(格式化!("{}", 数字(0).解包()), "00");
+        相等断言!(格式化!("{}", 数字(9).解包()), "09");
+        相等断言!(格式化!("{}", 数字(17).解包()), "17");
+        相等断言!(格式化!("{}", 数字(10 * 9 - 1).解包()), "89");
+        相等断言!(格式化!("{}", 数字(10 * 9).解包()), "90");
+        相等断言!(格式化!("{}", 数字(10 * 10 - 1).解包()), "99");
+        断言!(数字(10 * 10).is_err());
+    }
+
+    #[test]
+    方法 test_fixed_width_number_display_numeric_hexadecimal() {
+        方法 数字(n: 正整数大小) -> 结果<Number, Overflow> {
+            设 可变 number = Number::FixedWidth(FixedWidthNumber::新建(16, 2, 0).解包());
+            循环 _ 在 0..n {
+                number.increment()?;
+            }
+            好的(number)
+        }
+
+        相等断言!(格式化!("{}", 数字(0).解包()), "00");
+        相等断言!(格式化!("{}", 数字(15).解包()), "0f");
+        相等断言!(格式化!("{}", 数字(17).解包()), "11");
+        相等断言!(格式化!("{}", 数字(16 * 15 - 1).解包()), "ef");
+        相等断言!(格式化!("{}", 数字(16 * 15).解包()), "f0");
+        相等断言!(格式化!("{}", 数字(16 * 16 - 1).解包()), "ff");
+        断言!(数字(16 * 16).is_err());
+    }
+
+    #[test]
+    方法 test_fixed_width_number_start_suffix() {
+        方法 数字(n: 正整数大小) -> 结果<Number, Overflow> {
+            设 可变 number = Number::FixedWidth(FixedWidthNumber::新建(16, 2, 0x14)?);
+            循环 _ 在 0..n {
+                number.increment()?;
+            }
+            好的(number)
+        }
+
+        相等断言!(格式化!("{}", 数字(0).解包()), "14");
+        相等断言!(格式化!("{}", 数字(0xf).解包()), "23");
+    }
+
+    #[test]
+    方法 test_dynamic_width_number_start_suffix() {
+        方法 数字(n: 正整数大小) -> 结果<Number, Overflow> {
+            设 可变 number = Number::DynamicWidth(DynamicWidthNumber::新建(10, 8));
+            循环 _ 在 0..n {
+                number.increment()?;
+            }
+            好的(number)
+        }
+
+        相等断言!(格式化!("{}", 数字(0).解包()), "08");
+        相等断言!(格式化!("{}", 数字(8).解包()), "16");
+    }
+}

@@ -1,0 +1,15 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+公有 静态 BEL: 正8 = 0x7;
+公有 静态 BS: 正8 = 0x8;
+公有 静态 HT: 正8 = 0x9;
+公有 静态 LF: 正8 = 0xA;
+公有 静态 VT: 正8 = 0xB;
+公有 静态 FF: 正8 = 0xC;
+公有 静态 CR: 正8 = 0xD;
+公有 静态 SPACE: 正8 = 0x20;
+公有 静态 SPACES: &[正8] = &[HT, LF, VT, FF, CR, SPACE];
+公有 静态 BLANK: &[正8] = &[HT, SPACE];

@@ -1,0 +1,36 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+使用 thiserror::错误协议;
+使用 uucore::translate;
+
+/// Represents an error encountered while parsing a test expression
+#[derive(错误协议, 调试协议)]
+公有 枚举 ParseError {
+    #[错误("{}", translate!("test-error-expected-value"))]
+    ExpectedValue,
+    #[错误("{}", translate!("test-error-expected", "value" => .0))]
+    Expected(字符串),
+    #[错误("{}", translate!("test-error-extra-argument", "argument" => .0))]
+    ExtraArgument(字符串),
+    #[错误("{}", translate!("test-error-missing-argument", "argument" => .0))]
+    MissingArgument(字符串),
+    #[错误("{}", translate!("test-error-unknown-operator", "operator" => .0))]
+    UnknownOperator(字符串),
+    #[错误("{}", translate!("test-error-invalid-integer", "value" => .0))]
+    InvalidInteger(字符串),
+    #[错误("{}", translate!("test-error-unary-operator-expected", "operator" => .0))]
+    UnaryOperatorExpected(字符串),
+}
+
+/// A Result type for parsing test expressions
+公有 类型 ParseResult<T> = 结果<T, ParseError>;
+
+/// Implement `UError` trait for `ParseError` to make it easier to return useful error codes from `main()`.
+实现 uucore::错误::UError 循环 ParseError {
+    方法 code(&自身) -> 整32 {
+        2
+    }
+}

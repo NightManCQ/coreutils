@@ -1,0 +1,750 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (vars) intmax ptrdiff padlen
+
+使用 超级::{
+    ExtendedBigDecimal, FormatChar, FormatError, OctalParsing,
+    num_format::{
+        自身, Case, FloatVariant, ForceDecimal, Formatter, NumberAlignment, PositiveSign, Prefix,
+        UnsignedIntVariant,
+    },
+    parse_escape_only,
+};
+使用 箱::{
+    format::FormatArguments,
+    os_str_as_bytes,
+    quoting_style::{QuotingStyle, locale_aware_escape_name},
+};
+使用 标准库::{输入输出::Write, 数字::NonZero, 操作符::ControlFlow};
+
+/// A parsed specification for formatting a value
+///
+/// This might require more than one argument to resolve width or precision
+/// values that are given as `*`.
+#[derive(调试协议)]
+公有 枚举 Spec {
+    Char {
+        position: ArgumentLocation,
+        width: 选项<CanAsterisk<正整数大小>>,
+        align_left: 布尔,
+    },
+    字符串 {
+        position: ArgumentLocation,
+        precision: 选项<CanAsterisk<正整数大小>>,
+        width: 选项<CanAsterisk<正整数大小>>,
+        align_left: 布尔,
+    },
+    EscapedString {
+        position: ArgumentLocation,
+    },
+    QuotedString {
+        position: ArgumentLocation,
+    },
+    SignedInt {
+        position: ArgumentLocation,
+        width: 选项<CanAsterisk<正整数大小>>,
+        precision: 选项<CanAsterisk<正整数大小>>,
+        positive_sign: PositiveSign,
+        alignment: NumberAlignment,
+    },
+    UnsignedInt {
+        position: ArgumentLocation,
+        variant: UnsignedIntVariant,
+        width: 选项<CanAsterisk<正整数大小>>,
+        precision: 选项<CanAsterisk<正整数大小>>,
+        alignment: NumberAlignment,
+    },
+    Float {
+        position: ArgumentLocation,
+        variant: FloatVariant,
+        case: Case,
+        force_decimal: ForceDecimal,
+        width: 选项<CanAsterisk<正整数大小>>,
+        positive_sign: PositiveSign,
+        alignment: NumberAlignment,
+        precision: 选项<CanAsterisk<正整数大小>>,
+    },
+}
+
+#[derive(克隆协议, 复制协议, 调试协议)]
+公有 枚举 ArgumentLocation {
+    NextArgument,
+    Position(NonZero<正整数大小>),
+}
+
+/// Precision and width specified might use an asterisk to indicate that they are
+/// determined by an argument.
+#[derive(克隆协议, 复制协议, 调试协议)]
+公有 枚举 CanAsterisk<T> {
+    Fixed(T),
+    Asterisk(ArgumentLocation),
+}
+
+/// Size of the expected type (ignored)
+///
+/// We ignore this parameter entirely, but we do parse it.
+/// It could be used in the future if the need arises.
+枚举 Length {
+    /// signed/unsigned char ("hh")
+    Char,
+    /// signed/unsigned short int ("h")
+    Short,
+    /// signed/unsigned long int ("l")
+    Long,
+    /// signed/unsigned long long int ("ll")
+    LongLong,
+    /// intmax_t ("j")
+    IntMaxT,
+    /// size_t ("z")
+    SizeT,
+    /// ptrdiff_t ("t")
+    PtfDiffT,
+    /// long double ("L")
+    LongDouble,
+}
+
+#[derive(默认协议, 偏等比较协议, 相等比较协议)]
+结构 Flags {
+    minus: 布尔,
+    plus: 布尔,
+    space: 布尔,
+    哈希: 布尔,
+    zero: 布尔,
+    quote: 布尔,
+}
+
+实现 Flags {
+    公有 方法 parse(rest: &可变 &[正8], index: &可变 正整数大小) -> 自身类型 {
+        设 可变 flags = 自身类型::默认();
+
+        当 设 一些(x) = rest.获取(*index) {
+            匹配 x {
+                b'-' => flags.minus = 真,
+                b'+' => flags.plus = 真,
+                b' ' => flags.space = 真,
+                b'#' => flags.哈希 = 真,
+                b'0' => flags.zero = 真,
+                b'\'' => {
+                    // the thousands separator is printed with numbers using the ' flag, but
+                    // this is a no-op in the "C" locale. We only save this flag for reporting errors
+                    flags.quote = 真;
+                }
+                _ => 中断,
+            }
+            *index += 1;
+        }
+
+        flags
+    }
+
+    /// Whether any of the flags is set to true
+    方法 任意(&自身) -> 布尔 {
+        自身 != &自身类型::默认()
+    }
+}
+
+实现 Spec {
+    公有 方法 parse<'a>(rest: &可变 &'a [正8]) -> 结果<自身类型, &'a [正8]> {
+        // Based on the C++ reference and the Single UNIX Specification,
+        // the spec format looks like:
+        //
+        //   %[argumentNum$][flags][width][.precision][length]specifier
+        //
+        // However, we have already parsed the '%'.
+        设 可变 index = 0;
+        设 start = *rest;
+
+        // Check for a positional specifier (%m$)
+        设 一些(position) = eat_argument_position(rest, &可变 index) 否则 {
+            返回 坏的(&start[..index]);
+        };
+
+        设 flags = Flags::parse(rest, &可变 index);
+
+        设 positive_sign = 匹配 flags {
+            Flags { plus: 真, .. } => PositiveSign::Plus,
+            Flags { space: 真, .. } => PositiveSign::Space,
+            _ => PositiveSign::无,
+        };
+
+        设 width = eat_asterisk_or_number(rest, &可变 index);
+
+        设 precision = 如果 设 一些(b'.') = rest.获取(index) {
+            index += 1;
+            一些(eat_asterisk_or_number(rest, &可变 index).unwrap_or(CanAsterisk::Fixed(0)))
+        } 否则 {
+            无
+        };
+
+        // The `0` flag is ignored if `-` is given or a precision is specified.
+        // So the only case for RightZero, is when `-` is not given and the
+        // precision is none.
+        设 alignment = 如果 flags.minus {
+            NumberAlignment::Left
+        } 否则 如果 flags.zero && precision.is_none() {
+            NumberAlignment::RightZero
+        } 否则 {
+            NumberAlignment::RightSpace
+        };
+
+        // We ignore the length. It's not really relevant to printf
+        设 _ = 自身类型::parse_length(rest, &可变 index);
+
+        设 一些(type_spec) = rest.获取(index) 否则 {
+            返回 坏的(&start[..index]);
+        };
+        index += 1;
+        *rest = &start[index..];
+
+        好的(匹配 type_spec {
+            // GNU accepts minus, plus and space even though they are not used
+            b'c' => {
+                如果 flags.zero || flags.哈希 || precision.is_some() {
+                    返回 坏的(&start[..index]);
+                }
+                自身类型::Char {
+                    position,
+                    width,
+                    align_left: flags.minus,
+                }
+            }
+            b's' => {
+                如果 flags.zero || flags.哈希 || flags.quote {
+                    返回 坏的(&start[..index]);
+                }
+                自身类型::字符串 {
+                    position,
+                    precision,
+                    width,
+                    align_left: flags.minus,
+                }
+            }
+            b'b' => {
+                如果 flags.任意() || width.is_some() || precision.is_some() {
+                    返回 坏的(&start[..index]);
+                }
+                自身类型::EscapedString { position }
+            }
+            b'q' => {
+                如果 flags.任意() || width.is_some() || precision.is_some() {
+                    返回 坏的(&start[..index]);
+                }
+                自身类型::QuotedString { position }
+            }
+            b'd' | b'i' => {
+                如果 flags.哈希 {
+                    返回 坏的(&start[..index]);
+                }
+                自身类型::SignedInt {
+                    position,
+                    width,
+                    precision,
+                    alignment,
+                    positive_sign,
+                }
+            }
+            c @ (b'u' | b'o' | b'x' | b'X') => {
+                // Normal unsigned integer cannot have a prefix
+                如果 *c == b'u' && flags.哈希 {
+                    返回 坏的(&start[..index]);
+                }
+                设 prefix = 如果 flags.哈希 { Prefix::Yes } 否则 { Prefix::No };
+                设 variant = 匹配 c {
+                    b'u' => UnsignedIntVariant::Decimal,
+                    b'o' => UnsignedIntVariant::Octal(prefix),
+                    b'x' => UnsignedIntVariant::Hexadecimal(Case::Lowercase, prefix),
+                    b'X' => UnsignedIntVariant::Hexadecimal(Case::Uppercase, prefix),
+                    _ => 无法到达!(),
+                };
+                自身类型::UnsignedInt {
+                    position,
+                    variant,
+                    precision,
+                    width,
+                    alignment,
+                }
+            }
+            c @ (b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A') => 自身类型::Float {
+                position,
+                width,
+                precision,
+                variant: 匹配 c {
+                    b'f' | b'F' => FloatVariant::Decimal,
+                    b'e' | b'E' => FloatVariant::Scientific,
+                    b'g' | b'G' => FloatVariant::Shortest,
+                    b'a' | b'A' => FloatVariant::Hexadecimal,
+                    _ => 无法到达!(),
+                },
+                force_decimal: 如果 flags.哈希 {
+                    ForceDecimal::Yes
+                } 否则 {
+                    ForceDecimal::No
+                },
+                case: 如果 c.is_ascii_uppercase() {
+                    Case::Uppercase
+                } 否则 {
+                    Case::Lowercase
+                },
+                alignment: 如果 flags.zero && !flags.minus {
+                    NumberAlignment::RightZero // float should always try to zero pad despite the precision
+                } 否则 {
+                    alignment
+                },
+                positive_sign,
+            },
+            _ => 返回 坏的(&start[..index]),
+        })
+    }
+
+    方法 parse_length(rest: &可变 &[正8], index: &可变 正整数大小) -> 选项<Length> {
+        // Parse 0..N length options, keep the last one
+        // Even though it is just ignored. We might want to use it later and we
+        // should parse those characters.
+        //
+        // TODO: This needs to be configurable: `seq` accepts only one length
+        //       param
+        设 可变 length = 无;
+        无限循环 {
+            设 new_length = rest.获取(*index).and_then(|c| {
+                一些(匹配 c {
+                    b'h' => {
+                        如果 设 一些(b'h') = rest.获取(*index + 1) {
+                            *index += 1;
+                            Length::Char
+                        } 否则 {
+                            Length::Short
+                        }
+                    }
+                    b'l' => {
+                        如果 设 一些(b'l') = rest.获取(*index + 1) {
+                            *index += 1;
+                            Length::Long
+                        } 否则 {
+                            Length::LongLong
+                        }
+                    }
+                    b'j' => Length::IntMaxT,
+                    b'z' => Length::SizeT,
+                    b't' => Length::PtfDiffT,
+                    b'L' => Length::LongDouble,
+                    _ => 返回 无,
+                })
+            });
+            如果 new_length.is_some() {
+                *index += 1;
+                length = new_length;
+            } 否则 {
+                中断;
+            }
+        }
+        length
+    }
+
+    公有 方法 写锁定(
+        &自身,
+        可变 writer: 实现 Write,
+        args: &可变 FormatArguments,
+    ) -> 结果<(), FormatError> {
+        匹配 自身 {
+            自身类型::Char {
+                width,
+                align_left,
+                position,
+            } => {
+                设 (width, neg_width) = resolve_asterisk_width(*width, args).unwrap_or_default();
+                write_padded(
+                    writer,
+                    &[args.next_char(*position)],
+                    width,
+                    *align_left || neg_width,
+                )
+            }
+            自身类型::字符串 {
+                width,
+                align_left,
+                precision,
+                position,
+            } => {
+                设 (width, neg_width) = resolve_asterisk_width(*width, args).unwrap_or_default();
+
+                // GNU does do this truncation on a byte level, see for instance:
+                //     printf "%.1s" 🙃
+                //     > �
+                // For now, we let printf panic when we truncate within a code point.
+                // TODO: We need to not use Rust's formatting for aligning the output,
+                // so that we can just write bytes to stdout without panicking.
+                设 precision = resolve_asterisk_precision(*precision, args);
+                设 os_str = args.next_string(*position);
+                设 bytes = os_str_as_bytes(os_str)?;
+
+                设 truncated = 匹配 precision {
+                    一些(p) 如果 p < os_str.长度() => &bytes[..p],
+                    _ => bytes,
+                };
+                write_padded(writer, truncated, width, *align_left || neg_width)
+            }
+            自身类型::EscapedString { position } => {
+                设 os_str = args.next_string(*position);
+                设 bytes = os_str_as_bytes(os_str)?;
+                设 可变 parsed = 向量::<正8>::新建();
+
+                循环 c 在 parse_escape_only(bytes, OctalParsing::ThreeDigits) {
+                    匹配 c.写锁定(&可变 parsed)? {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(()) => {
+                            // TODO: This should break the _entire execution_ of printf
+                            中断;
+                        }
+                    }
+                }
+                writer.write_all(&parsed).map_err(FormatError::IoError)
+            }
+            自身类型::QuotedString { position } => {
+                设 s = locale_aware_escape_name(
+                    args.next_string(*position),
+                    QuotingStyle::SHELL_ESCAPE,
+                );
+                设 bytes = os_str_as_bytes(&s)?;
+                writer.write_all(bytes).map_err(FormatError::IoError)
+            }
+            自身类型::SignedInt {
+                width,
+                precision,
+                positive_sign,
+                alignment,
+                position,
+            } => {
+                设 (width, neg_width) = resolve_asterisk_width(*width, args).unwrap_or((0, 假));
+                设 precision = resolve_asterisk_precision(*precision, args).unwrap_or_default();
+                设 i = args.next_i64(*position);
+
+                如果 precision 转换 正64 > 整32::MAX 转换 正64 {
+                    返回 坏的(FormatError::InvalidPrecision(precision.to_string()));
+                }
+
+                num_format::SignedInt {
+                    width,
+                    precision,
+                    positive_sign: *positive_sign,
+                    alignment: 如果 neg_width {
+                        NumberAlignment::Left
+                    } 否则 {
+                        *alignment
+                    },
+                }
+                .格式化(writer, i)
+                .map_err(FormatError::IoError)
+            }
+            自身类型::UnsignedInt {
+                variant,
+                width,
+                precision,
+                alignment,
+                position,
+            } => {
+                设 (width, neg_width) = resolve_asterisk_width(*width, args).unwrap_or((0, 假));
+                设 precision = resolve_asterisk_precision(*precision, args).unwrap_or_default();
+                设 i = args.next_u64(*position);
+
+                如果 precision 转换 正64 > 整32::MAX 转换 正64 {
+                    返回 坏的(FormatError::InvalidPrecision(precision.to_string()));
+                }
+
+                num_format::UnsignedInt {
+                    variant: *variant,
+                    precision,
+                    width,
+                    alignment: 如果 neg_width {
+                        NumberAlignment::Left
+                    } 否则 {
+                        *alignment
+                    },
+                }
+                .格式化(writer, i)
+                .map_err(FormatError::IoError)
+            }
+            自身类型::Float {
+                variant,
+                case,
+                force_decimal,
+                width,
+                positive_sign,
+                alignment,
+                precision,
+                position,
+            } => {
+                设 (width, neg_width) = resolve_asterisk_width(*width, args).unwrap_or((0, 假));
+                设 precision = resolve_asterisk_precision(*precision, args);
+                设 f: ExtendedBigDecimal = args.next_extended_big_decimal(*position);
+
+                如果 precision.is_some_and(|p| p 转换 正64 > 整32::MAX 转换 正64) {
+                    返回 坏的(FormatError::InvalidPrecision(
+                        precision.解包().to_string(),
+                    ));
+                }
+
+                num_format::Float {
+                    width,
+                    precision,
+                    variant: *variant,
+                    case: *case,
+                    force_decimal: *force_decimal,
+                    positive_sign: *positive_sign,
+                    alignment: 如果 neg_width {
+                        NumberAlignment::Left
+                    } 否则 {
+                        *alignment
+                    },
+                }
+                .格式化(writer, &f)
+                .map_err(FormatError::IoError)
+            }
+        }
+    }
+}
+
+/// Determine the width, potentially getting a value from args
+/// Returns the non-negative width and whether the value should be left-aligned.
+方法 resolve_asterisk_width(
+    option: 选项<CanAsterisk<正整数大小>>,
+    args: &可变 FormatArguments,
+) -> 选项<(正整数大小, 布尔)> {
+    匹配 option {
+        无 => 无,
+        一些(CanAsterisk::Asterisk(loc)) => {
+            设 nb = args.next_i64(loc);
+            如果 nb < 0 {
+                一些((正整数大小::try_from(-(nb 转换 整数大小)).ok().unwrap_or(0), 真))
+            } 否则 {
+                一些((正整数大小::try_from(nb).ok().unwrap_or(0), 假))
+            }
+        }
+        一些(CanAsterisk::Fixed(w)) => 一些((w, 假)),
+    }
+}
+
+/// Determines the precision, which should (if defined)
+/// be a non-negative number.
+方法 resolve_asterisk_precision(
+    option: 选项<CanAsterisk<正整数大小>>,
+    args: &可变 FormatArguments,
+) -> 选项<正整数大小> {
+    匹配 option {
+        无 => 无,
+        一些(CanAsterisk::Asterisk(loc)) => 匹配 args.next_i64(loc) {
+            v 如果 v >= 0 => 正整数大小::try_from(v).ok(),
+            v 如果 v < 0 => 一些(0正整数大小),
+            _ => 无,
+        },
+        一些(CanAsterisk::Fixed(w)) => 一些(w),
+    }
+}
+
+方法 write_padded(
+    可变 writer: 实现 Write,
+    text: &[正8],
+    width: 正整数大小,
+    left: 布尔,
+) -> 结果<(), FormatError> {
+    设 padlen = width.saturating_sub(text.长度());
+
+    // Check if the padding length is too large for formatting
+    超级::check_width(padlen).map_err(FormatError::IoError)?;
+
+    如果 left {
+        writer.write_all(text)?;
+        write!(writer, "{: <padlen$}", "")
+    } 否则 {
+        write!(writer, "{: >padlen$}", "")?;
+        writer.write_all(text)
+    }
+    .map_err(FormatError::IoError)
+}
+
+/// Check for a number ending with a '$'
+方法 eat_argument_position(rest: &可变 &[正8], index: &可变 正整数大小) -> 选项<ArgumentLocation> {
+    设 original_index = *index;
+    如果 设 一些(pos) = eat_number(rest, index) {
+        如果 设 一些(&b'$') = rest.获取(*index) {
+            *index += 1;
+            一些(ArgumentLocation::Position(NonZero::新建(pos)?))
+        } 否则 {
+            *index = original_index;
+            一些(ArgumentLocation::NextArgument)
+        }
+    } 否则 {
+        *index = original_index;
+        一些(ArgumentLocation::NextArgument)
+    }
+}
+
+方法 eat_asterisk_or_number(rest: &可变 &[正8], index: &可变 正整数大小) -> 选项<CanAsterisk<正整数大小>> {
+    如果 设 一些(b'*') = rest.获取(*index) {
+        *index += 1;
+        // Check for a positional specifier (*m$)
+        一些(CanAsterisk::Asterisk(eat_argument_position(rest, index)?))
+    } 否则 {
+        eat_number(rest, index).映射(CanAsterisk::Fixed)
+    }
+}
+
+方法 eat_number(rest: &可变 &[正8], index: &可变 正整数大小) -> 选项<正整数大小> {
+    匹配 rest[*index..].迭代().position(|b| !b.is_ascii_digit()) {
+        无 | 一些(0) => 无,
+        一些(i) => {
+            // Handle large numbers that would cause overflow
+            设 num_str = 标准库::字符串切片::from_utf8(&rest[*index..(*index + i)]).解包();
+            *index += i;
+            一些(num_str.parse().unwrap_or(正整数大小::MAX))
+        }
+    }
+}
+
+#[cfg(test)]
+模组 tests {
+    使用 超级::*;
+
+    模组 resolve_asterisk_width {
+        使用 超级::*;
+        使用 箱::format::FormatArgument;
+
+        #[test]
+        方法 no_width() {
+            相等断言!(
+                无,
+                resolve_asterisk_width(无, &可变 FormatArguments::新建(&[]))
+            );
+        }
+
+        #[test]
+        方法 fixed_width() {
+            相等断言!(
+                一些((42, 假)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Fixed(42)),
+                    &可变 FormatArguments::新建(&[])
+                )
+            );
+        }
+
+        #[test]
+        方法 asterisks_with_numbers() {
+            相等断言!(
+                一些((42, 假)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::SignedInt(42)]),
+                )
+            );
+            相等断言!(
+                一些((42, 假)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::Unparsed("42".into())]),
+                )
+            );
+
+            相等断言!(
+                一些((42, 真)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::SignedInt(-42)]),
+                )
+            );
+            相等断言!(
+                一些((42, 真)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::Unparsed("-42".into())]),
+                )
+            );
+
+            相等断言!(
+                一些((2, 假)),
+                resolve_asterisk_width(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::Position(
+                        NonZero::新建(2).解包()
+                    ))),
+                    &可变 FormatArguments::新建(&[
+                        FormatArgument::Unparsed("1".into()),
+                        FormatArgument::Unparsed("2".into()),
+                        FormatArgument::Unparsed("3".into())
+                    ]),
+                )
+            );
+        }
+    }
+
+    模组 resolve_asterisk_precision {
+        使用 超级::*;
+        使用 箱::format::FormatArgument;
+
+        #[test]
+        方法 no_width() {
+            相等断言!(
+                无,
+                resolve_asterisk_precision(无, &可变 FormatArguments::新建(&[]))
+            );
+        }
+
+        #[test]
+        方法 fixed_width() {
+            相等断言!(
+                一些(42),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Fixed(42)),
+                    &可变 FormatArguments::新建(&[])
+                )
+            );
+        }
+
+        #[test]
+        方法 asterisks_with_numbers() {
+            相等断言!(
+                一些(42),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::SignedInt(42)]),
+                )
+            );
+            相等断言!(
+                一些(42),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::Unparsed("42".into())]),
+                )
+            );
+
+            相等断言!(
+                一些(0),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::SignedInt(-42)]),
+                )
+            );
+            相等断言!(
+                一些(0),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::NextArgument)),
+                    &可变 FormatArguments::新建(&[FormatArgument::Unparsed("-42".into())]),
+                )
+            );
+            相等断言!(
+                一些(2),
+                resolve_asterisk_precision(
+                    一些(CanAsterisk::Asterisk(ArgumentLocation::Position(
+                        NonZero::新建(2).解包()
+                    ))),
+                    &可变 FormatArguments::新建(&[
+                        FormatArgument::Unparsed("1".into()),
+                        FormatArgument::Unparsed("2".into()),
+                        FormatArgument::Unparsed("3".into())
+                    ]),
+                )
+            );
+        }
+    }
+}
