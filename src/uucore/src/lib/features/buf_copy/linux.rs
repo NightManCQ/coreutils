@@ -48,25 +48,19 @@ impl From<rustix::io::Errno> for Error {
 /// # Arguments
 /// * `source` - `Read` implementor to copy data from.
 /// * `dest` - `Write` implementor to copy data to.
-///
-/// # Returns
-///
-/// Result of operation and bytes successfully written (as a `u64`) when
-/// operation is successful.
-pub fn copy_stream<R, S>(src: &mut R, dest: &mut S) -> UResult<u64>
+pub fn copy_stream<R, S>(src: &mut R, dest: &mut S) -> UResult<()>
 where
     R: Read + AsFd + AsRawFd,
     S: Write + AsFd + AsRawFd,
 {
     // If we're on Linux or Android, try to use the splice() system call
     // for faster writing. If it works, we're done.
-    let result = splice_write(src, &dest.as_fd())?;
-    if !result.1 {
-        return Ok(result.0);
+    if !splice_write(src, &dest.as_fd())? {
+        return Ok(());
     }
 
     // If the splice() call failed, fall back on slower writing.
-    let result = std::io::copy(src, dest)?;
+    std::io::copy(src, dest)?;
 
     // If the splice() call failed and there has been some data written to
     // stdout via while loop above AND there will be second splice() call
@@ -74,7 +68,7 @@ where
     // the data buffered in stdout.lock. Therefore additional explicit flush
     // is required here.
     dest.flush()?;
-    Ok(result)
+    Ok(())
 }
 
 /// Write from source `handle` into destination `write_fd` using Linux-specific
@@ -84,13 +78,12 @@ where
 /// - `source` - source handle
 /// - `dest` - destination handle
 #[inline]
-pub(crate) fn splice_write<R, S>(source: &R, dest: &S) -> UResult<(u64, bool)>
+pub(crate) fn splice_write<R, S>(source: &R, dest: &S) -> UResult<bool>
 where
     R: Read + AsFd + AsRawFd,
     S: AsRawFd + AsFd,
 {
     let (pipe_rd, pipe_wr) = pipe()?;
-    let mut bytes: u64 = 0;
     // improve throughput
     // no need to increase pipe size of input fd since
     // - sender with splice probably increased size already
@@ -99,10 +92,8 @@ where
 
     loop {
         match splice(&source, &pipe_wr, MAX_ROOTLESS_PIPE_SIZE) {
+            Ok(0) => return Ok(false),
             Ok(n) => {
-                if n == 0 {
-                    return Ok((bytes, false));
-                }
                 if splice_exact(&pipe_rd, dest, n).is_err() {
                     // If the first splice manages to copy to the intermediate
                     // pipe, but the second splice to stdout fails for some reason
@@ -110,14 +101,10 @@ where
                     // intermediate pipe to stdout using normal read/write. Then
                     // we tell the caller to fall back.
                     copy_exact(&pipe_rd, dest, n)?;
-                    return Ok((bytes, true));
+                    return Ok(true);
                 }
-
-                bytes += n as u64;
             }
-            Err(_) => {
-                return Ok((bytes, true));
-            }
+            Err(_) => return Ok(true),
         }
     }
 }
